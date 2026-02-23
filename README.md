@@ -151,6 +151,7 @@ skip_within = "7d"    # optional
 | `parallelism` | Number of concurrent tasks | `3` |
 | `skip_within` | Skip directories processed within this duration | `"7d"`, `"24h"`, `"1d12h"` |
 | `cleanup_after` | Auto-delete report directories older than this duration | `"7d"` (default) |
+| `report_dir` | Directory to save execution logs | `~/Documents/token-burn` (default) |
 
 `skip_within` accepts duration strings: `d` (days), `h` (hours), `m` (minutes), `s` (seconds). If omitted, directories processed since the previous reset are skipped. Excessively large values are rejected. Use `--fresh` to ignore saved state entirely.
 
@@ -193,8 +194,17 @@ exclude = ["archived-project"]
 [[scan]]
 base_dirs = ["~/git"]
 username = "owayo"
+recursive = true
 public_first = false
 ```
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `base_dirs` | Directories to scan for git repositories | (required) |
+| `username` | Filter repos whose remote URL owner matches this username | (none — all repos included) |
+| `public_first` | Sort public repositories before private ones so they are processed first | `true` |
+| `recursive` | Recurse into subdirectories to find nested git repositories | `false` |
+| `exclude` | Directory names to skip during scan | `[]` |
 
 ### Prompts
 
@@ -213,7 +223,12 @@ directory = "~/GitHub/important-project"
 prompt = "prompts/test-coverage.md"
 ```
 
-`directory` must point to an existing directory. Non-directory paths are skipped with a warning.
+| Field | Description |
+|-------|-------------|
+| `directory` | Path to the target directory (required). Must be an existing directory |
+| `prompt` | Prompt override for this target. If omitted, `[prompts].default` is used |
+
+If a target's `directory` matches a scan result, the explicit target takes precedence.
 
 ## Development
 
