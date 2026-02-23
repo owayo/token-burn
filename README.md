@@ -49,15 +49,37 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 
 ## Installation
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew install owayo/token-burn/token-burn
+```
+
 ### From Source
 
 ```bash
-cargo install --path .
+git clone https://github.com/owayo/token-burn.git
+cd token-burn
+make install
 ```
 
-### Binary Download
+### From GitHub Releases
 
-Download the latest release from [Releases](https://github.com/owayo/token-burn/releases).
+Download the latest binary from [Releases](https://github.com/owayo/token-burn/releases).
+
+#### macOS (Apple Silicon)
+
+```bash
+curl -L https://github.com/owayo/token-burn/releases/latest/download/token-burn-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv token-burn /usr/local/bin/
+```
+
+#### macOS (Intel)
+
+```bash
+curl -L https://github.com/owayo/token-burn/releases/latest/download/token-burn-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv token-burn /usr/local/bin/
+```
 
 ## Usage
 

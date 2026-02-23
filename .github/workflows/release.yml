@@ -87,23 +87,19 @@ jobs:
           echo "Dry run mode - skipping commit and tag"
           echo "Would release: ${{ steps.bump.outputs.tag }}"
 
-  build-and-release:
-    name: Build and Release
+  build:
+    name: Build (${{ matrix.target }})
     needs: prepare-release
     if: ${{ inputs.dry_run != true }}
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: token-burn
-            asset_name: token-burn-darwin-amd64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: token-burn
-            asset_name: token-burn-darwin-arm64
+          - target: x86_64-apple-darwin
+            asset_name: token-burn-x86_64-apple-darwin.tar.gz
+          - target: aarch64-apple-darwin
+            asset_name: token-burn-aarch64-apple-darwin.tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -118,15 +114,21 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czvf ../../../${{ matrix.asset_name }} ${{ env.BINARY_NAME }}
+          cd ../../..
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: ./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          path: ${{ matrix.asset_name }}
 
-  publish-release:
-    name: Publish Release
-    needs: [prepare-release, build-and-release]
+  release:
+    name: Create Release
+    needs: [prepare-release, build]
     if: ${{ inputs.dry_run != true }}
     runs-on: ubuntu-latest
     steps:
@@ -135,24 +137,145 @@ jobs:
         with:
           path: artifacts
 
-      - name: Prepare release assets
+      - name: Prepare release files
         run: |
-          mkdir -p release-assets
-          for dir in artifacts/*/; do
-            name=$(basename "$dir")
-            find "$dir" -type f -exec cp {} "release-assets/$name" \;
-          done
-          ls -la release-assets/
+          mkdir -p release
+          find artifacts -type f -name "*.tar.gz" -exec mv {} release/ \;
+          ls -la release/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare-release.outputs.tag }}
-          name: Release ${{ needs.prepare-release.outputs.tag }}
-          files: release-assets/*
-          generate_release_notes: true
+          name: ${{ needs.prepare-release.outputs.tag }}
+          body: |
+            ## token-burn ${{ needs.prepare-release.outputs.version }}
+
+            Consume AI coding assistant tokens before weekly reset
+
+            ### Installation
+
+            #### Homebrew (macOS)
+            ```bash
+            brew install owayo/token-burn/token-burn
+            ```
+
+            #### Manual Download
+
+            ##### macOS (Apple Silicon)
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/token-burn-aarch64-apple-darwin.tar.gz | tar xz
+            sudo mv token-burn /usr/local/bin/
+            ```
+
+            ##### macOS (Intel)
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/token-burn-x86_64-apple-darwin.tar.gz | tar xz
+            sudo mv token-burn /usr/local/bin/
+            ```
+
+          files: release/*
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Release summary
-        run: echo "Released ${{ needs.prepare-release.outputs.tag }}"
+  update-homebrew:
+    name: Update Homebrew Tap
+    needs: [prepare-release, release]
+    if: ${{ inputs.dry_run != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.PRIVATE_KEY }}
+          repositories: '["homebrew-token-burn"]'
+
+      - name: Download and Calculate SHA256
+        id: sha256
+        run: |
+          TAG="${{ needs.prepare-release.outputs.tag }}"
+
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/token-burn-aarch64-apple-darwin.tar.gz" -o arm64.tar.gz
+          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/token-burn-x86_64-apple-darwin.tar.gz" -o x86_64.tar.gz
+
+          SHA256_ARM64=$(sha256sum arm64.tar.gz | cut -d' ' -f1)
+          SHA256_X86_64=$(sha256sum x86_64.tar.gz | cut -d' ' -f1)
+
+          echo "sha256_arm64=${SHA256_ARM64}" >> $GITHUB_OUTPUT
+          echo "sha256_x86_64=${SHA256_X86_64}" >> $GITHUB_OUTPUT
+
+      - name: Update Homebrew Formula
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+          TAG="${{ needs.prepare-release.outputs.tag }}"
+          SHA256_ARM64="${{ steps.sha256.outputs.sha256_arm64 }}"
+          SHA256_X86_64="${{ steps.sha256.outputs.sha256_x86_64 }}"
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/owayo/homebrew-token-burn.git"
+          cd homebrew-token-burn
+
+          mkdir -p Formula
+
+          cat > Formula/token-burn.rb << 'FORMULA'
+          class TokenBurn < Formula
+            desc "Consume AI coding assistant tokens before weekly reset"
+            homepage "https://github.com/owayo/token-burn"
+            version "VERSION_PLACEHOLDER"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "URL_ARM64_PLACEHOLDER"
+                sha256 "SHA256_ARM64_PLACEHOLDER"
+              else
+                url "URL_X86_64_PLACEHOLDER"
+                sha256 "SHA256_X86_64_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "token-burn"
+            end
+
+            test do
+              system "#{bin}/token-burn", "--version"
+            end
+          end
+          FORMULA
+
+          sed -i "s|VERSION_PLACEHOLDER|${VERSION}|g" Formula/token-burn.rb
+          sed -i "s|URL_ARM64_PLACEHOLDER|https://github.com/owayo/token-burn/releases/download/${TAG}/token-burn-aarch64-apple-darwin.tar.gz|g" Formula/token-burn.rb
+          sed -i "s|SHA256_ARM64_PLACEHOLDER|${SHA256_ARM64}|g" Formula/token-burn.rb
+          sed -i "s|URL_X86_64_PLACEHOLDER|https://github.com/owayo/token-burn/releases/download/${TAG}/token-burn-x86_64-apple-darwin.tar.gz|g" Formula/token-burn.rb
+          sed -i "s|SHA256_X86_64_PLACEHOLDER|${SHA256_X86_64}|g" Formula/token-burn.rb
+
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' Formula/token-burn.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/token-burn.rb
+          git commit -m "Update token-burn to ${TAG}"
+          git push
+
+  release-summary:
+    name: Release Summary
+    needs: [prepare-release, release, update-homebrew]
+    if: ${{ inputs.dry_run != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "Released ${{ needs.prepare-release.outputs.tag }}"
+          echo ""
+          echo "Assets uploaded:"
+          echo "  - token-burn-x86_64-apple-darwin.tar.gz"
+          echo "  - token-burn-aarch64-apple-darwin.tar.gz"
+          echo ""
+          echo "Homebrew tap updated: owayo/homebrew-token-burn"
