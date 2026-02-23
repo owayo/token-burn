@@ -9,12 +9,14 @@ token-burn/
 ├── Cargo.toml              # 依存クレート定義
 ├── src/
 │   ├── main.rs             # エントリポイント、clap CLI定義
+│   ├── init.rs             # config/prompt 雛形の初期化
 │   ├── config.rs           # TOML設定ファイルの読み込み・バリデーション
 │   ├── scanner.rs          # ディレクトリスキャン・リポジトリ探索・gh CLI連携
 │   ├── schedule.rs         # リセット日時計算、最寄りエージェント選択
 │   ├── executor.rs         # プロセス起動・並列実行管理（tokio）
+│   ├── cleanup.rs          # レポートディレクトリの自動クリーンアップ
+│   ├── state.rs            # 処理済みターゲット状態の永続化
 │   └── display.rs          # ステータス表示・プログレス出力
-├── config.toml.example     # 設定ファイルサンプル
 ├── Makefile                # ビルドコマンド
 └── .github/workflows/      # CI/CD
 ```
@@ -41,5 +43,9 @@ make release  # リリースビルド
 - `[settings]` - 並列実行数
 - `[prompts]` - デフォルトプロンプト
 - `[[agents]]` - エージェント定義（command, リセットスケジュール）
-- `[scan]` - ディレクトリ自動スキャン設定
+- `[[scan]]` - ディレクトリ自動スキャン設定
 - `[[targets]]` - 個別ターゲット（任意）
+
+`[[agents]]` の `name` は空文字不可、`command` は1要素以上必須（先頭要素は実行ファイル名）です。
+
+実行ファイルが `claude` の場合、`--verbose`、`--output-format stream-json`、`--include-partial-messages` は自動付与されます。

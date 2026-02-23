@@ -61,6 +61,14 @@ pub async fn resolve_targets(config: &Config) -> Result<Vec<ResolvedTarget>> {
             );
             continue;
         }
+        if !path.is_dir() {
+            eprintln!(
+                "{}: {} is not a directory, skipping",
+                "Warning".yellow(),
+                target.directory
+            );
+            continue;
+        }
         let display_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -266,6 +274,8 @@ async fn fetch_visibility_map(username: &str) -> Result<HashMap<String, Visibili
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Agent, Config, Prompts, Settings, Target};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn extract_remote_owner_parses_https_url() {
@@ -293,5 +303,61 @@ mod tests {
             "/home/user/projects/my-repo",
             "some-user",
         ));
+    }
+
+    #[tokio::test]
+    async fn resolve_targets_skips_file_targets() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("token-burn-scanner-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+
+        let repo_dir = temp_dir.join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("repo dir should be created");
+        let file_target = temp_dir.join("not-a-dir.txt");
+        std::fs::write(&file_target, "dummy").expect("file target should be created");
+
+        let config = Config {
+            config_dir: temp_dir.clone(),
+            settings: Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+            },
+            prompts: Prompts {
+                default: "review".to_string(),
+            },
+            agents: vec![Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+            }],
+            scan: vec![],
+            targets: vec![
+                Target {
+                    directory: file_target.to_string_lossy().to_string(),
+                    prompt: None,
+                },
+                Target {
+                    directory: repo_dir.to_string_lossy().to_string(),
+                    prompt: Some("target prompt".to_string()),
+                },
+            ],
+        };
+
+        let resolved = resolve_targets(&config)
+            .await
+            .expect("one valid directory target should remain");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].directory, repo_dir);
+        assert_eq!(resolved[0].display_name, "repo");
+        assert_eq!(resolved[0].prompt, "target prompt");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

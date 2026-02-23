@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/app.png" width="128" alt="token-burn">
+</p>
+
 <h1 align="center">token-burn</h1>
 
 <p align="center">
@@ -26,6 +30,10 @@
 
 Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Japanese *mottainai* (もったいない) spirit — the belief that waste is something to be avoided — **token-burn** puts those remaining tokens to work. It runs your prompts across repositories in parallel before the reset deadline — code reviews, bug hunts, refactoring, test improvements, or anything else you define. When the reset time arrives, all running processes are automatically terminated.
 
+<p align="center">
+  <img src="docs/images/screenshot.png" width="800" alt="token-burn running">
+</p>
+
 ## Features
 
 - **Auto-discovery**: Scans directories for git repos, filters by username in remote URL
@@ -35,6 +43,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
 - **Deadline enforcement**: Kills all child processes when the reset time arrives
 - **Parallel execution**: Runs multiple prompts concurrently in tmux split panes with progress monitor
+- **Collision-safe logs**: Per-task logs are numbered to avoid overwrite when display names collide
 - **Prompt files**: Prompts can be `.md` files or inline strings
 - **Resume**: Automatically skips already-processed directories; configurable skip duration
 - **Dry run**: Preview execution plan without running commands
@@ -106,6 +115,7 @@ token-burn run
 | `run` | Execute token consumption (default) |
 | `status` | Show agent reset status |
 | `init` | Initialize config file and prompt templates |
+| `clean` | Clean up old report directories |
 
 ### Options
 
@@ -120,11 +130,13 @@ token-burn run
 
 `init` also accepts `--force` (`-f`) to overwrite existing files without confirmation.
 
+`clean` accepts `--older-than` to override the configured `cleanup_after` duration (e.g., `--older-than 3d`).
+
 ## Configuration
 
 Default config location: `~/.config/token-burn/config.toml`
 
-Run `token-burn init` to generate a config template, or see [config.toml.example](config.toml.example).
+Run `token-burn init` to generate a config template.
 
 ### Settings
 
@@ -138,8 +150,9 @@ skip_within = "7d"    # optional
 |-------|-------------|---------|
 | `parallelism` | Number of concurrent tasks | `3` |
 | `skip_within` | Skip directories processed within this duration | `"7d"`, `"24h"`, `"1d12h"` |
+| `cleanup_after` | Auto-delete report directories older than this duration | `"7d"` (default) |
 
-`skip_within` accepts duration strings: `d` (days), `h` (hours), `m` (minutes), `s` (seconds). If omitted, directories processed since the previous reset are skipped. Use `--fresh` to ignore saved state entirely.
+`skip_within` accepts duration strings: `d` (days), `h` (hours), `m` (minutes), `s` (seconds). If omitted, directories processed since the previous reset are skipped. Excessively large values are rejected. Use `--fresh` to ignore saved state entirely.
 
 State is stored in `~/.config/token-burn/state.json`.
 
@@ -161,6 +174,10 @@ timezone = "Asia/Tokyo"
 | `reset_weekday` | Reset day of week | `"monday"` |
 | `reset_time` | Reset time (HH:MM) | `"09:00"` |
 | `timezone` | IANA timezone | `"Asia/Tokyo"` |
+
+`name` must not be empty. `command` must contain at least one element, and the first element must be a non-empty executable name.
+
+**Claude auto-injected flags**: When the executable is `claude`, the following flags are automatically appended if not already present: `--verbose`, `--output-format stream-json`, `--include-partial-messages`. These are required for proper log capture and progress monitoring. You do not need to include them in your config.
 
 `reset_weekday` accepts: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday` (or short forms: `mon` `tue` `wed` `thu` `fri` `sat` `sun`)
 
@@ -195,6 +212,8 @@ default = "prompts/default.md"
 directory = "~/GitHub/important-project"
 prompt = "prompts/test-coverage.md"
 ```
+
+`directory` must point to an existing directory. Non-directory paths are skipped with a warning.
 
 ## Development
 

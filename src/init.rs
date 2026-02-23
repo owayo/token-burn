@@ -6,6 +6,8 @@ use std::path::Path;
 const DEFAULT_CONFIG: &str = r#"[settings]
 parallelism = 3                    # 並列実行数
 skip_within = "1d"                 # この期間以内に処理済みならスキップ（例: "7d", "24h", "1d12h"）
+# report_dir = "~/Documents/token-burn"  # ログ出力先（デフォルト: ~/Documents/token-burn）
+cleanup_after = "7d"               # この期間より古いレポートディレクトリを自動削除
 
 [prompts]
 default = "prompts/default.md"     # .md で終わる値はファイルパスとして読み込み

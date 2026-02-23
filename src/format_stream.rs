@@ -1,0 +1,1121 @@
+use anyhow::Result;
+use std::collections::HashMap;
+use std::io::{self, BufRead, Write};
+
+/// Process stream-json output from `claude -p` into readable text.
+/// Non-JSON lines are passed through as-is (works with any agent).
+pub fn run() -> Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let out = stdout.lock();
+    process(stdin.lock(), out)
+}
+
+fn process(reader: impl BufRead, mut out: impl Write) -> Result<()> {
+    let mut block_type = String::new();
+    let mut tool_name = String::new();
+    let mut tool_input = String::new();
+    let mut thinking_chars = 0usize;
+    let mut tool_id_map: HashMap<String, String> = HashMap::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                // Not JSON — pass through (e.g. codex plain text output)
+                writeln!(out, "{}", line)?;
+                out.flush()?;
+                continue;
+            }
+        };
+
+        let msg_type = v["type"].as_str().unwrap_or("");
+
+        match msg_type {
+            "system" => {} // skip init
+            "stream_event" => {
+                handle_stream_event(
+                    &v["event"],
+                    &mut out,
+                    &mut StreamState {
+                        block_type: &mut block_type,
+                        tool_name: &mut tool_name,
+                        tool_input: &mut tool_input,
+                        thinking_chars: &mut thinking_chars,
+                        tool_id_map: &mut tool_id_map,
+                    },
+                )?;
+            }
+            "assistant" => {
+                // Extract tool_use ids from assistant messages (needed for subagent tool results)
+                if let Some(content) = v["message"]["content"].as_array() {
+                    for item in content {
+                        if item["type"].as_str() == Some("tool_use") {
+                            if let (Some(id), Some(name)) =
+                                (item["id"].as_str(), item["name"].as_str())
+                            {
+                                tool_id_map.insert(id.to_string(), name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            "user" => {
+                // Tool result — show which tool completed
+                if let Some(content) = v["message"]["content"].as_array() {
+                    for item in content {
+                        if item["type"].as_str() == Some("tool_result") {
+                            let id = item["tool_use_id"].as_str().unwrap_or("");
+                            let name = tool_id_map.get(id).map(|s| s.as_str()).unwrap_or("?");
+                            let is_error = item["is_error"].as_bool().unwrap_or(false);
+                            if is_error {
+                                writeln!(out, "\x1b[31m  \u{2717} {}\x1b[0m", name)?;
+                            } else {
+                                writeln!(out, "\x1b[2m  \u{2713} {}\x1b[0m", name)?;
+                            }
+                        }
+                    }
+                }
+            }
+            "result" => {
+                handle_result(&v, &mut out)?;
+            }
+            _ => {} // rate_limit_event, message_stop, etc.
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_result(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    if let Some(cost) = v["total_cost_usd"].as_f64() {
+        writeln!(out, "\n\x1b[33m\u{1f4b0} ${:.4}\x1b[0m", cost)?;
+    }
+    if let Some(ms) = v["duration_ms"].as_u64() {
+        let secs = ms / 1000;
+        let m = secs / 60;
+        let s = secs % 60;
+        if let Some(turns) = v["num_turns"].as_u64() {
+            writeln!(
+                out,
+                "\x1b[33m\u{23f1}  {}m {}s ({} turns)\x1b[0m",
+                m, s, turns
+            )?;
+        } else {
+            writeln!(out, "\x1b[33m\u{23f1}  {}m {}s\x1b[0m", m, s)?;
+        }
+    }
+    let input = v["usage"]["input_tokens"].as_u64().unwrap_or(0)
+        + v["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0)
+        + v["usage"]["cache_creation_input_tokens"]
+            .as_u64()
+            .unwrap_or(0);
+    let output = v["usage"]["output_tokens"].as_u64().unwrap_or(0);
+    if output > 0 {
+        writeln!(
+            out,
+            "\x1b[33m\u{1f4ca} in:{} out:{}\x1b[0m",
+            format_number(input),
+            format_number(output)
+        )?;
+    }
+    Ok(())
+}
+
+struct StreamState<'a> {
+    block_type: &'a mut String,
+    tool_name: &'a mut String,
+    tool_input: &'a mut String,
+    thinking_chars: &'a mut usize,
+    tool_id_map: &'a mut HashMap<String, String>,
+}
+
+fn handle_stream_event(
+    event: &serde_json::Value,
+    out: &mut impl Write,
+    state: &mut StreamState,
+) -> Result<()> {
+    let event_type = event["type"].as_str().unwrap_or("");
+
+    match event_type {
+        "content_block_start" => {
+            let block = &event["content_block"];
+            let bt = block["type"].as_str().unwrap_or("");
+            *state.block_type = bt.to_string();
+
+            match bt {
+                "thinking" => {
+                    *state.thinking_chars = 0;
+                    write!(out, "\x1b[2m\u{1f4ad} ")?;
+                    out.flush()?;
+                }
+                "tool_use" => {
+                    let name = block["name"].as_str().unwrap_or("?").to_string();
+                    if let Some(id) = block["id"].as_str() {
+                        state.tool_id_map.insert(id.to_string(), name.clone());
+                    }
+                    *state.tool_name = name;
+                    state.tool_input.clear();
+                }
+                _ => {}
+            }
+        }
+        "content_block_delta" => {
+            let delta = &event["delta"];
+            let dt = delta["type"].as_str().unwrap_or("");
+
+            match dt {
+                "thinking_delta" => {
+                    if let Some(text) = delta["thinking"].as_str() {
+                        let prev = *state.thinking_chars / 100;
+                        *state.thinking_chars += text.len();
+                        let curr = *state.thinking_chars / 100;
+                        for _ in prev..curr {
+                            write!(out, ".")?;
+                        }
+                        out.flush()?;
+                    }
+                }
+                "text_delta" => {
+                    if let Some(text) = delta["text"].as_str() {
+                        write!(out, "{}", text)?;
+                        out.flush()?;
+                    }
+                }
+                "input_json_delta" => {
+                    if let Some(json) = delta["partial_json"].as_str() {
+                        state.tool_input.push_str(json);
+                    }
+                }
+                _ => {} // signature_delta etc
+            }
+        }
+        "content_block_stop" => {
+            if state.block_type.as_str() == "thinking" {
+                writeln!(out, "\x1b[0m")?;
+            } else if state.block_type.as_str() == "tool_use" {
+                let detail = extract_tool_detail(state.tool_name, state.tool_input);
+                if detail.is_empty() {
+                    writeln!(out, "\x1b[36m\u{1f527} {}\x1b[0m", state.tool_name)?;
+                } else {
+                    writeln!(
+                        out,
+                        "\x1b[36m\u{1f527} {}\x1b[0m \x1b[2m{}\x1b[0m",
+                        state.tool_name, detail
+                    )?;
+                }
+                if let Some(diff) = format_tool_diff(state.tool_name, state.tool_input) {
+                    write!(out, "{}", diff)?;
+                }
+            }
+            state.block_type.clear();
+        }
+        _ => {} // message_start, message_delta
+    }
+
+    Ok(())
+}
+
+fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(input_json) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    match tool_name {
+        "Edit" => {
+            let file = v["file_path"].as_str().unwrap_or("");
+            let old = v["old_string"].as_str().unwrap_or("");
+            let new = v["new_string"].as_str().unwrap_or("");
+            let old_lines = old.lines().count();
+            let new_lines = new.lines().count();
+            let added = new_lines.saturating_sub(old_lines);
+            let removed = old_lines.saturating_sub(new_lines);
+            return format!("{} (+{}/-{})", truncate_str(file, 80), added, removed);
+        }
+        "Bash" => {
+            let cmd = v["command"].as_str().unwrap_or("");
+            let desc = v["description"].as_str().unwrap_or("");
+            if !desc.is_empty() {
+                return format!("{} ({})", truncate_str(cmd, 60), truncate_str(desc, 40));
+            }
+            return truncate_str(cmd, 100).to_string();
+        }
+        "Task" => {
+            let desc = v["description"].as_str().unwrap_or("");
+            let name = v["name"].as_str().unwrap_or("");
+            let agent_type = v["subagent_type"].as_str().unwrap_or("");
+            if !name.is_empty() && !agent_type.is_empty() {
+                return format!("{} ({})", name, agent_type);
+            } else if !desc.is_empty() {
+                return truncate_str(desc, 80).to_string();
+            } else if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+        "TeamCreate" => {
+            if let Some(team) = v["team_name"].as_str() {
+                if !team.is_empty() {
+                    return team.to_string();
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Generic: try common field names in order of priority
+    for key in [
+        "file_path",
+        "path",
+        "pattern",
+        "command",
+        "query",
+        "url",
+        "description",
+        "name",
+    ] {
+        if let Some(val) = v[key].as_str() {
+            return truncate_str(val, 100).to_string();
+        }
+    }
+
+    String::new()
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        // Find a safe char boundary
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
+    }
+}
+
+fn format_tool_diff(tool_name: &str, input_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(input_json).ok()?;
+
+    match tool_name {
+        "Edit" => {
+            let old = v["old_string"].as_str().unwrap_or("");
+            let new = v["new_string"].as_str().unwrap_or("");
+            if old.is_empty() && new.is_empty() {
+                return None;
+            }
+            let diff = format_diff_lines(old, new);
+            if diff.is_empty() {
+                None
+            } else {
+                Some(diff)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Generate a colored diff between old and new text.
+/// Detects common prefix/suffix lines to show only the changed region.
+fn format_diff_lines(old: &str, new: &str) -> String {
+    let old_lines: Vec<&str> = if old.is_empty() {
+        Vec::new()
+    } else {
+        old.lines().collect()
+    };
+    let new_lines: Vec<&str> = if new.is_empty() {
+        Vec::new()
+    } else {
+        new.lines().collect()
+    };
+
+    // Find common prefix lines
+    let prefix_len = old_lines
+        .iter()
+        .zip(new_lines.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // Find common suffix lines (after prefix)
+    let old_rest = &old_lines[prefix_len..];
+    let new_rest = &new_lines[prefix_len..];
+    let suffix_len = old_rest
+        .iter()
+        .rev()
+        .zip(new_rest.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let old_changed = &old_lines[prefix_len..old_lines.len() - suffix_len];
+    let new_changed = &new_lines[prefix_len..new_lines.len() - suffix_len];
+
+    if old_changed.is_empty() && new_changed.is_empty() {
+        return String::new();
+    }
+
+    let max_context = 2;
+    let max_changed = 12;
+    let mut result = String::new();
+
+    // Context from prefix (last N lines)
+    let ctx_start = prefix_len.saturating_sub(max_context);
+    for line in &old_lines[ctx_start..prefix_len] {
+        result.push_str(&format!("\x1b[2m    {}\x1b[0m\n", line));
+    }
+
+    // Removed lines
+    for (i, line) in old_changed.iter().enumerate() {
+        if i >= max_changed {
+            result.push_str(&format!(
+                "\x1b[31m  ... ({} more)\x1b[0m\n",
+                old_changed.len() - max_changed
+            ));
+            break;
+        }
+        result.push_str(&format!("\x1b[31m  - {}\x1b[0m\n", line));
+    }
+
+    // Added lines
+    for (i, line) in new_changed.iter().enumerate() {
+        if i >= max_changed {
+            result.push_str(&format!(
+                "\x1b[32m  ... ({} more)\x1b[0m\n",
+                new_changed.len() - max_changed
+            ));
+            break;
+        }
+        result.push_str(&format!("\x1b[32m  + {}\x1b[0m\n", line));
+    }
+
+    // Context from suffix (first N lines)
+    let suffix_start = old_lines.len() - suffix_len;
+    let suffix_show = std::cmp::min(suffix_len, max_context);
+    for line in &old_lines[suffix_start..suffix_start + suffix_show] {
+        result.push_str(&format!("\x1b[2m    {}\x1b[0m\n", line));
+    }
+
+    result
+}
+
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn strip_ansi(s: &str) -> String {
+        let mut result = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    while let Some(&next) = chars.peek() {
+                        chars.next();
+                        if next.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    }
+
+    fn run_process(input: &str) -> String {
+        let reader = Cursor::new(input.as_bytes().to_vec());
+        let mut output = Vec::new();
+        process(reader, &mut output).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn extract_tool_detail_file_path() {
+        let input = r#"{"file_path":"/src/main.rs"}"#;
+        assert_eq!(extract_tool_detail("Read", input), "/src/main.rs");
+    }
+
+    #[test]
+    fn extract_tool_detail_command() {
+        let input = r#"{"command":"cargo test"}"#;
+        assert_eq!(extract_tool_detail("Bash", input), "cargo test");
+    }
+
+    #[test]
+    fn extract_tool_detail_bash_with_description() {
+        let input = r#"{"command":"pnpm install","description":"Install deps"}"#;
+        assert_eq!(
+            extract_tool_detail("Bash", input),
+            "pnpm install (Install deps)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_edit_shows_diff_stats() {
+        let input = r#"{"file_path":"/src/index.test.ts","old_string":"line1\nline2\nline3","new_string":"line1\nline2\nline3\nline4\nline5"}"#;
+        let result = extract_tool_detail("Edit", input);
+        assert!(result.contains("/src/index.test.ts"));
+        assert!(result.contains("(+2/-0)"));
+    }
+
+    #[test]
+    fn extract_tool_detail_edit_removal() {
+        let input = r#"{"file_path":"/src/main.rs","old_string":"a\nb\nc","new_string":"a"}"#;
+        let result = extract_tool_detail("Edit", input);
+        assert!(result.contains("(+0/-2)"));
+    }
+
+    #[test]
+    fn extract_tool_detail_truncates_long_values() {
+        let long_path = format!(r#"{{"file_path":"{}"}}"#, "a".repeat(200));
+        let result = extract_tool_detail("Read", &long_path);
+        assert!(result.len() <= 103); // 100 + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn extract_tool_detail_invalid_json() {
+        assert_eq!(extract_tool_detail("Read", "not json"), "");
+    }
+
+    #[test]
+    fn extract_tool_detail_no_known_fields() {
+        assert_eq!(extract_tool_detail("Unknown", r#"{"foo":"bar"}"#), "");
+    }
+
+    #[test]
+    fn format_number_with_commas() {
+        assert_eq!(format_number(1234567), "1,234,567");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1000), "1,000");
+    }
+
+    #[test]
+    fn process_text_only_response() {
+        // Pattern: simple text response without thinking (e.g. "say hello")
+        let input = [
+            r#"{"type":"system","subtype":"init","cwd":"/tmp","session_id":"s1"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","id":"msg_1"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world!"}}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello world!"}]}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.2148,"duration_ms":5191,"usage":{"input_tokens":3,"cache_read_input_tokens":14726,"output_tokens":45}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(clean.contains("Hello world!"));
+        assert!(clean.contains("$0.2148"));
+        assert!(clean.contains("0m 5s"));
+        assert!(clean.contains("in:14,729 out:45"));
+        // system/assistant/rate_limit should be suppressed
+        assert!(!clean.contains("init"));
+        assert!(!clean.contains("rate_limit"));
+    }
+
+    #[test]
+    fn process_thinking_then_tool_use() {
+        // Pattern: thinking block → tool use → tool result → text response
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me analyze this code..."}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"Read","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"/src/main.rs\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":1}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"fn main() {}"}]}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Found the file."}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        // Thinking indicator
+        assert!(clean.contains("\u{1f4ad}"));
+        // Tool name and file path
+        assert!(clean.contains("\u{1f527} Read"));
+        assert!(clean.contains("/src/main.rs"));
+        // Tool result shows tool name
+        assert!(
+            clean.contains("\u{2713} Read"),
+            "expected '✓ Read' in: {}",
+            clean
+        );
+        // Text output
+        assert!(clean.contains("Found the file."));
+    }
+
+    #[test]
+    fn process_non_json_passthrough() {
+        let input = "plain text line\nanother line\n";
+        let output = run_process(input);
+        assert!(output.contains("plain text line"));
+        assert!(output.contains("another line"));
+    }
+
+    #[test]
+    fn process_result_without_cache() {
+        let input = r#"{"type":"result","total_cost_usd":0.05,"duration_ms":1234,"usage":{"input_tokens":100,"output_tokens":50}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("$0.0500"));
+        assert!(clean.contains("in:100 out:50"));
+    }
+
+    #[test]
+    fn process_edit_tool_shows_diff_stats() {
+        // Real pattern: Edit tool with file_path, old_string, new_string
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t_edit","name":"Edit","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/index.test.ts\",\"old_string\":\"line1\\nline2\",\"new_string\":\"line1\\nline2\\nline3\\nline4\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":1}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t_edit","type":"tool_result","content":"The file has been updated successfully."}]}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("\u{1f527} Edit"),
+            "expected Edit tool icon in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("/src/index.test.ts"),
+            "expected file path in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("(+2/-0)"),
+            "expected diff stats in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("\u{2713} Edit"),
+            "expected checkmark in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_bash_tool_with_description() {
+        // Real pattern: Bash tool with command and description
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t_bash","name":"Bash","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pnpm install\",\"description\":\"Install dependencies\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t_bash","type":"tool_result","content":"+ typescript 5.9.3"}]}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("\u{1f527} Bash"),
+            "expected Bash tool icon in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("pnpm install"),
+            "expected command in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("(Install dependencies)"),
+            "expected description in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_tool_result_error() {
+        // Real pattern: tool_result with is_error: true
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t_err","name":"Bash","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"exit 1\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t_err","type":"tool_result","is_error":true,"content":"Command failed"}]}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        // Error should show ✗ instead of ✓
+        assert!(
+            clean.contains("\u{2717} Bash"),
+            "expected error mark in: {}",
+            clean
+        );
+        assert!(
+            !clean.contains("\u{2713}"),
+            "should not have checkmark on error: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_with_full_stats() {
+        // Real pattern from actual claude run: includes num_turns and cache_creation_input_tokens
+        let input = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":41712,"num_turns":9,"total_cost_usd":0.5565,"usage":{"input_tokens":14,"cache_creation_input_tokens":54926,"cache_read_input_tokens":372099,"output_tokens":987}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(clean.contains("$0.5565"), "expected cost in: {}", clean);
+        assert!(clean.contains("0m 41s"), "expected duration in: {}", clean);
+        assert!(clean.contains("(9 turns)"), "expected turns in: {}", clean);
+        // input = 14 + 54926 + 372099 = 427039
+        assert!(
+            clean.contains("in:427,039"),
+            "expected input tokens with cache creation in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("out:987"),
+            "expected output tokens in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_multi_turn_read_edit_bash() {
+        // Real pattern: Read → Edit → Bash (multi-tool sequence)
+        let input = [
+            // Turn 1: Read
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"Read","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/index.ts\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"export function add(a, b) { return a + b; }"}]}}"#,
+            // Turn 2: Edit
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t2","name":"Edit","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/index.test.ts\",\"old_string\":\"test1\",\"new_string\":\"test1\\ntest2\\ntest3\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t2","type":"tool_result","content":"Updated successfully."}]}}"#,
+            // Turn 3: Bash
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t3","name":"Bash","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pnpm exec tsc --noEmit\",\"description\":\"Type check\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t3","type":"tool_result","content":""}]}}"#,
+            // Final text
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            // Result
+            r#"{"type":"result","total_cost_usd":0.55,"duration_ms":41000,"num_turns":4,"usage":{"input_tokens":10,"cache_read_input_tokens":1000,"output_tokens":100}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        // Read
+        assert!(clean.contains("\u{1f527} Read"));
+        assert!(clean.contains("/src/index.ts"));
+        assert!(clean.contains("\u{2713} Read"));
+        // Edit
+        assert!(clean.contains("\u{1f527} Edit"));
+        assert!(clean.contains("/src/index.test.ts"));
+        assert!(clean.contains("(+2/-0)"));
+        assert!(clean.contains("\u{2713} Edit"));
+        // Bash
+        assert!(clean.contains("\u{1f527} Bash"));
+        assert!(clean.contains("pnpm exec tsc --noEmit"));
+        assert!(clean.contains("(Type check)"));
+        assert!(clean.contains("\u{2713} Bash"));
+        // Text
+        assert!(clean.contains("Done."));
+        // Result
+        assert!(clean.contains("(4 turns)"));
+    }
+
+    #[test]
+    fn extract_tool_detail_task_with_name_and_type() {
+        let input = r#"{"description":"implement feature","name":"worker-1","subagent_type":"general-purpose","prompt":"Do stuff","team_name":"my-team"}"#;
+        assert_eq!(
+            extract_tool_detail("Task", input),
+            "worker-1 (general-purpose)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_task_description_only() {
+        let input = r#"{"description":"research codebase","prompt":"Investigate..."}"#;
+        assert_eq!(extract_tool_detail("Task", input), "research codebase");
+    }
+
+    #[test]
+    fn extract_tool_detail_task_name_only() {
+        let input = r#"{"name":"explorer","prompt":"Find files"}"#;
+        assert_eq!(extract_tool_detail("Task", input), "explorer");
+    }
+
+    #[test]
+    fn extract_tool_detail_team_create() {
+        let input = r#"{"team_name":"demo-team","description":"Working on feature X"}"#;
+        assert_eq!(extract_tool_detail("TeamCreate", input), "demo-team");
+    }
+
+    #[test]
+    fn extract_tool_detail_generic_description_fallback() {
+        // Tools like TaskCreate that have description but no special handler
+        let input = r#"{"subject":"Run tests","description":"Execute test suite","activeForm":"Running tests"}"#;
+        assert_eq!(
+            extract_tool_detail("TaskCreate", input),
+            "Execute test suite"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_generic_name_fallback() {
+        // Tools with only a name field (after all higher-priority fields)
+        let input = r#"{"name":"my-worktree"}"#;
+        assert_eq!(extract_tool_detail("EnterWorktree", input), "my-worktree");
+    }
+
+    #[test]
+    fn process_system_task_started_skipped() {
+        // system events with subtype "task_started" should be silently skipped
+        let input = [
+            r#"{"type":"system","subtype":"init","cwd":"/tmp","session_id":"s1"}"#,
+            r#"{"type":"system","subtype":"task_started","task_type":"in_process_teammate","task_id":"abc-123","tool_use_id":"tu_1","description":"implement feature"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        // system events should not appear
+        assert!(!clean.contains("task_started"));
+        assert!(!clean.contains("in_process_teammate"));
+        // text should still appear
+        assert!(clean.contains("Hello"));
+    }
+
+    #[test]
+    fn process_team_create_then_task_spawn() {
+        // Pattern: TeamCreate → Task (team agent spawning sequence)
+        let input = [
+            // TeamCreate
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tc1","name":"TeamCreate","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"team_name\":\"demo-team\",\"description\":\"Build demo project\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tc1","type":"tool_result","content":"Team created"}]}}"#,
+            // Task spawn
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"ts1","name":"Task","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"description\":\"implement utils\",\"name\":\"worker-1\",\"subagent_type\":\"general-purpose\",\"team_name\":\"demo-team\",\"prompt\":\"Create utility module\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"ts1","type":"tool_result","content":"{\"status\":\"teammate_spawned\"}"}]}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        // TeamCreate
+        assert!(
+            clean.contains("\u{1f527} TeamCreate"),
+            "expected TeamCreate tool in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("demo-team"),
+            "expected team name in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("\u{2713} TeamCreate"),
+            "expected checkmark for TeamCreate in: {}",
+            clean
+        );
+        // Task
+        assert!(
+            clean.contains("\u{1f527} Task"),
+            "expected Task tool in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("worker-1 (general-purpose)"),
+            "expected agent name and type in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("\u{2713} Task"),
+            "expected checkmark for Task in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_with_model_usage() {
+        // Pattern: result with modelUsage per-model breakdown (should not break)
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":1.234,"duration_ms":120000,"num_turns":15,"usage":{"input_tokens":500,"cache_read_input_tokens":50000,"output_tokens":2000},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":200,"outputTokens":1500,"cacheReadInputTokens":40000,"cost":0.234},"claude-opus-4-6":{"inputTokens":300,"outputTokens":500,"cacheReadInputTokens":10000,"cost":1.0}},"stop_reason":null}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(clean.contains("$1.2340"), "expected cost in: {}", clean);
+        assert!(clean.contains("2m 0s"), "expected duration in: {}", clean);
+        assert!(clean.contains("(15 turns)"), "expected turns in: {}", clean);
+        // input = 500 + 50000 = 50500
+        assert!(
+            clean.contains("in:50,500"),
+            "expected input tokens in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("out:2,000"),
+            "expected output tokens in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_with_stop_reason_null() {
+        // Pattern: result with stop_reason: null (team sessions)
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.01,"duration_ms":3000,"usage":{"input_tokens":10,"output_tokens":5},"stop_reason":null}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("$0.0100"));
+        assert!(clean.contains("0m 3s"));
+    }
+
+    // --- format_diff_lines unit tests ---
+
+    #[test]
+    fn diff_pure_deletion() {
+        let diff = format_diff_lines("line1\nline2\nline3", "");
+        let clean = strip_ansi(&diff);
+        assert!(clean.contains("- line1"), "got: {}", clean);
+        assert!(clean.contains("- line2"), "got: {}", clean);
+        assert!(clean.contains("- line3"), "got: {}", clean);
+        assert!(!clean.contains("+"), "should have no additions: {}", clean);
+    }
+
+    #[test]
+    fn diff_pure_addition() {
+        let diff = format_diff_lines("", "new1\nnew2");
+        let clean = strip_ansi(&diff);
+        assert!(clean.contains("+ new1"), "got: {}", clean);
+        assert!(clean.contains("+ new2"), "got: {}", clean);
+        assert!(!clean.contains("-"), "should have no removals: {}", clean);
+    }
+
+    #[test]
+    fn diff_with_context() {
+        // Common prefix "aaa", common suffix "zzz", middle changed
+        let old = "aaa\nbbb\nzzz";
+        let new = "aaa\nccc\nddd\nzzz";
+        let diff = format_diff_lines(old, new);
+        let clean = strip_ansi(&diff);
+        // Context lines (prefix/suffix)
+        assert!(
+            clean.contains("    aaa"),
+            "expected prefix context: {}",
+            clean
+        );
+        assert!(
+            clean.contains("    zzz"),
+            "expected suffix context: {}",
+            clean
+        );
+        // Changed lines
+        assert!(clean.contains("- bbb"), "expected removal: {}", clean);
+        assert!(clean.contains("+ ccc"), "expected addition: {}", clean);
+        assert!(clean.contains("+ ddd"), "expected addition: {}", clean);
+    }
+
+    #[test]
+    fn diff_identical_returns_empty() {
+        let diff = format_diff_lines("same\nlines", "same\nlines");
+        assert!(
+            diff.is_empty(),
+            "identical strings should produce empty diff"
+        );
+    }
+
+    #[test]
+    fn diff_truncates_long_changes() {
+        // 20 removed lines should be truncated
+        let old_lines: Vec<&str> = (0..20).map(|_| "old").collect();
+        let old = old_lines.join("\n");
+        let diff = format_diff_lines(&old, "new");
+        let clean = strip_ansi(&diff);
+        assert!(
+            clean.contains("... (8 more)"),
+            "expected truncation indicator: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn diff_single_line_change() {
+        let diff = format_diff_lines("old line", "new line");
+        let clean = strip_ansi(&diff);
+        assert!(clean.contains("- old line"), "got: {}", clean);
+        assert!(clean.contains("+ new line"), "got: {}", clean);
+    }
+
+    // --- format_tool_diff unit tests ---
+
+    #[test]
+    fn format_tool_diff_edit() {
+        let input =
+            r#"{"file_path":"/src/main.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#;
+        let diff = format_tool_diff("Edit", input).unwrap();
+        let clean = strip_ansi(&diff);
+        assert!(clean.contains("- let x = 1;"));
+        assert!(clean.contains("+ let x = 2;"));
+    }
+
+    #[test]
+    fn format_tool_diff_edit_empty_strings() {
+        let input = r#"{"file_path":"/src/main.rs","old_string":"","new_string":""}"#;
+        assert!(format_tool_diff("Edit", input).is_none());
+    }
+
+    #[test]
+    fn format_tool_diff_non_edit() {
+        let input = r#"{"command":"ls"}"#;
+        assert!(format_tool_diff("Bash", input).is_none());
+    }
+
+    // --- Integration: Edit diff in process pipeline ---
+
+    #[test]
+    fn process_edit_shows_diff_output() {
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"Edit","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/lib.rs\",\"old_string\":\"fn old() {}\\nfn keep() {}\",\"new_string\":\"fn new() {}\\nfn also_new() {}\\nfn keep() {}\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        // Tool header
+        assert!(
+            clean.contains("\u{1f527} Edit"),
+            "expected Edit header: {}",
+            clean
+        );
+        assert!(
+            clean.contains("/src/lib.rs"),
+            "expected file path: {}",
+            clean
+        );
+        // Diff content
+        assert!(
+            clean.contains("- fn old() {}"),
+            "expected removed line: {}",
+            clean
+        );
+        assert!(
+            clean.contains("+ fn new() {}"),
+            "expected added line: {}",
+            clean
+        );
+        assert!(
+            clean.contains("+ fn also_new() {}"),
+            "expected added line: {}",
+            clean
+        );
+        // Context (common suffix)
+        assert!(
+            clean.contains("    fn keep() {}"),
+            "expected context line: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_edit_pure_deletion_shows_diff() {
+        // Pattern from log: Edit (+0/-7) — pure deletion
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"Edit","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/repo.rs\",\"old_string\":\"    if found {\\n        break;\\n    }\",\"new_string\":\"\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(clean.contains("(+0/-3)"), "expected diff stats: {}", clean);
+        assert!(clean.contains("- "), "expected removed lines: {}", clean);
+        assert!(
+            !clean.contains("+ "),
+            "should have no added lines: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_subagent_tool_uses_from_assistant_message() {
+        // Subagent tool uses arrive as assistant messages (not stream_event blocks).
+        // The assistant message contains tool_use items with parent_tool_use_id set.
+        // The subsequent user message contains tool_result items referencing those IDs.
+        let input = [
+            r#"{"type":"system","subtype":"init"}"#,
+            // Assistant message with two tool_use blocks (subagent pattern)
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"sub_read_1","name":"Read","input":{"file_path":"/src/lib.rs"},"parent_tool_use_id":"task_1"},{"type":"tool_use","id":"sub_glob_2","name":"Glob","input":{"pattern":"**/*.rs"},"parent_tool_use_id":"task_1"}]}}"#,
+            // User message with tool_result for both
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"sub_read_1","content":"file contents"},{"type":"tool_result","tool_use_id":"sub_glob_2","content":"src/lib.rs\nsrc/main.rs"}]}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        // Both tool results should show the correct tool name, not "?"
+        assert!(
+            clean.contains("\u{2713} Read"),
+            "expected '✓ Read' but got: {}",
+            clean
+        );
+        assert!(
+            clean.contains("\u{2713} Glob"),
+            "expected '✓ Glob' but got: {}",
+            clean
+        );
+        assert!(
+            !clean.contains("\u{2713} ?"),
+            "should not contain '✓ ?' fallback: {}",
+            clean
+        );
+    }
+}

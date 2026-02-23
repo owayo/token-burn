@@ -63,13 +63,19 @@ pub fn parse_duration(s: &str) -> Result<chrono::Duration> {
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid duration number: {}", num_buf))?;
             num_buf.clear();
-            match c {
-                'd' => total_secs += n * 86400,
-                'h' => total_secs += n * 3600,
-                'm' => total_secs += n * 60,
-                's' => total_secs += n,
+            let unit_secs: i64 = match c {
+                'd' => 86400,
+                'h' => 3600,
+                'm' => 60,
+                's' => 1,
                 _ => anyhow::bail!("Invalid duration unit '{}' in: {}", c, s),
-            }
+            };
+            let add_secs = n
+                .checked_mul(unit_secs)
+                .ok_or_else(|| anyhow::anyhow!("Duration is too large: {}", s))?;
+            total_secs = total_secs
+                .checked_add(add_secs)
+                .ok_or_else(|| anyhow::anyhow!("Duration is too large: {}", s))?;
         }
     }
 
@@ -109,5 +115,19 @@ mod tests {
     fn parse_duration_rejects_zero_duration() {
         let err = parse_duration("0s").expect_err("zero duration must fail");
         assert!(err.to_string().contains("Duration must be positive"));
+    }
+
+    #[test]
+    fn parse_duration_rejects_multiplication_overflow() {
+        let input = format!("{}d", i64::MAX);
+        let err = parse_duration(&input).expect_err("overflowing duration must fail");
+        assert!(err.to_string().contains("Duration is too large"));
+    }
+
+    #[test]
+    fn parse_duration_rejects_addition_overflow() {
+        let input = format!("{}s1s", i64::MAX);
+        let err = parse_duration(&input).expect_err("overflowing duration must fail");
+        assert!(err.to_string().contains("Duration is too large"));
     }
 }

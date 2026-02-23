@@ -1,6 +1,8 @@
+mod cleanup;
 mod config;
 mod display;
 mod executor;
+mod format_stream;
 mod init;
 mod scanner;
 mod schedule;
@@ -50,6 +52,12 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+    /// Clean up old report directories
+    Clean {
+        /// Delete reports older than this duration (overrides config cleanup_after)
+        #[arg(long)]
+        older_than: Option<String>,
+    },
     /// Record task completion (internal use by worker scripts)
     #[command(hide = true)]
     Mark {
@@ -60,6 +68,9 @@ enum Commands {
         /// State file path
         state_file: PathBuf,
     },
+    /// Format stream-json output into readable text (internal use by worker scripts)
+    #[command(hide = true, name = "format-stream")]
+    FormatStream,
 }
 
 #[tokio::main]
@@ -71,6 +82,10 @@ async fn main() -> Result<()> {
     if let Commands::Init { force } = command {
         let config_path = cli.config.unwrap_or_else(config::default_config_path);
         return init::run_init(&config_path, force);
+    }
+
+    if let Commands::FormatStream = command {
+        return format_stream::run();
     }
 
     if let Commands::Mark {
@@ -99,8 +114,12 @@ async fn main() -> Result<()> {
         Commands::Run => {
             run(config, &config_path, agent_name, dry_run, fresh).await?;
         }
+        Commands::Clean { older_than } => {
+            run_clean(&config, older_than)?;
+        }
         Commands::Mark { .. } => unreachable!(),
         Commands::Init { .. } => unreachable!(),
+        Commands::FormatStream => unreachable!(),
     }
 
     Ok(())
@@ -176,15 +195,48 @@ async fn run(
     }
 
     let reset_info = sched.next_reset.format("%Y/%m/%d %H:%M").to_string();
+    let report_dir = resolve_report_dir(&config.settings);
     executor::execute_plan_tmux(
         plan,
         config.settings.parallelism,
         sched.time_until_reset,
         &state_file,
         &reset_info,
+        &report_dir,
     )?;
 
+    // Auto-cleanup old report directories
+    let max_age = config.settings.cleanup_after.as_deref().unwrap_or("7d");
+    println!();
+    match cleanup::cleanup_old_reports(&report_dir, max_age) {
+        Ok(deleted) => cleanup::print_cleanup_result(&deleted),
+        Err(e) => eprintln!("{}: cleanup failed: {}", "Warning".yellow(), e),
+    }
+
     Ok(())
+}
+
+fn run_clean(config: &config::Config, older_than: Option<String>) -> Result<()> {
+    let report_dir = resolve_report_dir(&config.settings);
+    let max_age = older_than
+        .as_deref()
+        .or(config.settings.cleanup_after.as_deref())
+        .unwrap_or("7d");
+    let deleted = cleanup::cleanup_old_reports(&report_dir, max_age)?;
+    cleanup::print_cleanup_result(&deleted);
+    Ok(())
+}
+
+fn resolve_report_dir(settings: &config::Settings) -> PathBuf {
+    if let Some(ref dir) = settings.report_dir {
+        let expanded = shellexpand::tilde(dir);
+        PathBuf::from(expanded.as_ref())
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join("Documents")
+            .join("token-burn")
+    }
 }
 
 fn filter_by_state(

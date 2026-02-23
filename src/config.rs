@@ -22,6 +22,10 @@ pub struct Settings {
     /// Skip directories processed within this duration (e.g., "7d", "24h", "1d12h").
     /// If omitted, defaults to skipping directories processed since the previous reset.
     pub skip_within: Option<String>,
+    /// Directory to save execution logs (default: ~/Documents/token-burn)
+    pub report_dir: Option<String>,
+    /// Auto-delete report directories older than this duration (default: "7d").
+    pub cleanup_after: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +110,18 @@ impl Config {
             anyhow::bail!("parallelism must be at least 1");
         }
         for agent in &self.agents {
+            if agent.name.trim().is_empty() {
+                anyhow::bail!("Agent name must not be empty");
+            }
+            if agent.command.is_empty() {
+                anyhow::bail!(
+                    "Agent '{}' command must include at least one element",
+                    agent.name
+                );
+            }
+            if agent.command[0].trim().is_empty() {
+                anyhow::bail!("Agent '{}' executable must not be empty", agent.name);
+            }
             parse_weekday(&agent.reset_weekday)?;
             parse_time(&agent.reset_time)?;
             agent
@@ -158,4 +174,66 @@ pub fn parse_time(s: &str) -> Result<(u32, u32)> {
         anyhow::bail!("Invalid time: {}", s);
     }
     Ok((hour, minute))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> Config {
+        Config {
+            config_dir: PathBuf::from("."),
+            settings: Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+            },
+            prompts: Prompts {
+                default: "review".to_string(),
+            },
+            agents: vec![Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+            }],
+            scan: vec![],
+            targets: vec![Target {
+                directory: ".".to_string(),
+                prompt: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_agent_command() {
+        let mut config = base_config();
+        config.agents[0].command = vec![];
+
+        let err = config
+            .validate()
+            .expect_err("empty command must be rejected");
+        assert!(err.to_string().contains("include at least one element"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_agent_executable() {
+        let mut config = base_config();
+        config.agents[0].command = vec!["".to_string(), "-p".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("empty executable must be rejected");
+        assert!(err.to_string().contains("executable must not be empty"));
+    }
+
+    #[test]
+    fn validate_accepts_non_empty_agent_command() {
+        let config = base_config();
+        config
+            .validate()
+            .expect("valid agent command should pass validation");
+    }
 }

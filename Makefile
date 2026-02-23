@@ -29,6 +29,7 @@ fmt: ## Format code
 	cargo fmt
 
 check: ## Run clippy and format check
+	cargo fmt -- --check
 	cargo clippy -- -D warnings
 	cargo check
 

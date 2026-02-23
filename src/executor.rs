@@ -12,9 +12,39 @@ pub struct ExecutionPlan {
 }
 
 pub fn build_plan(agent: &Agent, targets: Vec<ResolvedTarget>) -> ExecutionPlan {
+    let mut agent = agent.clone();
+    ensure_required_flags(&mut agent);
     ExecutionPlan {
-        agent: agent.clone(),
+        agent,
         tasks: targets,
+    }
+}
+
+/// Auto-inject required flags for known agents.
+/// For `claude`, `--verbose`, `--output-format stream-json`, and `--include-partial-messages`
+/// are mandatory for proper log capture and must always be present.
+fn ensure_required_flags(agent: &mut Agent) {
+    let executable = agent.command.first().map(|s| s.as_str()).unwrap_or("");
+    if executable != "claude" {
+        return;
+    }
+
+    let needs_verbose = !agent.command.iter().any(|s| s == "--verbose");
+    let needs_output_format = !agent.command.iter().any(|s| s == "--output-format");
+    let needs_partial = !agent
+        .command
+        .iter()
+        .any(|s| s == "--include-partial-messages");
+
+    if needs_verbose {
+        agent.command.push("--verbose".to_string());
+    }
+    if needs_output_format {
+        agent.command.push("--output-format".to_string());
+        agent.command.push("stream-json".to_string());
+    }
+    if needs_partial {
+        agent.command.push("--include-partial-messages".to_string());
     }
 }
 
@@ -52,6 +82,7 @@ pub fn execute_plan_tmux(
     deadline: Duration,
     state_file: &std::path::Path,
     reset_info: &str,
+    report_dir: &std::path::Path,
 ) -> Result<()> {
     // Check tmux is available
     std::process::Command::new("tmux")
@@ -69,6 +100,15 @@ pub fn execute_plan_tmux(
     let tmp_dir = std::env::temp_dir().join("token-burn");
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir)?;
+
+    // Create report directory for this run
+    let now = chrono::Local::now();
+    let run_dir = report_dir.join(format!(
+        "{}_{}",
+        now.format("%Y%m%d_%H%M%S"),
+        plan.agent.name
+    ));
+    std::fs::create_dir_all(&run_dir)?;
 
     let total = plan.tasks.len();
 
@@ -109,19 +149,36 @@ pub fn execute_plan_tmux(
                     worker_done_marker,
                 );
             }
-            let cmd_str = build_shell_command(&plan.agent.command, &task.prompt, &task.directory);
+            // Write prompt to a temp file and pass it via command substitution
+            let prompt_file = tmp_dir.join(format!("prompt-{}.txt", idx));
+            std::fs::write(&prompt_file, &task.prompt)?;
+            let cmd_str = build_shell_command(&plan.agent.command, &prompt_file, &task.directory);
             let done_marker =
                 shell_escape(&marker_dir.join(format!("done-{}", idx)).to_string_lossy());
             let failed_marker =
                 shell_escape(&marker_dir.join(format!("failed-{}", idx)).to_string_lossy());
             let error_prefix = shell_escape(&format!("[{}] ", task.display_name));
+            let log_base = task_log_base(idx, &task.display_name);
+            let jsonl_file = shell_escape(
+                &run_dir
+                    .join(format!("{}.jsonl", log_base))
+                    .to_string_lossy(),
+            );
+            let log_file =
+                shell_escape(&run_dir.join(format!("{}.log", log_base)).to_string_lossy());
 
             script += &build_task_header_script(idx, total, &task.display_name);
-            script += &format!("{}\n", cmd_str);
+            // Tee raw JSON to .jsonl, then pipe through format-stream for readable output to .log
+            let fmt_cmd = shell_escape(&exe_path.to_string_lossy());
+            script += &format!(
+                "{} 2>&1 | tee {} | {} format-stream 2>&1 | tee {}\n",
+                cmd_str, jsonl_file, fmt_cmd, log_file
+            );
+            script += "CMD_EXIT=${PIPESTATUS[0]}\n";
             // Check exit code - stop worker on failure
             script += &format!(
                 concat!(
-                    "if [ $? -ne 0 ]; then ",
+                    "if [ \"$CMD_EXIT\" -ne 0 ]; then ",
                     "ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1); ",
                     "printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}; ",
                     "touch {failed}; touch {wdone}; ",
@@ -170,6 +227,7 @@ pub fn execute_plan_tmux(
         session,
         worker_count,
         &stop_file,
+        &run_dir,
     );
     std::fs::write(&monitor_path, &monitor_script)?;
     std::process::Command::new("chmod")
@@ -223,6 +281,14 @@ pub fn execute_plan_tmux(
         .args(["resize-pane", "-t", &format!("{}:.0", session), "-x", "35%"])
         .status();
 
+    // Enable scrollback and mouse support
+    let _ = std::process::Command::new("tmux")
+        .args(["set-option", "-t", session, "history-limit", "50000"])
+        .status();
+    let _ = std::process::Command::new("tmux")
+        .args(["set-option", "-t", session, "mouse", "on"])
+        .status();
+
     // Enable pane border titles
     let _ = std::process::Command::new("tmux")
         .args(["set-option", "-t", session, "pane-border-status", "top"])
@@ -262,8 +328,16 @@ pub fn execute_plan_tmux(
     // Clean up
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
+    // Strip ANSI escape codes from log files
+    strip_ansi_from_dir(&run_dir);
+
     println!();
     println!("{}", "tmux session ended.".bold());
+    println!(
+        "  {} {}",
+        "Logs:".dimmed(),
+        run_dir.display().to_string().cyan()
+    );
     Ok(())
 }
 
@@ -278,6 +352,7 @@ fn generate_monitor_script(
     session: &str,
     worker_count: usize,
     stop_file: &std::path::Path,
+    report_dir: &std::path::Path,
 ) -> String {
     let agent_escaped = shell_escape(agent_name);
     let command_escaped = shell_escape(command_str);
@@ -285,6 +360,7 @@ fn generate_monitor_script(
     let marker_dir_escaped = shell_escape(&marker_dir.to_string_lossy());
     let session_escaped = shell_escape(session);
     let stop_file_escaped = shell_escape(&stop_file.to_string_lossy());
+    let report_dir_escaped = shell_escape(&report_dir.to_string_lossy());
 
     format!(
         r#"#!/bin/bash
@@ -297,6 +373,7 @@ MARKER_DIR={marker_dir}
 SESSION={session}
 WORKER_COUNT={worker_count}
 STOP_FILE={stop_file}
+REPORT_DIR={report_dir}
 STOPPED=0
 DISPLAYED_ERRORS=""
 
@@ -308,6 +385,8 @@ handle_signal() {{
         echo " ⏳ Waiting for current tasks to finish..."
         echo "    Press Ctrl-C again to force kill."
     else
+        echo ""
+        echo " 📁 Logs: $REPORT_DIR"
         echo ""
         echo " Force killing session..."
         tmux kill-session -t "$SESSION" 2>/dev/null
@@ -328,6 +407,8 @@ echo " Agent:   $AGENT"
 echo " Command: $COMMAND"
 echo " Reset:   $RESET"
 echo " Tasks:   $TOTAL"
+echo " Workers: $WORKER_COUNT"
+echo " Logs:    $REPORT_DIR"
 echo ""
 
 while true; do
@@ -355,6 +436,8 @@ while true; do
             printf "\r ✅ All %d/%d tasks completed!          \n" "$DONE" "$TOTAL"
         fi
         echo ""
+        echo " 📁 Logs: $REPORT_DIR"
+        echo ""
         echo " Press Ctrl-C to close session."
         exec sleep infinity
     fi
@@ -364,6 +447,8 @@ while true; do
         WORKERS_DONE=$(find "$MARKER_DIR" -name 'worker-done-*' 2>/dev/null | wc -l | tr -d ' ')
         if [ "$WORKERS_DONE" -ge "$WORKER_COUNT" ]; then
             printf "\r ⏹ Stopped: %d/%d processed (%d failed)          \n" "$PROCESSED" "$TOTAL" "$FAILED"
+            echo ""
+            echo " 📁 Logs: $REPORT_DIR"
             echo ""
             echo " Press Ctrl-C to close session."
             exec sleep infinity
@@ -402,10 +487,10 @@ while true; do
         H=$(((REMAINING % 86400) / 3600))
         M=$(((REMAINING % 3600) / 60))
         S=$((REMAINING % 60))
-        printf "\r ⏱ %dd %02dh %02dm %02ds  [%s] %d/%d (%d%%%%, fail:%d)" \
+        printf "\r ⏱ %dd %02dh %02dm %02ds  [%s] %d/%d (%d%%, fail:%d)          " \
             "$D" "$H" "$M" "$S" "$BAR" "$PROCESSED" "$TOTAL" "$PCT" "$FAILED"
     else
-        printf "\r ⏳ Stopping...  [%s] %d/%d (%d%%%%, fail:%d)" \
+        printf "\r ⏳ Stopping...  [%s] %d/%d (%d%%, fail:%d)          " \
             "$BAR" "$PROCESSED" "$TOTAL" "$PCT" "$FAILED"
     fi
 
@@ -421,6 +506,7 @@ done
         marker_dir = marker_dir_escaped,
         worker_count = worker_count,
         stop_file = stop_file_escaped,
+        report_dir = report_dir_escaped,
     )
 }
 
@@ -434,16 +520,78 @@ fn build_task_header_script(idx: usize, total: usize, display_name: &str) -> Str
     )
 }
 
-fn build_shell_command(cmd_parts: &[String], prompt: &str, directory: &std::path::Path) -> String {
+fn build_shell_command(
+    cmd_parts: &[String],
+    prompt_file: &std::path::Path,
+    directory: &std::path::Path,
+) -> String {
     let mut parts: Vec<String> = vec![format!("cd {}", shell_escape(&directory.to_string_lossy()))];
-    let mut cmd: Vec<String> = cmd_parts.iter().map(|s| shell_escape(s)).collect();
-    cmd.push(shell_escape(prompt));
-    parts.push(cmd.join(" "));
+    let cmd: Vec<String> = cmd_parts.iter().map(|s| shell_escape(s)).collect();
+    // Pass prompt as argument via command substitution $(cat file)
+    // Using stdin pipe doesn't work reliably with claude -p
+    parts.push(format!(
+        "{} \"$(cat {})\"",
+        cmd.join(" "),
+        shell_escape(&prompt_file.to_string_lossy())
+    ));
     parts.join(" && ")
 }
 
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn task_log_base(idx: usize, display_name: &str) -> String {
+    format!("{idx:04}_{}", sanitize_filename(display_name))
+}
+
+fn strip_ansi_from_dir(dir: &std::path::Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "log").unwrap_or(false) {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let cleaned = strip_ansi(&content);
+                let _ = std::fs::write(&path, cleaned);
+            }
+        }
+    }
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -478,6 +626,7 @@ mod tests {
             "token-burn",
             1,
             std::path::Path::new("/tmp/stop file"),
+            std::path::Path::new("/tmp/report dir"),
         );
 
         assert!(script.contains("AGENT='ag\"$(touch /tmp/pwn)\"'"));
@@ -489,5 +638,84 @@ mod tests {
     #[test]
     fn shell_escape_escapes_single_quotes() {
         assert_eq!(shell_escape("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn strip_ansi_removes_escape_sequences() {
+        let input = "\x1b[1mBold\x1b[0m normal \x1b[31mred\x1b[0m";
+        assert_eq!(strip_ansi(input), "Bold normal red");
+    }
+
+    #[test]
+    fn strip_ansi_preserves_plain_text() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
+    }
+
+    #[test]
+    fn sanitize_filename_replaces_special_chars() {
+        assert_eq!(sanitize_filename("my-project"), "my-project");
+        assert_eq!(sanitize_filename("path/to/repo"), "path_to_repo");
+        assert_eq!(sanitize_filename("a b@c"), "a_b_c");
+    }
+
+    #[test]
+    fn task_log_base_is_unique_even_with_same_display_name() {
+        assert_ne!(task_log_base(1, "repo"), task_log_base(2, "repo"));
+    }
+
+    #[test]
+    fn task_log_base_sanitizes_display_name() {
+        assert_eq!(task_log_base(3, "path/to/repo"), "0003_path_to_repo");
+    }
+
+    fn make_agent(command: Vec<&str>) -> Agent {
+        Agent {
+            name: "claude".to_string(),
+            command: command.into_iter().map(String::from).collect(),
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+        }
+    }
+
+    #[test]
+    fn ensure_required_flags_adds_missing_claude_flags() {
+        let mut agent = make_agent(vec!["claude", "-p"]);
+        ensure_required_flags(&mut agent);
+        assert!(agent.command.contains(&"--verbose".to_string()));
+        assert!(agent.command.contains(&"--output-format".to_string()));
+        assert!(agent.command.contains(&"stream-json".to_string()));
+        assert!(agent
+            .command
+            .contains(&"--include-partial-messages".to_string()));
+    }
+
+    #[test]
+    fn ensure_required_flags_skips_existing_flags() {
+        let mut agent = make_agent(vec![
+            "claude",
+            "-p",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+        ]);
+        let original_len = agent.command.len();
+        ensure_required_flags(&mut agent);
+        assert_eq!(agent.command.len(), original_len);
+    }
+
+    #[test]
+    fn ensure_required_flags_ignores_non_claude_agent() {
+        let mut agent = Agent {
+            name: "codex".to_string(),
+            command: vec!["codex".to_string(), "exec".to_string()],
+            reset_weekday: "thursday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+        };
+        let original_len = agent.command.len();
+        ensure_required_flags(&mut agent);
+        assert_eq!(agent.command.len(), original_len);
     }
 }
