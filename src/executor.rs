@@ -396,12 +396,13 @@ handle_signal() {{
 trap handle_signal INT TERM
 
 printf '\033]2;token-burn\033\\'
+printf '\033[?7l'
 
 END=$(($(date +%s) + DEADLINE))
 
-echo "━━━━━━━━━━━━━━━━━━━━━━"
-echo " 🔥 token-burn"
-echo "━━━━━━━━━━━━━━━━━━━━━━"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " 🔥 token-burn 🔥"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo " Agent:   $AGENT"
 echo " Command: $COMMAND"
@@ -431,9 +432,9 @@ while true; do
     # All tasks processed (including failures)
     if [ "$PROCESSED" -ge "$TOTAL" ]; then
         if [ "$FAILED" -gt 0 ]; then
-            printf "\r ❌ Completed with failures: %d succeeded / %d failed          \n" "$DONE" "$FAILED"
+            printf "\r\033[2K ❌ Completed with failures: %d succeeded / %d failed\n" "$DONE" "$FAILED"
         else
-            printf "\r ✅ All %d/%d tasks completed!          \n" "$DONE" "$TOTAL"
+            printf "\r\033[2K ✅ All %d/%d tasks completed!\n" "$DONE" "$TOTAL"
         fi
         echo ""
         echo " 📁 Logs: $REPORT_DIR"
@@ -446,7 +447,7 @@ while true; do
     if [ $STOPPED -eq 1 ]; then
         WORKERS_DONE=$(find "$MARKER_DIR" -name 'worker-done-*' 2>/dev/null | wc -l | tr -d ' ')
         if [ "$WORKERS_DONE" -ge "$WORKER_COUNT" ]; then
-            printf "\r ⏹ Stopped: %d/%d processed (%d failed)          \n" "$PROCESSED" "$TOTAL" "$FAILED"
+            printf "\r\033[2K ⏹ Stopped: %d/%d processed (%d failed)\n" "$PROCESSED" "$TOTAL" "$FAILED"
             echo ""
             echo " 📁 Logs: $REPORT_DIR"
             echo ""
@@ -487,10 +488,10 @@ while true; do
         H=$(((REMAINING % 86400) / 3600))
         M=$(((REMAINING % 3600) / 60))
         S=$((REMAINING % 60))
-        printf "\r ⏱ %dd %02dh %02dm %02ds  [%s] %d/%d (%d%%, fail:%d)          " \
+        printf "\r\033[2K ⏱ %dd %02dh %02dm %02ds  [%s] %d/%d (%d%%, fail:%d)" \
             "$D" "$H" "$M" "$S" "$BAR" "$PROCESSED" "$TOTAL" "$PCT" "$FAILED"
     else
-        printf "\r ⏳ Stopping...  [%s] %d/%d (%d%%, fail:%d)          " \
+        printf "\r\033[2K ⏳ Stopping...  [%s] %d/%d (%d%%, fail:%d)" \
             "$BAR" "$PROCESSED" "$TOTAL" "$PCT" "$FAILED"
     fi
 

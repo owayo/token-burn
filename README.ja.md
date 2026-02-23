@@ -130,7 +130,7 @@ token-burn run
 
 `init` は `--force`（`-f`）で既存ファイルを確認なしで上書きできます。
 
-`clean` は `--older-than` で設定ファイルの `cleanup_after` を上書きできます（例: `--older-than 3d`）。
+`clean` は `--older-than` で `cleanup_after` の設定値を一時的に変更できます（例: `--older-than 3d`）。
 
 ## 設定
 
@@ -152,7 +152,7 @@ skip_within = "7d"    # 任意
 | `skip_within` | この期間以内に処理済みならスキップ | `"7d"`, `"24h"`, `"1d12h"` |
 | `cleanup_after` | この期間より古いレポートディレクトリを自動削除 | `"7d"`（デフォルト） |
 
-`skip_within` は期間文字列を指定: `d`（日）、`h`（時間）、`m`（分）、`s`（秒）。省略時は前回リセット以降の処理済みをスキップ。過大な値はエラーになります。`--fresh` で保存済み状態を無視して全ターゲットを処理できます。
+`skip_within` には期間文字列を指定します: `d`（日）、`h`（時間）、`m`（分）、`s`（秒）。省略時は前回リセット以降に処理済みのターゲットをスキップします。過大な値はエラーになります。`--fresh` を指定すると保存済み状態を無視して全ターゲットを処理します。
 
 状態ファイル: `~/.config/token-burn/state.json`
 
@@ -177,7 +177,7 @@ timezone = "Asia/Tokyo"
 
 `name` は空文字不可です。`command` は1要素以上を指定し、先頭要素には空でない実行ファイル名を指定してください。
 
-**Claude 必須フラグの自動付与**: 実行ファイルが `claude` の場合、`--verbose`、`--output-format stream-json`、`--include-partial-messages` が未指定であれば自動的に追加されます。ログ出力と進捗モニタリングに必須のため、設定ファイルに記述する必要はありません。
+**Claude 必須フラグの自動付与**: コマンドの実行ファイルが `claude` の場合、ログ出力と進捗モニタリングに必要な `--verbose`、`--output-format stream-json`、`--include-partial-messages` が未指定であれば自動的に追加されます。設定ファイルへの記述は不要です。
 
 `reset_weekday` に指定可能な値: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday`（短縮形: `mon` `tue` `wed` `thu` `fri` `sat` `sun`）
 
@@ -213,7 +213,7 @@ directory = "~/GitHub/important-project"
 prompt = "prompts/test-coverage.md"
 ```
 
-`directory` は既存ディレクトリを指定してください。ファイルパスなどディレクトリ以外は警告してスキップされます。
+`directory` には既存のディレクトリを指定してください。ディレクトリ以外（ファイルパスなど）は警告を表示してスキップします。
 
 ## 開発
 
@@ -224,7 +224,7 @@ make build
 # テスト実行
 make test
 
-# clippy と フォーマットチェック
+# clippy とフォーマットチェック
 make check
 
 # リリースビルド
