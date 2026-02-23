@@ -1,0 +1,43 @@
+[settings]
+parallelism = 3                    # 並列実行数
+skip_within = "1d"                 # この期間以内に処理済みならスキップ（例: "7d", "24h", "1d12h"）
+
+[prompts]
+default = "prompts/default.md"    # .md で終わる値はファイルパスとして読み込み（相対パスは設定ファイルからの相対）
+# default = "prompts/default.ja.md"
+
+# ---- エージェント定義 ----
+
+[[agents]]
+name = "claude"
+command = ["claude", "-p", "--dangerously-skip-permissions", "--model", "opus"]
+reset_weekday = "monday"           # リセット曜日
+reset_time = "09:00"               # リセット時刻
+timezone = "Asia/Tokyo"
+
+[[agents]]
+name = "codex"
+command = ["codex", "exec", "--full-auto", "-c", "model='gpt-5.3-codex'", "-c", "model_reasoning_effort='xhigh'"]
+reset_weekday = "thursday"
+reset_time = "09:00"
+timezone = "Asia/Tokyo"
+
+# ---- ディレクトリ自動スキャン設定（複数定義可） ----
+
+[[scan]]
+base_dirs = ["~/GitHub"]           # スキャン対象のベースディレクトリ
+recursive = false                  # true: ネストされたサブディレクトリも再帰的に探索
+username = "owayo"                 # このユーザーのリポジトリのみ対象（remote URLで判定）
+public_first = true                # 公開リポジトリを優先的に処理
+exclude = ["archived-project"]     # 除外するディレクトリ名
+
+# [[scan]]
+# base_dirs = ["~/git"]
+# username = "owayo"
+# public_first = false
+
+# ---- 個別ターゲット（任意、スキャン結果とマージ） ----
+
+# [[targets]]
+# directory = "~/GitHub/important-project"
+# prompt = "prompts/test-coverage.md"     # .md ファイルパスまたはリテラル文字列

@@ -1,0 +1,195 @@
+<h1 align="center">token-burn</h1>
+
+<p align="center">
+  <strong>週次リセット前にAIコーディングアシスタントのトークンを消費するCLIツール</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/owayo/token-burn/actions/workflows/ci.yml">
+    <img alt="CI" src="https://github.com/owayo/token-burn/actions/workflows/ci.yml/badge.svg?branch=main">
+  </a>
+  <a href="https://github.com/owayo/token-burn/releases/latest">
+    <img alt="Version" src="https://img.shields.io/github/v/release/owayo/token-burn">
+  </a>
+  <a href="LICENSE">
+    <img alt="License" src="https://img.shields.io/github/license/owayo/token-burn">
+  </a>
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> | 日本語
+</p>
+
+---
+
+## 概要
+
+Claude Code / Codex CLI のトークンは週次でリセットされますが、未使用分は繰り越されません。「もったいない」精神で、**token-burn** はリセット直前の残りトークンを有効活用します。コードレビュー、バグ修正、リファクタリング、テスト改善など、自由に定義したプロンプトをリポジトリ群に対して並列実行します。リセット時刻が来ると、実行中のプロセスは自動的に終了されます。
+
+## 特徴
+
+- **自動探索**: ディレクトリをスキャンしてGitリポジトリを検出、remote URLのユーザー名でフィルタ
+- **複数スキャンソース**: GitHub用、GitLab用など、スキャン設定を複数定義可能
+- **可視性対応**: 公開リポジトリを優先的に処理
+- **マルチエージェント**: Claude Code、Codex CLI、カスタムエージェントに対応
+- **スマートスケジューリング**: リセット期限が最も近いエージェントを自動選択
+- **デッドライン制御**: リセット時刻到達時に全子プロセスを自動終了
+- **並列実行**: tmuxペイン分割とプログレスモニター付きで複数プロンプトを同時実行
+- **プロンプトファイル**: `.md` ファイルまたはインライン文字列でプロンプトを指定可能
+- **レジューム**: 処理済みディレクトリを自動スキップ、スキップ期間を設定可能
+- **ドライラン**: コマンドを実行せずに実行計画をプレビュー
+
+## 動作環境
+
+- **OS**: macOS
+- **tmux**: ペイン分割実行に必要
+- **Rust**: 1.70以上（ソースからビルドする場合）
+- **gh CLI**: リポジトリ可視性の検出に必要
+- **Claude Code** および/または **Codex CLI**: 少なくとも1つのエージェントが必要
+
+## インストール
+
+### ソースからビルド
+
+```bash
+cargo install --path .
+```
+
+### バイナリダウンロード
+
+[Releases](https://github.com/owayo/token-burn/releases) から最新版をダウンロード。
+
+## 使い方
+
+### クイックスタート
+
+```bash
+# 設定ファイルとデフォルトプロンプトを生成
+token-burn init
+
+# エージェントのリセット状況を確認
+token-burn status
+
+# 実行計画のプレビュー
+token-burn run -n
+
+# トークン消費を実行
+token-burn run
+```
+
+### コマンド
+
+| コマンド | 説明 |
+|---------|------|
+| `run` | トークン消費を実行（デフォルト） |
+| `status` | エージェントのリセット状況を表示 |
+| `init` | 設定ファイルとプロンプトテンプレートを生成 |
+
+### オプション
+
+| オプション | 短縮形 | 説明 |
+|-----------|-------|------|
+| `--config <PATH>` | `-c` | 設定ファイルパス（デフォルト: `~/.config/token-burn/config.toml`） |
+| `--agent <NAME>` | | エージェントを強制指定 |
+| `--dry-run` | `-n` | 実行せずにプレビュー |
+| `--fresh` | | 保存済み状態を無視して全ターゲットを処理 |
+| `--help` | `-h` | ヘルプ表示 |
+| `--version` | `-V` | バージョン表示 |
+
+`init` は `--force`（`-f`）で既存ファイルを確認なしで上書きできます。
+
+## 設定
+
+デフォルトの設定ファイルパス: `~/.config/token-burn/config.toml`
+
+`token-burn init` で設定テンプレートを生成するか、[config.toml.example](config.toml.example) を参照してください。
+
+### 基本設定
+
+```toml
+[settings]
+parallelism = 3
+skip_within = "7d"    # 任意
+```
+
+| フィールド | 説明 | 例 |
+|-----------|------|-----|
+| `parallelism` | 並列実行数 | `3` |
+| `skip_within` | この期間以内に処理済みならスキップ | `"7d"`, `"24h"`, `"1d12h"` |
+
+`skip_within` は期間文字列を指定: `d`（日）、`h`（時間）、`m`（分）、`s`（秒）。省略時は前回リセット以降の処理済みをスキップ。`--fresh` で保存済み状態を無視して全ターゲットを処理できます。
+
+状態ファイル: `~/.config/token-burn/state.json`
+
+### エージェント
+
+```toml
+[[agents]]
+name = "claude"
+command = ["claude", "-p", "--dangerously-skip-permissions", "--model", "opus"]
+reset_weekday = "monday"
+reset_time = "09:00"
+timezone = "Asia/Tokyo"
+```
+
+| フィールド | 説明 | 例 |
+|-----------|------|-----|
+| `name` | エージェント識別名 | `"claude"` |
+| `command` | コマンドと引数 | `["claude", "-p"]` |
+| `reset_weekday` | リセット曜日 | `"monday"` |
+| `reset_time` | リセット時刻（HH:MM） | `"09:00"` |
+| `timezone` | IANAタイムゾーン | `"Asia/Tokyo"` |
+
+`reset_weekday` に指定可能な値: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday`（短縮形: `mon` `tue` `wed` `thu` `fri` `sat` `sun`）
+
+### 自動スキャン（複数定義可）
+
+```toml
+[[scan]]
+base_dirs = ["~/GitHub"]
+username = "owayo"
+public_first = true
+exclude = ["archived-project"]
+
+[[scan]]
+base_dirs = ["~/git"]
+username = "owayo"
+public_first = false
+```
+
+### プロンプト
+
+`.md` で終わる値はファイルパスとして読み込まれます。相対パスは設定ファイルのディレクトリから解決されます。
+
+```toml
+[prompts]
+default = "prompts/default.md"
+```
+
+### 個別ターゲット（スキャン結果とマージ）
+
+```toml
+[[targets]]
+directory = "~/GitHub/important-project"
+prompt = "prompts/test-coverage.md"
+```
+
+## 開発
+
+```bash
+# ビルド
+make build
+
+# テスト実行
+make test
+
+# clippy と フォーマットチェック
+make check
+
+# リリースビルド
+make release
+```
+
+## ライセンス
+
+[MIT](LICENSE)
