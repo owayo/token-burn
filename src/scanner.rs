@@ -79,17 +79,26 @@ pub async fn resolve_targets(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| target.directory.clone());
 
-        targets.retain(|t| t.directory != path);
-
         let prompt_value = target.prompt.as_deref().unwrap_or(effective_default);
         let prompt = config.resolve_prompt(prompt_value)?;
 
-        targets.push(ResolvedTarget {
-            directory: path,
+        let new_target = ResolvedTarget {
+            directory: path.clone(),
             display_name,
             prompt,
             visibility: Visibility::Unknown,
-        });
+        };
+
+        if let Some(pos) = targets.iter().position(|t| t.directory == path) {
+            // Preserve visibility from scan and replace in-place
+            let existing_visibility = targets[pos].visibility.clone();
+            targets[pos] = ResolvedTarget {
+                visibility: existing_visibility,
+                ..new_target
+            };
+        } else {
+            targets.push(new_target);
+        }
     }
 
     if targets.is_empty() {
@@ -363,6 +372,143 @@ mod tests {
         assert_eq!(resolved[0].directory, repo_dir);
         assert_eq!(resolved[0].display_name, "repo");
         assert_eq!(resolved[0].prompt, "target prompt");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_targets_preserves_scan_order_when_target_overrides() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("token-burn-scanner-order-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+
+        // Create three directories to simulate scanned targets
+        let dir_a = temp_dir.join("aaa");
+        let dir_b = temp_dir.join("bbb");
+        let dir_c = temp_dir.join("ccc");
+        std::fs::create_dir_all(&dir_a).expect("dir_a should be created");
+        std::fs::create_dir_all(&dir_b).expect("dir_b should be created");
+        std::fs::create_dir_all(&dir_c).expect("dir_c should be created");
+
+        // Pre-populate targets as if they came from scan (order: a, b, c)
+        // We skip actual scanning and directly test resolve_targets with explicit targets
+        // by placing all three as scanned entries + overriding bbb via [[targets]]
+        let config = Config {
+            config_dir: temp_dir.clone(),
+            settings: Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+            },
+            prompts: Prompts {
+                default: "default prompt".to_string(),
+            },
+            agents: vec![Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: Some("agent prompt".to_string()),
+            }],
+            scan: vec![],
+            targets: vec![
+                Target {
+                    directory: dir_a.to_string_lossy().to_string(),
+                    prompt: None,
+                },
+                Target {
+                    directory: dir_b.to_string_lossy().to_string(),
+                    prompt: Some("override prompt".to_string()),
+                },
+                Target {
+                    directory: dir_c.to_string_lossy().to_string(),
+                    prompt: None,
+                },
+            ],
+        };
+
+        let resolved = resolve_targets(&config, &config.agents[0])
+            .await
+            .expect("three targets should resolve");
+
+        assert_eq!(resolved.len(), 3);
+        // Order preserved: a, b, c
+        assert_eq!(resolved[0].directory, dir_a);
+        assert_eq!(resolved[1].directory, dir_b);
+        assert_eq!(resolved[2].directory, dir_c);
+        // bbb uses override prompt, others use agent prompt
+        assert_eq!(resolved[0].prompt, "agent prompt");
+        assert_eq!(resolved[1].prompt, "override prompt");
+        assert_eq!(resolved[2].prompt, "agent prompt");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_targets_inplace_override_preserves_visibility() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("token-burn-scanner-vis-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+
+        let dir_a = temp_dir.join("aaa");
+        let dir_b = temp_dir.join("bbb");
+        std::fs::create_dir_all(&dir_a).expect("dir_a should be created");
+        std::fs::create_dir_all(&dir_b).expect("dir_b should be created");
+
+        let config = Config {
+            config_dir: temp_dir.clone(),
+            settings: Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+            },
+            prompts: Prompts {
+                default: "default".to_string(),
+            },
+            agents: vec![Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![],
+            // bbb will be added twice — first without prompt, then with override
+            targets: vec![
+                Target {
+                    directory: dir_a.to_string_lossy().to_string(),
+                    prompt: None,
+                },
+                Target {
+                    directory: dir_b.to_string_lossy().to_string(),
+                    prompt: None,
+                },
+                Target {
+                    directory: dir_b.to_string_lossy().to_string(),
+                    prompt: Some("overridden".to_string()),
+                },
+            ],
+        };
+
+        let resolved = resolve_targets(&config, &config.agents[0])
+            .await
+            .expect("targets should resolve");
+
+        // bbb appears only once (deduped), prompt overridden, order preserved
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].directory, dir_a);
+        assert_eq!(resolved[1].directory, dir_b);
+        assert_eq!(resolved[1].prompt, "overridden");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
