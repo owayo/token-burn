@@ -42,7 +42,7 @@ make release  # リリースビルド
 主要セクション:
 - `[settings]` - 並列実行数
 - `[prompts]` - デフォルトプロンプト
-- `[[agents]]` - エージェント定義（command, リセットスケジュール）
+- `[[agents]]` - エージェント定義（command, リセットスケジュール, prompt）
 - `[[scan]]` - ディレクトリ自動スキャン設定
 - `[[targets]]` - 個別ターゲット（任意）
 

@@ -705,6 +705,7 @@ mod tests {
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
+            prompt: None,
         }
     }
 
@@ -780,6 +781,7 @@ mod tests {
             reset_weekday: "thursday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
+            prompt: None,
         };
         let original_len = agent.command.len();
         ensure_required_flags(&mut agent);

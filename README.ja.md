@@ -167,6 +167,7 @@ command = ["claude", "-p", "--dangerously-skip-permissions", "--model", "opus"]
 reset_weekday = "monday"
 reset_time = "09:00"
 timezone = "Asia/Tokyo"
+prompt = "prompts/test-coverage.md"  # 任意
 ```
 
 | フィールド | 説明 | 例 |
@@ -176,8 +177,11 @@ timezone = "Asia/Tokyo"
 | `reset_weekday` | リセット曜日 | `"monday"` |
 | `reset_time` | リセット時刻（HH:MM） | `"09:00"` |
 | `timezone` | IANAタイムゾーン | `"Asia/Tokyo"` |
+| `prompt` | エージェント固有プロンプト（任意） | `"prompts/test-coverage.md"` |
 
-`name` は空文字不可です。`command` は1要素以上を指定し、先頭要素には空でない実行ファイル名を指定してください。
+`name` は空文字不可です。`command` は1要素以上を指定し、先頭要素には空でない実行ファイル名を指定してください。`prompt` を指定するとグローバルの `[prompts].default` の代わりに使われます。ターゲット固有の `prompt` が最優先です。
+
+**プロンプト優先順位**: `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default`
 
 **Claude 必須フラグの自動付与**: コマンドの実行ファイルが `claude` の場合、ログ出力と進捗モニタリングに必要な `--verbose`、`--output-format stream-json`、`--include-partial-messages` が必ず有効化されます。未指定フラグは自動追加され、既存の `--output-format` 値（`--output-format=...` 形式を含む）は `stream-json` に正規化されます。設定ファイルへの記述は不要です。
 

@@ -21,6 +21,7 @@ command = ["claude", "-p", "--dangerously-skip-permissions", "--model", "opus"]
 reset_weekday = "monday"           # リセット曜日
 reset_time = "09:00"               # リセット時刻
 timezone = "Asia/Tokyo"
+# prompt = "prompts/test-coverage.md"  # エージェント固有プロンプト（省略時は [prompts].default を使用）
 
 [[agents]]
 name = "codex"
@@ -28,6 +29,7 @@ command = ["codex", "exec", "--full-auto", "-c", "model='gpt-5.3-codex'", "-c", 
 reset_weekday = "thursday"
 reset_time = "09:00"
 timezone = "Asia/Tokyo"
+# prompt = "prompts/codex.md"
 
 # ---- ディレクトリ自動スキャン設定（複数定義可） ----
 

@@ -40,6 +40,8 @@ pub struct Agent {
     pub reset_weekday: String,
     pub reset_time: String,
     pub timezone: String,
+    /// Agent-specific prompt override (takes precedence over [prompts].default)
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +200,7 @@ mod tests {
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
+                prompt: None,
             }],
             scan: vec![],
             targets: vec![Target {

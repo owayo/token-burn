@@ -151,7 +151,7 @@ async fn run(
     );
     println!();
 
-    let targets = scanner::resolve_targets(&config).await?;
+    let targets = scanner::resolve_targets(&config, agent).await?;
 
     // Filter targets by saved state (skip already-processed directories)
     let state_file = state::state_path(config_path);

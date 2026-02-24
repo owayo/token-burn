@@ -37,8 +37,13 @@ struct GhRepo {
     visibility: String,
 }
 
-pub async fn resolve_targets(config: &Config) -> Result<Vec<ResolvedTarget>> {
-    let default_prompt = config.resolve_prompt(&config.prompts.default)?;
+pub async fn resolve_targets(
+    config: &Config,
+    agent: &crate::config::Agent,
+) -> Result<Vec<ResolvedTarget>> {
+    // Priority: target prompt > agent prompt > global default
+    let effective_default = agent.prompt.as_deref().unwrap_or(&config.prompts.default);
+    let default_prompt = config.resolve_prompt(effective_default)?;
     let mut targets = Vec::new();
 
     for scan in &config.scan {
@@ -76,7 +81,7 @@ pub async fn resolve_targets(config: &Config) -> Result<Vec<ResolvedTarget>> {
 
         targets.retain(|t| t.directory != path);
 
-        let prompt_value = target.prompt.as_deref().unwrap_or(&config.prompts.default);
+        let prompt_value = target.prompt.as_deref().unwrap_or(effective_default);
         let prompt = config.resolve_prompt(prompt_value)?;
 
         targets.push(ResolvedTarget {
@@ -336,6 +341,7 @@ mod tests {
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
+                prompt: None,
             }],
             scan: vec![],
             targets: vec![
@@ -350,7 +356,7 @@ mod tests {
             ],
         };
 
-        let resolved = resolve_targets(&config)
+        let resolved = resolve_targets(&config, &config.agents[0])
             .await
             .expect("one valid directory target should remain");
         assert_eq!(resolved.len(), 1);

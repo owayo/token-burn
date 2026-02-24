@@ -167,6 +167,7 @@ command = ["claude", "-p", "--dangerously-skip-permissions", "--model", "opus"]
 reset_weekday = "monday"
 reset_time = "09:00"
 timezone = "Asia/Tokyo"
+prompt = "prompts/test-coverage.md"  # optional
 ```
 
 | Field | Description | Example |
@@ -176,8 +177,11 @@ timezone = "Asia/Tokyo"
 | `reset_weekday` | Reset day of week | `"monday"` |
 | `reset_time` | Reset time (HH:MM) | `"09:00"` |
 | `timezone` | IANA timezone | `"Asia/Tokyo"` |
+| `prompt` | Agent-specific prompt (optional) | `"prompts/test-coverage.md"` |
 
-`name` must not be empty. `command` must contain at least one element, and the first element must be a non-empty executable name.
+`name` must not be empty. `command` must contain at least one element, and the first element must be a non-empty executable name. `prompt` overrides the global `[prompts].default` for this agent; target-level `prompt` takes highest priority.
+
+**Prompt priority**: `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default`
 
 **Claude auto-injected flags**: When the executable is `claude`, the following flags are enforced: `--verbose`, `--output-format stream-json`, `--include-partial-messages`. Missing flags are appended automatically, and an existing `--output-format` value is normalized to `stream-json` (including `--output-format=...` form). These are required for proper log capture and progress monitoring. You do not need to include them in your config.
 
