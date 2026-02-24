@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "token-burn"
-version = "26.2.103"
+version = "26.2.104"
 dependencies = [
  "anyhow",
  "chrono",
