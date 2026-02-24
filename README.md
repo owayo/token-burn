@@ -34,6 +34,10 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
   <img src="docs/images/screenshot.png" width="800" alt="token-burn running">
 </p>
 
+<p align="center">
+  <img src="docs/images/deadline.png" width="800" alt="Deadline reached — waiting for tasks to finish">
+</p>
+
 ## Features
 
 - **Auto-discovery**: Scans directories for git repos, filters by username in remote URL
