@@ -188,21 +188,32 @@ pub fn execute_plan_tmux(
                 shell_escape(&marker_dir.join(format!("failed-{}", idx)).to_string_lossy());
             let error_prefix = shell_escape(&format!("[{}] ", task.display_name));
             let log_base = task_log_base(idx, &task.display_name);
-            let jsonl_file = shell_escape(
-                &run_dir
-                    .join(format!("{}.jsonl", log_base))
-                    .to_string_lossy(),
-            );
             let log_file =
                 shell_escape(&run_dir.join(format!("{}.log", log_base)).to_string_lossy());
 
             script += &build_task_header_script(idx, total, &task.display_name);
-            // Tee raw JSON to .jsonl, then pipe through format-stream for readable output to .log
-            let fmt_cmd = shell_escape(&exe_path.to_string_lossy());
-            script += &format!(
-                "{} 2>&1 | tee {} | {} format-stream 2>&1 | tee {}\n",
-                cmd_str, jsonl_file, fmt_cmd, log_file
-            );
+            let is_claude = plan
+                .agent
+                .command
+                .first()
+                .map(|s| s.as_str() == "claude")
+                .unwrap_or(false);
+            if is_claude {
+                // Tee raw JSON to .jsonl, then pipe through format-stream for readable output to .log
+                let jsonl_file = shell_escape(
+                    &run_dir
+                        .join(format!("{}.jsonl", log_base))
+                        .to_string_lossy(),
+                );
+                let fmt_cmd = shell_escape(&exe_path.to_string_lossy());
+                script += &format!(
+                    "{} 2>&1 | tee {} | {} format-stream 2>&1 | tee {}\n",
+                    cmd_str, jsonl_file, fmt_cmd, log_file
+                );
+            } else {
+                // Non-claude agents: pipe directly to log file
+                script += &format!("{} 2>&1 | tee {}\n", cmd_str, log_file);
+            }
             script += "CMD_EXIT=${PIPESTATUS[0]}\n";
             // Check exit code - stop worker on failure
             script += &format!(
