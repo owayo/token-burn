@@ -1,7 +1,9 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Per-agent map of directory path → last processed timestamp
@@ -32,15 +34,45 @@ impl State {
             .or_default()
             .insert(directory.to_string_lossy().to_string(), Utc::now());
     }
+}
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
-        Ok(())
+/// Atomically mark a directory as completed for an agent.
+/// This function acquires an exclusive file lock so concurrent worker processes
+/// do not overwrite each other's updates.
+pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) -> Result<()> {
+    use std::fs::OpenOptions;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+
+    file.lock_exclusive()?;
+
+    let mut content = String::new();
+    file.seek(SeekFrom::Start(0))?;
+    file.read_to_string(&mut content)?;
+
+    let mut state = if content.trim().is_empty() {
+        State::default()
+    } else {
+        serde_json::from_str(&content).unwrap_or_default()
+    };
+    state.mark_completed(agent_name, directory);
+
+    let serialized = serde_json::to_string_pretty(&state)?;
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(serialized.as_bytes())?;
+    file.sync_data()?;
+    file.unlock()?;
+    Ok(())
 }
 
 pub fn state_path(config_path: &Path) -> PathBuf {
@@ -91,7 +123,10 @@ pub fn parse_duration(s: &str) -> Result<chrono::Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_duration;
+    use super::{mark_completed_atomic, parse_duration, State};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Barrier};
+    use tempfile::TempDir;
 
     #[test]
     fn parse_duration_supports_compound_values() {
@@ -129,5 +164,40 @@ mod tests {
         let input = format!("{}s1s", i64::MAX);
         let err = parse_duration(&input).expect_err("overflowing duration must fail");
         assert!(err.to_string().contains("Duration is too large"));
+    }
+
+    #[test]
+    fn mark_completed_atomic_preserves_concurrent_updates() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let state_file = tmp.path().join("state.json");
+        let workers = 8usize;
+        let barrier = Arc::new(Barrier::new(workers));
+
+        let mut handles = Vec::new();
+        for i in 0..workers {
+            let barrier = Arc::clone(&barrier);
+            let state_file = state_file.clone();
+            handles.push(std::thread::spawn(move || {
+                let dir = PathBuf::from(format!("/tmp/repo-{i}"));
+                barrier.wait();
+                mark_completed_atomic(&state_file, "claude", &dir)
+                    .expect("atomic mark should succeed");
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("worker thread should join");
+        }
+
+        let state = State::load(&state_file);
+        let map = state
+            .agents
+            .get("claude")
+            .expect("agent entry should exist after updates");
+        assert_eq!(map.len(), workers);
+        for i in 0..workers {
+            let key = format!("/tmp/repo-{i}");
+            assert!(map.contains_key(&key), "missing key: {key}");
+        }
     }
 }

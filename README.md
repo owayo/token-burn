@@ -46,6 +46,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Collision-safe logs**: Per-task logs are numbered to avoid overwrite when display names collide
 - **Prompt files**: Prompts can be `.md` files or inline strings
 - **Resume**: Automatically skips already-processed directories; configurable skip duration
+- **Concurrent-safe state**: Parallel workers update `state.json` atomically with file locking
 - **Dry run**: Preview execution plan without running commands
 
 ## Requirements
@@ -155,7 +156,7 @@ skip_within = "7d"    # optional
 
 `skip_within` accepts duration strings: `d` (days), `h` (hours), `m` (minutes), `s` (seconds). If omitted, directories processed since the previous reset are skipped. Excessively large values are rejected. Use `--fresh` to ignore saved state entirely.
 
-State is stored in `~/.config/token-burn/state.json`.
+State is stored in `~/.config/token-burn/state.json` and updated atomically to avoid lost updates during parallel runs.
 
 ### Agents
 
@@ -178,7 +179,7 @@ timezone = "Asia/Tokyo"
 
 `name` must not be empty. `command` must contain at least one element, and the first element must be a non-empty executable name.
 
-**Claude auto-injected flags**: When the executable is `claude`, the following flags are automatically appended if not already present: `--verbose`, `--output-format stream-json`, `--include-partial-messages`. These are required for proper log capture and progress monitoring. You do not need to include them in your config.
+**Claude auto-injected flags**: When the executable is `claude`, the following flags are enforced: `--verbose`, `--output-format stream-json`, `--include-partial-messages`. Missing flags are appended automatically, and an existing `--output-format` value is normalized to `stream-json` (including `--output-format=...` form). These are required for proper log capture and progress monitoring. You do not need to include them in your config.
 
 `reset_weekday` accepts: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday` (or short forms: `mon` `tue` `wed` `thu` `fri` `sat` `sun`)
 

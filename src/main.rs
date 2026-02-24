@@ -94,9 +94,7 @@ async fn main() -> Result<()> {
         state_file,
     } = command
     {
-        let mut run_state = state::State::load(&state_file);
-        run_state.mark_completed(&agent, &directory);
-        run_state.save(&state_file)?;
+        state::mark_completed_atomic(&state_file, &agent, &directory)?;
         return Ok(());
     }
 

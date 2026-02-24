@@ -30,16 +30,45 @@ fn ensure_required_flags(agent: &mut Agent) {
     }
 
     let needs_verbose = !agent.command.iter().any(|s| s == "--verbose");
-    let needs_output_format = !agent.command.iter().any(|s| s == "--output-format");
     let needs_partial = !agent
         .command
         .iter()
         .any(|s| s == "--include-partial-messages");
 
+    let mut has_output_format = false;
+    let mut idx = 0usize;
+    while idx < agent.command.len() {
+        let arg = &agent.command[idx];
+        if arg == "--output-format" {
+            has_output_format = true;
+            let next_is_value = agent
+                .command
+                .get(idx + 1)
+                .map(|s| !s.starts_with('-'))
+                .unwrap_or(false);
+            if next_is_value {
+                if agent.command[idx + 1] != "stream-json" {
+                    agent.command[idx + 1] = "stream-json".to_string();
+                }
+            } else {
+                agent.command.insert(idx + 1, "stream-json".to_string());
+            }
+            break;
+        }
+        if arg.starts_with("--output-format=") {
+            has_output_format = true;
+            if arg != "--output-format=stream-json" {
+                agent.command[idx] = "--output-format=stream-json".to_string();
+            }
+            break;
+        }
+        idx += 1;
+    }
+
     if needs_verbose {
         agent.command.push("--verbose".to_string());
     }
-    if needs_output_format {
+    if !has_output_format {
         agent.command.push("--output-format".to_string());
         agent.command.push("stream-json".to_string());
     }
@@ -704,6 +733,43 @@ mod tests {
         let original_len = agent.command.len();
         ensure_required_flags(&mut agent);
         assert_eq!(agent.command.len(), original_len);
+    }
+
+    #[test]
+    fn ensure_required_flags_rewrites_non_stream_json_output_format() {
+        let mut agent = make_agent(vec!["claude", "-p", "--output-format", "text"]);
+        ensure_required_flags(&mut agent);
+
+        let idx = agent
+            .command
+            .iter()
+            .position(|s| s == "--output-format")
+            .expect("output-format flag should exist");
+        assert_eq!(agent.command.get(idx + 1), Some(&"stream-json".to_string()));
+    }
+
+    #[test]
+    fn ensure_required_flags_supports_equals_style_output_format() {
+        let mut agent = make_agent(vec!["claude", "-p", "--output-format=stream-json"]);
+        let original_len = agent.command.len();
+        ensure_required_flags(&mut agent);
+        assert_eq!(agent.command.len(), original_len + 2);
+        assert!(agent
+            .command
+            .contains(&"--output-format=stream-json".to_string()));
+        assert!(!agent.command.iter().any(|s| s == "--output-format"));
+    }
+
+    #[test]
+    fn ensure_required_flags_adds_missing_output_format_value() {
+        let mut agent = make_agent(vec!["claude", "-p", "--output-format"]);
+        ensure_required_flags(&mut agent);
+        let idx = agent
+            .command
+            .iter()
+            .position(|s| s == "--output-format")
+            .expect("output-format flag should exist");
+        assert_eq!(agent.command.get(idx + 1), Some(&"stream-json".to_string()));
     }
 
     #[test]
