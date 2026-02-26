@@ -62,3 +62,32 @@ pub fn format_duration(d: Duration) -> String {
         format!("{}m", minutes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_duration_days() {
+        let d = Duration::from_secs(90061); // 1d 1h 1m 1s
+        assert_eq!(format_duration(d), "1d 1h 1m");
+    }
+
+    #[test]
+    fn format_duration_hours() {
+        let d = Duration::from_secs(7260); // 2h 1m
+        assert_eq!(format_duration(d), "2h 1m");
+    }
+
+    #[test]
+    fn format_duration_minutes_only() {
+        let d = Duration::from_secs(300); // 5m
+        assert_eq!(format_duration(d), "5m");
+    }
+
+    #[test]
+    fn format_duration_zero() {
+        let d = Duration::from_secs(0);
+        assert_eq!(format_duration(d), "0m");
+    }
+}

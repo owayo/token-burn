@@ -14,6 +14,7 @@ token-burn/
 │   ├── scanner.rs          # ディレクトリスキャン・リポジトリ探索・gh CLI連携
 │   ├── schedule.rs         # リセット日時計算、最寄りエージェント選択
 │   ├── executor.rs         # プロセス起動・並列実行管理（tokio）
+│   ├── format_stream.rs    # claude stream-json出力のフォーマッター
 │   ├── cleanup.rs          # レポートディレクトリの自動クリーンアップ
 │   ├── state.rs            # 処理済みターゲット状態の永続化
 │   └── display.rs          # ステータス表示・プログレス出力

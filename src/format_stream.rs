@@ -288,16 +288,19 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        // Find a safe char boundary
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
+    let mut iter = s.chars();
+    let mut prefix = String::new();
+    for _ in 0..max {
+        match iter.next() {
+            Some(ch) => prefix.push(ch),
+            None => return prefix,
         }
-        format!("{}...", &s[..end])
     }
+    if iter.next().is_none() {
+        return prefix;
+    }
+    let kept: String = prefix.chars().take(max.saturating_sub(3)).collect();
+    format!("{kept}...")
 }
 
 fn format_tool_diff(tool_name: &str, input_json: &str) -> Option<String> {
@@ -1117,5 +1120,30 @@ mod tests {
             "should not contain '✓ ?' fallback: {}",
             clean
         );
+    }
+
+    // --- truncate_str unit tests ---
+
+    #[test]
+    fn truncate_str_short_string_unchanged() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_exact_length_unchanged() {
+        assert_eq!(truncate_str("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn truncate_str_long_string_truncated() {
+        assert_eq!(truncate_str("abcdefghij", 7), "abcd...");
+    }
+
+    #[test]
+    fn truncate_str_multibyte_counts_chars() {
+        // 5 Japanese characters = 15 bytes, but only 5 chars
+        let s = "あいうえお";
+        assert_eq!(truncate_str(s, 5), "あいうえお");
+        assert_eq!(truncate_str(s, 4), "あ...");
     }
 }

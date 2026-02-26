@@ -239,4 +239,55 @@ mod tests {
             .validate()
             .expect("valid agent command should pass validation");
     }
+
+    #[test]
+    fn parse_weekday_accepts_full_and_short_names() {
+        assert_eq!(parse_weekday("monday").unwrap(), chrono::Weekday::Mon);
+        assert_eq!(parse_weekday("Mon").unwrap(), chrono::Weekday::Mon);
+        assert_eq!(parse_weekday("FRIDAY").unwrap(), chrono::Weekday::Fri);
+        assert_eq!(parse_weekday("sun").unwrap(), chrono::Weekday::Sun);
+    }
+
+    #[test]
+    fn parse_weekday_rejects_invalid() {
+        assert!(parse_weekday("funday").is_err());
+        assert!(parse_weekday("").is_err());
+    }
+
+    #[test]
+    fn parse_time_valid() {
+        assert_eq!(parse_time("09:00").unwrap(), (9, 0));
+        assert_eq!(parse_time("23:59").unwrap(), (23, 59));
+        assert_eq!(parse_time("00:00").unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn parse_time_rejects_invalid() {
+        assert!(parse_time("24:00").is_err());
+        assert!(parse_time("09:60").is_err());
+        assert!(parse_time("9").is_err());
+        assert!(parse_time("09:00:00").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_agents() {
+        let mut config = base_config();
+        config.agents = vec![];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_parallelism() {
+        let mut config = base_config();
+        config.settings.parallelism = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_no_scan_or_targets() {
+        let mut config = base_config();
+        config.scan = vec![];
+        config.targets = vec![];
+        assert!(config.validate().is_err());
+    }
 }

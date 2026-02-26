@@ -615,18 +615,42 @@ fn strip_ansi_from_dir(dir: &std::path::Path) {
 }
 
 fn strip_ansi(s: &str) -> String {
+    fn is_csi_final(c: char) -> bool {
+        ('\u{40}'..='\u{7e}').contains(&c)
+    }
+
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                while let Some(&next) = chars.peek() {
+            match chars.peek().copied() {
+                Some('[') => {
+                    // CSI sequence: \x1b[...final_byte (0x40-0x7E)
                     chars.next();
-                    if next.is_ascii_alphabetic() {
-                        break;
+                    for ch in chars.by_ref() {
+                        if is_csi_final(ch) {
+                            break;
+                        }
                     }
                 }
+                Some(']') => {
+                    // OSC sequence: \x1b]...ST (ST = \x1b\\ or \x07)
+                    chars.next();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\x07' {
+                            break;
+                        }
+                        if ch == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    // Other escape sequences (e.g., \x1b(B) — skip next char
+                    chars.next();
+                }
+                None => break,
             }
         } else {
             result.push(c);
@@ -690,6 +714,30 @@ mod tests {
     #[test]
     fn strip_ansi_preserves_plain_text() {
         assert_eq!(strip_ansi("hello world"), "hello world");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_with_bel() {
+        let input = "\x1b]2;pane title\x07ok";
+        assert_eq!(strip_ansi(input), "ok");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_with_st() {
+        let input = "\x1b]2;pane title\x1b\\ok";
+        assert_eq!(strip_ansi(input), "ok");
+    }
+
+    #[test]
+    fn strip_ansi_removes_bracketed_paste() {
+        let input = "\x1b[200~pasted text\x1b[201~";
+        assert_eq!(strip_ansi(input), "pasted text");
+    }
+
+    #[test]
+    fn strip_ansi_handles_mixed_sequences() {
+        let input = "\x1b]2;title\x07\x1b[1mBold\x1b[0m text\x1b]0;icon\x1b\\end";
+        assert_eq!(strip_ansi(input), "Bold textend");
     }
 
     #[test]

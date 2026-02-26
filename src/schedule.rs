@@ -88,3 +88,66 @@ pub fn select_nearest_agent(agents: &[Agent]) -> Result<(usize, AgentSchedule)> 
 
     Ok((nearest_idx, nearest_schedule))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Weekday;
+
+    #[test]
+    fn days_until_same_weekday_is_zero() {
+        assert_eq!(days_until_weekday(Weekday::Mon, Weekday::Mon), 0);
+        assert_eq!(days_until_weekday(Weekday::Fri, Weekday::Fri), 0);
+    }
+
+    #[test]
+    fn days_until_next_weekday() {
+        assert_eq!(days_until_weekday(Weekday::Mon, Weekday::Wed), 2);
+        assert_eq!(days_until_weekday(Weekday::Mon, Weekday::Sun), 6);
+    }
+
+    #[test]
+    fn days_until_previous_weekday_wraps() {
+        assert_eq!(days_until_weekday(Weekday::Wed, Weekday::Mon), 5);
+        assert_eq!(days_until_weekday(Weekday::Sun, Weekday::Mon), 1);
+    }
+
+    fn make_agent(name: &str, weekday: &str, time: &str) -> Agent {
+        Agent {
+            name: name.to_string(),
+            command: vec!["echo".to_string()],
+            reset_weekday: weekday.to_string(),
+            reset_time: time.to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        }
+    }
+
+    #[test]
+    fn calculate_next_reset_returns_future_time() {
+        let agent = make_agent("test", "monday", "09:00");
+        let sched = calculate_next_reset(&agent).unwrap();
+        assert!(sched.time_until_reset.as_secs() > 0);
+        assert!(sched.next_reset > sched.previous_reset);
+    }
+
+    #[test]
+    fn previous_reset_is_seven_days_before_next() {
+        let agent = make_agent("test", "wednesday", "14:00");
+        let sched = calculate_next_reset(&agent).unwrap();
+        let diff = sched.next_reset - sched.previous_reset;
+        assert_eq!(diff.num_days(), 7);
+    }
+
+    #[test]
+    fn select_nearest_agent_picks_valid_agent() {
+        let agents = vec![
+            make_agent("a", "monday", "09:00"),
+            make_agent("b", "thursday", "09:00"),
+        ];
+        let (idx, sched) = select_nearest_agent(&agents).unwrap();
+        assert!(idx < agents.len());
+        assert_eq!(sched.agent_name, agents[idx].name);
+        assert!(sched.time_until_reset.as_secs() > 0);
+    }
+}
