@@ -38,6 +38,10 @@ struct Cli {
     /// Ignore saved state and process all targets
     #[arg(long, global = true)]
     fresh: bool,
+
+    /// Maximum number of targets to process (default: from config or 10)
+    #[arg(short, long, global = true)]
+    limit: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -104,13 +108,14 @@ async fn main() -> Result<()> {
     let agent_name = cli.agent;
     let dry_run = cli.dry_run;
     let fresh = cli.fresh;
+    let limit = cli.limit;
 
     match command {
         Commands::Status => {
             display::print_status(&config)?;
         }
         Commands::Run => {
-            run(config, &config_path, agent_name, dry_run, fresh).await?;
+            run(config, &config_path, agent_name, dry_run, fresh, limit).await?;
         }
         Commands::Clean { older_than } => {
             run_clean(&config, older_than)?;
@@ -129,6 +134,7 @@ async fn run(
     agent_name: Option<String>,
     dry_run: bool,
     fresh: bool,
+    limit_override: Option<usize>,
 ) -> Result<()> {
     let (agent_idx, sched) = if let Some(name) = &agent_name {
         let idx = config
@@ -162,7 +168,25 @@ async fn run(
         filter_by_state(targets, &run_state, agent, &config, &sched)
     };
 
+    // Apply limit: CLI option overrides config value
+    let limit = limit_override.unwrap_or(config.settings.limit);
+    let truncated = if targets.len() > limit {
+        targets.len() - limit
+    } else {
+        0
+    };
+    let targets: Vec<_> = targets.into_iter().take(limit).collect();
+
     display::print_targets(&targets);
+
+    if truncated > 0 {
+        println!(
+            "  {} {} targets (limit: {})",
+            "Truncated:".dimmed(),
+            truncated,
+            limit
+        );
+    }
 
     if skipped > 0 {
         println!(

@@ -340,6 +340,7 @@ mod tests {
                 skip_within: None,
                 report_dir: None,
                 cleanup_after: None,
+                limit: 10,
             },
             prompts: Prompts {
                 default: "review".to_string(),
@@ -403,6 +404,7 @@ mod tests {
                 skip_within: None,
                 report_dir: None,
                 cleanup_after: None,
+                limit: 10,
             },
             prompts: Prompts {
                 default: "default prompt".to_string(),
@@ -470,6 +472,7 @@ mod tests {
                 skip_within: None,
                 report_dir: None,
                 cleanup_after: None,
+                limit: 10,
             },
             prompts: Prompts {
                 default: "default".to_string(),

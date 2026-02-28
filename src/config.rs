@@ -26,6 +26,13 @@ pub struct Settings {
     pub report_dir: Option<String>,
     /// Auto-delete report directories older than this duration (default: "7d").
     pub cleanup_after: Option<String>,
+    /// Maximum number of targets to process per run (default: 10).
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+fn default_limit() -> usize {
+    10
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +197,7 @@ mod tests {
                 skip_within: None,
                 report_dir: None,
                 cleanup_after: None,
+                limit: 10,
             },
             prompts: Prompts {
                 default: "review".to_string(),
