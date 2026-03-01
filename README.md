@@ -160,7 +160,7 @@ skip_within = "7d"    # optional
 
 `skip_within` accepts duration strings: `d` (days), `h` (hours), `m` (minutes), `s` (seconds). If omitted, directories processed since the previous reset are skipped. Excessively large values are rejected. Use `--fresh` to ignore saved state entirely.
 
-State is stored in `~/.config/token-burn/state.json` and updated atomically to avoid lost updates during parallel runs.
+State is stored in `<config-dir>/state.json` (same directory as the active config file) and updated atomically to avoid lost updates during parallel runs. With the default config path, this is `~/.config/token-burn/state.json`.
 
 ### Agents
 

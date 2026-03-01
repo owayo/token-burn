@@ -167,6 +167,25 @@ pub fn execute_plan_tmux(
         );
         let stop_file_escaped = shell_escape(&stop_file.to_string_lossy());
         let error_file = shell_escape(&marker_dir.join(format!("error-{}", w)).to_string_lossy());
+
+        // Signal handler: mark current task as failed and worker as done on cancel
+        script += &format!(
+            concat!(
+                "CURRENT_FAILED_MARKER=\"\"\n",
+                "WORKER_DONE_MARKER={wdone}\n",
+                "handle_cancel() {{\n",
+                "  if [ -n \"$CURRENT_FAILED_MARKER\" ]; then touch \"$CURRENT_FAILED_MARKER\"; fi\n",
+                "  touch \"$WORKER_DONE_MARKER\"\n",
+                "  printf '\\033]2;Worker {w} cancelled\\033\\\\'\n",
+                "  echo '━━━ Cancelled ━━━'\n",
+                "  exec sleep infinity\n",
+                "}}\n",
+                "trap handle_cancel INT TERM\n",
+            ),
+            wdone = worker_done_marker,
+            w = w + 1,
+        );
+
         for (i, (idx, task)) in tasks.iter().enumerate() {
             let idx = *idx;
             // Check stop signal before starting next task (skip first task)
@@ -190,6 +209,9 @@ pub fn execute_plan_tmux(
             let log_base = task_log_base(idx, &task.display_name);
             let log_file =
                 shell_escape(&run_dir.join(format!("{}.log", log_base)).to_string_lossy());
+
+            // Set current task's failed marker for signal handler
+            script += &format!("CURRENT_FAILED_MARKER={}\n", failed_marker);
 
             script += &build_task_header_script(idx, total, &task.display_name);
             let is_claude = plan
@@ -215,6 +237,8 @@ pub fn execute_plan_tmux(
                 script += &format!("{} 2>&1 | tee {}\n", cmd_str, log_file);
             }
             script += "CMD_EXIT=${PIPESTATUS[0]}\n";
+            // Clear signal handler target (exit code captured, normal flow handles it)
+            script += "CURRENT_FAILED_MARKER=\"\"\n";
             // Check exit code - stop worker on failure
             script += &format!(
                 concat!(

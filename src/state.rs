@@ -76,7 +76,14 @@ pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) ->
 }
 
 pub fn state_path(config_path: &Path) -> PathBuf {
-    config_path
+    let resolved_config_path = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(config_path)
+    };
+    resolved_config_path
         .parent()
         .unwrap_or(Path::new("."))
         .join("state.json")
@@ -123,8 +130,8 @@ pub fn parse_duration(s: &str) -> Result<chrono::Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_completed_atomic, parse_duration, State};
-    use std::path::PathBuf;
+    use super::{mark_completed_atomic, parse_duration, state_path, State};
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
@@ -199,5 +206,27 @@ mod tests {
             let key = format!("/tmp/repo-{i}");
             assert!(map.contains_key(&key), "missing key: {key}");
         }
+    }
+
+    #[test]
+    fn state_path_resolves_relative_config_to_absolute_path() {
+        let old_cwd = std::env::current_dir().expect("cwd should be available");
+        let tmp = TempDir::new().expect("temp dir should be created");
+        std::env::set_current_dir(tmp.path()).expect("should switch cwd");
+
+        let cwd = std::env::current_dir().expect("cwd should be available");
+        let path = state_path(Path::new("cfg/config.toml"));
+        assert_eq!(path, cwd.join("cfg").join("state.json"));
+        assert!(path.is_absolute());
+
+        std::env::set_current_dir(old_cwd).expect("should restore cwd");
+    }
+
+    #[test]
+    fn state_path_preserves_absolute_config_base() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let abs_config = tmp.path().join("cfg").join("config.toml");
+        let path = state_path(&abs_config);
+        assert_eq!(path, tmp.path().join("cfg").join("state.json"));
     }
 }

@@ -52,3 +52,5 @@ make release  # リリースビルド
 実行ファイルが `claude` の場合、`--verbose`、`--output-format stream-json`、`--include-partial-messages` は自動付与されます。`--output-format` が既存でも値は `stream-json` に正規化されます。
 
 `claude` エージェントのみ出力を `.jsonl` + `format-stream` パイプラインで処理します。`codex` 等の他エージェントは `.log` に直接出力します。
+
+処理済み状態は有効な設定ファイルと同じディレクトリの `state.json` に保存されます（デフォルト: `~/.config/token-burn/state.json`）。
