@@ -206,6 +206,17 @@ pub fn execute_plan_tmux(
             // Set current task's failed marker for signal handler
             script += &format!("CURRENT_FAILED_MARKER={}\n", failed_marker);
 
+            // Mark state BEFORE execution: tokens are burned once the task starts,
+            // so even if the session is killed mid-execution, we don't re-run.
+            let mark_cmd = format!(
+                "{} mark {} {} {}",
+                shell_escape(&exe_path.to_string_lossy()),
+                shell_escape(&plan.agent.name),
+                shell_escape(&task.directory.to_string_lossy()),
+                shell_escape(&state_file.to_string_lossy()),
+            );
+            script += &format!("{}\n", mark_cmd);
+
             script += &build_task_header_script(idx, total, &task.display_name);
             let is_claude = plan
                 .agent
@@ -249,7 +260,6 @@ pub fn execute_plan_tmux(
                     "    exec sleep infinity\n",
                     "  fi\n",
                     "else\n",
-                    "  {mark}\n",
                     "  touch {done}\n",
                     "fi\n",
                 ),
@@ -258,13 +268,6 @@ pub fn execute_plan_tmux(
                 failed = failed_marker,
                 wdone = worker_done_marker,
                 w = w + 1,
-                mark = format!(
-                    "{} mark {} {} {}",
-                    shell_escape(&exe_path.to_string_lossy()),
-                    shell_escape(&plan.agent.name),
-                    shell_escape(&task.directory.to_string_lossy()),
-                    shell_escape(&state_file.to_string_lossy()),
-                ),
                 done = done_marker,
             );
             script += "echo ''\n";
