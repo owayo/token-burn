@@ -168,22 +168,15 @@ pub fn execute_plan_tmux(
         let stop_file_escaped = shell_escape(&stop_file.to_string_lossy());
         let error_file = shell_escape(&marker_dir.join(format!("error-{}", w)).to_string_lossy());
 
-        // Signal handler: mark current task as failed and worker as done on cancel
-        script += &format!(
-            concat!(
-                "CURRENT_FAILED_MARKER=\"\"\n",
-                "WORKER_DONE_MARKER={wdone}\n",
-                "handle_cancel() {{\n",
-                "  if [ -n \"$CURRENT_FAILED_MARKER\" ]; then touch \"$CURRENT_FAILED_MARKER\"; fi\n",
-                "  touch \"$WORKER_DONE_MARKER\"\n",
-                "  printf '\\033]2;Worker {w} cancelled\\033\\\\'\n",
-                "  echo '━━━ Cancelled ━━━'\n",
-                "  exec sleep infinity\n",
-                "}}\n",
-                "trap handle_cancel INT TERM\n",
-            ),
-            wdone = worker_done_marker,
-            w = w + 1,
+        // Signal handler: set flag only; actual handling is in the error check after each command
+        script += concat!(
+            "CURRENT_FAILED_MARKER=\"\"\n",
+            "CANCELLED=0\n",
+            "handle_cancel() {\n",
+            "  CANCELLED=1\n",
+            "  if [ -n \"$CURRENT_FAILED_MARKER\" ]; then touch \"$CURRENT_FAILED_MARKER\"; fi\n",
+            "}\n",
+            "trap handle_cancel INT TERM\n",
         );
 
         for (i, (idx, task)) in tasks.iter().enumerate() {
@@ -239,16 +232,25 @@ pub fn execute_plan_tmux(
             script += "CMD_EXIT=${PIPESTATUS[0]}\n";
             // Clear signal handler target (exit code captured, normal flow handles it)
             script += "CURRENT_FAILED_MARKER=\"\"\n";
-            // Check exit code - stop worker on failure
+            // Check exit code
             script += &format!(
                 concat!(
-                    "if [ \"$CMD_EXIT\" -ne 0 ]; then ",
-                    "ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1); ",
-                    "printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}; ",
-                    "touch {failed}; touch {wdone}; ",
-                    "printf '\\033]2;Worker {w} error\\033\\\\'; ",
-                    "echo '━━━ Error - stopped ━━━'; ",
-                    "exec sleep infinity; ",
+                    "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
+                    "  if [ $CANCELLED -eq 1 ]; then\n",
+                    "    CANCELLED=0\n",
+                    "    touch {failed}\n",
+                    "    echo '━━━ Cancelled ━━━'\n",
+                    "  else\n",
+                    "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+                    "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
+                    "    touch {failed}; touch {wdone}\n",
+                    "    printf '\\033]2;Worker {w} error\\033\\\\'\n",
+                    "    echo '━━━ Error - stopped ━━━'\n",
+                    "    exec sleep infinity\n",
+                    "  fi\n",
+                    "else\n",
+                    "  {mark}\n",
+                    "  touch {done}\n",
                     "fi\n",
                 ),
                 prefix = error_prefix,
@@ -256,15 +258,15 @@ pub fn execute_plan_tmux(
                 failed = failed_marker,
                 wdone = worker_done_marker,
                 w = w + 1,
+                mark = format!(
+                    "{} mark {} {} {}",
+                    shell_escape(&exe_path.to_string_lossy()),
+                    shell_escape(&plan.agent.name),
+                    shell_escape(&task.directory.to_string_lossy()),
+                    shell_escape(&state_file.to_string_lossy()),
+                ),
+                done = done_marker,
             );
-            script += &format!(
-                "{} mark {} {} {}\n",
-                shell_escape(&exe_path.to_string_lossy()),
-                shell_escape(&plan.agent.name),
-                shell_escape(&task.directory.to_string_lossy()),
-                shell_escape(&state_file.to_string_lossy()),
-            );
-            script += &format!("touch {}\n", done_marker);
             script += "echo ''\n";
         }
         script += &format!("printf '\\033]2;Worker {} done\\033\\\\'\n", w + 1);
