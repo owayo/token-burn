@@ -40,8 +40,12 @@ struct Cli {
     fresh: bool,
 
     /// Maximum number of targets to process (default: from config or 10)
-    #[arg(short, long, global = true)]
+    #[arg(short, long, global = true, conflicts_with = "no_limit")]
     limit: Option<usize>,
+
+    /// Process all targets without limit
+    #[arg(long, global = true, conflicts_with = "limit")]
+    no_limit: bool,
 }
 
 #[derive(Subcommand)]
@@ -108,7 +112,11 @@ async fn main() -> Result<()> {
     let agent_name = cli.agent;
     let dry_run = cli.dry_run;
     let fresh = cli.fresh;
-    let limit = cli.limit;
+    let limit = if cli.no_limit {
+        Some(usize::MAX)
+    } else {
+        cli.limit
+    };
 
     match command {
         Commands::Status => {
