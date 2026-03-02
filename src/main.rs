@@ -46,6 +46,10 @@ struct Cli {
     /// Process all targets without limit
     #[arg(long, global = true, conflicts_with = "limit")]
     no_limit: bool,
+
+    /// Only process public repositories
+    #[arg(long, global = true)]
+    public_only: bool,
 }
 
 #[derive(Subcommand)]
@@ -117,13 +121,14 @@ async fn main() -> Result<()> {
     } else {
         cli.limit
     };
+    let public_only = cli.public_only;
 
     match command {
         Commands::Status => {
             display::print_status(&config)?;
         }
         Commands::Run => {
-            run(config, &config_path, agent_name, dry_run, fresh, limit).await?;
+            run(config, &config_path, agent_name, dry_run, fresh, limit, public_only).await?;
         }
         Commands::Clean { older_than } => {
             run_clean(&config, older_than)?;
@@ -143,6 +148,7 @@ async fn run(
     dry_run: bool,
     fresh: bool,
     limit_override: Option<usize>,
+    public_only: bool,
 ) -> Result<()> {
     let (agent_idx, sched) = if let Some(name) = &agent_name {
         let idx = config
@@ -166,6 +172,28 @@ async fn run(
     println!();
 
     let targets = scanner::resolve_targets(&config, agent).await?;
+
+    // Filter to public repositories only if requested
+    let (targets, public_filtered) = if public_only {
+        let before = targets.len();
+        let filtered: Vec<_> = targets
+            .into_iter()
+            .filter(|t| t.visibility == scanner::Visibility::Public)
+            .collect();
+        let removed = before - filtered.len();
+        (filtered, removed)
+    } else {
+        (targets, 0usize)
+    };
+
+    if public_only && targets.is_empty() {
+        println!(
+            "{}",
+            "No public repositories found. Ensure scan.username is set for visibility detection."
+                .yellow()
+        );
+        return Ok(());
+    }
 
     // Filter targets by saved state (skip already-processed directories)
     let state_file = state::state_path(config_path);
@@ -196,12 +224,23 @@ async fn run(
         );
     }
 
+    if public_filtered > 0 {
+        println!(
+            "  {} {} targets (non-public)",
+            "Filtered:".dimmed(),
+            public_filtered
+        );
+    }
+
     if skipped > 0 {
         println!(
             "  {} {} targets (already processed)",
             "Skipped:".dimmed(),
             skipped
         );
+    }
+
+    if public_filtered > 0 || skipped > 0 {
         println!();
     }
 
