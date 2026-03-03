@@ -634,11 +634,11 @@ fn strip_ansi_from_dir(dir: &std::path::Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map(|e| e == "log").unwrap_or(false) {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let cleaned = strip_ansi(&content);
-                let _ = std::fs::write(&path, cleaned);
-            }
+        if path.extension().map(|e| e == "log").unwrap_or(false)
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            let cleaned = strip_ansi(&content);
+            let _ = std::fs::write(&path, cleaned);
         }
     }
 }
@@ -704,7 +704,9 @@ mod tests {
     #[test]
     fn build_task_header_script_escapes_display_name() {
         let script = build_task_header_script(1, 3, "repo'; touch /tmp/pwn #");
-        assert!(script.contains("printf '\\033]2;%s\\033\\\\' '[1/3] repo'\\''; touch /tmp/pwn #'"));
+        assert!(
+            script.contains("printf '\\033]2;%s\\033\\\\' '[1/3] repo'\\''; touch /tmp/pwn #'")
+        );
         assert!(script.contains("echo '━━━ [1/3] repo'\\''; touch /tmp/pwn # ━━━'"));
     }
 
@@ -804,9 +806,11 @@ mod tests {
         assert!(agent.command.contains(&"--verbose".to_string()));
         assert!(agent.command.contains(&"--output-format".to_string()));
         assert!(agent.command.contains(&"stream-json".to_string()));
-        assert!(agent
-            .command
-            .contains(&"--include-partial-messages".to_string()));
+        assert!(
+            agent
+                .command
+                .contains(&"--include-partial-messages".to_string())
+        );
     }
 
     #[test]
@@ -843,9 +847,11 @@ mod tests {
         let original_len = agent.command.len();
         ensure_required_flags(&mut agent);
         assert_eq!(agent.command.len(), original_len + 2);
-        assert!(agent
-            .command
-            .contains(&"--output-format=stream-json".to_string()));
+        assert!(
+            agent
+                .command
+                .contains(&"--output-format=stream-json".to_string())
+        );
         assert!(!agent.command.iter().any(|s| s == "--output-format"));
     }
 

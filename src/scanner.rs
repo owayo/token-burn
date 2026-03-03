@@ -196,10 +196,10 @@ fn check_repo(
     }
 
     let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if let Some(username) = &scan.username {
-        if !remote_belongs_to_username(&remote_url, username) {
-            return None;
-        }
+    if let Some(username) = &scan.username
+        && !remote_belongs_to_username(&remote_url, username)
+    {
+        return None;
     }
 
     let visibility_key = extract_remote_repo(&remote_url)
@@ -236,14 +236,15 @@ fn extract_remote_owner_and_repo(remote_url: &str) -> Option<(String, String)> {
     let trimmed = remote_url.trim().trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
 
-    if let Some((host_part, path_part)) = trimmed.split_once(':') {
-        if host_part.contains('@') && !host_part.contains("://") {
-            let mut parts = path_part.split('/');
-            let owner = parts.next()?;
-            let repo = parts.next()?;
-            if !owner.is_empty() && !repo.is_empty() {
-                return Some((owner.to_string(), repo.to_string()));
-            }
+    if let Some((host_part, path_part)) = trimmed.split_once(':')
+        && host_part.contains('@')
+        && !host_part.contains("://")
+    {
+        let mut parts = path_part.split('/');
+        let owner = parts.next()?;
+        let repo = parts.next()?;
+        if !owner.is_empty() && !repo.is_empty() {
+            return Some((owner.to_string(), repo.to_string()));
         }
     }
 

@@ -349,11 +349,11 @@ fn filter_by_state(
     let mut kept = Vec::new();
     let mut skipped = 0usize;
     for target in targets {
-        if let Some(last) = run_state.last_processed(&agent.name, &target.directory) {
-            if last >= cutoff {
-                skipped += 1;
-                continue;
-            }
+        if let Some(last) = run_state.last_processed(&agent.name, &target.directory)
+            && last >= cutoff
+        {
+            skipped += 1;
+            continue;
         }
         kept.push(target);
     }

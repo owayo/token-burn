@@ -3,7 +3,7 @@ use chrono::{Datelike, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 use std::time::Duration;
 
-use crate::config::{parse_time, parse_weekday, Agent};
+use crate::config::{Agent, parse_time, parse_weekday};
 
 #[derive(Debug)]
 pub struct AgentSchedule {

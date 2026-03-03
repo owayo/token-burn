@@ -55,12 +55,11 @@ fn process(reader: impl BufRead, mut out: impl Write) -> Result<()> {
                 // Extract tool_use ids from assistant messages (needed for subagent tool results)
                 if let Some(content) = v["message"]["content"].as_array() {
                     for item in content {
-                        if item["type"].as_str() == Some("tool_use") {
-                            if let (Some(id), Some(name)) =
+                        if item["type"].as_str() == Some("tool_use")
+                            && let (Some(id), Some(name)) =
                                 (item["id"].as_str(), item["name"].as_str())
-                            {
-                                tool_id_map.insert(id.to_string(), name.to_string());
-                            }
+                        {
+                            tool_id_map.insert(id.to_string(), name.to_string());
                         }
                     }
                 }
@@ -259,10 +258,10 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             }
         }
         "TeamCreate" => {
-            if let Some(team) = v["team_name"].as_str() {
-                if !team.is_empty() {
-                    return team.to_string();
-                }
+            if let Some(team) = v["team_name"].as_str()
+                && !team.is_empty()
+            {
+                return team.to_string();
             }
         }
         _ => {}
@@ -314,11 +313,7 @@ fn format_tool_diff(tool_name: &str, input_json: &str) -> Option<String> {
                 return None;
             }
             let diff = format_diff_lines(old, new);
-            if diff.is_empty() {
-                None
-            } else {
-                Some(diff)
-            }
+            if diff.is_empty() { None } else { Some(diff) }
         }
         _ => None,
     }

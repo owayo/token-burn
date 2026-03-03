@@ -130,7 +130,7 @@ pub fn parse_duration(s: &str) -> Result<chrono::Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_completed_atomic, parse_duration, state_path, State};
+    use super::{State, mark_completed_atomic, parse_duration, state_path};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
