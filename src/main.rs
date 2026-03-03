@@ -128,7 +128,16 @@ async fn main() -> Result<()> {
             display::print_status(&config)?;
         }
         Commands::Run => {
-            run(config, &config_path, agent_name, dry_run, fresh, limit, public_only).await?;
+            run(
+                config,
+                &config_path,
+                agent_name,
+                dry_run,
+                fresh,
+                limit,
+                public_only,
+            )
+            .await?;
         }
         Commands::Clean { older_than } => {
             run_clean(&config, older_than)?;

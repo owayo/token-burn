@@ -41,7 +41,7 @@ pub async fn resolve_targets(
     config: &Config,
     agent: &crate::config::Agent,
 ) -> Result<Vec<ResolvedTarget>> {
-    // Priority: target prompt > agent prompt > global default
+    // 優先順位: target prompt > agent prompt > global default
     let effective_default = agent.prompt.as_deref().unwrap_or(&config.prompts.default);
     let default_prompt = config.resolve_prompt(effective_default)?;
     let mut targets = Vec::new();
@@ -90,7 +90,7 @@ pub async fn resolve_targets(
         };
 
         if let Some(pos) = targets.iter().position(|t| t.directory == path) {
-            // Preserve visibility from scan and replace in-place
+            // スキャンで得た可視性を維持したまま上書きする
             let existing_visibility = targets[pos].visibility.clone();
             targets[pos] = ResolvedTarget {
                 visibility: existing_visibility,
@@ -202,8 +202,11 @@ fn check_repo(
         }
     }
 
+    let visibility_key = extract_remote_repo(&remote_url)
+        .unwrap_or_else(|| dir_name.to_string())
+        .to_ascii_lowercase();
     let visibility = visibility_map
-        .get(dir_name)
+        .get(&visibility_key)
         .cloned()
         .unwrap_or(Visibility::Unknown);
 
@@ -222,22 +225,28 @@ fn remote_belongs_to_username(remote_url: &str, username: &str) -> bool {
 }
 
 fn extract_remote_owner(remote_url: &str) -> Option<String> {
+    extract_remote_owner_and_repo(remote_url).map(|(owner, _)| owner)
+}
+
+fn extract_remote_repo(remote_url: &str) -> Option<String> {
+    extract_remote_owner_and_repo(remote_url).map(|(_, repo)| repo)
+}
+
+fn extract_remote_owner_and_repo(remote_url: &str) -> Option<(String, String)> {
     let trimmed = remote_url.trim().trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
 
-    // SCP-like SSH URL: git@host:owner/repo
     if let Some((host_part, path_part)) = trimmed.split_once(':') {
         if host_part.contains('@') && !host_part.contains("://") {
             let mut parts = path_part.split('/');
             let owner = parts.next()?;
             let repo = parts.next()?;
             if !owner.is_empty() && !repo.is_empty() {
-                return Some(owner.to_string());
+                return Some((owner.to_string(), repo.to_string()));
             }
         }
     }
 
-    // URL with scheme: https://host/owner/repo or ssh://git@host/owner/repo
     let (_, after_scheme) = trimmed.split_once("://")?;
     let (_, path) = after_scheme.split_once('/')?;
     let mut parts = path.split('/');
@@ -246,7 +255,7 @@ fn extract_remote_owner(remote_url: &str) -> Option<String> {
     if owner.is_empty() || repo.is_empty() {
         return None;
     }
-    Some(owner.to_string())
+    Some((owner.to_string(), repo.to_string()))
 }
 
 async fn fetch_visibility_map(username: &str) -> Result<HashMap<String, Visibility>> {
@@ -280,7 +289,7 @@ async fn fetch_visibility_map(username: &str) -> Result<HashMap<String, Visibili
                 "PRIVATE" => Visibility::Private,
                 _ => Visibility::Unknown,
             };
-            (r.name, vis)
+            (r.name.to_ascii_lowercase(), vis)
         })
         .collect())
 }
@@ -304,6 +313,12 @@ mod tests {
     }
 
     #[test]
+    fn extract_remote_repo_parses_remote_url() {
+        let repo = extract_remote_repo("https://github.com/owayo/token-burn.git");
+        assert_eq!(repo.as_deref(), Some("token-burn"));
+    }
+
+    #[test]
     fn remote_belongs_to_username_requires_exact_owner_match() {
         let remote = "https://github.com/some-user/token-burn.git";
         assert!(remote_belongs_to_username(remote, "some-user"));
@@ -317,6 +332,52 @@ mod tests {
             "/home/user/projects/my-repo",
             "some-user",
         ));
+    }
+
+    #[test]
+    fn check_repo_uses_remote_repo_name_for_visibility_lookup() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("token-burn-check-repo-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+        let repo_dir = temp_dir.join("local-dir-name");
+        std::fs::create_dir_all(&repo_dir).expect("repo dir should be created");
+
+        let status = std::process::Command::new("git")
+            .args(["-C", &repo_dir.to_string_lossy(), "init", "--quiet"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        let status = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owayo/Token-Burn.git",
+            ])
+            .status()
+            .expect("git remote add should run");
+        assert!(status.success(), "git remote add should succeed");
+
+        let scan = Scan {
+            base_dirs: vec![],
+            recursive: false,
+            username: Some("owayo".to_string()),
+            public_first: true,
+            exclude: vec![],
+        };
+        let visibility_map = HashMap::from([(String::from("token-burn"), Visibility::Public)]);
+
+        let target = check_repo(&repo_dir, "local-dir-name", &scan, &visibility_map)
+            .expect("repository should be detected");
+        assert_eq!(target.visibility, Visibility::Public);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
@@ -386,7 +447,7 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("token-burn-scanner-order-test-{unique}"));
         std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
 
-        // Create three directories to simulate scanned targets
+        // スキャン結果を模擬するための3ディレクトリを作成
         let dir_a = temp_dir.join("aaa");
         let dir_b = temp_dir.join("bbb");
         let dir_c = temp_dir.join("ccc");
@@ -394,9 +455,7 @@ mod tests {
         std::fs::create_dir_all(&dir_b).expect("dir_b should be created");
         std::fs::create_dir_all(&dir_c).expect("dir_c should be created");
 
-        // Pre-populate targets as if they came from scan (order: a, b, c)
-        // We skip actual scanning and directly test resolve_targets with explicit targets
-        // by placing all three as scanned entries + overriding bbb via [[targets]]
+        // scan 由来の順序（a, b, c）を明示ターゲットで再現して検証する
         let config = Config {
             config_dir: temp_dir.clone(),
             settings: Settings {
@@ -439,11 +498,11 @@ mod tests {
             .expect("three targets should resolve");
 
         assert_eq!(resolved.len(), 3);
-        // Order preserved: a, b, c
+        // 順序は a, b, c のまま維持される
         assert_eq!(resolved[0].directory, dir_a);
         assert_eq!(resolved[1].directory, dir_b);
         assert_eq!(resolved[2].directory, dir_c);
-        // bbb uses override prompt, others use agent prompt
+        // bbb は上書きプロンプト、他は agent prompt を使う
         assert_eq!(resolved[0].prompt, "agent prompt");
         assert_eq!(resolved[1].prompt, "override prompt");
         assert_eq!(resolved[2].prompt, "agent prompt");
@@ -486,7 +545,7 @@ mod tests {
                 prompt: None,
             }],
             scan: vec![],
-            // bbb will be added twice — first without prompt, then with override
+            // bbb を2回追加し、2回目でプロンプトを上書きする
             targets: vec![
                 Target {
                     directory: dir_a.to_string_lossy().to_string(),
@@ -507,7 +566,7 @@ mod tests {
             .await
             .expect("targets should resolve");
 
-        // bbb appears only once (deduped), prompt overridden, order preserved
+        // bbb は重複排除されて1件になり、上書きプロンプトが反映される
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].directory, dir_a);
         assert_eq!(resolved[1].directory, dir_b);

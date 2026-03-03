@@ -42,7 +42,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 
 - **Auto-discovery**: Scans directories for git repos, filters by username in remote URL
 - **Multiple scan sources**: Define separate scan configs for GitHub, GitLab, etc.
-- **Visibility-aware**: Prioritizes public repositories over private ones
+- **Visibility-aware**: Prioritizes public repositories over private ones (matched by remote repository name)
 - **Multi-agent**: Supports Claude Code, Codex CLI, and custom agents
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
 - **Deadline enforcement**: Kills all child processes when the reset time arrives
@@ -130,6 +130,9 @@ token-burn run
 | `--agent <NAME>` | | Force specific agent |
 | `--dry-run` | `-n` | Preview without executing |
 | `--fresh` | | Ignore saved state and process all targets |
+| `--limit <N>` | `-l` | Maximum number of targets to process |
+| `--no-limit` | | Process all targets without limit |
+| `--public-only` | | Process only repositories detected as public |
 | `--help` | `-h` | Show help |
 | `--version` | `-V` | Show version |
 
@@ -222,6 +225,8 @@ public_first = false
 | `public_first` | Sort public repositories before private ones so they are processed first | `true` |
 | `recursive` | Recurse into subdirectories to find nested git repositories | `false` |
 | `exclude` | Directory names to skip during scan | `[]` |
+
+When `username` is set, visibility lookup uses the repository name parsed from each repository's `origin` remote URL (case-insensitive), so local directory names can differ from remote repository names.
 
 ### Prompts
 
