@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::state::parse_duration;
 
-/// Parse a directory name starting with `YYYYMMDD_HHMMSS` and return its timestamp.
+/// `YYYYMMDD_HHMMSS` で始まるディレクトリ名からタイムスタンプを解析して返す。
 fn parse_dir_timestamp(name: &str) -> Option<NaiveDateTime> {
     // Format: YYYYMMDD_HHMMSS_agentname (at least 15 chars for the timestamp part)
     if name.len() < 15 {
@@ -14,8 +14,8 @@ fn parse_dir_timestamp(name: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(&name[..15], "%Y%m%d_%H%M%S").ok()
 }
 
-/// Remove report directories older than `max_age` from `report_dir`.
-/// Returns the list of deleted directory paths.
+/// `report_dir` から `max_age` より古いレポートディレクトリを削除する。
+/// 削除されたディレクトリパスのリストを返す。
 pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<Vec<PathBuf>> {
     let duration = parse_duration(max_age)?;
     let cutoff = Local::now().naive_local() - duration;
@@ -53,7 +53,7 @@ pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<Vec<PathB
     Ok(deleted)
 }
 
-/// Print cleanup results.
+/// クリーンアップ結果を表示する。
 pub fn print_cleanup_result(deleted: &[PathBuf]) {
     if deleted.is_empty() {
         println!("{}", "No old report directories to clean up.".dimmed());

@@ -219,3 +219,46 @@ fn confirm_overwrite(path: &Path) -> Result<bool> {
     let input = input.trim().to_lowercase();
     Ok(input == "y" || input == "yes")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn run_init_creates_config_and_prompts() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        run_init(&config_path, false).expect("init should succeed");
+
+        assert!(config_path.exists(), "config.toml が作成されるべき");
+        assert!(
+            tmp.path().join("prompts/default.md").exists(),
+            "default.md が作成されるべき"
+        );
+        assert!(
+            tmp.path().join("prompts/default.ja.md").exists(),
+            "default.ja.md が作成されるべき"
+        );
+
+        // 設定ファイルの内容が有効な TOML であることを確認
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("[settings]"));
+        assert!(content.contains("[[agents]]"));
+    }
+
+    #[test]
+    fn run_init_overwrites_with_force() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "original").unwrap();
+
+        run_init(&config_path, true).expect("init with force should succeed");
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            content.contains("[settings]"),
+            "force=true では上書きされるべき"
+        );
+    }
+}

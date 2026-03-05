@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Per-agent map of directory path → last processed timestamp
+/// エージェントごとのディレクトリパス → 最終処理タイムスタンプのマップ
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(flatten)]
@@ -36,9 +36,9 @@ impl State {
     }
 }
 
-/// Atomically mark a directory as completed for an agent.
-/// This function acquires an exclusive file lock so concurrent worker processes
-/// do not overwrite each other's updates.
+/// エージェントに対してディレクトリの処理完了をアトミックに記録する。
+/// 排他ファイルロックを取得し、並行ワーカープロセス間で
+/// 更新が上書きされないようにする。
 pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) -> Result<()> {
     use std::fs::OpenOptions;
 
@@ -89,7 +89,7 @@ pub fn state_path(config_path: &Path) -> PathBuf {
         .join("state.json")
 }
 
-/// Parse a duration string like "7d", "24h", "30m", "1d12h"
+/// 期間文字列をパースする（例: "7d", "24h", "30m", "1d12h"）
 pub fn parse_duration(s: &str) -> Result<chrono::Duration> {
     let mut total_secs: i64 = 0;
     let mut num_buf = String::new();

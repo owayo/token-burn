@@ -20,9 +20,9 @@ pub fn build_plan(agent: &Agent, targets: Vec<ResolvedTarget>) -> ExecutionPlan 
     }
 }
 
-/// Auto-inject required flags for known agents.
-/// For `claude`, `--verbose`, `--output-format stream-json`, and `--include-partial-messages`
-/// are mandatory for proper log capture and must always be present.
+/// 既知エージェントに必要なフラグを自動付与する。
+/// `claude` の場合、`--verbose`、`--output-format stream-json`、`--include-partial-messages`
+/// はログ取得に必須であり、常に存在しなければならない。
 fn ensure_required_flags(agent: &mut Agent) {
     let executable = agent.command.first().map(|s| s.as_str()).unwrap_or("");
     if executable != "claude" {
@@ -113,7 +113,7 @@ pub fn execute_plan_tmux(
     reset_info: &str,
     report_dir: &std::path::Path,
 ) -> Result<()> {
-    // Check tmux is available
+    // tmux の存在確認
     std::process::Command::new("tmux")
         .arg("-V")
         .output()
@@ -121,7 +121,7 @@ pub fn execute_plan_tmux(
 
     let session = "token-burn";
 
-    // Kill existing session if any
+    // 既存セッションがあれば終了
     let _ = std::process::Command::new("tmux")
         .args(["kill-session", "-t", session])
         .output();
@@ -130,7 +130,7 @@ pub fn execute_plan_tmux(
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir)?;
 
-    // Create report directory for this run
+    // 今回の実行用レポートディレクトリを作成
     let now = chrono::Local::now();
     let run_dir = report_dir.join(format!(
         "{}_{}",
@@ -141,14 +141,14 @@ pub fn execute_plan_tmux(
 
     let total = plan.tasks.len();
 
-    // Distribute tasks round-robin to workers
+    // タスクをラウンドロビンでワーカーに分配
     let worker_count = parallelism.min(total);
     let mut worker_tasks: Vec<Vec<(usize, &ResolvedTarget)>> = vec![vec![]; worker_count];
     for (i, task) in plan.tasks.iter().enumerate() {
         worker_tasks[i % worker_count].push((i + 1, task));
     }
 
-    // Generate worker scripts (each creates a marker file per completed task)
+    // ワーカースクリプトを生成（各タスク完了時にマーカーファイルを作成）
     let marker_dir = tmp_dir.join("markers");
     std::fs::create_dir_all(&marker_dir)?;
 
@@ -168,7 +168,7 @@ pub fn execute_plan_tmux(
         let stop_file_escaped = shell_escape(&stop_file.to_string_lossy());
         let error_file = shell_escape(&marker_dir.join(format!("error-{}", w)).to_string_lossy());
 
-        // Signal handler: set flag only; actual handling is in the error check after each command
+        // シグナルハンドラ: フラグ設定のみ。実際の処理は各コマンド後のエラーチェックで行う
         script += concat!(
             "CURRENT_FAILED_MARKER=\"\"\n",
             "CANCELLED=0\n",
@@ -181,7 +181,7 @@ pub fn execute_plan_tmux(
 
         for (i, (idx, task)) in tasks.iter().enumerate() {
             let idx = *idx;
-            // Check stop signal before starting next task (skip first task)
+            // 次のタスク開始前に停止シグナルを確認（最初のタスクはスキップ）
             if i > 0 {
                 script += &format!(
                     "if [ -f {} ]; then printf '\\033]2;Worker {} stopped\\033\\\\'; echo '━━━ Stopped ━━━'; touch {}; exec sleep infinity; fi\n",
@@ -190,7 +190,7 @@ pub fn execute_plan_tmux(
                     worker_done_marker,
                 );
             }
-            // Write prompt to a temp file and pass it via command substitution
+            // プロンプトを一時ファイルに書き出し、コマンド置換で渡す
             let prompt_file = tmp_dir.join(format!("prompt-{}.txt", idx));
             std::fs::write(&prompt_file, &task.prompt)?;
             let cmd_str = build_shell_command(&plan.agent.command, &prompt_file, &task.directory);
@@ -203,11 +203,11 @@ pub fn execute_plan_tmux(
             let log_file =
                 shell_escape(&run_dir.join(format!("{}.log", log_base)).to_string_lossy());
 
-            // Set current task's failed marker for signal handler
+            // シグナルハンドラ用に現タスクの失敗マーカーを設定
             script += &format!("CURRENT_FAILED_MARKER={}\n", failed_marker);
 
-            // Mark state BEFORE execution: tokens are burned once the task starts,
-            // so even if the session is killed mid-execution, we don't re-run.
+            // 実行前に状態を記録: タスク開始時点でトークンは消費されるため、
+            // セッションが途中で終了しても再実行しない
             let mark_cmd = format!(
                 "{} mark {} {} {}",
                 shell_escape(&exe_path.to_string_lossy()),
@@ -225,7 +225,7 @@ pub fn execute_plan_tmux(
                 .map(|s| s.as_str() == "claude")
                 .unwrap_or(false);
             if is_claude {
-                // Tee raw JSON to .jsonl, then pipe through format-stream for readable output to .log
+                // 生JSONを.jsonlに tee し、format-stream で整形して.logに出力
                 let jsonl_file = shell_escape(
                     &run_dir
                         .join(format!("{}.jsonl", log_base))
@@ -237,13 +237,13 @@ pub fn execute_plan_tmux(
                     cmd_str, jsonl_file, fmt_cmd, log_file
                 );
             } else {
-                // Non-claude agents: pipe directly to log file
+                // claude以外のエージェント: ログファイルに直接出力
                 script += &format!("{} 2>&1 | tee {}\n", cmd_str, log_file);
             }
             script += "CMD_EXIT=${PIPESTATUS[0]}\n";
-            // Clear signal handler target (exit code captured, normal flow handles it)
+            // シグナルハンドラのターゲットをクリア（終了コード取得済み、通常フローで処理）
             script += "CURRENT_FAILED_MARKER=\"\"\n";
-            // Check exit code
+            // 終了コードを確認
             script += &format!(
                 concat!(
                     "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
@@ -283,7 +283,7 @@ pub fn execute_plan_tmux(
         script_paths.push(script_path);
     }
 
-    // Generate monitor script for left pane
+    // 左ペイン用モニタースクリプトを生成
     let monitor_path = tmp_dir.join("monitor.sh");
     let command_str = plan.agent.command.join(" ");
     let monitor_script = generate_monitor_script(
@@ -303,7 +303,7 @@ pub fn execute_plan_tmux(
         .args(["+x", &monitor_path.to_string_lossy()])
         .output()?;
 
-    // Create tmux session with monitor (left pane)
+    // モニター（左ペイン）付き tmux セッションを作成
     std::process::Command::new("tmux")
         .args([
             "new-session",
@@ -315,7 +315,7 @@ pub fn execute_plan_tmux(
         .status()
         .context("Failed to create tmux session")?;
 
-    // Split right for first worker
+    // 最初のワーカー用に右ペインを分割
     std::process::Command::new("tmux")
         .args([
             "split-window",
@@ -326,7 +326,7 @@ pub fn execute_plan_tmux(
         ])
         .status()?;
 
-    // Add remaining workers as vertical splits in the right area
+    // 残りのワーカーを右エリアに垂直分割で追加
     for script in &script_paths[1..] {
         // Target the last pane (right side) for vertical split
         std::process::Command::new("tmux")
@@ -340,17 +340,17 @@ pub fn execute_plan_tmux(
             .status()?;
     }
 
-    // Even out the right-side panes
+    // 右側ペインのサイズを均等化
     let _ = std::process::Command::new("tmux")
         .args(["select-layout", "-t", session, "main-vertical"])
         .status();
 
-    // Set left pane (monitor) width to ~30%
+    // 左ペイン（モニター）の幅を約30%に設定
     let _ = std::process::Command::new("tmux")
         .args(["resize-pane", "-t", &format!("{}:.0", session), "-x", "35%"])
         .status();
 
-    // Enable scrollback and mouse support
+    // スクロールバックとマウスサポートを有効化
     let _ = std::process::Command::new("tmux")
         .args(["set-option", "-t", session, "history-limit", "50000"])
         .status();
@@ -358,7 +358,7 @@ pub fn execute_plan_tmux(
         .args(["set-option", "-t", session, "mouse", "on"])
         .status();
 
-    // Enable pane border titles
+    // ペインボーダータイトルを有効化
     let _ = std::process::Command::new("tmux")
         .args(["set-option", "-t", session, "pane-border-status", "top"])
         .status();
@@ -372,7 +372,7 @@ pub fn execute_plan_tmux(
         ])
         .status();
 
-    // Focus monitor pane
+    // モニターペインにフォーカス
     let _ = std::process::Command::new("tmux")
         .args(["select-pane", "-t", &format!("{}:.0", session)])
         .status();
@@ -388,16 +388,16 @@ pub fn execute_plan_tmux(
         "Detach: Ctrl-b d | Ctrl-C in monitor pane to abort".dimmed()
     );
 
-    // Attach (blocks until session ends or is killed)
+    // セッションに接続（終了またはkillされるまでブロック）
     std::process::Command::new("tmux")
         .args(["attach-session", "-t", session])
         .status()
         .context("Failed to attach to tmux session")?;
 
-    // Clean up
+    // クリーンアップ
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
-    // Strip ANSI escape codes from log files
+    // ログファイルから ANSI エスケープコードを除去
     strip_ansi_from_dir(&run_dir);
 
     println!();
@@ -597,8 +597,8 @@ fn build_shell_command(
 ) -> String {
     let mut parts: Vec<String> = vec![format!("cd {}", shell_escape(&directory.to_string_lossy()))];
     let cmd: Vec<String> = cmd_parts.iter().map(|s| shell_escape(s)).collect();
-    // Pass prompt as argument via command substitution $(cat file)
-    // Using stdin pipe doesn't work reliably with claude -p
+    // プロンプトをコマンド置換 $(cat file) で引数として渡す
+    // stdin パイプは claude -p で確実に動作しないため
     parts.push(format!(
         "{} \"$(cat {})\"",
         cmd.join(" "),
@@ -654,7 +654,7 @@ fn strip_ansi(s: &str) -> String {
         if c == '\x1b' {
             match chars.peek().copied() {
                 Some('[') => {
-                    // CSI sequence: \x1b[...final_byte (0x40-0x7E)
+                    // CSIシーケンス: \x1b[...終端バイト (0x40-0x7E)
                     chars.next();
                     for ch in chars.by_ref() {
                         if is_csi_final(ch) {
@@ -663,7 +663,7 @@ fn strip_ansi(s: &str) -> String {
                     }
                 }
                 Some(']') => {
-                    // OSC sequence: \x1b]...ST (ST = \x1b\\ or \x07)
+                    // OSCシーケンス: \x1b]...ST (ST = \x1b\\ または \x07)
                     chars.next();
                     while let Some(ch) = chars.next() {
                         if ch == '\x07' {
@@ -676,7 +676,7 @@ fn strip_ansi(s: &str) -> String {
                     }
                 }
                 Some(_) => {
-                    // Other escape sequences (e.g., \x1b(B) — skip next char
+                    // その他のエスケープシーケンス (例: \x1b(B) — 次の文字をスキップ
                     chars.next();
                 }
                 None => break,
@@ -786,6 +786,40 @@ mod tests {
     #[test]
     fn task_log_base_sanitizes_display_name() {
         assert_eq!(task_log_base(3, "path/to/repo"), "0003_path_to_repo");
+    }
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_length_unchanged() {
+        assert_eq!(truncate("12345", 5), "12345");
+    }
+
+    #[test]
+    fn truncate_long_string_adds_ellipsis() {
+        assert_eq!(truncate("abcdefghij", 7), "abcd...");
+    }
+
+    #[test]
+    fn truncate_multibyte_counts_chars() {
+        // 5文字の日本語文字列を3文字に切り詰め
+        assert_eq!(truncate("あいうえお", 3), "...");
+        assert_eq!(truncate("あいうえお", 5), "あいうえお");
+        assert_eq!(truncate("あいうえお", 4), "あ...");
+    }
+
+    #[test]
+    fn build_shell_command_escapes_paths() {
+        let cmd = vec!["claude".to_string(), "-p".to_string()];
+        let prompt = std::path::Path::new("/tmp/prompt.txt");
+        let dir = std::path::Path::new("/home/user/my project");
+        let result = build_shell_command(&cmd, prompt, dir);
+        assert!(result.contains("cd '/home/user/my project'"));
+        assert!(result.contains("'claude' '-p'"));
+        assert!(result.contains("$(cat '/tmp/prompt.txt')"));
     }
 
     fn make_agent(command: Vec<&str>) -> Agent {

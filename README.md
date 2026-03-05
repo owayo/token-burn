@@ -57,7 +57,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 
 - **OS**: macOS
 - **tmux**: Required for split-pane execution
-- **Rust**: 1.70+ (for building from source)
+- **Rust**: 1.85+ (for building from source)
 - **gh CLI**: Required for repository visibility detection
 - **Claude Code** and/or **Codex CLI**: At least one agent must be installed
 

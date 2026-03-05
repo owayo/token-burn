@@ -19,14 +19,14 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 pub struct Settings {
     pub parallelism: usize,
-    /// Skip directories processed within this duration (e.g., "7d", "24h", "1d12h").
-    /// If omitted, defaults to skipping directories processed since the previous reset.
+    /// この期間以内に処理済みのディレクトリをスキップ（例: "7d", "24h", "1d12h"）。
+    /// 省略時は前回リセット以降に処理済みのディレクトリをスキップ。
     pub skip_within: Option<String>,
-    /// Directory to save execution logs (default: ~/Documents/token-burn)
+    /// 実行ログの保存先ディレクトリ（デフォルト: ~/Documents/token-burn）
     pub report_dir: Option<String>,
-    /// Auto-delete report directories older than this duration (default: "7d").
+    /// この期間より古いレポートディレクトリを自動削除（デフォルト: "7d"）。
     pub cleanup_after: Option<String>,
-    /// Maximum number of targets to process per run (default: 10).
+    /// 1回の実行で処理する最大ターゲット数（デフォルト: 10）。
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -47,7 +47,7 @@ pub struct Agent {
     pub reset_weekday: String,
     pub reset_time: String,
     pub timezone: String,
-    /// Agent-specific prompt override (takes precedence over [prompts].default)
+    /// エージェント固有のプロンプト上書き（[prompts].default より優先）
     pub prompt: Option<String>,
 }
 
@@ -89,8 +89,8 @@ impl Config {
         Ok(config)
     }
 
-    /// Resolve a prompt value: if it ends with `.md`, read file contents; otherwise use as literal string.
-    /// Relative paths are resolved from the config file's directory.
+    /// プロンプト値を解決: `.md` で終わる場合はファイル内容を読み込み、それ以外はそのまま使用。
+    /// 相対パスは設定ファイルのディレクトリから解決される。
     pub fn resolve_prompt(&self, value: &str) -> Result<String> {
         if value.ends_with(".md") {
             let expanded = shellexpand::tilde(value);
@@ -275,6 +275,30 @@ mod tests {
         assert!(parse_time("09:60").is_err());
         assert!(parse_time("9").is_err());
         assert!(parse_time("09:00:00").is_err());
+    }
+
+    #[test]
+    fn resolve_prompt_literal_string() {
+        let config = base_config();
+        let result = config.resolve_prompt("review code").unwrap();
+        assert_eq!(result, "review code");
+    }
+
+    #[test]
+    fn resolve_prompt_reads_md_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prompt_path = tmp.path().join("test.md");
+        std::fs::write(&prompt_path, "  file content  ").unwrap();
+        let mut config = base_config();
+        config.config_dir = tmp.path().to_path_buf();
+        let result = config.resolve_prompt("test.md").unwrap();
+        assert_eq!(result, "file content");
+    }
+
+    #[test]
+    fn resolve_prompt_missing_md_file_returns_error() {
+        let config = base_config();
+        assert!(config.resolve_prompt("nonexistent.md").is_err());
     }
 
     #[test]

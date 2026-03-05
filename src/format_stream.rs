@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
-/// Process stream-json output from `claude -p` into readable text.
-/// Non-JSON lines are passed through as-is (works with any agent).
+/// `claude -p` の stream-json 出力を読みやすいテキストに変換する。
+/// JSON以外の行はそのまま出力（任意のエージェントで動作）。
 pub fn run() -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -27,7 +27,7 @@ fn process(reader: impl BufRead, mut out: impl Write) -> Result<()> {
         let v: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => {
-                // Not JSON — pass through (e.g. codex plain text output)
+                // JSON以外 — そのまま出力（例: codex のプレーンテキスト出力）
                 writeln!(out, "{}", line)?;
                 out.flush()?;
                 continue;
@@ -37,7 +37,7 @@ fn process(reader: impl BufRead, mut out: impl Write) -> Result<()> {
         let msg_type = v["type"].as_str().unwrap_or("");
 
         match msg_type {
-            "system" => {} // skip init
+            "system" => {} // 初期化メッセージをスキップ
             "stream_event" => {
                 handle_stream_event(
                     &v["event"],
@@ -52,7 +52,7 @@ fn process(reader: impl BufRead, mut out: impl Write) -> Result<()> {
                 )?;
             }
             "assistant" => {
-                // Extract tool_use ids from assistant messages (needed for subagent tool results)
+                // assistant メッセージから tool_use ID を抽出（サブエージェントのツール結果に必要）
                 if let Some(content) = v["message"]["content"].as_array() {
                     for item in content {
                         if item["type"].as_str() == Some("tool_use")
@@ -65,7 +65,7 @@ fn process(reader: impl BufRead, mut out: impl Write) -> Result<()> {
                 }
             }
             "user" => {
-                // Tool result — show which tool completed
+                // ツール結果 — 完了したツール名を表示
                 if let Some(content) = v["message"]["content"].as_array() {
                     for item in content {
                         if item["type"].as_str() == Some("tool_result") {
@@ -84,7 +84,7 @@ fn process(reader: impl BufRead, mut out: impl Write) -> Result<()> {
             "result" => {
                 handle_result(&v, &mut out)?;
             }
-            _ => {} // rate_limit_event, message_stop, etc.
+            _ => {} // rate_limit_event, message_stop 等
         }
     }
 
@@ -267,7 +267,7 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
         _ => {}
     }
 
-    // Generic: try common field names in order of priority
+    // 汎用: よくあるフィールド名を優先順に試行
     for key in [
         "file_path",
         "path",
@@ -319,8 +319,8 @@ fn format_tool_diff(tool_name: &str, input_json: &str) -> Option<String> {
     }
 }
 
-/// Generate a colored diff between old and new text.
-/// Detects common prefix/suffix lines to show only the changed region.
+/// 新旧テキスト間のカラー差分を生成する。
+/// 共通のプレフィックス/サフィックス行を検出し、変更部分のみ表示する。
 fn format_diff_lines(old: &str, new: &str) -> String {
     let old_lines: Vec<&str> = if old.is_empty() {
         Vec::new()
@@ -333,14 +333,14 @@ fn format_diff_lines(old: &str, new: &str) -> String {
         new.lines().collect()
     };
 
-    // Find common prefix lines
+    // 共通プレフィックス行を検出
     let prefix_len = old_lines
         .iter()
         .zip(new_lines.iter())
         .take_while(|(a, b)| a == b)
         .count();
 
-    // Find common suffix lines (after prefix)
+    // 共通サフィックス行を検出（プレフィックス以降）
     let old_rest = &old_lines[prefix_len..];
     let new_rest = &new_lines[prefix_len..];
     let suffix_len = old_rest
@@ -361,13 +361,13 @@ fn format_diff_lines(old: &str, new: &str) -> String {
     let max_changed = 12;
     let mut result = String::new();
 
-    // Context from prefix (last N lines)
+    // プレフィックスからのコンテキスト（末尾N行）
     let ctx_start = prefix_len.saturating_sub(max_context);
     for line in &old_lines[ctx_start..prefix_len] {
         result.push_str(&format!("\x1b[2m    {}\x1b[0m\n", line));
     }
 
-    // Removed lines
+    // 削除行
     for (i, line) in old_changed.iter().enumerate() {
         if i >= max_changed {
             result.push_str(&format!(
@@ -379,7 +379,7 @@ fn format_diff_lines(old: &str, new: &str) -> String {
         result.push_str(&format!("\x1b[31m  - {}\x1b[0m\n", line));
     }
 
-    // Added lines
+    // 追加行
     for (i, line) in new_changed.iter().enumerate() {
         if i >= max_changed {
             result.push_str(&format!(
@@ -391,7 +391,7 @@ fn format_diff_lines(old: &str, new: &str) -> String {
         result.push_str(&format!("\x1b[32m  + {}\x1b[0m\n", line));
     }
 
-    // Context from suffix (first N lines)
+    // サフィックスからのコンテキスト（先頭N行）
     let suffix_start = old_lines.len() - suffix_len;
     let suffix_show = std::cmp::min(suffix_len, max_context);
     for line in &old_lines[suffix_start..suffix_start + suffix_show] {

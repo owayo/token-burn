@@ -24,7 +24,7 @@ token-burn/
 
 ## 技術スタック
 
-- **Rust** (edition 2021)
+- **Rust** (edition 2024)
 - clap (CLI), serde + toml (設定), chrono + chrono-tz (日時), tokio (非同期), colored (出力)
 
 ## 開発コマンド
@@ -41,7 +41,7 @@ make release  # リリースビルド
 デフォルトパス: `~/.config/token-burn/config.toml`
 
 主要セクション:
-- `[settings]` - 並列実行数
+- `[settings]` - 並列実行数、スキップ期間、レポート設定、ターゲット上限
 - `[prompts]` - デフォルトプロンプト
 - `[[agents]]` - エージェント定義（command, リセットスケジュール, prompt）
 - `[[scan]]` - ディレクトリ自動スキャン設定

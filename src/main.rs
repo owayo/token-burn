@@ -182,7 +182,7 @@ async fn run(
 
     let targets = scanner::resolve_targets(&config, agent).await?;
 
-    // Filter to public repositories only if requested
+    // 公開リポジトリのみにフィルタリング
     let (targets, public_filtered) = if public_only {
         let before = targets.len();
         let filtered: Vec<_> = targets
@@ -204,7 +204,7 @@ async fn run(
         return Ok(());
     }
 
-    // Filter targets by saved state (skip already-processed directories)
+    // 保存済み状態でフィルタリング（処理済みディレクトリをスキップ）
     let state_file = state::state_path(config_path);
     let run_state = state::State::load(&state_file);
     let (targets, skipped) = if fresh {
@@ -213,7 +213,7 @@ async fn run(
         filter_by_state(targets, &run_state, agent, &config, &sched)
     };
 
-    // Apply limit: CLI option overrides config value
+    // 制限適用: CLIオプションが設定値を上書き
     let limit = limit_override.unwrap_or(config.settings.limit);
     let truncated = if targets.len() > limit {
         targets.len() - limit
@@ -283,7 +283,7 @@ async fn run(
         &report_dir,
     )?;
 
-    // Auto-cleanup old report directories
+    // 古いレポートディレクトリを自動クリーンアップ
     let max_age = config.settings.cleanup_after.as_deref().unwrap_or("7d");
     println!();
     match cleanup::cleanup_old_reports(&report_dir, max_age) {
@@ -326,7 +326,7 @@ fn filter_by_state(
 ) -> (Vec<scanner::ResolvedTarget>, usize) {
     use chrono::Utc;
 
-    // Determine the cutoff time: skip directories processed after this time
+    // カットオフ時刻を決定: この時刻以降に処理済みのディレクトリをスキップ
     let cutoff = if let Some(ref skip_within) = config.settings.skip_within {
         match state::parse_duration(skip_within) {
             Ok(dur) => Utc::now() - dur,
@@ -337,12 +337,12 @@ fn filter_by_state(
                     skip_within,
                     e
                 );
-                // Fall back to previous reset
+                // 前回リセット時刻にフォールバック
                 sched.previous_reset.with_timezone(&Utc)
             }
         }
     } else {
-        // Default: skip directories processed since the previous reset
+        // デフォルト: 前回リセット以降に処理済みのディレクトリをスキップ
         sched.previous_reset.with_timezone(&Utc)
     };
 
@@ -358,4 +358,37 @@ fn filter_by_state(
         kept.push(target);
     }
     (kept, skipped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_report_dir_uses_default_when_none() {
+        let settings = config::Settings {
+            parallelism: 1,
+            skip_within: None,
+            report_dir: None,
+            cleanup_after: None,
+            limit: 10,
+        };
+        let dir = resolve_report_dir(&settings);
+        assert!(dir.ends_with("Documents/token-burn"));
+    }
+
+    #[test]
+    fn resolve_report_dir_expands_tilde() {
+        let settings = config::Settings {
+            parallelism: 1,
+            skip_within: None,
+            report_dir: Some("~/custom-reports".to_string()),
+            cleanup_after: None,
+            limit: 10,
+        };
+        let dir = resolve_report_dir(&settings);
+        // チルダが展開されていることを確認
+        assert!(!dir.to_string_lossy().contains('~'));
+        assert!(dir.to_string_lossy().ends_with("custom-reports"));
+    }
 }
