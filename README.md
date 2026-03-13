@@ -42,6 +42,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 
 - **Auto-discovery**: Scans directories for git repos, filters by username in remote URL
 - **Multiple scan sources**: Define separate scan configs for GitHub, GitLab, etc.
+- **Duplicate-safe scan merge**: If multiple scan sources find the same directory, it is processed only once
 - **Visibility-aware**: Prioritizes public repositories over private ones (matched by remote repository name)
 - **Multi-agent**: Supports Claude Code, Codex CLI, and custom agents
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
@@ -160,6 +161,7 @@ skip_within = "7d"    # optional
 | `skip_within` | Skip directories processed within this duration | `"7d"`, `"24h"`, `"1d12h"` |
 | `cleanup_after` | Auto-delete report directories older than this duration | `"7d"` (default) |
 | `report_dir` | Directory to save execution logs | `~/Documents/token-burn` (default) |
+| `limit` | Maximum number of targets to process per run | `10` (default) |
 
 `skip_within` accepts duration strings: `d` (days), `h` (hours), `m` (minutes), `s` (seconds). If omitted, directories processed since the previous reset are skipped. Excessively large values are rejected. Use `--fresh` to ignore saved state entirely.
 
@@ -227,6 +229,8 @@ public_first = false
 | `exclude` | Directory names to skip during scan | `[]` |
 
 When `username` is set, visibility lookup uses the repository name parsed from each repository's `origin` remote URL (case-insensitive), so local directory names can differ from remote repository names.
+
+If multiple `[[scan]]` entries discover the same repository directory, scan results are deduplicated by directory path so the same repository is not executed twice in a single run.
 
 ### Prompts
 

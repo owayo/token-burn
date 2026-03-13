@@ -44,16 +44,26 @@ pub async fn resolve_targets(
     // 優先順位: target prompt > agent prompt > global default
     let effective_default = agent.prompt.as_deref().unwrap_or(&config.prompts.default);
     let default_prompt = config.resolve_prompt(effective_default)?;
-    let mut targets = Vec::new();
+    let mut targets: Vec<ResolvedTarget> = Vec::new();
 
     for scan in &config.scan {
         let mut scanned = scan_directories(scan).await?;
-        for target in &mut scanned {
+        for mut target in scanned.drain(..) {
             if target.prompt.is_empty() {
                 target.prompt.clone_from(&default_prompt);
             }
+            if let Some(existing) = targets.iter_mut().find(|t| t.directory == target.directory) {
+                // 同一ディレクトリが複数の scan から見つかった場合は重複追加しない。
+                // 可視性だけは Unknown より具体的な値を優先して更新する。
+                if existing.visibility == Visibility::Unknown
+                    && target.visibility != Visibility::Unknown
+                {
+                    existing.visibility = target.visibility;
+                }
+                continue;
+            }
+            targets.push(target);
         }
-        targets.extend(scanned);
     }
 
     for target in &config.targets {
@@ -336,6 +346,42 @@ mod tests {
     }
 
     #[test]
+    fn extract_remote_owner_without_git_suffix() {
+        // .git サフィックスなしでも正しくパースされる
+        let owner = extract_remote_owner("https://github.com/owayo/token-burn");
+        assert_eq!(owner.as_deref(), Some("owayo"));
+    }
+
+    #[test]
+    fn extract_remote_repo_without_git_suffix() {
+        let repo = extract_remote_repo("https://github.com/owayo/token-burn");
+        assert_eq!(repo.as_deref(), Some("token-burn"));
+    }
+
+    #[test]
+    fn extract_remote_owner_with_trailing_slash() {
+        let owner = extract_remote_owner("https://github.com/owayo/token-burn/");
+        assert_eq!(owner.as_deref(), Some("owayo"));
+    }
+
+    #[test]
+    fn extract_remote_owner_scp_style_without_git_suffix() {
+        let owner = extract_remote_owner("git@github.com:owayo/token-burn");
+        assert_eq!(owner.as_deref(), Some("owayo"));
+    }
+
+    #[test]
+    fn extract_remote_returns_none_for_scp_missing_repo() {
+        // owner のみでリポジトリ部分がない場合は None
+        assert!(extract_remote_owner_and_repo("git@github.com:owner").is_none());
+    }
+
+    #[test]
+    fn extract_remote_returns_none_for_empty_owner() {
+        assert!(extract_remote_owner_and_repo("https://github.com//repo.git").is_none());
+    }
+
+    #[test]
     fn check_repo_uses_remote_repo_name_for_visibility_lookup() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -572,6 +618,87 @@ mod tests {
         assert_eq!(resolved[0].directory, dir_a);
         assert_eq!(resolved[1].directory, dir_b);
         assert_eq!(resolved[1].prompt, "overridden");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_targets_deduplicates_overlapping_scan_results() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("token-burn-scanner-dedup-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+
+        let repo_dir = temp_dir.join("dup-repo");
+        std::fs::create_dir_all(&repo_dir).expect("repo dir should be created");
+
+        let status = std::process::Command::new("git")
+            .args(["-C", &repo_dir.to_string_lossy(), "init", "--quiet"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        let status = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.to_string_lossy(),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owayo/dup-repo.git",
+            ])
+            .status()
+            .expect("git remote add should run");
+        assert!(status.success(), "git remote add should succeed");
+
+        let config = Config {
+            config_dir: temp_dir.clone(),
+            settings: Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: Prompts {
+                default: "default prompt".to_string(),
+            },
+            agents: vec![Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![
+                Scan {
+                    base_dirs: vec![temp_dir.to_string_lossy().to_string()],
+                    recursive: false,
+                    username: None,
+                    public_first: true,
+                    exclude: vec![],
+                },
+                Scan {
+                    base_dirs: vec![temp_dir.to_string_lossy().to_string()],
+                    recursive: false,
+                    username: None,
+                    public_first: true,
+                    exclude: vec![],
+                },
+            ],
+            targets: vec![],
+        };
+
+        let resolved = resolve_targets(&config, &config.agents[0])
+            .await
+            .expect("targets should resolve");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].directory, repo_dir);
+        assert_eq!(resolved[0].display_name, "dup-repo");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

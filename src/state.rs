@@ -229,4 +229,31 @@ mod tests {
         let path = state_path(&abs_config);
         assert_eq!(path, tmp.path().join("cfg").join("state.json"));
     }
+
+    #[test]
+    fn parse_duration_empty_string_rejected() {
+        let err = parse_duration("").expect_err("空文字列は拒否されるべき");
+        assert!(err.to_string().contains("Duration must be positive"));
+    }
+
+    #[test]
+    fn parse_duration_unit_without_number_rejected() {
+        let err = parse_duration("d").expect_err("数値なし単位は拒否されるべき");
+        assert!(err.to_string().contains("Invalid duration number"));
+    }
+
+    #[test]
+    fn parse_duration_repeated_units_accumulate() {
+        let d = parse_duration("1d1d").expect("同一単位の繰り返しは許容されるべき");
+        assert_eq!(d.num_seconds(), 172_800); // 2日分
+    }
+
+    #[test]
+    fn state_load_malformed_json_returns_default() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let state_file = tmp.path().join("state.json");
+        std::fs::write(&state_file, "not valid json").expect("ファイル書き込み成功");
+        let state = State::load(&state_file);
+        assert!(state.agents.is_empty());
+    }
 }

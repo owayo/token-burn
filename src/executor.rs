@@ -328,7 +328,7 @@ pub fn execute_plan_tmux(
 
     // 残りのワーカーを右エリアに垂直分割で追加
     for script in &script_paths[1..] {
-        // Target the last pane (right side) for vertical split
+        // 右側の最後のペインに垂直分割で追加
         std::process::Command::new("tmux")
             .args([
                 "split-window",
@@ -444,7 +444,7 @@ WORKER_COUNT={worker_count}
 STOP_FILE={stop_file}
 REPORT_DIR={report_dir}
 STOPPED=0
-DISPLAYED_ERRORS=""
+DISPLAYED_ERRORS=":"
 
 handle_signal() {{
     if [ $STOPPED -eq 0 ]; then
@@ -529,11 +529,11 @@ while true; do
     for f in $(find "$MARKER_DIR" -name 'error-*' 2>/dev/null); do
         EFILE=$(basename "$f")
         case "$DISPLAYED_ERRORS" in
-            *"$EFILE"*) ;;
+            *":$EFILE:"*) ;;
             *)
                 echo ""
                 echo " ❌ $(cat "$f")"
-                DISPLAYED_ERRORS="$DISPLAYED_ERRORS $EFILE"
+                DISPLAYED_ERRORS="$DISPLAYED_ERRORS$EFILE:"
                 ;;
         esac
     done
@@ -726,6 +726,8 @@ mod tests {
         );
 
         assert!(script.contains("AGENT='ag\"$(touch /tmp/pwn)\"'"));
+        assert!(script.contains("DISPLAYED_ERRORS=\":\""));
+        assert!(script.contains("*\":$EFILE:\"*"));
         assert!(script.contains("FAILED=$(find \"$MARKER_DIR\" -name 'failed-*'"));
         assert!(script.contains("PROCESSED=$((DONE + FAILED))"));
         assert!(script.contains("Completed with failures"));
@@ -769,6 +771,34 @@ mod tests {
     fn strip_ansi_handles_mixed_sequences() {
         let input = "\x1b]2;title\x07\x1b[1mBold\x1b[0m text\x1b]0;icon\x1b\\end";
         assert_eq!(strip_ansi(input), "Bold textend");
+    }
+
+    #[test]
+    fn strip_ansi_lone_esc_at_end() {
+        // 末尾の孤立ESCは安全に消費される
+        let input = "text\x1b";
+        assert_eq!(strip_ansi(input), "text");
+    }
+
+    #[test]
+    fn strip_ansi_incomplete_csi_at_end() {
+        // 終端バイトなしの不完全なCSIシーケンスは安全に除去される
+        let input = "text\x1b[1";
+        assert_eq!(strip_ansi(input), "text");
+    }
+
+    #[test]
+    fn strip_ansi_incomplete_osc_at_end() {
+        // BEL/ST終端なしの不完全なOSCシーケンスは安全に除去される
+        let input = "text\x1b]2;title";
+        assert_eq!(strip_ansi(input), "text");
+    }
+
+    #[test]
+    fn strip_ansi_other_escape_skips_one_char() {
+        // ESC + 非 `[`/`]` 文字 → ESCと次の1文字のみスキップ
+        let input = "before\x1b(after";
+        assert_eq!(strip_ansi(input), "beforeafter");
     }
 
     #[test]

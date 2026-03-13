@@ -7,8 +7,9 @@ use crate::state::parse_duration;
 
 /// `YYYYMMDD_HHMMSS` で始まるディレクトリ名からタイムスタンプを解析して返す。
 fn parse_dir_timestamp(name: &str) -> Option<NaiveDateTime> {
-    // Format: YYYYMMDD_HHMMSS_agentname (at least 15 chars for the timestamp part)
-    if name.len() < 15 {
+    // タイムスタンプ部分は15文字（YYYYMMDD_HHMMSS）
+    // マルチバイト文字を含む場合のパニックを避けるため、char境界を確認
+    if !name.is_char_boundary(15) || name.len() < 15 {
         return None;
     }
     NaiveDateTime::parse_from_str(&name[..15], "%Y%m%d_%H%M%S").ok()
@@ -137,5 +138,22 @@ mod tests {
     fn cleanup_nonexistent_dir_returns_empty() {
         let deleted = cleanup_old_reports(Path::new("/nonexistent/path/token-burn"), "7d").unwrap();
         assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn parse_dir_timestamp_multibyte_at_boundary_does_not_panic() {
+        // バイト位置15がマルチバイト文字の途中にある場合でもパニックしない
+        // "20250101_12000" (14 ASCII bytes) + "あ" (3 bytes) = 17 bytes
+        // バイト位置15はマルチバイト文字の途中
+        assert!(parse_dir_timestamp("20250101_12000あ").is_none());
+    }
+
+    #[test]
+    fn parse_dir_timestamp_exact_15_chars_no_suffix() {
+        let ts = parse_dir_timestamp("20250101_120000").unwrap();
+        assert_eq!(
+            ts.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2025-01-01 12:00:00"
+        );
     }
 }

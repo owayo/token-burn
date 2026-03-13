@@ -391,4 +391,107 @@ mod tests {
         assert!(!dir.to_string_lossy().contains('~'));
         assert!(dir.to_string_lossy().ends_with("custom-reports"));
     }
+
+    #[test]
+    fn filter_by_state_skips_processed_targets() {
+        use chrono::Utc;
+
+        let agent = config::Agent {
+            name: "claude".to_string(),
+            command: vec!["echo".to_string()],
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        let conf = config::Config {
+            config_dir: std::path::PathBuf::from("."),
+            settings: config::Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: config::Prompts {
+                default: "review".to_string(),
+            },
+            agents: vec![agent.clone()],
+            scan: vec![],
+            targets: vec![],
+        };
+        let sched = schedule::calculate_next_reset(&agent).unwrap();
+
+        // 2つのターゲットを用意: 1つは処理済み、1つは未処理
+        let targets = vec![
+            scanner::ResolvedTarget {
+                directory: std::path::PathBuf::from("/tmp/processed-repo"),
+                display_name: "processed-repo".to_string(),
+                prompt: "review".to_string(),
+                visibility: scanner::Visibility::Unknown,
+            },
+            scanner::ResolvedTarget {
+                directory: std::path::PathBuf::from("/tmp/new-repo"),
+                display_name: "new-repo".to_string(),
+                prompt: "review".to_string(),
+                visibility: scanner::Visibility::Unknown,
+            },
+        ];
+
+        let mut run_state = state::State::default();
+        run_state
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .insert("/tmp/processed-repo".to_string(), Utc::now());
+
+        let (kept, skipped) = filter_by_state(targets, &run_state, &agent, &conf, &sched);
+        assert_eq!(skipped, 1);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].display_name, "new-repo");
+    }
+
+    #[test]
+    fn filter_by_state_fresh_keeps_all() {
+        let targets = vec![scanner::ResolvedTarget {
+            directory: std::path::PathBuf::from("/tmp/repo"),
+            display_name: "repo".to_string(),
+            prompt: "review".to_string(),
+            visibility: scanner::Visibility::Unknown,
+        }];
+        // fresh=true の場合はスキップ数0、全ターゲット保持
+        let original_len = targets.len();
+        // filter_by_state は fresh=true では呼ばれない（main.rs で分岐）
+        // ここでは空の State で全ターゲット保持を確認
+        let agent = config::Agent {
+            name: "claude".to_string(),
+            command: vec!["echo".to_string()],
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        let conf = config::Config {
+            config_dir: std::path::PathBuf::from("."),
+            settings: config::Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: config::Prompts {
+                default: "review".to_string(),
+            },
+            agents: vec![agent.clone()],
+            scan: vec![],
+            targets: vec![],
+        };
+        let sched = schedule::calculate_next_reset(&agent).unwrap();
+        let empty_state = state::State::default();
+
+        let (kept, skipped) = filter_by_state(targets, &empty_state, &agent, &conf, &sched);
+        assert_eq!(skipped, 0);
+        assert_eq!(kept.len(), original_len);
+    }
 }

@@ -322,4 +322,47 @@ mod tests {
         config.targets = vec![];
         assert!(config.validate().is_err());
     }
+
+    #[test]
+    fn validate_rejects_whitespace_only_agent_name() {
+        let mut config = base_config();
+        config.agents[0].name = "   ".to_string();
+        let err = config
+            .validate()
+            .expect_err("空白のみのエージェント名は拒否されるべき");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_executable() {
+        let mut config = base_config();
+        config.agents[0].command = vec!["  ".to_string()];
+        let err = config
+            .validate()
+            .expect_err("空白のみの実行ファイル名は拒否されるべき");
+        assert!(err.to_string().contains("executable must not be empty"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_timezone() {
+        let mut config = base_config();
+        config.agents[0].timezone = "Invalid/Zone".to_string();
+        let err = config
+            .validate()
+            .expect_err("無効なタイムゾーンは拒否されるべき");
+        assert!(err.to_string().contains("Invalid timezone"));
+    }
+
+    #[test]
+    fn parse_time_rejects_whitespace_padded() {
+        assert!(parse_time(" 09:00").is_err());
+        assert!(parse_time("09:00 ").is_err());
+    }
+
+    #[test]
+    fn resolve_prompt_empty_string_returns_empty() {
+        let config = base_config();
+        let result = config.resolve_prompt("").unwrap();
+        assert_eq!(result, "");
+    }
 }
