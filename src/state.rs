@@ -256,4 +256,65 @@ mod tests {
         let state = State::load(&state_file);
         assert!(state.agents.is_empty());
     }
+
+    #[test]
+    fn state_load_nonexistent_file_returns_default() {
+        let state = State::load(Path::new("/nonexistent/state.json"));
+        assert!(state.agents.is_empty());
+    }
+
+    #[test]
+    fn mark_completed_updates_timestamp() {
+        let mut state = State::default();
+        let dir = Path::new("/tmp/test-repo");
+        state.mark_completed("claude", dir);
+
+        let ts = state.last_processed("claude", dir);
+        assert!(ts.is_some(), "処理済みタイムスタンプが記録されるべき");
+    }
+
+    #[test]
+    fn last_processed_returns_none_for_unknown_agent() {
+        let state = State::default();
+        assert!(
+            state
+                .last_processed("unknown-agent", Path::new("/tmp/repo"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn last_processed_returns_none_for_unknown_directory() {
+        let mut state = State::default();
+        state.mark_completed("claude", Path::new("/tmp/repo-a"));
+        assert!(
+            state
+                .last_processed("claude", Path::new("/tmp/repo-b"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_duration_single_day() {
+        let d = parse_duration("7d").expect("7日はパースできるべき");
+        assert_eq!(d.num_seconds(), 604_800);
+    }
+
+    #[test]
+    fn parse_duration_single_hour() {
+        let d = parse_duration("24h").expect("24時間はパースできるべき");
+        assert_eq!(d.num_seconds(), 86_400);
+    }
+
+    #[test]
+    fn parse_duration_single_minute() {
+        let d = parse_duration("30m").expect("30分はパースできるべき");
+        assert_eq!(d.num_seconds(), 1_800);
+    }
+
+    #[test]
+    fn parse_duration_single_second() {
+        let d = parse_duration("1s").expect("1秒はパースできるべき");
+        assert_eq!(d.num_seconds(), 1);
+    }
 }

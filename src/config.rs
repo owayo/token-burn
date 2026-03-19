@@ -401,6 +401,49 @@ mod tests {
     }
 
     #[test]
+    fn resolve_directory_absolute_path_unchanged() {
+        let path = resolve_directory("/tmp/some-repo").expect("絶対パスは解決されるべき");
+        assert_eq!(path, std::path::PathBuf::from("/tmp/some-repo"));
+        assert!(path.is_absolute());
+    }
+
+    #[test]
+    fn resolve_directory_tilde_expansion() {
+        let path = resolve_directory("~/test-dir").expect("チルダは展開されるべき");
+        assert!(path.is_absolute());
+        assert!(!path.to_string_lossy().contains('~'));
+        assert!(path.to_string_lossy().ends_with("test-dir"));
+    }
+
+    #[test]
+    fn normalize_path_handles_parent_dir() {
+        let path = normalize_path(Path::new("/a/b/../c"));
+        assert_eq!(path, PathBuf::from("/a/c"));
+    }
+
+    #[test]
+    fn normalize_path_handles_current_dir() {
+        let path = normalize_path(Path::new("/a/./b/./c"));
+        assert_eq!(path, PathBuf::from("/a/b/c"));
+    }
+
+    #[test]
+    fn normalize_path_parent_at_root() {
+        // ルートを超える .. はルートに留まる
+        let path = normalize_path(Path::new("/a/../.."));
+        assert_eq!(path, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn default_config_path_is_absolute() {
+        let path = default_config_path();
+        // ホームディレクトリが取得できない場合は "~" になるが、
+        // 通常は絶対パスになる
+        assert!(path.to_string_lossy().contains("config.toml"));
+        assert!(path.to_string_lossy().contains("token-burn"));
+    }
+
+    #[test]
     fn resolve_directory_normalizes_relative_segments() {
         let old_cwd = std::env::current_dir().expect("cwd should be available");
         let tmp = TempDir::new().expect("temp dir should be created");

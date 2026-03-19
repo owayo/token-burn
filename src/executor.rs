@@ -932,6 +932,45 @@ mod tests {
     }
 
     #[test]
+    fn build_plan_clones_agent_and_targets() {
+        let agent = make_agent(vec!["claude", "-p"]);
+        let targets = vec![ResolvedTarget {
+            directory: std::path::PathBuf::from("/tmp/repo"),
+            display_name: "repo".to_string(),
+            prompt: "review".to_string(),
+            visibility: Visibility::Public,
+        }];
+        let plan = build_plan(&agent, targets);
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].display_name, "repo");
+        // claude エージェントにはフラグが自動付与される
+        assert!(plan.agent.command.contains(&"--verbose".to_string()));
+    }
+
+    #[test]
+    fn truncate_max_len_3() {
+        // max_len=3 の場合は "..." のみ
+        assert_eq!(truncate("hello", 3), "...");
+    }
+
+    #[test]
+    fn strip_ansi_empty_string() {
+        assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn sanitize_filename_empty_string() {
+        assert_eq!(sanitize_filename(""), "");
+    }
+
+    #[test]
+    fn sanitize_filename_unicode() {
+        // 日本語文字はアルファニューメリックとして扱われる
+        let result = sanitize_filename("日本語repo");
+        assert!(result.contains("repo"));
+    }
+
+    #[test]
     fn ensure_required_flags_ignores_non_claude_agent() {
         let mut agent = Agent {
             name: "codex".to_string(),

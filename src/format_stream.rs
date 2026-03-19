@@ -1120,6 +1120,42 @@ mod tests {
     // --- truncate_str の単体テスト ---
 
     #[test]
+    fn process_result_duration_only() {
+        // コストなし、duration_ms のみ
+        let input =
+            r#"{"type":"result","duration_ms":65000,"usage":{"input_tokens":0,"output_tokens":0}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("1m 5s"), "expected duration in: {}", clean);
+        // output=0 の場合はトークン行を出力しない
+        assert!(
+            !clean.contains("in:"),
+            "output=0 ではトークン行を出力しない: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_no_duration() {
+        // duration_ms がない場合
+        let input = r#"{"type":"result","total_cost_usd":0.01,"usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("$0.0100"));
+        assert!(!clean.contains("m "), "duration なしでは時間を表示しない");
+    }
+
+    #[test]
+    fn format_number_zero() {
+        assert_eq!(format_number(0), "0");
+    }
+
+    #[test]
+    fn format_number_large() {
+        assert_eq!(format_number(1_000_000), "1,000,000");
+    }
+
+    #[test]
     fn truncate_str_short_string_unchanged() {
         assert_eq!(truncate_str("hello", 10), "hello");
     }

@@ -149,6 +149,27 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_skips_files_in_report_dir() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // ファイル（ディレクトリではない）はスキップされる
+        let file_path = base.join("20200101_000000_log.txt");
+        fs::write(&file_path, "data").unwrap();
+
+        let deleted = cleanup_old_reports(base, "1d").unwrap();
+        assert!(deleted.is_empty());
+        assert!(file_path.exists(), "ファイルは削除されるべきでない");
+    }
+
+    #[test]
+    fn cleanup_empty_dir_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let deleted = cleanup_old_reports(tmp.path(), "1d").unwrap();
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
     fn parse_dir_timestamp_exact_15_chars_no_suffix() {
         let ts = parse_dir_timestamp("20250101_120000").unwrap();
         assert_eq!(

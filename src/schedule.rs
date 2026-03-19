@@ -150,4 +150,39 @@ mod tests {
         assert_eq!(sched.agent_name, agents[idx].name);
         assert!(sched.time_until_reset.as_secs() > 0);
     }
+
+    #[test]
+    fn select_nearest_agent_single_agent() {
+        let agents = vec![make_agent("only", "wednesday", "12:00")];
+        let (idx, sched) = select_nearest_agent(&agents).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(sched.agent_name, "only");
+    }
+
+    #[test]
+    fn calculate_next_reset_includes_agent_name() {
+        let agent = make_agent("test-agent", "friday", "18:00");
+        let sched = calculate_next_reset(&agent).unwrap();
+        assert_eq!(sched.agent_name, "test-agent");
+    }
+
+    #[test]
+    fn days_until_weekday_all_combinations() {
+        // 全曜日の組み合わせで 0〜6 の範囲に収まることを確認
+        let weekdays = [
+            Weekday::Mon,
+            Weekday::Tue,
+            Weekday::Wed,
+            Weekday::Thu,
+            Weekday::Fri,
+            Weekday::Sat,
+            Weekday::Sun,
+        ];
+        for &from in &weekdays {
+            for &to in &weekdays {
+                let days = days_until_weekday(from, to);
+                assert!(days <= 6, "{:?} → {:?} = {} (> 6)", from, to, days);
+            }
+        }
+    }
 }
