@@ -131,7 +131,7 @@ token-burn run
 | `--agent <NAME>` | | Force specific agent |
 | `--dry-run` | `-n` | Preview without executing |
 | `--fresh` | | Ignore saved state and process all targets |
-| `--limit <N>` | `-l` | Maximum number of targets to process |
+| `--limit <N>` | `-l` | Maximum number of targets to process (`N >= 1`) |
 | `--no-limit` | | Process all targets without limit |
 | `--public-only` | | Process only repositories detected as public |
 | `--help` | `-h` | Show help |
@@ -161,7 +161,7 @@ skip_within = "7d"    # optional
 | `skip_within` | Skip directories processed within this duration | `"7d"`, `"24h"`, `"1d12h"` |
 | `cleanup_after` | Auto-delete report directories older than this duration | `"7d"` (default) |
 | `report_dir` | Directory to save execution logs | `~/Documents/token-burn` (default) |
-| `limit` | Maximum number of targets to process per run | `10` (default) |
+| `limit` | Maximum number of targets to process per run (`>= 1`) | `10` (default) |
 
 `skip_within` accepts duration strings: `d` (days), `h` (hours), `m` (minutes), `s` (seconds). If omitted, directories processed since the previous reset are skipped. Excessively large values are rejected. Use `--fresh` to ignore saved state entirely.
 
@@ -230,7 +230,11 @@ public_first = false
 
 When `username` is set, visibility lookup uses the repository name parsed from each repository's `origin` remote URL (case-insensitive), so local directory names can differ from remote repository names.
 
+When `username` is not set, repositories are included even if they do not have an `origin` remote. In that case visibility remains `Unknown`.
+
 If multiple `[[scan]]` entries discover the same repository directory, scan results are deduplicated by directory path so the same repository is not executed twice in a single run.
+
+Directory paths are normalized to absolute paths before deduplication and state tracking, so equivalent relative paths such as `repo` and `./repo` are treated as the same target.
 
 ### Prompts
 

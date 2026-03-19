@@ -38,11 +38,11 @@ pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<Vec<PathB
 
         let name = match entry.file_name().into_string() {
             Ok(n) => n,
-            Err(_) => continue, // non-UTF-8 name, skip
+            Err(_) => continue, // UTF-8 でない名前は安全にスキップ
         };
 
         let Some(ts) = parse_dir_timestamp(&name) else {
-            continue; // unparseable name, skip safely
+            continue; // 解析できない名前は安全にスキップ
         };
 
         if ts < cutoff {
@@ -111,17 +111,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
 
-        // Old directory (2020)
+        // 古いディレクトリ（2020年）
         let old_dir = base.join("20200101_000000_claude");
         fs::create_dir(&old_dir).unwrap();
         fs::write(old_dir.join("log.txt"), "old").unwrap();
 
-        // Recent directory (far future)
+        // 新しいディレクトリ（十分未来）
         let new_dir = base.join("20990101_000000_codex");
         fs::create_dir(&new_dir).unwrap();
         fs::write(new_dir.join("log.txt"), "new").unwrap();
 
-        // Unparseable directory (should be skipped)
+        // 解析不能なディレクトリ（削除対象外）
         let skip_dir = base.join("random_dir");
         fs::create_dir(&skip_dir).unwrap();
 
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn parse_dir_timestamp_multibyte_at_boundary_does_not_panic() {
         // バイト位置15がマルチバイト文字の途中にある場合でもパニックしない
-        // "20250101_12000" (14 ASCII bytes) + "あ" (3 bytes) = 17 bytes
+        // "20250101_12000"（ASCII 14バイト）+ "あ"（3バイト）= 17バイト
         // バイト位置15はマルチバイト文字の途中
         assert!(parse_dir_timestamp("20250101_12000あ").is_none());
     }

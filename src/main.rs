@@ -17,72 +17,88 @@ use std::path::PathBuf;
 #[command(name = "token-burn")]
 #[command(
     version,
-    about = "Consume AI coding assistant tokens before weekly reset"
+    about = "週次リセット前に AI コーディングアシスタントのトークンを消費する"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Config file path
+    /// 設定ファイルのパス
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
-    /// Force specific agent
+    /// 使用するエージェントを固定する
     #[arg(long, global = true)]
     agent: Option<String>,
 
-    /// Dry run mode
+    /// 実行せずに計画だけ表示する
     #[arg(short = 'n', long, global = true)]
     dry_run: bool,
 
-    /// Ignore saved state and process all targets
+    /// 保存済み状態を無視して全ターゲットを処理する
     #[arg(long, global = true)]
     fresh: bool,
 
-    /// Maximum number of targets to process (default: from config or 10)
-    #[arg(short, long, global = true, conflicts_with = "no_limit")]
+    /// 処理するターゲット数の上限（デフォルト: 設定値または 10）
+    #[arg(
+        short,
+        long,
+        global = true,
+        conflicts_with = "no_limit",
+        value_parser = parse_positive_limit
+    )]
     limit: Option<usize>,
 
-    /// Process all targets without limit
+    /// 上限なしで全ターゲットを処理する
     #[arg(long, global = true, conflicts_with = "limit")]
     no_limit: bool,
 
-    /// Only process public repositories
+    /// 公開リポジトリのみ処理する
     #[arg(long, global = true)]
     public_only: bool,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Execute token consumption
+    /// トークン消費を実行する
     Run,
-    /// Show agent reset status
+    /// エージェントのリセット状況を表示する
     Status,
-    /// Initialize config file and prompt templates
+    /// 設定ファイルとプロンプト雛形を初期化する
     Init {
-        /// Overwrite existing files without confirmation
+        /// 確認なしで既存ファイルを上書きする
         #[arg(short, long)]
         force: bool,
     },
-    /// Clean up old report directories
+    /// 古いレポートディレクトリを削除する
     Clean {
-        /// Delete reports older than this duration (overrides config cleanup_after)
+        /// この期間より古いレポートを削除する（config の cleanup_after より優先）
         #[arg(long)]
         older_than: Option<String>,
     },
-    /// Record task completion (internal use by worker scripts)
+    /// タスク完了を記録する（ワーカースクリプト専用）
     #[command(hide = true)]
     Mark {
-        /// Agent name
+        /// エージェント名
         agent: String,
-        /// Directory that was processed
+        /// 処理したディレクトリ
         directory: PathBuf,
-        /// State file path
+        /// state.json のパス
         state_file: PathBuf,
     },
-    /// Format stream-json output into readable text (internal use by worker scripts)
+    /// stream-json 出力を読みやすいテキストに整形する（ワーカースクリプト専用）
     #[command(hide = true, name = "format-stream")]
     FormatStream,
+}
+
+fn parse_positive_limit(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("無効な数値です: {value}"))?;
+    if parsed == 0 {
+        return Err("limit には 1 以上を指定してください".to_string());
+    }
+    Ok(parsed)
 }
 
 #[tokio::main]
@@ -363,6 +379,7 @@ fn filter_by_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn resolve_report_dir_uses_default_when_none() {
@@ -493,5 +510,11 @@ mod tests {
         let (kept, skipped) = filter_by_state(targets, &empty_state, &agent, &conf, &sched);
         assert_eq!(skipped, 0);
         assert_eq!(kept.len(), original_len);
+    }
+
+    #[test]
+    fn cli_limit_rejects_zero() {
+        let result = Cli::try_parse_from(["token-burn", "--limit", "0"]);
+        assert!(result.is_err(), "limit=0 は CLI で拒否されるべき");
     }
 }

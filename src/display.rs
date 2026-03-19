@@ -69,19 +69,19 @@ mod tests {
 
     #[test]
     fn format_duration_days() {
-        let d = Duration::from_secs(90061); // 1d 1h 1m 1s
+        let d = Duration::from_secs(90061); // 1日1時間1分1秒
         assert_eq!(format_duration(d), "1d 1h 1m");
     }
 
     #[test]
     fn format_duration_hours() {
-        let d = Duration::from_secs(7260); // 2h 1m
+        let d = Duration::from_secs(7260); // 2時間1分
         assert_eq!(format_duration(d), "2h 1m");
     }
 
     #[test]
     fn format_duration_minutes_only() {
-        let d = Duration::from_secs(300); // 5m
+        let d = Duration::from_secs(300); // 5分
         assert_eq!(format_duration(d), "5m");
     }
 

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -118,6 +118,9 @@ impl Config {
         if self.settings.parallelism == 0 {
             anyhow::bail!("parallelism must be at least 1");
         }
+        if self.settings.limit == 0 {
+            anyhow::bail!("limit must be at least 1");
+        }
         for agent in &self.agents {
             if agent.name.trim().is_empty() {
                 anyhow::bail!("Agent name must not be empty");
@@ -144,7 +147,29 @@ impl Config {
 
 pub fn resolve_directory(dir: &str) -> Result<PathBuf> {
     let expanded = shellexpand::tilde(dir);
-    Ok(PathBuf::from(expanded.as_ref()))
+    let path = PathBuf::from(expanded.as_ref());
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(normalize_path(&absolute))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -188,6 +213,7 @@ pub fn parse_time(s: &str) -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn base_config() -> Config {
         Config {
@@ -316,6 +342,14 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_zero_limit() {
+        let mut config = base_config();
+        config.settings.limit = 0;
+        let err = config.validate().expect_err("limit=0 は拒否されるべき");
+        assert!(err.to_string().contains("limit must be at least 1"));
+    }
+
+    #[test]
     fn validate_rejects_no_scan_or_targets() {
         let mut config = base_config();
         config.scan = vec![];
@@ -364,5 +398,21 @@ mod tests {
         let config = base_config();
         let result = config.resolve_prompt("").unwrap();
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn resolve_directory_normalizes_relative_segments() {
+        let old_cwd = std::env::current_dir().expect("cwd should be available");
+        let tmp = TempDir::new().expect("temp dir should be created");
+        std::env::set_current_dir(tmp.path()).expect("should switch cwd");
+
+        let expected = std::env::current_dir()
+            .expect("cwd should be available")
+            .join("repo");
+        let path = resolve_directory("./nested/../repo").expect("relative path should resolve");
+        std::env::set_current_dir(old_cwd).expect("should restore cwd");
+
+        assert_eq!(path, expected);
+        assert!(path.is_absolute());
     }
 }

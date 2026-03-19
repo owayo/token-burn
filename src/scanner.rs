@@ -196,29 +196,32 @@ fn check_repo(
     scan: &Scan,
     visibility_map: &HashMap<String, Visibility>,
 ) -> Option<ResolvedTarget> {
-    let output = std::process::Command::new("git")
+    let remote_url = std::process::Command::new("git")
         .args(["-C", &path.to_string_lossy(), "remote", "get-url", "origin"])
         .output()
-        .ok()?;
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
 
-    if !output.status.success() {
-        return None;
+    if let Some(username) = &scan.username {
+        let remote_url = remote_url.as_deref()?;
+        if !remote_belongs_to_username(remote_url, username) {
+            return None;
+        }
     }
 
-    let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if let Some(username) = &scan.username
-        && !remote_belongs_to_username(&remote_url, username)
-    {
-        return None;
-    }
-
-    let visibility_key = extract_remote_repo(&remote_url)
-        .unwrap_or_else(|| dir_name.to_string())
-        .to_ascii_lowercase();
-    let visibility = visibility_map
-        .get(&visibility_key)
-        .cloned()
-        .unwrap_or(Visibility::Unknown);
+    // `username` 未指定の通常スキャンでは `origin` がなくても対象に含める。
+    let visibility = if let Some(remote_url) = remote_url.as_deref() {
+        let visibility_key = extract_remote_repo(remote_url)
+            .unwrap_or_else(|| dir_name.to_string())
+            .to_ascii_lowercase();
+        visibility_map
+            .get(&visibility_key)
+            .cloned()
+            .unwrap_or(Visibility::Unknown)
+    } else {
+        Visibility::Unknown
+    };
 
     Some(ResolvedTarget {
         directory: path.to_path_buf(),
@@ -423,6 +426,41 @@ mod tests {
         let target = check_repo(&repo_dir, "local-dir-name", &scan, &visibility_map)
             .expect("repository should be detected");
         assert_eq!(target.visibility, Visibility::Public);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn check_repo_without_origin_is_included_when_username_is_not_set() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("token-burn-check-no-origin-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+        let repo_dir = temp_dir.join("local-only-repo");
+        std::fs::create_dir_all(&repo_dir).expect("repo dir should be created");
+
+        let status = std::process::Command::new("git")
+            .args(["-C", &repo_dir.to_string_lossy(), "init", "--quiet"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        let scan = Scan {
+            base_dirs: vec![],
+            recursive: false,
+            username: None,
+            public_first: true,
+            exclude: vec![],
+        };
+
+        let target = check_repo(&repo_dir, "local-only-repo", &scan, &HashMap::new())
+            .expect("repository without origin should still be detected");
+        assert_eq!(target.directory, repo_dir);
+        assert_eq!(target.display_name, "local-only-repo");
+        assert_eq!(target.visibility, Visibility::Unknown);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -699,6 +737,76 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].directory, repo_dir);
         assert_eq!(resolved[0].display_name, "dup-repo");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_targets_deduplicates_relative_target_and_scan_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("token-burn-scanner-relative-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+
+        let repo_dir = temp_dir.join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("repo dir should be created");
+
+        let status = std::process::Command::new("git")
+            .args(["-C", &repo_dir.to_string_lossy(), "init", "--quiet"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        let old_cwd = std::env::current_dir().expect("cwd should be available");
+        std::env::set_current_dir(&temp_dir).expect("should switch cwd");
+        let expected_repo_dir = std::env::current_dir()
+            .expect("cwd should be available")
+            .join("repo");
+
+        let config = Config {
+            config_dir: temp_dir.clone(),
+            settings: Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: Prompts {
+                default: "default prompt".to_string(),
+            },
+            agents: vec![Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![Scan {
+                base_dirs: vec![".".to_string()],
+                recursive: false,
+                username: None,
+                public_first: true,
+                exclude: vec![],
+            }],
+            targets: vec![Target {
+                directory: "repo".to_string(),
+                prompt: Some("target prompt".to_string()),
+            }],
+        };
+
+        let resolved = resolve_targets(&config, &config.agents[0]).await;
+        std::env::set_current_dir(old_cwd).expect("should restore cwd");
+        let resolved = resolved.expect("same directory should be deduplicated");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].directory, expected_repo_dir);
+        assert_eq!(resolved[0].display_name, "repo");
+        assert_eq!(resolved[0].prompt, "target prompt");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn process_text_only_response() {
-        // Pattern: simple text response without thinking (e.g. "say hello")
+        // 思考ブロックなしの単純なテキスト応答（例: "say hello"）
         let input = [
             r#"{"type":"system","subtype":"init","cwd":"/tmp","session_id":"s1"}"#,
             r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","id":"msg_1"}}}"#,
@@ -532,14 +532,14 @@ mod tests {
         assert!(clean.contains("$0.2148"));
         assert!(clean.contains("0m 5s"));
         assert!(clean.contains("in:14,729 out:45"));
-        // system/assistant/rate_limit should be suppressed
+        // system/assistant/rate_limit は表示しない
         assert!(!clean.contains("init"));
         assert!(!clean.contains("rate_limit"));
     }
 
     #[test]
     fn process_thinking_then_tool_use() {
-        // Pattern: thinking block → tool use → tool result → text response
+        // 思考ブロック → ツール使用 → ツール結果 → テキスト応答
         let input = [
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me analyze this code..."}}}"#,
@@ -558,18 +558,18 @@ mod tests {
         let output = run_process(&input);
         let clean = strip_ansi(&output);
 
-        // Thinking indicator
+        // 思考インジケーター
         assert!(clean.contains("\u{1f4ad}"));
-        // Tool name and file path
+        // ツール名とファイルパス
         assert!(clean.contains("\u{1f527} Read"));
         assert!(clean.contains("/src/main.rs"));
-        // Tool result shows tool name
+        // ツール結果にツール名が表示される
         assert!(
             clean.contains("\u{2713} Read"),
             "expected '✓ Read' in: {}",
             clean
         );
-        // Text output
+        // テキスト応答
         assert!(clean.contains("Found the file."));
     }
 
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn process_edit_tool_shows_diff_stats() {
-        // Real pattern: Edit tool with file_path, old_string, new_string
+        // 実際の Edit ツールと同じ入力形式
         let input = [
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t_edit","name":"Edit","input":{}}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/index.test.ts\",\"old_string\":\"line1\\nline2\",\"new_string\":\"line1\\nline2\\nline3\\nline4\"}"}}}"#,
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn process_bash_tool_with_description() {
-        // Real pattern: Bash tool with command and description
+        // 実際の Bash ツールと同じ入力形式
         let input = [
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t_bash","name":"Bash","input":{}}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pnpm install\",\"description\":\"Install dependencies\"}"}}}"#,
@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn process_tool_result_error() {
-        // Real pattern: tool_result with is_error: true
+        // is_error=true の tool_result
         let input = [
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t_err","name":"Bash","input":{}}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"exit 1\"}"}}}"#,
@@ -671,7 +671,7 @@ mod tests {
         let output = run_process(&input);
         let clean = strip_ansi(&output);
 
-        // Error should show ✗ instead of ✓
+        // エラー時は ✓ ではなく ✗ を表示する
         assert!(
             clean.contains("\u{2717} Bash"),
             "expected error mark in: {}",
@@ -686,7 +686,7 @@ mod tests {
 
     #[test]
     fn process_result_with_full_stats() {
-        // Real pattern from actual claude run: includes num_turns and cache_creation_input_tokens
+        // 実際の claude 実行結果と同じく num_turns と cache_creation_input_tokens を含む
         let input = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":41712,"num_turns":9,"total_cost_usd":0.5565,"usage":{"input_tokens":14,"cache_creation_input_tokens":54926,"cache_read_input_tokens":372099,"output_tokens":987}}"#;
         let output = run_process(input);
         let clean = strip_ansi(&output);
@@ -709,28 +709,28 @@ mod tests {
 
     #[test]
     fn process_multi_turn_read_edit_bash() {
-        // Real pattern: Read → Edit → Bash (multi-tool sequence)
+        // Read → Edit → Bash の複数ツール連続実行
         let input = [
-            // Turn 1: Read
+            // 1ターン目: Read
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"Read","input":{}}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/index.ts\"}"}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
             r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"export function add(a, b) { return a + b; }"}]}}"#,
-            // Turn 2: Edit
+            // 2ターン目: Edit
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t2","name":"Edit","input":{}}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/index.test.ts\",\"old_string\":\"test1\",\"new_string\":\"test1\\ntest2\\ntest3\"}"}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
             r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t2","type":"tool_result","content":"Updated successfully."}]}}"#,
-            // Turn 3: Bash
+            // 3ターン目: Bash
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t3","name":"Bash","input":{}}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pnpm exec tsc --noEmit\",\"description\":\"Type check\"}"}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
             r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t3","type":"tool_result","content":""}]}}"#,
-            // Final text
+            // 最終テキスト
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
-            // Result
+            // 結果
             r#"{"type":"result","total_cost_usd":0.55,"duration_ms":41000,"num_turns":4,"usage":{"input_tokens":10,"cache_read_input_tokens":1000,"output_tokens":100}}"#,
         ]
         .join("\n");
@@ -752,9 +752,9 @@ mod tests {
         assert!(clean.contains("pnpm exec tsc --noEmit"));
         assert!(clean.contains("(Type check)"));
         assert!(clean.contains("\u{2713} Bash"));
-        // Text
+        // テキスト
         assert!(clean.contains("Done."));
-        // Result
+        // 結果
         assert!(clean.contains("(4 turns)"));
     }
 
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn extract_tool_detail_generic_description_fallback() {
-        // Tools like TaskCreate that have description but no special handler
+        // TaskCreate のように description はあるが専用ハンドラがないツール
         let input = r#"{"subject":"Run tests","description":"Execute test suite","activeForm":"Running tests"}"#;
         assert_eq!(
             extract_tool_detail("TaskCreate", input),
@@ -797,14 +797,14 @@ mod tests {
 
     #[test]
     fn extract_tool_detail_generic_name_fallback() {
-        // Tools with only a name field (after all higher-priority fields)
+        // 優先フィールドがなく name だけを持つツール
         let input = r#"{"name":"my-worktree"}"#;
         assert_eq!(extract_tool_detail("EnterWorktree", input), "my-worktree");
     }
 
     #[test]
     fn process_system_task_started_skipped() {
-        // system events with subtype "task_started" should be silently skipped
+        // subtype が task_started の system イベントは黙って無視する
         let input = [
             r#"{"type":"system","subtype":"init","cwd":"/tmp","session_id":"s1"}"#,
             r#"{"type":"system","subtype":"task_started","task_type":"in_process_teammate","task_id":"abc-123","tool_use_id":"tu_1","description":"implement feature"}"#,
@@ -817,23 +817,23 @@ mod tests {
         let output = run_process(&input);
         let clean = strip_ansi(&output);
 
-        // system events should not appear
+        // system イベントは表示しない
         assert!(!clean.contains("task_started"));
         assert!(!clean.contains("in_process_teammate"));
-        // text should still appear
+        // テキストは表示される
         assert!(clean.contains("Hello"));
     }
 
     #[test]
     fn process_team_create_then_task_spawn() {
-        // Pattern: TeamCreate → Task (team agent spawning sequence)
+        // TeamCreate → Task の順でチームエージェントを起動する流れ
         let input = [
             // TeamCreate
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tc1","name":"TeamCreate","input":{}}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"team_name\":\"demo-team\",\"description\":\"Build demo project\"}"}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
             r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tc1","type":"tool_result","content":"Team created"}]}}"#,
-            // Task spawn
+            // Task 起動
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"ts1","name":"Task","input":{}}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"description\":\"implement utils\",\"name\":\"worker-1\",\"subagent_type\":\"general-purpose\",\"team_name\":\"demo-team\",\"prompt\":\"Create utility module\"}"}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn process_result_with_model_usage() {
-        // Pattern: result with modelUsage per-model breakdown (should not break)
+        // modelUsage のモデル別内訳があっても崩れないことを確認
         let input = r#"{"type":"result","subtype":"success","total_cost_usd":1.234,"duration_ms":120000,"num_turns":15,"usage":{"input_tokens":500,"cache_read_input_tokens":50000,"output_tokens":2000},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":200,"outputTokens":1500,"cacheReadInputTokens":40000,"cost":0.234},"claude-opus-4-6":{"inputTokens":300,"outputTokens":500,"cacheReadInputTokens":10000,"cost":1.0}},"stop_reason":null}"#;
         let output = run_process(input);
         let clean = strip_ansi(&output);
@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn process_result_with_stop_reason_null() {
-        // Pattern: result with stop_reason: null (team sessions)
+        // team session では stop_reason が null でも処理できる
         let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.01,"duration_ms":3000,"usage":{"input_tokens":10,"output_tokens":5},"stop_reason":null}"#;
         let output = run_process(input);
         let clean = strip_ansi(&output);
@@ -911,7 +911,7 @@ mod tests {
         assert!(clean.contains("0m 3s"));
     }
 
-    // --- format_diff_lines unit tests ---
+    // --- format_diff_lines の単体テスト ---
 
     #[test]
     fn diff_pure_deletion() {
@@ -934,12 +934,12 @@ mod tests {
 
     #[test]
     fn diff_with_context() {
-        // Common prefix "aaa", common suffix "zzz", middle changed
+        // 共通プレフィックス "aaa" と共通サフィックス "zzz" の間だけが変化
         let old = "aaa\nbbb\nzzz";
         let new = "aaa\nccc\nddd\nzzz";
         let diff = format_diff_lines(old, new);
         let clean = strip_ansi(&diff);
-        // Context lines (prefix/suffix)
+        // コンテキスト行（前後）
         assert!(
             clean.contains("    aaa"),
             "expected prefix context: {}",
@@ -950,7 +950,7 @@ mod tests {
             "expected suffix context: {}",
             clean
         );
-        // Changed lines
+        // 変更行
         assert!(clean.contains("- bbb"), "expected removal: {}", clean);
         assert!(clean.contains("+ ccc"), "expected addition: {}", clean);
         assert!(clean.contains("+ ddd"), "expected addition: {}", clean);
@@ -967,7 +967,7 @@ mod tests {
 
     #[test]
     fn diff_truncates_long_changes() {
-        // 20 removed lines should be truncated
+        // 20行の削除は省略表示される
         let old_lines: Vec<&str> = (0..20).map(|_| "old").collect();
         let old = old_lines.join("\n");
         let diff = format_diff_lines(&old, "new");
@@ -987,7 +987,7 @@ mod tests {
         assert!(clean.contains("+ new line"), "got: {}", clean);
     }
 
-    // --- format_tool_diff unit tests ---
+    // --- format_tool_diff の単体テスト ---
 
     #[test]
     fn format_tool_diff_edit() {
@@ -1011,7 +1011,7 @@ mod tests {
         assert!(format_tool_diff("Bash", input).is_none());
     }
 
-    // --- Integration: Edit diff in process pipeline ---
+    // --- process パイプラインで Edit 差分が出る統合テスト ---
 
     #[test]
     fn process_edit_shows_diff_output() {
@@ -1025,7 +1025,7 @@ mod tests {
         let output = run_process(&input);
         let clean = strip_ansi(&output);
 
-        // Tool header
+        // ツールヘッダー
         assert!(
             clean.contains("\u{1f527} Edit"),
             "expected Edit header: {}",
@@ -1036,7 +1036,7 @@ mod tests {
             "expected file path: {}",
             clean
         );
-        // Diff content
+        // 差分内容
         assert!(
             clean.contains("- fn old() {}"),
             "expected removed line: {}",
@@ -1052,7 +1052,7 @@ mod tests {
             "expected added line: {}",
             clean
         );
-        // Context (common suffix)
+        // コンテキスト（共通サフィックス）
         assert!(
             clean.contains("    fn keep() {}"),
             "expected context line: {}",
@@ -1062,7 +1062,7 @@ mod tests {
 
     #[test]
     fn process_edit_pure_deletion_shows_diff() {
-        // Pattern from log: Edit (+0/-7) — pure deletion
+        // ログに現れる純削除パターン
         let input = [
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"Edit","input":{}}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/repo.rs\",\"old_string\":\"    if found {\\n        break;\\n    }\",\"new_string\":\"\"}"}}}"#,
@@ -1084,14 +1084,14 @@ mod tests {
 
     #[test]
     fn process_subagent_tool_uses_from_assistant_message() {
-        // Subagent tool uses arrive as assistant messages (not stream_event blocks).
-        // The assistant message contains tool_use items with parent_tool_use_id set.
-        // The subsequent user message contains tool_result items referencing those IDs.
+        // サブエージェントの tool_use は stream_event ではなく assistant message として届く。
+        // assistant message 内の tool_use に parent_tool_use_id が入り、
+        // 後続の user message の tool_result がその ID を参照する。
         let input = [
             r#"{"type":"system","subtype":"init"}"#,
-            // Assistant message with two tool_use blocks (subagent pattern)
+            // tool_use を 2 つ含む assistant message
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"sub_read_1","name":"Read","input":{"file_path":"/src/lib.rs"},"parent_tool_use_id":"task_1"},{"type":"tool_use","id":"sub_glob_2","name":"Glob","input":{"pattern":"**/*.rs"},"parent_tool_use_id":"task_1"}]}}"#,
-            // User message with tool_result for both
+            // 2 つの tool_result を返す user message
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"sub_read_1","content":"file contents"},{"type":"tool_result","tool_use_id":"sub_glob_2","content":"src/lib.rs\nsrc/main.rs"}]}}"#,
         ]
         .join("\n");
@@ -1099,7 +1099,7 @@ mod tests {
         let output = run_process(&input);
         let clean = strip_ansi(&output);
 
-        // Both tool results should show the correct tool name, not "?"
+        // どちらの結果も "?" ではなく正しいツール名を表示する
         assert!(
             clean.contains("\u{2713} Read"),
             "expected '✓ Read' but got: {}",
@@ -1117,7 +1117,7 @@ mod tests {
         );
     }
 
-    // --- truncate_str unit tests ---
+    // --- truncate_str の単体テスト ---
 
     #[test]
     fn truncate_str_short_string_unchanged() {
@@ -1136,7 +1136,7 @@ mod tests {
 
     #[test]
     fn truncate_str_multibyte_counts_chars() {
-        // 5 Japanese characters = 15 bytes, but only 5 chars
+        // 日本語 5 文字は 15 バイトでも、文字数としては 5 として扱う
         let s = "あいうえお";
         assert_eq!(truncate_str(s, 5), "あいうえお");
         assert_eq!(truncate_str(s, 4), "あ...");
