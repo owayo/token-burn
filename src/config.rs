@@ -121,6 +121,8 @@ impl Config {
         if self.settings.limit == 0 {
             anyhow::bail!("limit must be at least 1");
         }
+        validate_optional_duration("skip_within", self.settings.skip_within.as_deref())?;
+        validate_optional_duration("cleanup_after", self.settings.cleanup_after.as_deref())?;
         for agent in &self.agents {
             if agent.name.trim().is_empty() {
                 anyhow::bail!("Agent name must not be empty");
@@ -143,6 +145,15 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn validate_optional_duration(field_name: &str, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        crate::state::parse_duration(value)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Invalid {field_name}: {e}"))?;
+    }
+    Ok(())
 }
 
 pub fn resolve_directory(dir: &str) -> Result<PathBuf> {
@@ -385,6 +396,26 @@ mod tests {
             .validate()
             .expect_err("無効なタイムゾーンは拒否されるべき");
         assert!(err.to_string().contains("Invalid timezone"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_skip_within() {
+        let mut config = base_config();
+        config.settings.skip_within = Some("broken".to_string());
+        let err = config
+            .validate()
+            .expect_err("無効な skip_within は拒否されるべき");
+        assert!(err.to_string().contains("Invalid skip_within"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_cleanup_after() {
+        let mut config = base_config();
+        config.settings.cleanup_after = Some("broken".to_string());
+        let err = config
+            .validate()
+            .expect_err("無効な cleanup_after は拒否されるべき");
+        assert!(err.to_string().contains("Invalid cleanup_after"));
     }
 
     #[test]
