@@ -88,7 +88,11 @@ enum Commands {
     },
     /// stream-json 出力を読みやすいテキストに整形する（ワーカースクリプト専用）
     #[command(hide = true, name = "format-stream")]
-    FormatStream,
+    FormatStream {
+        /// 受け取った生の stream-json 入力をそのまま保存するパス
+        #[arg(long)]
+        raw_output: Option<PathBuf>,
+    },
 }
 
 fn parse_positive_limit(value: &str) -> Result<usize, String> {
@@ -112,8 +116,8 @@ async fn main() -> Result<()> {
         return init::run_init(&config_path, force);
     }
 
-    if let Commands::FormatStream = command {
-        return format_stream::run();
+    if let Commands::FormatStream { raw_output } = &command {
+        return format_stream::run(raw_output.as_deref());
     }
 
     if let Commands::Mark {
@@ -160,7 +164,7 @@ async fn main() -> Result<()> {
         }
         Commands::Mark { .. } => unreachable!(),
         Commands::Init { .. } => unreachable!(),
-        Commands::FormatStream => unreachable!(),
+        Commands::FormatStream { .. } => unreachable!(),
     }
 
     Ok(())

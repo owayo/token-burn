@@ -1,25 +1,31 @@
 use anyhow::Result;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 
 /// `claude -p` の stream-json 出力を読みやすいテキストに変換する。
 /// JSON以外の行はそのまま出力（任意のエージェントで動作）。
-pub fn run() -> Result<()> {
+pub fn run(raw_output: Option<&Path>) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let out = stdout.lock();
-    process(stdin.lock(), out)
+    process(stdin.lock(), out, raw_output)
 }
 
-fn process(reader: impl BufRead, mut out: impl Write) -> Result<()> {
-    let mut block_type = String::new();
-    let mut tool_name = String::new();
-    let mut tool_input = String::new();
-    let mut thinking_chars = 0usize;
+fn process(reader: impl BufRead, mut out: impl Write, raw_output: Option<&Path>) -> Result<()> {
     let mut tool_id_map: HashMap<String, String> = HashMap::new();
+    let mut blocks: HashMap<usize, ContentBlockState> = HashMap::new();
+    let mut raw_writer = match raw_output {
+        Some(path) => Some(io::BufWriter::new(File::create(path)?)),
+        None => None,
+    };
 
     for line in reader.lines() {
         let line = line?;
+        if let Some(writer) = raw_writer.as_mut() {
+            writeln!(writer, "{}", line)?;
+        }
         if line.is_empty() {
             continue;
         }
@@ -43,10 +49,7 @@ fn process(reader: impl BufRead, mut out: impl Write) -> Result<()> {
                     &v["event"],
                     &mut out,
                     &mut StreamState {
-                        block_type: &mut block_type,
-                        tool_name: &mut tool_name,
-                        tool_input: &mut tool_input,
-                        thinking_chars: &mut thinking_chars,
+                        blocks: &mut blocks,
                         tool_id_map: &mut tool_id_map,
                     },
                 )?;
@@ -55,7 +58,7 @@ fn process(reader: impl BufRead, mut out: impl Write) -> Result<()> {
                 // assistant メッセージから tool_use ID を抽出（サブエージェントのツール結果に必要）
                 if let Some(content) = v["message"]["content"].as_array() {
                     for item in content {
-                        if item["type"].as_str() == Some("tool_use")
+                        if matches!(item["type"].as_str(), Some("tool_use" | "server_tool_use"))
                             && let (Some(id), Some(name)) =
                                 (item["id"].as_str(), item["name"].as_str())
                         {
@@ -82,11 +85,14 @@ fn process(reader: impl BufRead, mut out: impl Write) -> Result<()> {
                 }
             }
             "result" => {
+                finalize_open_blocks(&mut out, &mut blocks)?;
                 handle_result(&v, &mut out)?;
             }
             _ => {} // rate_limit_event, message_stop 等
         }
     }
+
+    finalize_open_blocks(&mut out, &mut blocks)?;
 
     Ok(())
 }
@@ -127,11 +133,136 @@ fn handle_result(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
 }
 
 struct StreamState<'a> {
-    block_type: &'a mut String,
-    tool_name: &'a mut String,
-    tool_input: &'a mut String,
-    thinking_chars: &'a mut usize,
+    blocks: &'a mut HashMap<usize, ContentBlockState>,
     tool_id_map: &'a mut HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockKind {
+    Text,
+    Thinking,
+    ToolUse,
+    ServerToolUse,
+    Unknown,
+}
+
+struct ContentBlockState {
+    kind: BlockKind,
+    tool_name: String,
+    tool_input: String,
+    text: String,
+    thinking_chars: usize,
+    thinking_started: bool,
+}
+
+impl ContentBlockState {
+    fn new(kind: BlockKind) -> Self {
+        Self {
+            kind,
+            tool_name: String::new(),
+            tool_input: String::new(),
+            text: String::new(),
+            thinking_chars: 0,
+            thinking_started: false,
+        }
+    }
+
+    fn from_start_block(block: &serde_json::Value) -> Self {
+        let kind = block_kind(block["type"].as_str().unwrap_or(""));
+        let mut state = Self::new(kind);
+
+        if matches!(kind, BlockKind::ToolUse | BlockKind::ServerToolUse) {
+            state.tool_name = block["name"].as_str().unwrap_or("?").to_string();
+            if let Some(input) = block.get("input")
+                && !input.is_null()
+                && input.as_object().map(|obj| !obj.is_empty()).unwrap_or(true)
+                && let Ok(serialized) = serde_json::to_string(input)
+            {
+                state.tool_input = serialized;
+            }
+        }
+
+        if kind == BlockKind::Text {
+            state.text = block["text"].as_str().unwrap_or("").to_string();
+        }
+
+        state
+    }
+
+    fn ensure_thinking_started(&mut self, out: &mut impl Write) -> Result<()> {
+        if !self.thinking_started {
+            write!(out, "\x1b[2m\u{1f4ad} ")?;
+            out.flush()?;
+            self.thinking_started = true;
+        }
+        Ok(())
+    }
+}
+
+fn block_kind(block_type: &str) -> BlockKind {
+    match block_type {
+        "text" => BlockKind::Text,
+        "thinking" => BlockKind::Thinking,
+        "tool_use" => BlockKind::ToolUse,
+        "server_tool_use" => BlockKind::ServerToolUse,
+        _ => BlockKind::Unknown,
+    }
+}
+
+fn infer_block_kind_from_delta(delta_type: &str) -> BlockKind {
+    match delta_type {
+        "text_delta" => BlockKind::Text,
+        "thinking_delta" | "signature_delta" => BlockKind::Thinking,
+        "input_json_delta" => BlockKind::ToolUse,
+        _ => BlockKind::Unknown,
+    }
+}
+
+fn finalize_block(out: &mut impl Write, block: ContentBlockState) -> Result<()> {
+    match block.kind {
+        BlockKind::Thinking => {
+            if block.thinking_started {
+                writeln!(out, "\x1b[0m")?;
+            }
+        }
+        BlockKind::ToolUse | BlockKind::ServerToolUse => {
+            let tool_name = if block.tool_name.is_empty() {
+                "?"
+            } else {
+                block.tool_name.as_str()
+            };
+            let detail = extract_tool_detail(tool_name, &block.tool_input);
+            if detail.is_empty() {
+                writeln!(out, "\x1b[36m\u{1f527} {}\x1b[0m", tool_name)?;
+            } else {
+                writeln!(
+                    out,
+                    "\x1b[36m\u{1f527} {}\x1b[0m \x1b[2m{}\x1b[0m",
+                    tool_name, detail
+                )?;
+            }
+            if let Some(diff) = format_tool_diff(tool_name, &block.tool_input) {
+                write!(out, "{}", diff)?;
+            }
+        }
+        BlockKind::Text | BlockKind::Unknown => {}
+    }
+
+    Ok(())
+}
+
+fn finalize_open_blocks(
+    out: &mut impl Write,
+    blocks: &mut HashMap<usize, ContentBlockState>,
+) -> Result<()> {
+    let mut indices: Vec<_> = blocks.keys().copied().collect();
+    indices.sort_unstable();
+    for index in indices {
+        if let Some(block) = blocks.remove(&index) {
+            finalize_block(out, block)?;
+        }
+    }
+    Ok(())
 }
 
 fn handle_stream_event(
@@ -142,38 +273,74 @@ fn handle_stream_event(
     let event_type = event["type"].as_str().unwrap_or("");
 
     match event_type {
+        "message_start" => {
+            finalize_open_blocks(out, state.blocks)?;
+        }
         "content_block_start" => {
             let block = &event["content_block"];
-            let bt = block["type"].as_str().unwrap_or("");
-            *state.block_type = bt.to_string();
+            let index = event["index"]
+                .as_u64()
+                .and_then(|idx| usize::try_from(idx).ok())
+                .unwrap_or(0);
+            let incoming = ContentBlockState::from_start_block(block);
+            let current = state
+                .blocks
+                .entry(index)
+                .or_insert_with(|| ContentBlockState::new(incoming.kind));
 
-            match bt {
-                "thinking" => {
-                    *state.thinking_chars = 0;
-                    write!(out, "\x1b[2m\u{1f4ad} ")?;
-                    out.flush()?;
-                }
-                "tool_use" => {
-                    let name = block["name"].as_str().unwrap_or("?").to_string();
-                    if let Some(id) = block["id"].as_str() {
-                        state.tool_id_map.insert(id.to_string(), name.clone());
-                    }
-                    *state.tool_name = name;
-                    state.tool_input.clear();
-                }
-                _ => {}
+            if current.kind == BlockKind::Unknown {
+                current.kind = incoming.kind;
+            }
+            if current.tool_name.is_empty() && !incoming.tool_name.is_empty() {
+                current.tool_name = incoming.tool_name.clone();
+            }
+            if current.tool_input.is_empty() && !incoming.tool_input.is_empty() {
+                current.tool_input = incoming.tool_input;
+            }
+            if current.text.is_empty() && !incoming.text.is_empty() {
+                current.text = incoming.text.clone();
+                write!(out, "{}", incoming.text)?;
+                out.flush()?;
+            }
+
+            if matches!(current.kind, BlockKind::ToolUse | BlockKind::ServerToolUse)
+                && let Some(id) = block["id"].as_str()
+            {
+                let name = if current.tool_name.is_empty() {
+                    "?"
+                } else {
+                    current.tool_name.as_str()
+                };
+                state.tool_id_map.insert(id.to_string(), name.to_string());
+            }
+
+            if current.kind == BlockKind::Thinking {
+                current.ensure_thinking_started(out)?;
             }
         }
         "content_block_delta" => {
             let delta = &event["delta"];
             let dt = delta["type"].as_str().unwrap_or("");
+            let index = event["index"]
+                .as_u64()
+                .and_then(|idx| usize::try_from(idx).ok())
+                .unwrap_or(0);
+            let block = state
+                .blocks
+                .entry(index)
+                .or_insert_with(|| ContentBlockState::new(infer_block_kind_from_delta(dt)));
+
+            if block.kind == BlockKind::Unknown {
+                block.kind = infer_block_kind_from_delta(dt);
+            }
 
             match dt {
                 "thinking_delta" => {
                     if let Some(text) = delta["thinking"].as_str() {
-                        let prev = *state.thinking_chars / 100;
-                        *state.thinking_chars += text.len();
-                        let curr = *state.thinking_chars / 100;
+                        block.ensure_thinking_started(out)?;
+                        let prev = block.thinking_chars / 100;
+                        block.thinking_chars += text.len();
+                        let curr = block.thinking_chars / 100;
                         for _ in prev..curr {
                             write!(out, ".")?;
                         }
@@ -182,38 +349,29 @@ fn handle_stream_event(
                 }
                 "text_delta" => {
                     if let Some(text) = delta["text"].as_str() {
+                        block.text.push_str(text);
                         write!(out, "{}", text)?;
                         out.flush()?;
                     }
                 }
                 "input_json_delta" => {
                     if let Some(json) = delta["partial_json"].as_str() {
-                        state.tool_input.push_str(json);
+                        block.tool_input.push_str(json);
                     }
                 }
                 _ => {} // signature_delta etc
             }
         }
         "content_block_stop" => {
-            if state.block_type.as_str() == "thinking" {
-                writeln!(out, "\x1b[0m")?;
-            } else if state.block_type.as_str() == "tool_use" {
-                let detail = extract_tool_detail(state.tool_name, state.tool_input);
-                if detail.is_empty() {
-                    writeln!(out, "\x1b[36m\u{1f527} {}\x1b[0m", state.tool_name)?;
-                } else {
-                    writeln!(
-                        out,
-                        "\x1b[36m\u{1f527} {}\x1b[0m \x1b[2m{}\x1b[0m",
-                        state.tool_name, detail
-                    )?;
-                }
-                if let Some(diff) = format_tool_diff(state.tool_name, state.tool_input) {
-                    write!(out, "{}", diff)?;
-                }
+            let index = event["index"]
+                .as_u64()
+                .and_then(|idx| usize::try_from(idx).ok())
+                .unwrap_or(0);
+            if let Some(block) = state.blocks.remove(&index) {
+                finalize_block(out, block)?;
             }
-            state.block_type.clear();
         }
+        "message_stop" => finalize_open_blocks(out, state.blocks)?,
         _ => {} // message_start, message_delta
     }
 
@@ -440,9 +598,13 @@ mod tests {
     }
 
     fn run_process(input: &str) -> String {
+        run_process_with_raw_log(input, None)
+    }
+
+    fn run_process_with_raw_log(input: &str, raw_output: Option<&std::path::Path>) -> String {
         let reader = Cursor::new(input.as_bytes().to_vec());
         let mut output = Vec::new();
-        process(reader, &mut output).unwrap();
+        process(reader, &mut output, raw_output).unwrap();
         String::from_utf8(output).unwrap()
     }
 
@@ -1115,6 +1277,83 @@ mod tests {
             "should not contain '✓ ?' fallback: {}",
             clean
         );
+    }
+
+    #[test]
+    fn process_input_json_delta_before_block_start() {
+        // 実装によっては delta が start より先に見えることがあるため、
+        // index 単位で入力断片を保持して後続 start と結合する。
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"cargo test\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"Bash","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":1}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(clean.contains("\u{1f527} Bash"), "got: {}", clean);
+        assert!(clean.contains("cargo test"), "got: {}", clean);
+        assert!(clean.contains("\u{2713} Bash"), "got: {}", clean);
+    }
+
+    #[test]
+    fn process_message_stop_flushes_open_tool_use() {
+        // content_block_stop が欠けても message_stop で未完了 block を確定する。
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"Read","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/tmp/demo.txt\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(clean.contains("\u{1f527} Read"), "got: {}", clean);
+        assert!(clean.contains("/tmp/demo.txt"), "got: {}", clean);
+    }
+
+    #[test]
+    fn process_server_tool_use() {
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srv1","name":"WebFetch","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"url\":\"https://example.com\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"srv1","content":"ok"}]}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(clean.contains("\u{1f527} WebFetch"), "got: {}", clean);
+        assert!(clean.contains("https://example.com"), "got: {}", clean);
+        assert!(clean.contains("\u{2713} WebFetch"), "got: {}", clean);
+    }
+
+    #[test]
+    fn process_writes_raw_stream_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_path = dir.path().join("raw.jsonl");
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            "",
+            "plain text line",
+        ]
+        .join("\n");
+
+        let _ = run_process_with_raw_log(&input, Some(&raw_path));
+        let raw = std::fs::read_to_string(&raw_path).unwrap();
+
+        assert!(raw.contains("\"content_block_start\""), "got: {}", raw);
+        assert!(raw.contains("\"text_delta\""), "got: {}", raw);
+        assert!(raw.contains("plain text line"), "got: {}", raw);
+        assert!(raw.lines().count() >= 4, "got: {}", raw);
     }
 
     // --- truncate_str の単体テスト ---

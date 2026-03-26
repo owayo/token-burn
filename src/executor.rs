@@ -225,7 +225,7 @@ pub fn execute_plan_tmux(
                 .map(|s| s.as_str() == "claude")
                 .unwrap_or(false);
             if is_claude {
-                // 生JSONを.jsonlに tee し、format-stream で整形して.logに出力
+                // format-stream 自身に生入力を .jsonl 保存させつつ、整形済みログを .log に出力
                 let jsonl_file = shell_escape(
                     &run_dir
                         .join(format!("{}.jsonl", log_base))
@@ -233,8 +233,8 @@ pub fn execute_plan_tmux(
                 );
                 let fmt_cmd = shell_escape(&exe_path.to_string_lossy());
                 script += &format!(
-                    "{} 2>&1 | tee {} | {} format-stream 2>&1 | tee {}\n",
-                    cmd_str, jsonl_file, fmt_cmd, log_file
+                    "{} 2>&1 | {} format-stream --raw-output {} 2>&1 | tee {}\n",
+                    cmd_str, fmt_cmd, jsonl_file, log_file
                 );
             } else {
                 // claude以外のエージェント: ログファイルに直接出力
