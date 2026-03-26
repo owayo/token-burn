@@ -16,6 +16,7 @@ pub fn run(raw_output: Option<&Path>) -> Result<()> {
 fn process(reader: impl BufRead, mut out: impl Write, raw_output: Option<&Path>) -> Result<()> {
     let mut tool_id_map: HashMap<String, String> = HashMap::new();
     let mut blocks: HashMap<usize, ContentBlockState> = HashMap::new();
+    let mut summary = StreamSummary::default();
     let mut raw_writer = match raw_output {
         Some(path) => Some(io::BufWriter::new(File::create(path)?)),
         None => None,
@@ -43,7 +44,9 @@ fn process(reader: impl BufRead, mut out: impl Write, raw_output: Option<&Path>)
         let msg_type = v["type"].as_str().unwrap_or("");
 
         match msg_type {
-            "system" => {} // 初期化メッセージをスキップ
+            "system" => {
+                summary.update_from_system(&v);
+            }
             "stream_event" => {
                 handle_stream_event(
                     &v["event"],
@@ -51,6 +54,7 @@ fn process(reader: impl BufRead, mut out: impl Write, raw_output: Option<&Path>)
                     &mut StreamState {
                         blocks: &mut blocks,
                         tool_id_map: &mut tool_id_map,
+                        summary: &mut summary,
                     },
                 )?;
             }
@@ -85,8 +89,9 @@ fn process(reader: impl BufRead, mut out: impl Write, raw_output: Option<&Path>)
                 }
             }
             "result" => {
+                summary.update_from_result(v.as_object());
                 finalize_open_blocks(&mut out, &mut blocks)?;
-                handle_result(&v, &mut out)?;
+                handle_result(&v, &summary, &mut out)?;
             }
             _ => {} // rate_limit_event, message_stop 等
         }
@@ -97,7 +102,11 @@ fn process(reader: impl BufRead, mut out: impl Write, raw_output: Option<&Path>)
     Ok(())
 }
 
-fn handle_result(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+fn handle_result(
+    v: &serde_json::Value,
+    summary: &StreamSummary,
+    out: &mut impl Write,
+) -> Result<()> {
     if let Some(cost) = v["total_cost_usd"].as_f64() {
         writeln!(out, "\n\x1b[33m\u{1f4b0} ${:.4}\x1b[0m", cost)?;
     }
@@ -115,12 +124,8 @@ fn handle_result(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
             writeln!(out, "\x1b[33m\u{23f1}  {}m {}s\x1b[0m", m, s)?;
         }
     }
-    let input = v["usage"]["input_tokens"].as_u64().unwrap_or(0)
-        + v["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0)
-        + v["usage"]["cache_creation_input_tokens"]
-            .as_u64()
-            .unwrap_or(0);
-    let output = v["usage"]["output_tokens"].as_u64().unwrap_or(0);
+    let input = summary.usage.total_input_tokens();
+    let output = summary.usage.output_tokens;
     if output > 0 {
         writeln!(
             out,
@@ -129,12 +134,164 @@ fn handle_result(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
             format_number(output)
         )?;
     }
+    if summary.usage.has_cache_details() {
+        let mut details = Vec::new();
+        if summary.usage.cache_read_input_tokens > 0 {
+            details.push(format!(
+                "read:{}",
+                format_number(summary.usage.cache_read_input_tokens)
+            ));
+        }
+        if summary.usage.cache_write_5m_tokens() > 0 {
+            details.push(format!(
+                "write5m:{}",
+                format_number(summary.usage.cache_write_5m_tokens())
+            ));
+        }
+        if summary.usage.cache_creation_1h_input_tokens > 0 {
+            details.push(format!(
+                "write1h:{}",
+                format_number(summary.usage.cache_creation_1h_input_tokens)
+            ));
+        }
+        writeln!(out, "\x1b[2m   cache {}\x1b[0m", details.join(" "))?;
+    }
+    if let Some(model) = &summary.model
+        && !model.is_empty()
+    {
+        writeln!(out, "\x1b[2m   model {}\x1b[0m", model)?;
+    }
+    if let Some(stop_reason) = &summary.stop_reason
+        && !stop_reason.is_empty()
+        && stop_reason != "end_turn"
+    {
+        writeln!(out, "\x1b[2m   stop {}\x1b[0m", stop_reason)?;
+    }
+    if summary.usage.web_search_requests > 0 {
+        writeln!(
+            out,
+            "\x1b[2m   web_search {}\x1b[0m",
+            summary.usage.web_search_requests
+        )?;
+    }
     Ok(())
 }
 
 struct StreamState<'a> {
     blocks: &'a mut HashMap<usize, ContentBlockState>,
     tool_id_map: &'a mut HashMap<String, String>,
+    summary: &'a mut StreamSummary,
+}
+
+#[derive(Default)]
+struct StreamSummary {
+    session_id: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+    message_id: Option<String>,
+    stop_reason: Option<String>,
+    usage: UsageSummary,
+}
+
+impl StreamSummary {
+    fn update_from_system(&mut self, value: &serde_json::Value) {
+        if self.session_id.is_none() {
+            self.session_id = value["session_id"].as_str().map(ToOwned::to_owned);
+        }
+        if self.cwd.is_none() {
+            self.cwd = value["cwd"].as_str().map(ToOwned::to_owned);
+        }
+    }
+
+    fn update_from_message(&mut self, value: &serde_json::Value) {
+        if let Some(model) = value["model"].as_str() {
+            self.model = Some(model.to_string());
+        }
+        if let Some(id) = value["id"].as_str() {
+            self.message_id = Some(id.to_string());
+        }
+        self.usage.merge_from_value(value.get("usage"));
+    }
+
+    fn update_from_message_delta(&mut self, event: &serde_json::Value) {
+        if let Some(stop_reason) = event["delta"]["stop_reason"].as_str() {
+            self.stop_reason = Some(stop_reason.to_string());
+        }
+        self.usage.merge_from_value(event.get("usage"));
+    }
+
+    fn update_from_result(&mut self, value: Option<&serde_json::Map<String, serde_json::Value>>) {
+        let Some(value) = value else {
+            return;
+        };
+        if let Some(model) = value.get("model").and_then(|v| v.as_str()) {
+            self.model = Some(model.to_string());
+        }
+        if let Some(stop_reason) = value.get("stop_reason").and_then(|v| v.as_str()) {
+            self.stop_reason = Some(stop_reason.to_string());
+        }
+        self.usage.merge_from_value(value.get("usage"));
+    }
+}
+
+#[derive(Default)]
+struct UsageSummary {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_creation_5m_input_tokens: u64,
+    cache_creation_1h_input_tokens: u64,
+    web_search_requests: u64,
+}
+
+impl UsageSummary {
+    fn merge_from_value(&mut self, value: Option<&serde_json::Value>) {
+        let Some(value) = value else {
+            return;
+        };
+
+        if let Some(v) = value["input_tokens"].as_u64() {
+            self.input_tokens = v;
+        }
+        if let Some(v) = value["output_tokens"].as_u64() {
+            self.output_tokens = v;
+        }
+        if let Some(v) = value["cache_read_input_tokens"].as_u64() {
+            self.cache_read_input_tokens = v;
+        }
+        if let Some(v) = value["cache_creation_input_tokens"].as_u64() {
+            self.cache_creation_input_tokens = v;
+        }
+        if let Some(v) = value["cache_creation"]["ephemeral_5m_input_tokens"].as_u64() {
+            self.cache_creation_5m_input_tokens = v;
+        }
+        if let Some(v) = value["cache_creation"]["ephemeral_1h_input_tokens"].as_u64() {
+            self.cache_creation_1h_input_tokens = v;
+        }
+        if let Some(v) = value["server_tool_use"]["web_search_requests"].as_u64() {
+            self.web_search_requests = v;
+        }
+    }
+
+    fn total_input_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
+
+    fn cache_write_5m_tokens(&self) -> u64 {
+        if self.cache_creation_5m_input_tokens > 0 {
+            self.cache_creation_5m_input_tokens
+        } else {
+            self.cache_creation_input_tokens
+        }
+    }
+
+    fn has_cache_details(&self) -> bool {
+        self.cache_read_input_tokens > 0
+            || self.cache_creation_input_tokens > 0
+            || self.cache_creation_5m_input_tokens > 0
+            || self.cache_creation_1h_input_tokens > 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,6 +432,7 @@ fn handle_stream_event(
     match event_type {
         "message_start" => {
             finalize_open_blocks(out, state.blocks)?;
+            state.summary.update_from_message(&event["message"]);
         }
         "content_block_start" => {
             let block = &event["content_block"];
@@ -370,6 +528,9 @@ fn handle_stream_event(
             if let Some(block) = state.blocks.remove(&index) {
                 finalize_block(out, block)?;
             }
+        }
+        "message_delta" => {
+            state.summary.update_from_message_delta(event);
         }
         "message_stop" => finalize_open_blocks(out, state.blocks)?,
         _ => {} // message_start, message_delta
@@ -867,6 +1028,11 @@ mod tests {
             "expected output tokens in: {}",
             clean
         );
+        assert!(
+            clean.contains("cache read:372,099 write5m:54,926"),
+            "expected cache breakdown in: {}",
+            clean
+        );
     }
 
     #[test]
@@ -1061,6 +1227,28 @@ mod tests {
             "expected output tokens in: {}",
             clean
         );
+    }
+
+    #[test]
+    fn process_result_shows_model_and_web_search_usage() {
+        let input = [
+            r#"{"type":"system","subtype":"init","cwd":"/tmp","session_id":"s1"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","id":"msg_1","usage":{"input_tokens":12,"cache_creation_input_tokens":44,"cache_creation":{"ephemeral_5m_input_tokens":30,"ephemeral_1h_input_tokens":14}}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":12,"output_tokens":7,"cache_read_input_tokens":20,"server_tool_use":{"web_search_requests":2}}}}"#,
+            r#"{"type":"result","total_cost_usd":0.0101,"duration_ms":1000}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(clean.contains("model claude-opus-4-6"), "got: {}", clean);
+        assert!(
+            clean.contains("cache read:20 write5m:30 write1h:14"),
+            "got: {}",
+            clean
+        );
+        assert!(clean.contains("web_search 2"), "got: {}", clean);
     }
 
     #[test]
