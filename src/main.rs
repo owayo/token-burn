@@ -61,7 +61,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// トークン消費を実行する
-    Run,
+    Run {
+        /// 強制実行するディレクトリパス（指定時はスキャン・状態フィルタリングをスキップ）
+        #[arg(value_name = "PATH")]
+        paths: Vec<PathBuf>,
+    },
     /// エージェントのリセット状況を表示する
     Status,
     /// 設定ファイルとプロンプト雛形を初期化する
@@ -109,7 +113,7 @@ fn parse_positive_limit(value: &str) -> Result<usize, String> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let command = cli.command.unwrap_or(Commands::Run);
+    let command = cli.command.unwrap_or(Commands::Run { paths: vec![] });
 
     if let Commands::Init { force } = command {
         let config_path = cli.config.unwrap_or_else(config::default_config_path);
@@ -147,7 +151,7 @@ async fn main() -> Result<()> {
         Commands::Status => {
             display::print_status(&config)?;
         }
-        Commands::Run => {
+        Commands::Run { paths } => {
             run(
                 config,
                 &config_path,
@@ -156,6 +160,7 @@ async fn main() -> Result<()> {
                 fresh,
                 limit,
                 public_only,
+                paths,
             )
             .await?;
         }
@@ -178,6 +183,7 @@ async fn run(
     fresh: bool,
     limit_override: Option<usize>,
     public_only: bool,
+    force_paths: Vec<PathBuf>,
 ) -> Result<()> {
     let (agent_idx, sched) = if let Some(name) = &agent_name {
         let idx = config
@@ -200,7 +206,11 @@ async fn run(
     );
     println!();
 
-    let targets = scanner::resolve_targets(&config, agent).await?;
+    let targets = if force_paths.is_empty() {
+        scanner::resolve_targets(&config, agent).await?
+    } else {
+        resolve_force_paths(&config, agent, &force_paths)?
+    };
 
     // 公開リポジトリのみにフィルタリング
     let (targets, public_filtered) = if public_only {
@@ -225,9 +235,10 @@ async fn run(
     }
 
     // 保存済み状態でフィルタリング（処理済みディレクトリをスキップ）
+    // force_paths 指定時は状態フィルタリングをスキップ
     let state_file = state::state_path(config_path);
     let run_state = state::State::load(&state_file);
-    let (targets, skipped) = if fresh {
+    let (targets, skipped) = if fresh || !force_paths.is_empty() {
         (targets, 0usize)
     } else {
         filter_by_state(targets, &run_state, agent, &config, &sched)
@@ -335,6 +346,43 @@ fn resolve_report_dir(settings: &config::Settings) -> PathBuf {
             .join("Documents")
             .join("token-burn")
     }
+}
+
+fn resolve_force_paths(
+    config: &config::Config,
+    agent: &config::Agent,
+    paths: &[PathBuf],
+) -> Result<Vec<scanner::ResolvedTarget>> {
+    let effective_default = agent.prompt.as_deref().unwrap_or(&config.prompts.default);
+    let default_prompt = config.resolve_prompt(effective_default)?;
+
+    let mut targets = Vec::new();
+    for path in paths {
+        let dir_str = path.to_string_lossy();
+        let resolved = config::resolve_directory(&dir_str)?;
+        if !resolved.exists() {
+            anyhow::bail!("Directory does not exist: {}", resolved.display());
+        }
+        if !resolved.is_dir() {
+            anyhow::bail!("Not a directory: {}", resolved.display());
+        }
+        let display_name = resolved
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| dir_str.to_string());
+        targets.push(scanner::ResolvedTarget {
+            directory: resolved,
+            display_name,
+            prompt: default_prompt.clone(),
+            visibility: scanner::Visibility::Unknown,
+        });
+    }
+
+    if targets.is_empty() {
+        anyhow::bail!("No valid paths specified");
+    }
+
+    Ok(targets)
 }
 
 fn filter_by_state(
