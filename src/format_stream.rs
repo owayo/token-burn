@@ -1177,4 +1177,67 @@ mod tests {
         assert_eq!(truncate_str(s, 5), "あいうえお");
         assert_eq!(truncate_str(s, 4), "あ...");
     }
+
+    #[test]
+    fn process_empty_tool_input_on_block_stop() {
+        // tool_input が空（partial_json なし）で content_block_stop が来た場合
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"Read","id":"t1"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop"}}"#,
+        ]
+        .join("\n");
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("Read"), "ツール名が表示されるべき");
+    }
+
+    #[test]
+    fn process_unknown_tool_result_id() {
+        // tool_id_map に存在しない ID の tool_result
+        let input = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"unknown-id","content":"ok"}]}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("?"), "不明なツールは '?' と表示されるべき");
+    }
+
+    #[test]
+    fn process_tool_result_error_flag() {
+        // is_error: true の tool_result は異なるマーカーで表示
+        let input = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"command failed"}]}}"#,
+        ]
+        .join("\n");
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+        // エラーマーカー "✗" が表示される
+        assert!(clean.contains("\u{2717}"), "エラーマーカーが表示されるべき");
+    }
+
+    #[test]
+    fn format_number_single_digit() {
+        assert_eq!(format_number(5), "5");
+    }
+
+    #[test]
+    fn format_number_three_digits() {
+        assert_eq!(format_number(999), "999");
+    }
+
+    #[test]
+    fn format_number_four_digits() {
+        assert_eq!(format_number(1000), "1,000");
+    }
+
+    #[test]
+    fn truncate_str_empty_string() {
+        assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn truncate_str_max_three() {
+        // max=3 の場合、3文字以下は変化なし、4文字以上は "..." のみ
+        assert_eq!(truncate_str("abc", 3), "abc");
+        assert_eq!(truncate_str("abcd", 3), "...");
+    }
 }

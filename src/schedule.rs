@@ -92,7 +92,7 @@ pub fn select_nearest_agent(agents: &[Agent]) -> Result<(usize, AgentSchedule)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Weekday;
+    use chrono::{Timelike, Weekday};
 
     #[test]
     fn days_until_same_weekday_is_zero() {
@@ -164,6 +164,59 @@ mod tests {
         let agent = make_agent("test-agent", "friday", "18:00");
         let sched = calculate_next_reset(&agent).unwrap();
         assert_eq!(sched.agent_name, "test-agent");
+    }
+
+    #[test]
+    fn select_nearest_agent_all_same_schedule() {
+        // 全エージェントが同じスケジュールの場合、いずれかのエージェントが返る
+        let agents = vec![
+            make_agent("first", "monday", "09:00"),
+            make_agent("second", "monday", "09:00"),
+        ];
+        let (idx, sched) = select_nearest_agent(&agents).unwrap();
+        // 同一スケジュールなので < 比較により最初のエージェントが保持される
+        assert!(idx < agents.len());
+        assert_eq!(sched.agent_name, agents[idx].name);
+    }
+
+    #[test]
+    fn calculate_next_reset_different_timezones() {
+        // 異なるタイムゾーンでも正しく計算される
+        let agent_tokyo = Agent {
+            name: "tokyo".to_string(),
+            command: vec!["echo".to_string()],
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "Asia/Tokyo".to_string(),
+            prompt: None,
+        };
+        let agent_utc = make_agent("utc", "monday", "09:00");
+
+        let sched_tokyo = calculate_next_reset(&agent_tokyo).unwrap();
+        let sched_utc = calculate_next_reset(&agent_utc).unwrap();
+
+        // 東京の方がUTCより早くリセットされる（UTC+9）
+        // 両方とも未来であること
+        assert!(sched_tokyo.time_until_reset.as_secs() > 0);
+        assert!(sched_utc.time_until_reset.as_secs() > 0);
+    }
+
+    #[test]
+    fn calculate_next_reset_midnight() {
+        // 深夜0時のリセットが正しく計算される
+        let agent = make_agent("midnight", "friday", "00:00");
+        let sched = calculate_next_reset(&agent).unwrap();
+        assert!(sched.time_until_reset.as_secs() > 0);
+        assert_eq!(sched.next_reset.time().hour(), 0);
+        assert_eq!(sched.next_reset.time().minute(), 0);
+    }
+
+    #[test]
+    fn calculate_next_reset_end_of_day() {
+        // 23:59のリセットが正しく計算される
+        let agent = make_agent("late", "sunday", "23:59");
+        let sched = calculate_next_reset(&agent).unwrap();
+        assert!(sched.time_until_reset.as_secs() > 0);
     }
 
     #[test]

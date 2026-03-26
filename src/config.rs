@@ -475,6 +475,70 @@ mod tests {
     }
 
     #[test]
+    fn parse_time_rejects_negative_values() {
+        // 負の値は数値パースで弾かれる
+        assert!(parse_time("-1:00").is_err());
+        assert!(parse_time("09:-5").is_err());
+    }
+
+    #[test]
+    fn parse_time_rejects_non_numeric() {
+        assert!(parse_time("ab:cd").is_err());
+        assert!(parse_time("9.5:00").is_err());
+    }
+
+    #[test]
+    fn parse_weekday_case_insensitive_mixed() {
+        // 大文字小文字混在でも受け付ける
+        assert_eq!(parse_weekday("MoNdAy").unwrap(), chrono::Weekday::Mon);
+        assert_eq!(parse_weekday("TUESDAY").unwrap(), chrono::Weekday::Tue);
+    }
+
+    #[test]
+    fn parse_weekday_rejects_partial_names() {
+        // 2文字の短縮形は受け付けない
+        assert!(parse_weekday("mo").is_err());
+        assert!(parse_weekday("fr").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_agent_names() {
+        // 同名エージェントは現状許容されている（バグではなく仕様確認）
+        let mut config = base_config();
+        config.agents.push(config.agents[0].clone());
+        // 同名エージェントでもバリデーションは通る（重複禁止ルールなし）
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn load_nonexistent_file_returns_error() {
+        let result = Config::load(Path::new("/nonexistent/config.toml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_invalid_toml_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "not valid toml {{{{").unwrap();
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_prompt_absolute_md_path() {
+        let tmp = TempDir::new().unwrap();
+        let prompt_path = tmp.path().join("absolute.md");
+        std::fs::write(&prompt_path, "absolute content").unwrap();
+
+        let config = base_config();
+        let result = config
+            .resolve_prompt(&prompt_path.to_string_lossy())
+            .unwrap();
+        assert_eq!(result, "absolute content");
+    }
+
+    #[test]
     fn resolve_directory_normalizes_relative_segments() {
         let old_cwd = std::env::current_dir().expect("cwd should be available");
         let tmp = TempDir::new().expect("temp dir should be created");

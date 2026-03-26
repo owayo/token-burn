@@ -317,4 +317,64 @@ mod tests {
         let d = parse_duration("1s").expect("1秒はパースできるべき");
         assert_eq!(d.num_seconds(), 1);
     }
+
+    #[test]
+    fn parse_duration_rejects_spaces() {
+        // スペースを含む期間文字列は拒否される
+        let err = parse_duration("1 d").expect_err("スペース入り期間は拒否されるべき");
+        assert!(err.to_string().contains("Invalid duration"));
+    }
+
+    #[test]
+    fn parse_duration_rejects_decimal() {
+        // 小数値は拒否される
+        let err = parse_duration("1.5d").expect_err("小数入り期間は拒否されるべき");
+        assert!(err.to_string().contains("Invalid duration"));
+    }
+
+    #[test]
+    fn parse_duration_rejects_uppercase_units() {
+        // 大文字単位は拒否される
+        let err = parse_duration("1D").expect_err("大文字単位は拒否されるべき");
+        assert!(err.to_string().contains("Invalid duration unit"));
+    }
+
+    #[test]
+    fn mark_completed_atomic_creates_parent_dirs() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let state_file = tmp.path().join("nested").join("dir").join("state.json");
+        mark_completed_atomic(&state_file, "agent", Path::new("/tmp/repo"))
+            .expect("親ディレクトリが自動作成されるべき");
+        assert!(state_file.exists());
+    }
+
+    #[test]
+    fn state_roundtrip_serialization() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let state_file = tmp.path().join("state.json");
+
+        // 書き込み
+        mark_completed_atomic(&state_file, "claude", Path::new("/tmp/repo-a"))
+            .expect("書き込み成功");
+        mark_completed_atomic(&state_file, "codex", Path::new("/tmp/repo-b"))
+            .expect("書き込み成功");
+
+        // 読み込み
+        let state = State::load(&state_file);
+        assert!(
+            state
+                .last_processed("claude", Path::new("/tmp/repo-a"))
+                .is_some()
+        );
+        assert!(
+            state
+                .last_processed("codex", Path::new("/tmp/repo-b"))
+                .is_some()
+        );
+        assert!(
+            state
+                .last_processed("claude", Path::new("/tmp/repo-b"))
+                .is_none()
+        );
+    }
 }

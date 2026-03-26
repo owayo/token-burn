@@ -90,4 +90,24 @@ mod tests {
         let d = Duration::from_secs(0);
         assert_eq!(format_duration(d), "0m");
     }
+
+    #[test]
+    fn format_duration_under_one_minute() {
+        // 1分未満は "0m" として表示される
+        let d = Duration::from_secs(59);
+        assert_eq!(format_duration(d), "0m");
+    }
+
+    #[test]
+    fn format_duration_exact_one_day() {
+        let d = Duration::from_secs(86400);
+        assert_eq!(format_duration(d), "1d 0h 0m");
+    }
+
+    #[test]
+    fn format_duration_large_value() {
+        // 30日以上の長期間
+        let d = Duration::from_secs(30 * 86400 + 5 * 3600 + 30 * 60);
+        assert_eq!(format_duration(d), "30d 5h 30m");
+    }
 }

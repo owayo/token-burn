@@ -691,6 +691,8 @@ fn strip_ansi(s: &str) -> String {
 fn truncate(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
         s.to_string()
+    } else if max_len <= 3 {
+        "...".to_string()
     } else {
         let truncated: String = s.chars().take(max_len - 3).collect();
         format!("{}...", truncated)
@@ -968,6 +970,59 @@ mod tests {
         // 日本語文字はアルファニューメリックとして扱われる
         let result = sanitize_filename("日本語repo");
         assert!(result.contains("repo"));
+    }
+
+    #[test]
+    fn truncate_max_len_zero() {
+        // max_len=0 の場合
+        assert_eq!(truncate("hello", 0), "...");
+    }
+
+    #[test]
+    fn truncate_max_len_one() {
+        assert_eq!(truncate("hello", 1), "...");
+    }
+
+    #[test]
+    fn truncate_max_len_two() {
+        assert_eq!(truncate("hello", 2), "...");
+    }
+
+    #[test]
+    fn truncate_emoji_string() {
+        // 絵文字を含む文字列の切り詰め
+        let input = "🔥🚀✨🎉💡";
+        assert_eq!(truncate(input, 5), "🔥🚀✨🎉💡");
+        assert_eq!(truncate(input, 4), "🔥...");
+    }
+
+    #[test]
+    fn ensure_required_flags_empty_command_returns_early() {
+        // command が空の場合（executable が空文字列にならない）
+        let mut agent = Agent {
+            name: "test".to_string(),
+            command: vec![],
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        let original_len = agent.command.len();
+        ensure_required_flags(&mut agent);
+        // 空のcommandは "claude" ではないので何も変更されない
+        assert_eq!(agent.command.len(), original_len);
+    }
+
+    #[test]
+    fn sanitize_filename_preserves_dots() {
+        assert_eq!(sanitize_filename("file.log"), "file.log");
+        assert_eq!(sanitize_filename("v1.2.3"), "v1.2.3");
+    }
+
+    #[test]
+    fn task_log_base_zero_padded() {
+        assert_eq!(task_log_base(1, "repo"), "0001_repo");
+        assert_eq!(task_log_base(9999, "repo"), "9999_repo");
     }
 
     #[test]
