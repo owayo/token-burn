@@ -152,16 +152,16 @@ async fn main() -> Result<()> {
             display::print_status(&config)?;
         }
         Commands::Run { paths } => {
-            run(
+            run(RunOptions {
                 config,
-                &config_path,
+                config_path,
                 agent_name,
                 dry_run,
                 fresh,
-                limit,
+                limit_override: limit,
                 public_only,
-                paths,
-            )
+                force_paths: paths,
+            })
             .await?;
         }
         Commands::Clean { older_than } => {
@@ -175,16 +175,28 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run(
+struct RunOptions {
     config: config::Config,
-    config_path: &std::path::Path,
+    config_path: PathBuf,
     agent_name: Option<String>,
     dry_run: bool,
     fresh: bool,
     limit_override: Option<usize>,
     public_only: bool,
     force_paths: Vec<PathBuf>,
-) -> Result<()> {
+}
+
+async fn run(opts: RunOptions) -> Result<()> {
+    let RunOptions {
+        config,
+        config_path,
+        agent_name,
+        dry_run,
+        fresh,
+        limit_override,
+        public_only,
+        force_paths,
+    } = opts;
     let (agent_idx, sched) = if let Some(name) = &agent_name {
         let idx = config
             .agents
@@ -236,7 +248,7 @@ async fn run(
 
     // 保存済み状態でフィルタリング（処理済みディレクトリをスキップ）
     // force_paths 指定時は状態フィルタリングをスキップ
-    let state_file = state::state_path(config_path);
+    let state_file = state::state_path(&config_path);
     let run_state = state::State::load(&state_file);
     let (targets, skipped) = if fresh || !force_paths.is_empty() {
         (targets, 0usize)
@@ -356,6 +368,7 @@ fn resolve_force_paths(
     let effective_default = agent.prompt.as_deref().unwrap_or(&config.prompts.default);
     let default_prompt = config.resolve_prompt(effective_default)?;
 
+    let mut seen = std::collections::HashSet::new();
     let mut targets = Vec::new();
     for path in paths {
         let dir_str = path.to_string_lossy();
@@ -365,6 +378,10 @@ fn resolve_force_paths(
         }
         if !resolved.is_dir() {
             anyhow::bail!("Not a directory: {}", resolved.display());
+        }
+        // 等価なパスが複数指定されても同一ターゲットは 1 回だけ処理する。
+        if !seen.insert(resolved.clone()) {
+            continue;
         }
         let display_name = resolved
             .file_name()
@@ -432,6 +449,7 @@ fn filter_by_state(
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn resolve_report_dir_uses_default_when_none() {
@@ -568,5 +586,60 @@ mod tests {
     fn cli_limit_rejects_zero() {
         let result = Cli::try_parse_from(["token-burn", "--limit", "0"]);
         assert!(result.is_err(), "limit=0 は CLI で拒否されるべき");
+    }
+
+    #[test]
+    fn resolve_force_paths_deduplicates_equivalent_relative_paths() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("token-burn-force-paths-test-{unique}"));
+        let repo_dir = temp_dir.join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("repo dir should be created");
+
+        let old_cwd = std::env::current_dir().expect("cwd should be available");
+        std::env::set_current_dir(&temp_dir).expect("should switch cwd");
+        let expected_repo_dir =
+            config::resolve_directory("repo").expect("repo path should resolve");
+
+        let config = config::Config {
+            config_dir: temp_dir.clone(),
+            settings: config::Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: config::Prompts {
+                default: "default prompt".to_string(),
+            },
+            agents: vec![config::Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![],
+            targets: vec![],
+        };
+
+        let resolved = resolve_force_paths(
+            &config,
+            &config.agents[0],
+            &[PathBuf::from("repo"), PathBuf::from("./repo")],
+        );
+
+        std::env::set_current_dir(old_cwd).expect("should restore cwd");
+        let resolved = resolved.expect("same directory should be deduplicated");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].directory, expected_repo_dir);
+        assert_eq!(resolved[0].display_name, "repo");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

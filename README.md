@@ -110,6 +110,9 @@ token-burn status
 # Preview execution plan
 token-burn run -n
 
+# Run only specific repositories
+token-burn run ~/GitHub/repo-a ./repo-b
+
 # Run token consumption
 token-burn run
 ```
@@ -140,6 +143,8 @@ token-burn run
 `init` also accepts `--force` (`-f`) to overwrite existing files without confirmation.
 
 `clean` accepts `--older-than` to override the configured `cleanup_after` duration (e.g., `--older-than 3d`).
+
+When you pass one or more `PATH` arguments to `run`, scan discovery and state-based skipping are bypassed for those directories. Equivalent paths such as `repo` and `./repo` are normalized and deduplicated, so the same directory is never executed twice in a single run.
 
 ## Configuration
 
@@ -235,6 +240,8 @@ When `username` is not set, repositories are included even if they do not have a
 If multiple `[[scan]]` entries discover the same repository directory, scan results are deduplicated by directory path so the same repository is not executed twice in a single run.
 
 Directory paths are normalized to absolute paths before deduplication and state tracking, so equivalent relative paths such as `repo` and `./repo` are treated as the same target.
+
+The same normalization and deduplication rule also applies when `token-burn run PATH...` is used to force specific directories.
 
 ### Prompts
 
