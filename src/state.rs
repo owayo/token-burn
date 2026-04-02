@@ -1,16 +1,44 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// エージェントごとのディレクトリパス → 最終処理タイムスタンプのマップ
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct State {
     #[serde(flatten)]
     pub agents: HashMap<String, HashMap<String, DateTime<Utc>>>,
+}
+
+impl Serialize for State {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // エージェント名でソートし、各エージェント内はタイムスタンプ降順でソート
+        let mut sorted_agents: Vec<_> = self.agents.iter().collect();
+        sorted_agents.sort_by_key(|(name, _)| (*name).clone());
+
+        let mut map = serializer.serialize_map(Some(sorted_agents.len()))?;
+        for (agent_name, entries) in sorted_agents {
+            let mut sorted_entries: Vec<_> = entries.iter().collect();
+            sorted_entries.sort_by(|(_, ts_a), (_, ts_b)| ts_b.cmp(ts_a));
+
+            let ordered: serde_json::Map<String, serde_json::Value> = sorted_entries
+                .into_iter()
+                .map(|(path, ts)| {
+                    (
+                        path.clone(),
+                        serde_json::Value::String(
+                            ts.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                        ),
+                    )
+                })
+                .collect();
+            map.serialize_entry(agent_name, &ordered)?;
+        }
+        map.end()
+    }
 }
 
 impl State {
