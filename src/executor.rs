@@ -20,12 +20,24 @@ pub fn build_plan(agent: &Agent, targets: Vec<ResolvedTarget>) -> ExecutionPlan 
     }
 }
 
+/// command の先頭要素が claude 実行ファイル（ラッパースクリプト含む）かを判定する。
+/// ファイル名（basename）が "claude" そのもの、または "claude-" / "claude_" で始まる場合に true。
+fn is_claude_command(command: &[String]) -> bool {
+    let Some(first) = command.first() else {
+        return false;
+    };
+    let basename = std::path::Path::new(first.as_str())
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    basename == "claude" || basename.starts_with("claude-") || basename.starts_with("claude_")
+}
+
 /// 既知エージェントに必要なフラグを自動付与する。
 /// `claude` の場合、`--verbose`、`--output-format stream-json`、`--include-partial-messages`
 /// はログ取得に必須であり、常に存在しなければならない。
 fn ensure_required_flags(agent: &mut Agent) {
-    let executable = agent.command.first().map(|s| s.as_str()).unwrap_or("");
-    if executable != "claude" {
+    if !is_claude_command(&agent.command) {
         return;
     }
 
@@ -218,12 +230,7 @@ pub fn execute_plan_tmux(
             script += &format!("{}\n", mark_cmd);
 
             script += &build_task_header_script(idx, total, &task.display_name);
-            let is_claude = plan
-                .agent
-                .command
-                .first()
-                .map(|s| s.as_str() == "claude")
-                .unwrap_or(false);
+            let is_claude = is_claude_command(&plan.agent.command);
             if is_claude {
                 // format-stream 自身に生入力を .jsonl 保存させつつ、整形済みログを .log に出力
                 let jsonl_file = shell_escape(
@@ -1071,6 +1078,56 @@ mod tests {
     fn strip_ansi_from_dir_nonexistent_dir_does_not_panic() {
         // 存在しないディレクトリでもパニックしない
         strip_ansi_from_dir(std::path::Path::new("/nonexistent/dir"));
+    }
+
+    #[test]
+    fn is_claude_command_detects_bare_claude() {
+        assert!(is_claude_command(&["claude".to_string()]));
+        assert!(is_claude_command(&["claude".to_string(), "-p".to_string()]));
+    }
+
+    #[test]
+    fn is_claude_command_detects_wrapper_script() {
+        assert!(is_claude_command(&[
+            "/Users/owa/shell/claude-wrapper.sh".to_string()
+        ]));
+        assert!(is_claude_command(&[
+            "./claude-wrapper.sh".to_string(),
+            "-p".to_string(),
+        ]));
+        assert!(is_claude_command(&["claude-code.sh".to_string()]));
+        assert!(is_claude_command(&["claude_custom".to_string()]));
+    }
+
+    #[test]
+    fn is_claude_command_rejects_non_claude() {
+        assert!(!is_claude_command(&["codex".to_string()]));
+        assert!(!is_claude_command(&["my-claude-fork".to_string()]));
+        assert!(!is_claude_command(&[]));
+    }
+
+    #[test]
+    fn ensure_required_flags_works_with_wrapper() {
+        let mut agent = Agent {
+            name: "claude".to_string(),
+            command: vec![
+                "/Users/owa/shell/claude-wrapper.sh".to_string(),
+                "-p".to_string(),
+            ],
+            reset_weekday: "friday".to_string(),
+            reset_time: "13:00".to_string(),
+            timezone: "Asia/Tokyo".to_string(),
+            prompt: None,
+        };
+        ensure_required_flags(&mut agent);
+        assert!(agent.command.contains(&"--verbose".to_string()));
+        assert!(agent.command.contains(&"--output-format".to_string()));
+        assert!(agent.command.contains(&"stream-json".to_string()));
+        assert!(
+            agent
+                .command
+                .contains(&"--include-partial-messages".to_string())
+        );
     }
 
     #[test]
