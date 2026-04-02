@@ -291,4 +291,67 @@ mod tests {
         let diff = sched.next_reset - sched.previous_reset;
         assert_eq!(diff.num_days(), 7);
     }
+
+    #[test]
+    fn select_nearest_agent_picks_closest_reset() {
+        // 異なるタイムゾーンのエージェントを用意し、最も近いリセットが選ばれることを確認
+        let now = Utc::now();
+        let today_weekday = now.weekday();
+
+        // 今日の曜日の次の曜日（1日後）と、その次（2日後）を設定
+        let next_day = today_weekday.succ();
+        let day_after = next_day.succ();
+        let weekday_to_str = |w: Weekday| -> &'static str {
+            match w {
+                Weekday::Mon => "monday",
+                Weekday::Tue => "tuesday",
+                Weekday::Wed => "wednesday",
+                Weekday::Thu => "thursday",
+                Weekday::Fri => "friday",
+                Weekday::Sat => "saturday",
+                Weekday::Sun => "sunday",
+            }
+        };
+
+        let agents = vec![
+            make_agent("far", weekday_to_str(day_after), "09:00"),
+            make_agent("near", weekday_to_str(next_day), "09:00"),
+        ];
+        let (idx, sched) = select_nearest_agent(&agents).unwrap();
+        assert_eq!(idx, 1, "最も近いリセットのエージェントが選ばれるべき");
+        assert_eq!(sched.agent_name, "near");
+    }
+
+    #[test]
+    fn calculate_next_reset_invalid_timezone_returns_error() {
+        let agent = Agent {
+            name: "bad-tz".to_string(),
+            command: vec!["echo".to_string()],
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "Invalid/Timezone".to_string(),
+            prompt: None,
+        };
+        let result = calculate_next_reset(&agent);
+        assert!(result.is_err(), "無効なタイムゾーンはエラーになるべき");
+    }
+
+    #[test]
+    fn calculate_next_reset_previous_is_always_past() {
+        // すべてのテストエージェントで previous_reset が現在時刻より過去であることを確認
+        let agents = vec![
+            make_agent("a", "monday", "00:00"),
+            make_agent("b", "wednesday", "12:00"),
+            make_agent("c", "friday", "23:59"),
+        ];
+        let now = Utc::now();
+        for agent in &agents {
+            let sched = calculate_next_reset(agent).unwrap();
+            assert!(
+                sched.previous_reset.with_timezone(&Utc) <= now,
+                "{} の previous_reset が未来になっている",
+                agent.name
+            );
+        }
+    }
 }

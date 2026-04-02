@@ -589,6 +589,45 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_invalid_reset_weekday() {
+        let mut config = base_config();
+        config.agents[0].reset_weekday = "notaday".to_string();
+        let err = config.validate().expect_err("無効な曜日は拒否されるべき");
+        assert!(err.to_string().contains("Invalid weekday"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_reset_time() {
+        let mut config = base_config();
+        config.agents[0].reset_time = "25:00".to_string();
+        let err = config.validate().expect_err("無効な時刻は拒否されるべき");
+        assert!(err.to_string().contains("Invalid time"));
+    }
+
+    #[test]
+    fn resolve_prompt_trims_whitespace_from_md_file() {
+        let tmp = TempDir::new().unwrap();
+        let prompt_path = tmp.path().join("whitespace.md");
+        std::fs::write(&prompt_path, "\n  content with whitespace  \n\n").unwrap();
+        let mut config = base_config();
+        config.config_dir = tmp.path().to_path_buf();
+        let result = config.resolve_prompt("whitespace.md").unwrap();
+        assert_eq!(result, "content with whitespace");
+    }
+
+    #[test]
+    fn normalize_path_multiple_parent_dirs() {
+        let path = normalize_path(Path::new("/a/b/c/../../d"));
+        assert_eq!(path, PathBuf::from("/a/d"));
+    }
+
+    #[test]
+    fn normalize_path_only_root() {
+        let path = normalize_path(Path::new("/"));
+        assert_eq!(path, PathBuf::from("/"));
+    }
+
+    #[test]
     // resolve_prompt で .md 以外の拡張子（.txt）はファイル読み込みではなくリテラルとして扱われる
     fn resolve_prompt_non_md_extension_is_treated_as_literal() {
         let tmp = TempDir::new().unwrap();

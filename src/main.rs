@@ -589,6 +589,189 @@ mod tests {
     }
 
     #[test]
+    fn filter_by_state_with_skip_within_uses_duration_cutoff() {
+        use chrono::Utc;
+
+        let agent = config::Agent {
+            name: "claude".to_string(),
+            command: vec!["echo".to_string()],
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        // skip_within を 1 時間に設定
+        let conf = config::Config {
+            config_dir: std::path::PathBuf::from("."),
+            settings: config::Settings {
+                parallelism: 1,
+                skip_within: Some("1h".to_string()),
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: config::Prompts {
+                default: "review".to_string(),
+            },
+            agents: vec![agent.clone()],
+            scan: vec![],
+            targets: vec![],
+        };
+        let sched = schedule::calculate_next_reset(&agent).unwrap();
+
+        let targets = vec![
+            scanner::ResolvedTarget {
+                directory: std::path::PathBuf::from("/tmp/recent-repo"),
+                display_name: "recent-repo".to_string(),
+                prompt: "review".to_string(),
+                visibility: scanner::Visibility::Unknown,
+            },
+            scanner::ResolvedTarget {
+                directory: std::path::PathBuf::from("/tmp/old-repo"),
+                display_name: "old-repo".to_string(),
+                prompt: "review".to_string(),
+                visibility: scanner::Visibility::Unknown,
+            },
+        ];
+
+        let mut run_state = state::State::default();
+        // 30分前に処理済み → skip_within=1h 以内なのでスキップ
+        run_state
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .insert(
+                "/tmp/recent-repo".to_string(),
+                Utc::now() - chrono::Duration::minutes(30),
+            );
+        // 2時間前に処理済み → skip_within=1h を超えているので再処理
+        run_state
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .insert(
+                "/tmp/old-repo".to_string(),
+                Utc::now() - chrono::Duration::hours(2),
+            );
+
+        let (kept, skipped) = filter_by_state(targets, &run_state, &agent, &conf, &sched);
+        assert_eq!(
+            skipped, 1,
+            "1時間以内に処理済みのターゲットはスキップされるべき"
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].display_name, "old-repo");
+    }
+
+    #[test]
+    fn resolve_force_paths_rejects_nonexistent_directory() {
+        let config = config::Config {
+            config_dir: std::path::PathBuf::from("."),
+            settings: config::Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: config::Prompts {
+                default: "default".to_string(),
+            },
+            agents: vec![config::Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![],
+            targets: vec![],
+        };
+
+        let result = resolve_force_paths(
+            &config,
+            &config.agents[0],
+            &[PathBuf::from("/nonexistent/path/that/does/not/exist")],
+        );
+        assert!(result.is_err(), "存在しないパスはエラーになるべき");
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn resolve_force_paths_rejects_file_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("token-burn-file-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let file_path = temp_dir.join("not-a-dir.txt");
+        std::fs::write(&file_path, "dummy").expect("file should be created");
+
+        let config = config::Config {
+            config_dir: temp_dir.clone(),
+            settings: config::Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: config::Prompts {
+                default: "default".to_string(),
+            },
+            agents: vec![config::Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![],
+            targets: vec![],
+        };
+
+        let result = resolve_force_paths(&config, &config.agents[0], &[file_path]);
+        assert!(result.is_err(), "ファイルパスはエラーになるべき");
+        assert!(result.unwrap_err().to_string().contains("Not a directory"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn resolve_force_paths_empty_paths_returns_error() {
+        let config = config::Config {
+            config_dir: std::path::PathBuf::from("."),
+            settings: config::Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: config::Prompts {
+                default: "default".to_string(),
+            },
+            agents: vec![config::Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![],
+            targets: vec![],
+        };
+
+        let result = resolve_force_paths(&config, &config.agents[0], &[]);
+        assert!(result.is_err(), "空のパスリストはエラーになるべき");
+        assert!(result.unwrap_err().to_string().contains("No valid paths"));
+    }
+
+    #[test]
     fn resolve_force_paths_deduplicates_equivalent_relative_paths() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
