@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use std::collections::HashMap;
@@ -27,10 +27,11 @@ impl Serialize for State {
             let ordered: serde_json::Map<String, serde_json::Value> = sorted_entries
                 .into_iter()
                 .map(|(path, ts)| {
+                    let local_ts: DateTime<Local> = (*ts).into();
                     (
                         path.clone(),
                         serde_json::Value::String(
-                            ts.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                            local_ts.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false),
                         ),
                     )
                 })
