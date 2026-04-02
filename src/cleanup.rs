@@ -177,4 +177,29 @@ mod tests {
             "2025-01-01 12:00:00"
         );
     }
+
+    #[test]
+    // ちょうど15文字でアンダースコア区切りがない場合もパースに成功する
+    fn parse_dir_timestamp_exact_15_chars_various_times() {
+        // 末日・最終時刻のバリエーション
+        let ts = parse_dir_timestamp("20251231_235959").unwrap();
+        assert_eq!(
+            ts.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2025-12-31 23:59:59"
+        );
+        // 後続文字列がアンダースコアではなくスラッシュなどでも先頭15文字が有効なら成功する
+        let ts2 = parse_dir_timestamp("20250601_000000/extra").unwrap();
+        assert_eq!(
+            ts2.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2025-06-01 00:00:00"
+        );
+    }
+
+    #[test]
+    // cleanup_old_reports に不正な max_age を渡した場合はエラーを返す
+    fn cleanup_old_reports_invalid_max_age_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let result = cleanup_old_reports(tmp.path(), "invalid");
+        assert!(result.is_err(), "不正な max_age はエラーになるべき");
+    }
 }

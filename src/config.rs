@@ -553,4 +553,54 @@ mod tests {
         assert_eq!(path, expected);
         assert!(path.is_absolute());
     }
+
+    #[test]
+    // normalize_path に空パス（""）を渡した場合は空の PathBuf を返す
+    fn normalize_path_empty_string_returns_empty() {
+        let path = normalize_path(Path::new(""));
+        assert_eq!(path, PathBuf::new());
+    }
+
+    #[test]
+    // parse_time の境界値 "00:59" は有効な時刻として受け付ける
+    fn parse_time_boundary_00_59_is_valid() {
+        let result = parse_time("00:59").unwrap();
+        assert_eq!(result, (0, 59));
+    }
+
+    #[test]
+    // scan と targets が両方存在する場合は validate が成功する（正常系の網羅）
+    fn validate_accepts_both_scan_and_targets() {
+        let mut config = base_config();
+        config.scan = vec![Scan {
+            base_dirs: vec![".".to_string()],
+            recursive: false,
+            username: None,
+            public_first: true,
+            exclude: vec![],
+        }];
+        config.targets = vec![Target {
+            directory: ".".to_string(),
+            prompt: None,
+        }];
+        config
+            .validate()
+            .expect("scan と targets が両方ある場合は成功するべき");
+    }
+
+    #[test]
+    // resolve_prompt で .md 以外の拡張子（.txt）はファイル読み込みではなくリテラルとして扱われる
+    fn resolve_prompt_non_md_extension_is_treated_as_literal() {
+        let tmp = TempDir::new().unwrap();
+        let txt_path = tmp.path().join("prompt.txt");
+        std::fs::write(&txt_path, "should not be read").unwrap();
+
+        let mut config = base_config();
+        config.config_dir = tmp.path().to_path_buf();
+
+        // .txt ファイルへのパス文字列をそのままリテラルとして返す
+        let value = txt_path.to_string_lossy().to_string();
+        let result = config.resolve_prompt(&value).unwrap();
+        assert_eq!(result, value);
+    }
 }

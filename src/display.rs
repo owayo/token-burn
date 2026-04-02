@@ -110,4 +110,18 @@ mod tests {
         let d = Duration::from_secs(30 * 86400 + 5 * 3600 + 30 * 60);
         assert_eq!(format_duration(d), "30d 5h 30m");
     }
+
+    #[test]
+    // ちょうど1時間（3600秒）は "1h 0m" を返す
+    fn format_duration_exact_one_hour() {
+        let d = Duration::from_secs(3600);
+        assert_eq!(format_duration(d), "1h 0m");
+    }
+
+    #[test]
+    // ちょうど1分（60秒）は "1m" を返す
+    fn format_duration_exact_one_minute() {
+        let d = Duration::from_secs(60);
+        assert_eq!(format_duration(d), "1m");
+    }
 }

@@ -92,7 +92,7 @@ pub fn select_nearest_agent(agents: &[Agent]) -> Result<(usize, AgentSchedule)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Timelike, Weekday};
+    use chrono::{Timelike, Utc, Weekday};
 
     #[test]
     fn days_until_same_weekday_is_zero() {
@@ -237,5 +237,58 @@ mod tests {
                 assert!(days <= 6, "{:?} → {:?} = {} (> 6)", from, to, days);
             }
         }
+    }
+
+    #[test]
+    #[should_panic]
+    fn select_nearest_agent_空スライスはパニック() {
+        // 空の agents スライスを渡すと agents[0] のインデックスアクセスでパニックになる
+        let agents: Vec<Agent> = vec![];
+        let _ = select_nearest_agent(&agents);
+    }
+
+    #[test]
+    fn calculate_next_reset_現在時刻と同一曜日同一時刻は7日後() {
+        // 現在時刻（UTC）の曜日と1分前の時刻をリセット設定に指定する
+        // days_until_weekday が 0 を返し、かつリセット時刻 < 現在時刻となるため
+        // next_reset <= now の条件に該当し、7日後にシフトされることを検証する
+        use chrono_tz::Tz;
+        let tz: Tz = "UTC".parse().unwrap();
+        let now = Utc::now().with_timezone(&tz);
+
+        let weekday_str = match now.weekday() {
+            Weekday::Mon => "monday",
+            Weekday::Tue => "tuesday",
+            Weekday::Wed => "wednesday",
+            Weekday::Thu => "thursday",
+            Weekday::Fri => "friday",
+            Weekday::Sat => "saturday",
+            Weekday::Sun => "sunday",
+        };
+
+        // 現在時刻の1分前をリセット時刻に設定（同一曜日 + 過去時刻 → 7日後にシフト）
+        let past_minute = now - chrono::Duration::minutes(1);
+        let reset_time = format!("{:02}:{:02}", past_minute.hour(), past_minute.minute());
+
+        let agent = make_agent("same-day", weekday_str, &reset_time);
+        let sched = calculate_next_reset(&agent).unwrap();
+
+        // next_reset は必ず現在より未来であること
+        assert!(
+            sched.next_reset > now,
+            "next_reset は現在時刻より未来でなければならない"
+        );
+
+        // 同一曜日・過去時刻のため7日後にシフトされるので、残り時間は6日超（余裕を持って5日以上）
+        let days_until = sched.time_until_reset.as_secs() / 86400;
+        assert!(
+            days_until >= 5,
+            "同一曜日の過去時刻を指定した場合、next_reset は7日後になるべきだが {} 日後だった",
+            days_until
+        );
+
+        // next_reset と previous_reset の差は常に7日
+        let diff = sched.next_reset - sched.previous_reset;
+        assert_eq!(diff.num_days(), 7);
     }
 }
