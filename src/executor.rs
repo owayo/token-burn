@@ -1039,4 +1039,49 @@ mod tests {
         ensure_required_flags(&mut agent);
         assert_eq!(agent.command.len(), original_len);
     }
+
+    #[test]
+    fn strip_ansi_from_dir_cleans_log_files() {
+        // .log ファイルから ANSI エスケープコードが除去されることを確認
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log_path = tmp.path().join("test.log");
+        let jsonl_path = tmp.path().join("test.jsonl");
+        let txt_path = tmp.path().join("test.txt");
+
+        std::fs::write(&log_path, "\x1b[1mBold\x1b[0m text").unwrap();
+        std::fs::write(&jsonl_path, "\x1b[31mred\x1b[0m").unwrap();
+        std::fs::write(&txt_path, "\x1b[32mgreen\x1b[0m").unwrap();
+
+        strip_ansi_from_dir(tmp.path());
+
+        // .log ファイルのみ ANSI が除去される
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "Bold text");
+        // .jsonl と .txt は変更されない
+        assert_eq!(
+            std::fs::read_to_string(&jsonl_path).unwrap(),
+            "\x1b[31mred\x1b[0m"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&txt_path).unwrap(),
+            "\x1b[32mgreen\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_from_dir_nonexistent_dir_does_not_panic() {
+        // 存在しないディレクトリでもパニックしない
+        strip_ansi_from_dir(std::path::Path::new("/nonexistent/dir"));
+    }
+
+    #[test]
+    fn build_shell_command_includes_cd_and_prompt() {
+        let cmd = build_shell_command(
+            &["claude".to_string(), "-p".to_string()],
+            std::path::Path::new("/tmp/prompt.txt"),
+            std::path::Path::new("/home/user/repo"),
+        );
+        assert!(cmd.contains("cd '/home/user/repo'"));
+        assert!(cmd.contains("$(cat '/tmp/prompt.txt')"));
+        assert!(cmd.contains("'claude' '-p'"));
+    }
 }

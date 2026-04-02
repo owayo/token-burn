@@ -248,6 +248,31 @@ mod tests {
     }
 
     #[test]
+    fn default_config_is_valid_toml() {
+        // DEFAULT_CONFIG が有効な TOML としてパースでき、Config 構造体にデシリアライズできることを確認
+        let config: Result<crate::config::Config, _> = toml::from_str(DEFAULT_CONFIG);
+        let config = config.expect("DEFAULT_CONFIG は有効な TOML であるべき");
+        assert!(
+            !config.agents.is_empty(),
+            "エージェントが定義されているべき"
+        );
+        assert!(config.settings.parallelism > 0, "並列数が正の値であるべき");
+    }
+
+    #[test]
+    fn default_prompts_are_not_empty() {
+        // 組み込みプロンプトが空でないことを確認
+        assert!(
+            !DEFAULT_PROMPT.trim().is_empty(),
+            "英語プロンプトが空であってはならない"
+        );
+        assert!(
+            !DEFAULT_PROMPT_JA.trim().is_empty(),
+            "日本語プロンプトが空であってはならない"
+        );
+    }
+
+    #[test]
     fn run_init_overwrites_with_force() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
