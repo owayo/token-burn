@@ -218,8 +218,6 @@ pub fn execute_plan_tmux(
             // シグナルハンドラ用に現タスクの失敗マーカーを設定
             script += &format!("CURRENT_FAILED_MARKER={}\n", failed_marker);
 
-            // 実行前に状態を記録: タスク開始時点でトークンは消費されるため、
-            // セッションが途中で終了しても再実行しない
             let mark_cmd = format!(
                 "{} mark {} {} {}",
                 shell_escape(&exe_path.to_string_lossy()),
@@ -227,7 +225,6 @@ pub fn execute_plan_tmux(
                 shell_escape(&task.directory.to_string_lossy()),
                 shell_escape(&state_file.to_string_lossy()),
             );
-            script += &format!("{}\n", mark_cmd);
 
             script += &build_task_header_script(idx, total, &task.display_name);
             let is_claude = is_claude_command(&plan.agent.command);
@@ -251,32 +248,74 @@ pub fn execute_plan_tmux(
             // シグナルハンドラのターゲットをクリア（終了コード取得済み、通常フローで処理）
             script += "CURRENT_FAILED_MARKER=\"\"\n";
             // 終了コードを確認
-            script += &format!(
-                concat!(
-                    "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
-                    "  if [ $CANCELLED -eq 1 ]; then\n",
-                    "    CANCELLED=0\n",
-                    "    touch {failed}\n",
-                    "    echo '━━━ Cancelled ━━━'\n",
-                    "  else\n",
-                    "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
-                    "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
-                    "    touch {failed}; touch {wdone}\n",
-                    "    printf '\\033]2;Worker {w} error\\033\\\\'\n",
-                    "    echo '━━━ Error - stopped ━━━'\n",
-                    "    exec sleep infinity\n",
-                    "  fi\n",
-                    "else\n",
-                    "  touch {done}\n",
-                    "fi\n",
-                ),
-                prefix = error_prefix,
-                error = error_file,
-                failed = failed_marker,
-                wdone = worker_done_marker,
-                w = w + 1,
-                done = done_marker,
-            );
+            if is_claude {
+                let jsonl_file = shell_escape(
+                    &run_dir
+                        .join(format!("{}.jsonl", log_base))
+                        .to_string_lossy(),
+                );
+                script += &format!(
+                    concat!(
+                        "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
+                        "  if [ $CANCELLED -eq 1 ]; then\n",
+                        "    CANCELLED=0\n",
+                        "    touch {failed}\n",
+                        "    echo '━━━ Cancelled ━━━'\n",
+                        "  else\n",
+                        "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+                        "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
+                        "    touch {failed}; touch {wdone}\n",
+                        "    printf '\\033]2;Worker {w} error\\033\\\\'\n",
+                        "    echo '━━━ Error - stopped ━━━'\n",
+                        "    exec sleep infinity\n",
+                        "  fi\n",
+                        "elif grep -q '\"type\":\"rate_limit_event\"' {jsonl} 2>/dev/null; then\n",
+                        "  touch {failed}\n",
+                        "  echo '━━━ Rate limited - not marking as completed ━━━'\n",
+                        "else\n",
+                        "  {mark}\n",
+                        "  touch {done}\n",
+                        "fi\n",
+                    ),
+                    prefix = error_prefix,
+                    error = error_file,
+                    failed = failed_marker,
+                    wdone = worker_done_marker,
+                    w = w + 1,
+                    done = done_marker,
+                    jsonl = jsonl_file,
+                    mark = mark_cmd,
+                );
+            } else {
+                script += &format!(
+                    concat!(
+                        "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
+                        "  if [ $CANCELLED -eq 1 ]; then\n",
+                        "    CANCELLED=0\n",
+                        "    touch {failed}\n",
+                        "    echo '━━━ Cancelled ━━━'\n",
+                        "  else\n",
+                        "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+                        "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
+                        "    touch {failed}; touch {wdone}\n",
+                        "    printf '\\033]2;Worker {w} error\\033\\\\'\n",
+                        "    echo '━━━ Error - stopped ━━━'\n",
+                        "    exec sleep infinity\n",
+                        "  fi\n",
+                        "else\n",
+                        "  {mark}\n",
+                        "  touch {done}\n",
+                        "fi\n",
+                    ),
+                    prefix = error_prefix,
+                    error = error_file,
+                    failed = failed_marker,
+                    wdone = worker_done_marker,
+                    w = w + 1,
+                    done = done_marker,
+                    mark = mark_cmd,
+                );
+            }
             script += "echo ''\n";
         }
         script += &format!("printf '\\033]2;Worker {} done\\033\\\\'\n", w + 1);
