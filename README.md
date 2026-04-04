@@ -49,6 +49,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Deadline enforcement**: Kills all child processes when the reset time arrives
 - **Parallel execution**: Runs multiple prompts concurrently in tmux split panes with progress monitor
 - **Sub-agent monitoring**: Real-time progress and completion notifications for Claude Code team/agent tasks
+- **Per-model usage**: Displays token usage and cost breakdown per model (e.g., Opus, Haiku) in result summary
 - **Collision-safe logs**: Per-task logs are numbered to avoid overwrite when display names collide
 - **Prompt files**: Prompts can be `.md` files or inline strings
 - **Resume**: Automatically skips already-processed directories; configurable skip duration

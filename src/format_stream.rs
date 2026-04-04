@@ -236,6 +236,24 @@ fn handle_result(
         }
         writeln!(out, "\x1b[2m   web {}\x1b[0m", parts.join(" "))?;
     }
+    // モデル別使用量（modelUsage）の表示
+    if let Some(model_usage) = v["modelUsage"].as_object() {
+        for (model_id, usage) in model_usage {
+            let cost = usage["costUSD"].as_f64().unwrap_or(0.0);
+            let input_tokens = usage["inputTokens"].as_u64().unwrap_or(0);
+            let output_tokens = usage["outputTokens"].as_u64().unwrap_or(0);
+            if cost > 0.0 || output_tokens > 0 {
+                writeln!(
+                    out,
+                    "\x1b[2m   {} ${:.4} (in:{} out:{})\x1b[0m",
+                    model_id,
+                    cost,
+                    format_number(input_tokens),
+                    format_number(output_tokens)
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -647,6 +665,30 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
                 && !team.is_empty()
             {
                 return team.to_string();
+            }
+        }
+        "Write" => {
+            let file = v["file_path"].as_str().unwrap_or("");
+            let content = v["content"].as_str().unwrap_or("");
+            let lines = content.lines().count();
+            return format!("{} ({} lines)", truncate_str(file, 80), lines);
+        }
+        "Skill" => {
+            let skill = v["skill"].as_str().unwrap_or("");
+            let args = v["args"].as_str().unwrap_or("");
+            if !args.is_empty() {
+                return format!("{} ({})", skill, truncate_str(args, 60));
+            }
+            return skill.to_string();
+        }
+        "TodoWrite" => {
+            if let Some(todos) = v["todos"].as_array() {
+                let total = todos.len();
+                let done = todos
+                    .iter()
+                    .filter(|t| t["status"].as_str() == Some("completed"))
+                    .count();
+                return format!("{}/{} completed", done, total);
             }
         }
         _ => {}
@@ -1842,5 +1884,56 @@ mod tests {
 
         assert!(!clean.contains("hook"), "hook events should be silent");
         assert!(clean.contains("OK"), "text should still appear");
+    }
+
+    #[test]
+    fn extract_tool_detail_write_shows_file_and_line_count() {
+        let input = r#"{"file_path":"/src/new.ts","content":"line1\nline2\nline3"}"#;
+        let result = extract_tool_detail("Write", input);
+        assert!(result.contains("/src/new.ts"));
+        assert!(result.contains("3 lines"));
+    }
+
+    #[test]
+    fn extract_tool_detail_skill_with_args() {
+        let input = r#"{"skill":"codex","args":"コードレビューして"}"#;
+        let result = extract_tool_detail("Skill", input);
+        assert_eq!(result, "codex (コードレビューして)");
+    }
+
+    #[test]
+    fn extract_tool_detail_skill_without_args() {
+        let input = r#"{"skill":"commit"}"#;
+        let result = extract_tool_detail("Skill", input);
+        assert_eq!(result, "commit");
+    }
+
+    #[test]
+    fn extract_tool_detail_todo_write_shows_progress() {
+        let input = r#"{"todos":[{"content":"task1","status":"completed","activeForm":"t1"},{"content":"task2","status":"in_progress","activeForm":"t2"},{"content":"task3","status":"pending","activeForm":"t3"}]}"#;
+        let result = extract_tool_detail("TodoWrite", input);
+        assert_eq!(result, "1/3 completed");
+    }
+
+    #[test]
+    fn process_result_with_model_usage_breakdown() {
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":1.5,"duration_ms":60000,"modelUsage":{"claude-opus-4-6[1m]":{"inputTokens":50000,"outputTokens":10000,"costUSD":1.2},"claude-haiku-4-5-20251001":{"inputTokens":5000,"outputTokens":2000,"costUSD":0.3}}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("claude-opus-4-6[1m]"),
+            "モデル名が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("$1.2000"),
+            "モデル別コストが表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("claude-haiku"),
+            "Haikuモデルも表示されるべき: {}",
+            clean
+        );
     }
 }
