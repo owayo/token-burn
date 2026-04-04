@@ -46,6 +46,7 @@ fn process(reader: impl BufRead, mut out: impl Write, raw_output: Option<&Path>)
         match msg_type {
             "system" => {
                 summary.update_from_system(&v);
+                handle_system_event(&v, &mut out)?;
             }
             "stream_event" => {
                 handle_stream_event(
@@ -99,6 +100,64 @@ fn process(reader: impl BufRead, mut out: impl Write, raw_output: Option<&Path>)
 
     finalize_open_blocks(&mut out, &mut blocks)?;
 
+    Ok(())
+}
+
+/// system イベントのうち、サブエージェント進捗・完了通知を表示する。
+fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    let subtype = v["subtype"].as_str().unwrap_or("");
+    match subtype {
+        "task_progress" => {
+            let desc = v["description"].as_str().unwrap_or("");
+            let tool = v["last_tool_name"].as_str().unwrap_or("");
+            if !desc.is_empty() {
+                if !tool.is_empty() {
+                    writeln!(
+                        out,
+                        "\x1b[2m  \u{1f504} {} ({})\x1b[0m",
+                        truncate_str(desc, 80),
+                        tool
+                    )?;
+                } else {
+                    writeln!(out, "\x1b[2m  \u{1f504} {}\x1b[0m", truncate_str(desc, 80))?;
+                }
+            }
+        }
+        "task_notification" => {
+            let status = v["status"].as_str().unwrap_or("");
+            let summary = v["summary"].as_str().unwrap_or("");
+            let tokens = v["usage"]["total_tokens"].as_u64().unwrap_or(0);
+            let duration_ms = v["usage"]["duration_ms"].as_u64().unwrap_or(0);
+            let dur_s = duration_ms / 1000;
+            let m = dur_s / 60;
+            let s = dur_s % 60;
+            if status == "completed" {
+                if !summary.is_empty() {
+                    writeln!(
+                        out,
+                        "\x1b[32m  \u{2705} {} ({}m {}s, {} tokens)\x1b[0m",
+                        truncate_str(summary, 60),
+                        m,
+                        s,
+                        format_number(tokens)
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "\x1b[32m  \u{2705} Task completed ({}m {}s)\x1b[0m",
+                        m, s
+                    )?;
+                }
+            } else if status == "failed" {
+                writeln!(
+                    out,
+                    "\x1b[31m  \u{274c} Task {} ({}m {}s)\x1b[0m",
+                    status, m, s
+                )?;
+            }
+        }
+        _ => {} // init, hook_started, hook_response, task_started 等は無視
+    }
     Ok(())
 }
 
@@ -167,12 +226,15 @@ fn handle_result(
     {
         writeln!(out, "\x1b[2m   stop {}\x1b[0m", stop_reason)?;
     }
-    if summary.usage.web_search_requests > 0 {
-        writeln!(
-            out,
-            "\x1b[2m   web_search {}\x1b[0m",
-            summary.usage.web_search_requests
-        )?;
+    if summary.usage.web_search_requests > 0 || summary.usage.web_fetch_requests > 0 {
+        let mut parts = Vec::new();
+        if summary.usage.web_search_requests > 0 {
+            parts.push(format!("search:{}", summary.usage.web_search_requests));
+        }
+        if summary.usage.web_fetch_requests > 0 {
+            parts.push(format!("fetch:{}", summary.usage.web_fetch_requests));
+        }
+        writeln!(out, "\x1b[2m   web {}\x1b[0m", parts.join(" "))?;
     }
     Ok(())
 }
@@ -243,6 +305,7 @@ struct UsageSummary {
     cache_creation_5m_input_tokens: u64,
     cache_creation_1h_input_tokens: u64,
     web_search_requests: u64,
+    web_fetch_requests: u64,
 }
 
 impl UsageSummary {
@@ -271,6 +334,9 @@ impl UsageSummary {
         }
         if let Some(v) = value["server_tool_use"]["web_search_requests"].as_u64() {
             self.web_search_requests = v;
+        }
+        if let Some(v) = value["server_tool_use"]["web_fetch_requests"].as_u64() {
+            self.web_fetch_requests = v;
         }
     }
 
@@ -564,7 +630,7 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             }
             return truncate_str(cmd, 100).to_string();
         }
-        "Task" => {
+        "Task" | "Agent" => {
             let desc = v["description"].as_str().unwrap_or("");
             let name = v["name"].as_str().unwrap_or("");
             let agent_type = v["subagent_type"].as_str().unwrap_or("");
@@ -1248,7 +1314,7 @@ mod tests {
             "got: {}",
             clean
         );
-        assert!(clean.contains("web_search 2"), "got: {}", clean);
+        assert!(clean.contains("web search:2"), "got: {}", clean);
     }
 
     #[test]
@@ -1666,5 +1732,115 @@ mod tests {
         // max=3 の場合、3文字以下は変化なし、4文字以上は "..." のみ
         assert_eq!(truncate_str("abc", 3), "abc");
         assert_eq!(truncate_str("abcd", 3), "...");
+    }
+
+    #[test]
+    fn process_task_progress_shows_subagent_progress() {
+        let input = [
+            r#"{"type":"system","subtype":"task_progress","task_id":"abc","tool_use_id":"tu1","description":"Running List all files","usage":{"total_tokens":5000,"tool_uses":1,"duration_ms":4823},"last_tool_name":"Bash"}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("\u{1f504} Running List all files (Bash)"),
+            "expected task progress in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_task_notification_completed() {
+        let input = [
+            r#"{"type":"system","subtype":"task_notification","task_id":"abc","tool_use_id":"tu1","status":"completed","summary":"コードベースの徹底レビュー","usage":{"total_tokens":141902,"tool_uses":47,"duration_ms":158066}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("\u{2705}"),
+            "expected completion mark in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("コードベースの徹底レビュー"),
+            "expected summary in: {}",
+            clean
+        );
+        assert!(clean.contains("2m 38s"), "expected duration in: {}", clean);
+        assert!(
+            clean.contains("141,902 tokens"),
+            "expected token count in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_task_notification_failed() {
+        let input = [
+            r#"{"type":"system","subtype":"task_notification","task_id":"abc","tool_use_id":"tu1","status":"failed","summary":"","usage":{"total_tokens":500,"tool_uses":1,"duration_ms":5000}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("\u{274c} Task failed"),
+            "expected failure mark in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_agent_with_description() {
+        let input = r#"{"description":"research codebase","prompt":"Investigate..."}"#;
+        assert_eq!(extract_tool_detail("Agent", input), "research codebase");
+    }
+
+    #[test]
+    fn extract_tool_detail_agent_with_name_and_type() {
+        let input = r#"{"description":"do stuff","name":"worker-1","subagent_type":"Explore"}"#;
+        assert_eq!(extract_tool_detail("Agent", input), "worker-1 (Explore)");
+    }
+
+    #[test]
+    fn process_result_with_web_fetch_requests() {
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"server_tool_use":{"web_search_requests":1,"web_fetch_requests":3}}}}"#,
+            r#"{"type":"result","total_cost_usd":0.01,"duration_ms":1000}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("web search:1 fetch:3"),
+            "expected web search and fetch in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_hook_events_are_silently_ignored() {
+        let input = [
+            r#"{"type":"system","subtype":"hook_started","hook_id":"h1","hook_name":"SessionStart:startup"}"#,
+            r#"{"type":"system","subtype":"hook_response","hook_id":"h1","hook_name":"SessionStart:startup","exit_code":0}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(!clean.contains("hook"), "hook events should be silent");
+        assert!(clean.contains("OK"), "text should still appear");
     }
 }

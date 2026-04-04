@@ -53,6 +53,13 @@ make release  # リリースビルド
 
 `claude` エージェントのみ出力を `.jsonl` + `format-stream` パイプラインで処理します。`codex` 等の他エージェントは `.log` に直接出力します。
 
+`format-stream` は以下の stream-json イベントを処理します:
+- テキスト応答のストリーミング表示
+- 思考ブロック（`thinking`）のプログレスインジケーター
+- ツール使用（`Read`/`Edit`/`Bash`/`Agent`/`Task`/`TeamCreate` 等）の詳細表示と差分出力
+- サブエージェントの進捗通知（`task_progress`）と完了通知（`task_notification`）
+- トークン使用量、コスト、キャッシュ内訳、Web検索/フェッチ回数の集計表示
+
 処理済み状態は有効な設定ファイルと同じディレクトリの `state.json` に保存されます（デフォルト: `~/.config/token-burn/state.json`）。
 
 `[settings]` の `limit` は 1 以上である必要があります。
