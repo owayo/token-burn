@@ -269,7 +269,7 @@ pub fn execute_plan_tmux(
                         "    echo '━━━ Error - stopped ━━━'\n",
                         "    exec sleep infinity\n",
                         "  fi\n",
-                        "elif grep -q '\"type\":\"rate_limit_event\"' {jsonl} 2>/dev/null; then\n",
+                        "elif grep '\"type\":\"result\"' {jsonl} 2>/dev/null | tail -1 | grep -qE 'resets [0-9]+(am|pm)'; then\n",
                         "  touch {failed}\n",
                         "  echo '━━━ Rate limited - not marking as completed ━━━'\n",
                         "else\n",
