@@ -877,8 +877,9 @@ mod tests {
             }],
         };
 
-        let resolved = resolve_force_paths(&config, &config.agents[0], &[repo_dir.clone()])
-            .expect("should resolve");
+        let resolved =
+            resolve_force_paths(&config, &config.agents[0], std::slice::from_ref(&repo_dir))
+                .expect("should resolve");
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].prompt, "custom target prompt");
@@ -916,8 +917,9 @@ mod tests {
             targets: vec![],
         };
 
-        let resolved = resolve_force_paths(&config, &config.agents[0], &[repo_dir.clone()])
-            .expect("should resolve");
+        let resolved =
+            resolve_force_paths(&config, &config.agents[0], std::slice::from_ref(&repo_dir))
+                .expect("should resolve");
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].prompt, "default prompt");
