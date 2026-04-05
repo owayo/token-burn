@@ -387,10 +387,28 @@ fn resolve_force_paths(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| dir_str.to_string());
+
+        // [[targets]] に定義された専用プロンプトがあればそちらを優先する
+        let prompt = config
+            .targets
+            .iter()
+            .filter_map(|t| {
+                let t_resolved = config::resolve_directory(&t.directory).ok()?;
+                if t_resolved == resolved {
+                    t.prompt.as_deref()
+                } else {
+                    None
+                }
+            })
+            .next()
+            .map(|p| config.resolve_prompt(p))
+            .transpose()?
+            .unwrap_or_else(|| default_prompt.clone());
+
         targets.push(scanner::ResolvedTarget {
             directory: resolved,
             display_name,
-            prompt: default_prompt.clone(),
+            prompt,
             visibility: scanner::Visibility::Unknown,
         });
     }
@@ -822,6 +840,87 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].directory, expected_repo_dir);
         assert_eq!(resolved[0].display_name, "repo");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn resolve_force_paths_uses_target_prompt() {
+        let temp_dir = std::env::temp_dir().join("token-burn-test-target-prompt");
+        let repo_dir = temp_dir.join("my-repo");
+        let _ = std::fs::create_dir_all(&repo_dir);
+
+        let config = config::Config {
+            config_dir: std::path::PathBuf::from("/tmp"),
+            settings: config::Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: config::Prompts {
+                default: "default prompt".to_string(),
+            },
+            agents: vec![config::Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![],
+            targets: vec![config::Target {
+                directory: repo_dir.to_string_lossy().to_string(),
+                prompt: Some("custom target prompt".to_string()),
+            }],
+        };
+
+        let resolved = resolve_force_paths(&config, &config.agents[0], &[repo_dir.clone()])
+            .expect("should resolve");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].prompt, "custom target prompt");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn resolve_force_paths_falls_back_to_default_without_target() {
+        let temp_dir = std::env::temp_dir().join("token-burn-test-no-target-prompt");
+        let repo_dir = temp_dir.join("other-repo");
+        let _ = std::fs::create_dir_all(&repo_dir);
+
+        let config = config::Config {
+            config_dir: std::path::PathBuf::from("/tmp"),
+            settings: config::Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: config::Prompts {
+                default: "default prompt".to_string(),
+            },
+            agents: vec![config::Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![],
+            targets: vec![],
+        };
+
+        let resolved = resolve_force_paths(&config, &config.agents[0], &[repo_dir.clone()])
+            .expect("should resolve");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].prompt, "default prompt");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
