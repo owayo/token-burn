@@ -242,17 +242,38 @@ fn handle_result(
             let cost = usage["costUSD"].as_f64().unwrap_or(0.0);
             let input_tokens = usage["inputTokens"].as_u64().unwrap_or(0);
             let output_tokens = usage["outputTokens"].as_u64().unwrap_or(0);
+            let cache_creation = usage["cacheCreationInputTokens"].as_u64().unwrap_or(0);
+            let web_search = usage["webSearchRequests"].as_u64().unwrap_or(0);
             if cost > 0.0 || output_tokens > 0 {
+                let mut extras = Vec::new();
+                if cache_creation > 0 {
+                    extras.push(format!("cache_write:{}", format_number(cache_creation)));
+                }
+                if web_search > 0 {
+                    extras.push(format!("web:{}", web_search));
+                }
+                let extra_str = if extras.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", extras.join(" "))
+                };
                 writeln!(
                     out,
-                    "\x1b[2m   {} ${:.4} (in:{} out:{})\x1b[0m",
+                    "\x1b[2m   {} ${:.4} (in:{} out:{}{})\x1b[0m",
                     model_id,
                     cost,
                     format_number(input_tokens),
-                    format_number(output_tokens)
+                    format_number(output_tokens),
+                    extra_str,
                 )?;
             }
         }
+    }
+    // fast_mode の表示（off 以外の場合）
+    if let Some(fast_mode) = v["fast_mode_state"].as_str()
+        && fast_mode != "off"
+    {
+        writeln!(out, "\x1b[2m   fast_mode {}\x1b[0m", fast_mode)?;
     }
     Ok(())
 }
@@ -1935,5 +1956,94 @@ mod tests {
             "Haikuモデルも表示されるべき: {}",
             clean
         );
+    }
+
+    #[test]
+    fn process_result_with_model_usage_cache_and_web() {
+        // modelUsage に cacheCreationInputTokens と webSearchRequests が含まれる場合
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":2.0,"duration_ms":120000,"modelUsage":{"claude-opus-4-6[1m]":{"inputTokens":80000,"outputTokens":15000,"costUSD":2.0,"cacheCreationInputTokens":50000,"webSearchRequests":3}}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("cache_write:50,000"),
+            "キャッシュ書き込みトークンが表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("web:3"),
+            "Web検索回数が表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_with_fast_mode_on() {
+        // fast_mode_state が "on" の場合は表示される
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.5,"duration_ms":30000,"fast_mode_state":"on"}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("fast_mode on"),
+            "fast_mode が表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_with_fast_mode_off() {
+        // fast_mode_state が "off" の場合は表示されない
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.5,"duration_ms":30000,"fast_mode_state":"off"}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            !clean.contains("fast_mode"),
+            "fast_mode off は表示されるべきでない: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_without_fast_mode() {
+        // fast_mode_state フィールドがない場合も表示されない
+        let input =
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.5,"duration_ms":30000}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            !clean.contains("fast_mode"),
+            "fast_mode フィールドがない場合は表示されるべきでない: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_model_usage_without_extras() {
+        // modelUsage に cacheCreationInputTokens や webSearchRequests がない場合
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":1.0,"duration_ms":60000,"modelUsage":{"claude-opus-4-6":{"inputTokens":30000,"outputTokens":5000,"costUSD":1.0}}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("claude-opus-4-6"),
+            "モデル名が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            !clean.contains("cache_write"),
+            "キャッシュ情報がない場合は表示されるべきでない: {}",
+            clean
+        );
+        assert!(
+            !clean.contains("web:"),
+            "Web検索情報がない場合は表示されるべきでない: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_rate_limit_event_ignored() {
+        // rate_limit_event は無視される
+        let input = r#"{"type":"rate_limit_event","limits":{"input_tokens":{"limit":100000,"remaining":50000}}}"#;
+        let output = run_process(input);
+        assert!(output.is_empty(), "rate_limit_event は出力されるべきでない");
     }
 }

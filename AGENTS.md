@@ -59,7 +59,8 @@ make release  # リリースビルド
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`/`Agent`/`Task`/`TeamCreate`/`Skill`/`TodoWrite` 等）の詳細表示と差分出力
 - サブエージェントの進捗通知（`task_progress`）と完了通知（`task_notification`）
 - トークン使用量、コスト、キャッシュ内訳、Web検索/フェッチ回数の集計表示
-- モデル別使用量（`modelUsage`）の内訳表示
+- モデル別使用量（`modelUsage`）の内訳表示（キャッシュ書き込みトークン、Web検索回数を含む）
+- fast mode 状態の表示（`fast_mode_state` が `off` 以外の場合）
 
 処理済み状態は有効な設定ファイルと同じディレクトリの `state.json` に保存されます（デフォルト: `~/.config/token-burn/state.json`）。
 
