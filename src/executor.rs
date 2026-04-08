@@ -125,6 +125,8 @@ pub fn execute_plan_tmux(
     reset_info: &str,
     report_dir: &std::path::Path,
 ) -> Result<()> {
+    anyhow::ensure!(!plan.tasks.is_empty(), "No tasks to execute");
+
     // tmux の存在確認
     std::process::Command::new("tmux")
         .arg("-V")

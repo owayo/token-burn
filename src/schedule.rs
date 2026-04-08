@@ -29,17 +29,18 @@ pub fn calculate_next_reset(agent: &Agent) -> Result<AgentSchedule> {
     let next_reset_date = now.date_naive() + chrono::Duration::days(days_until as i64);
     let next_reset_naive = next_reset_date.and_time(target_time);
 
+    // DST切り替え時の曖昧な時刻に対応するため earliest() を使用
     let next_reset = tz
         .from_local_datetime(&next_reset_naive)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("Ambiguous or invalid datetime"))?;
+        .earliest()
+        .ok_or_else(|| anyhow::anyhow!("Invalid datetime for timezone {}", agent.timezone))?;
 
     let next_reset = if next_reset <= now {
         let next_date = next_reset_date + chrono::Duration::days(7);
         let next_naive = next_date.and_time(target_time);
         tz.from_local_datetime(&next_naive)
-            .single()
-            .ok_or_else(|| anyhow::anyhow!("Ambiguous or invalid datetime"))?
+            .earliest()
+            .ok_or_else(|| anyhow::anyhow!("Invalid datetime for timezone {}", agent.timezone))?
     } else {
         next_reset
     };
@@ -48,8 +49,10 @@ pub fn calculate_next_reset(agent: &Agent) -> Result<AgentSchedule> {
         let prev_date = next_reset.date_naive() - chrono::Duration::days(7);
         let prev_naive = prev_date.and_time(target_time);
         tz.from_local_datetime(&prev_naive)
-            .single()
-            .ok_or_else(|| anyhow::anyhow!("Ambiguous or invalid datetime for previous reset"))?
+            .earliest()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Invalid datetime for previous reset in {}", agent.timezone)
+            })?
     };
 
     let duration = (next_reset - now)
@@ -75,6 +78,7 @@ fn days_until_weekday(current: Weekday, target: Weekday) -> u32 {
 }
 
 pub fn select_nearest_agent(agents: &[Agent]) -> Result<(usize, AgentSchedule)> {
+    anyhow::ensure!(!agents.is_empty(), "No agents configured");
     let mut nearest_idx = 0;
     let mut nearest_schedule = calculate_next_reset(&agents[0])?;
 
@@ -240,11 +244,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn select_nearest_agent_空スライスはパニック() {
-        // 空の agents スライスを渡すと agents[0] のインデックスアクセスでパニックになる
+    fn select_nearest_agent_空スライスはエラー() {
         let agents: Vec<Agent> = vec![];
-        let _ = select_nearest_agent(&agents);
+        let result = select_nearest_agent(&agents);
+        assert!(result.is_err(), "空スライスはエラーを返すべき");
     }
 
     #[test]

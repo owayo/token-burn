@@ -165,7 +165,8 @@ fn find_repos(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        // シンボリックリンクの追跡による無限再帰を防止
+        if path.is_symlink() || !path.is_dir() {
             continue;
         }
 
@@ -807,6 +808,79 @@ mod tests {
         assert_eq!(resolved[0].directory, expected_repo_dir);
         assert_eq!(resolved[0].display_name, "repo");
         assert_eq!(resolved[0].prompt, "target prompt");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn find_repos_skips_symlinks() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("token-burn-scanner-symlink-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+
+        // 実際のgitリポジトリを作成
+        let real_repo = temp_dir.join("real-repo");
+        std::fs::create_dir_all(&real_repo).expect("real-repo dir should be created");
+        let status = std::process::Command::new("git")
+            .args(["-C", &real_repo.to_string_lossy(), "init", "--quiet"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        // シンボリックリンクで同じリポジトリを指す
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real_repo, temp_dir.join("link-repo"))
+                .expect("symlink should be created");
+        }
+
+        let scan = Scan {
+            base_dirs: vec![temp_dir.to_string_lossy().to_string()],
+            recursive: false,
+            username: None,
+            public_first: true,
+            exclude: vec![],
+        };
+
+        let config = Config {
+            config_dir: temp_dir.clone(),
+            settings: Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+            },
+            prompts: Prompts {
+                default: "test".to_string(),
+            },
+            agents: vec![Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![scan],
+            targets: vec![],
+        };
+
+        let resolved = resolve_targets(&config, &config.agents[0]).await;
+        let resolved = resolved.expect("resolve should succeed");
+
+        // シンボリックリンクはスキップされ、実ディレクトリのみ検出される
+        assert_eq!(
+            resolved.len(),
+            1,
+            "シンボリックリンクはスキップされるべき: {:?}",
+            resolved.iter().map(|r| &r.display_name).collect::<Vec<_>>()
+        );
+        assert_eq!(resolved[0].display_name, "real-repo");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

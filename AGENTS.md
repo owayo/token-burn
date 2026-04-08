@@ -59,7 +59,8 @@ make release  # リリースビルド
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`/`Agent`/`Task`/`TeamCreate`/`Skill`/`TodoWrite` 等）の詳細表示と差分出力
 - サブエージェントの進捗通知（`task_progress`）と完了通知（`task_notification`）
 - トークン使用量、コスト、キャッシュ内訳、Web検索/フェッチ回数の集計表示
-- モデル別使用量（`modelUsage`）の内訳表示（キャッシュ書き込みトークン、Web検索回数を含む）
+- モデル別使用量（`modelUsage`）の内訳表示（キャッシュ読み取り/書き込みトークン、Web検索回数を含む）
+- API応答時間（`duration_api_ms`）の表示
 - fast mode 状態の表示（`fast_mode_state` が `off` 以外の場合）
 
 処理済み状態は有効な設定ファイルと同じディレクトリの `state.json` に保存されます（デフォルト: `~/.config/token-burn/state.json`）。
@@ -68,6 +69,8 @@ make release  # リリースビルド
 `[settings]` の `skip_within` と `cleanup_after` には `d` / `h` / `m` / `s` を使った有効な期間文字列を指定する必要があり、不正な値は設定読み込み時にエラーになります。
 
 `[[scan]]` で `username` を指定した場合、リポジトリ可視性（public/private）はローカルディレクトリ名ではなく `origin` の remote URL に含まれるリポジトリ名（大文字小文字を無視）で照合されます。`username` を指定しない通常スキャンでは `origin` remote がなくても対象に含まれ、可視性は `Unknown` になります。
+
+`[[scan]]` のディレクトリスキャンではシンボリックリンクはスキップされます（循環リンクによる無限再帰を防止）。
 
 複数の `[[scan]]` 設定で同一ディレクトリが重複検出された場合、ターゲットは1件に正規化されます（同一リポジトリの重複実行を防止）。
 

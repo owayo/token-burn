@@ -173,11 +173,17 @@ fn handle_result(
         let secs = ms / 1000;
         let m = secs / 60;
         let s = secs % 60;
+        let api_part = if let Some(api_ms) = v["duration_api_ms"].as_u64() {
+            let api_secs = api_ms / 1000;
+            format!(" api:{}m {}s", api_secs / 60, api_secs % 60)
+        } else {
+            String::new()
+        };
         if let Some(turns) = v["num_turns"].as_u64() {
             writeln!(
                 out,
-                "\x1b[33m\u{23f1}  {}m {}s ({} turns)\x1b[0m",
-                m, s, turns
+                "\x1b[33m\u{23f1}  {}m {}s ({} turns{})\x1b[0m",
+                m, s, turns, api_part
             )?;
         } else {
             writeln!(out, "\x1b[33m\u{23f1}  {}m {}s\x1b[0m", m, s)?;
@@ -242,10 +248,14 @@ fn handle_result(
             let cost = usage["costUSD"].as_f64().unwrap_or(0.0);
             let input_tokens = usage["inputTokens"].as_u64().unwrap_or(0);
             let output_tokens = usage["outputTokens"].as_u64().unwrap_or(0);
+            let cache_read = usage["cacheReadInputTokens"].as_u64().unwrap_or(0);
             let cache_creation = usage["cacheCreationInputTokens"].as_u64().unwrap_or(0);
             let web_search = usage["webSearchRequests"].as_u64().unwrap_or(0);
             if cost > 0.0 || output_tokens > 0 {
                 let mut extras = Vec::new();
+                if cache_read > 0 {
+                    extras.push(format!("cache_read:{}", format_number(cache_read)));
+                }
                 if cache_creation > 0 {
                     extras.push(format!("cache_write:{}", format_number(cache_creation)));
                 }
@@ -385,10 +395,14 @@ impl UsageSummary {
 
     fn cache_write_5m_tokens(&self) -> u64 {
         if self.cache_creation_5m_input_tokens > 0 {
-            self.cache_creation_5m_input_tokens
-        } else {
-            self.cache_creation_input_tokens
+            return self.cache_creation_5m_input_tokens;
         }
+        // 1hの内訳が存在する場合、5mは本当に0
+        if self.cache_creation_1h_input_tokens > 0 {
+            return 0;
+        }
+        // 内訳が存在しない場合は合計値をフォールバック
+        self.cache_creation_input_tokens
     }
 
     fn has_cache_details(&self) -> bool {
@@ -2045,5 +2059,109 @@ mod tests {
         let input = r#"{"type":"rate_limit_event","limits":{"input_tokens":{"limit":100000,"remaining":50000}}}"#;
         let output = run_process(input);
         assert!(output.is_empty(), "rate_limit_event は出力されるべきでない");
+    }
+
+    #[test]
+    fn cache_write_5m_returns_zero_when_only_1h_exists() {
+        // 1hキャッシュのみ存在する場合、5mは0を返す（二重表示の防止）
+        let usage = UsageSummary {
+            cache_creation_input_tokens: 20000,
+            cache_creation_1h_input_tokens: 20000,
+            ..Default::default()
+        };
+        assert_eq!(usage.cache_write_5m_tokens(), 0);
+    }
+
+    #[test]
+    fn cache_write_5m_returns_5m_when_both_exist() {
+        // 5mと1hの両方が存在する場合、5mの値を返す
+        let usage = UsageSummary {
+            cache_creation_input_tokens: 15000,
+            cache_creation_5m_input_tokens: 5000,
+            cache_creation_1h_input_tokens: 10000,
+            ..Default::default()
+        };
+        assert_eq!(usage.cache_write_5m_tokens(), 5000);
+    }
+
+    #[test]
+    fn cache_write_5m_fallback_when_no_breakdown() {
+        // 内訳が存在しない場合は合計値をフォールバック
+        let usage = UsageSummary {
+            cache_creation_input_tokens: 8000,
+            ..Default::default()
+        };
+        assert_eq!(usage.cache_write_5m_tokens(), 8000);
+    }
+
+    #[test]
+    fn process_result_with_model_usage_cache_read() {
+        // modelUsage に cacheReadInputTokens が含まれる場合の表示
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":3.0,"duration_ms":180000,"modelUsage":{"claude-opus-4-6[1m]":{"inputTokens":100,"outputTokens":20000,"costUSD":3.0,"cacheReadInputTokens":5000000,"cacheCreationInputTokens":80000}}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("cache_read:5,000,000"),
+            "cacheReadInputTokens が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("cache_write:80,000"),
+            "cacheCreationInputTokens も表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_with_duration_api_ms() {
+        // duration_api_ms が含まれる場合 api:Xm Ys が表示される
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":1.0,"duration_ms":600000,"duration_api_ms":900000,"num_turns":50}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("api:15m 0s"),
+            "duration_api_ms が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("10m 0s"),
+            "duration_ms も表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_without_duration_api_ms() {
+        // duration_api_ms がない場合は api: が表示されない
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.5,"duration_ms":120000,"num_turns":10}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            !clean.contains("api:"),
+            "duration_api_ms がない場合は api: は表示されるべきでない: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_only_1h_cache_no_write5m() {
+        // 1hキャッシュのみの場合、write5m が表示されずに write1h のみ表示される
+        let lines = [
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","id":"msg_01","type":"message","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":5000,"cache_creation_input_tokens":2000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2000}}}}}"#,
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.1,"duration_ms":5000}"#,
+        ];
+        let input = lines.join("\n");
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+        assert!(
+            !clean.contains("write5m:"),
+            "1hのみの場合 write5m は表示されるべきでない: {}",
+            clean
+        );
+        assert!(
+            clean.contains("write1h:2,000"),
+            "write1h が表示されるべき: {}",
+            clean
+        );
     }
 }
