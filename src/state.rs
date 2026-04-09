@@ -160,6 +160,7 @@ pub fn parse_duration(s: &str) -> Result<chrono::Duration> {
 #[cfg(test)]
 mod tests {
     use super::{State, mark_completed_atomic, parse_duration, state_path};
+    use chrono::{DateTime, Utc};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
@@ -404,6 +405,48 @@ mod tests {
             state
                 .last_processed("claude", Path::new("/tmp/repo-b"))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn state_serialization_orders_agents_and_entries() {
+        // エージェント名はアルファベット順、エントリはタイムスタンプ降順でシリアライズされる
+        let mut state = State::default();
+        let ts_old = DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ts_new = DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // 逆順で追加
+        state
+            .agents
+            .entry("codex".to_string())
+            .or_default()
+            .insert("/repo-a".to_string(), ts_old);
+        state
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .insert("/repo-z".to_string(), ts_old);
+        state
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .insert("/repo-a".to_string(), ts_new);
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let claude_pos = json.find("\"claude\"").expect("claude が存在するべき");
+        let codex_pos = json.find("\"codex\"").expect("codex が存在するべき");
+        assert!(claude_pos < codex_pos, "claude は codex より前に来るべき");
+
+        // claude 内では ts_new の /repo-a が ts_old の /repo-z より前
+        let repo_a_pos = json.find("/repo-a").expect("/repo-a が存在するべき");
+        let repo_z_pos = json.find("/repo-z").expect("/repo-z が存在するべき");
+        assert!(
+            repo_a_pos < repo_z_pos,
+            "新しいタイムスタンプのエントリが先に来るべき"
         );
     }
 }

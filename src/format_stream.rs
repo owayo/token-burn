@@ -94,7 +94,10 @@ fn process(reader: impl BufRead, mut out: impl Write, raw_output: Option<&Path>)
                 finalize_open_blocks(&mut out, &mut blocks)?;
                 handle_result(&v, &summary, &mut out)?;
             }
-            _ => {} // rate_limit_event, message_stop 等
+            "rate_limit_event" => {
+                handle_rate_limit_event(&v, &mut out)?;
+            }
+            _ => {} // message_stop 等
         }
     }
 
@@ -156,7 +159,50 @@ fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()
                 )?;
             }
         }
-        _ => {} // init, hook_started, hook_response, task_started 等は無視
+        "api_retry" => {
+            let attempt = v["attempt"].as_u64().unwrap_or(0);
+            let max_retries = v["max_retries"].as_u64().unwrap_or(0);
+            let error = v["error"].as_str().unwrap_or("unknown");
+            let status = v["error_status"]
+                .as_u64()
+                .map(|s| format!(" ({})", s))
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "\x1b[33m  \u{26a0} API retry {}/{}: {}{}\x1b[0m",
+                attempt, max_retries, error, status
+            )?;
+        }
+        _ => {} // init, hook_started, hook_response, hook_progress, task_started 等は無視
+    }
+    Ok(())
+}
+
+/// レート制限イベントを表示する。
+/// `allowed_warning` は使用率の警告、`rejected` はリクエスト拒否を示す。
+fn handle_rate_limit_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    let info = &v["rate_limit_info"];
+    let status = info["status"].as_str().unwrap_or("");
+    match status {
+        "allowed_warning" => {
+            let utilization = info["utilization"].as_f64().unwrap_or(0.0);
+            let limit_type = info["rateLimitType"].as_str().unwrap_or("");
+            writeln!(
+                out,
+                "\x1b[33m  \u{26a0} Rate limit warning: {:.0}% used ({})\x1b[0m",
+                utilization * 100.0,
+                limit_type
+            )?;
+        }
+        "rejected" => {
+            let limit_type = info["rateLimitType"].as_str().unwrap_or("");
+            writeln!(
+                out,
+                "\x1b[31m  \u{1f6ab} Rate limited: request rejected ({})\x1b[0m",
+                limit_type
+            )?;
+        }
+        _ => {} // "allowed" は表示不要
     }
     Ok(())
 }
@@ -2161,6 +2207,87 @@ mod tests {
         assert!(
             clean.contains("write1h:2,000"),
             "write1h が表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_rate_limit_warning_shows_utilization() {
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.79}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("79%"), "使用率が表示されるべき: {}", clean);
+        assert!(
+            clean.contains("seven_day"),
+            "制限タイプが表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_rate_limit_rejected_shows_error() {
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("rejected"),
+            "拒否状態が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("five_hour"),
+            "制限タイプが表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_rate_limit_allowed_is_silent() {
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"seven_day","utilization":0.5}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.is_empty(),
+            "allowed は表示されるべきでない: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_api_retry_shows_attempt_info() {
+        let input = r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"error":"server_error","error_status":503}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("1/10"),
+            "試行回数が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("server_error"),
+            "エラー種別が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("503"),
+            "HTTPステータスが表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_api_retry_null_status() {
+        let input = r#"{"type":"system","subtype":"api_retry","attempt":2,"max_retries":10,"error":"unknown","error_status":null}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("2/10"),
+            "試行回数が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            !clean.contains("("),
+            "null ステータスは括弧なしで表示されるべき: {}",
             clean
         );
     }

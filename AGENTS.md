@@ -62,6 +62,8 @@ make release  # リリースビルド
 - モデル別使用量（`modelUsage`）の内訳表示（キャッシュ読み取り/書き込みトークン、Web検索回数を含む）
 - API応答時間（`duration_api_ms`）の表示
 - fast mode 状態の表示（`fast_mode_state` が `off` 以外の場合）
+- レート制限警告（`rate_limit_event`）の使用率表示とリクエスト拒否通知
+- APIリトライ（`api_retry`）の試行回数とエラー情報の表示
 
 処理済み状態は有効な設定ファイルと同じディレクトリの `state.json` に保存されます（デフォルト: `~/.config/token-burn/state.json`）。
 

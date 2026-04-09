@@ -1172,6 +1172,25 @@ mod tests {
     }
 
     #[test]
+    fn ensure_required_flags_rewrites_equals_style_non_stream_json() {
+        // --output-format=text のequals形式は --output-format=stream-json に書き換えられる
+        let mut agent = make_agent(vec!["claude", "-p", "--output-format=text"]);
+        ensure_required_flags(&mut agent);
+        assert!(
+            agent
+                .command
+                .contains(&"--output-format=stream-json".to_string()),
+            "equals形式の値が stream-json に書き換えられるべき: {:?}",
+            agent.command
+        );
+        assert!(
+            !agent.command.contains(&"--output-format=text".to_string()),
+            "元の値が残るべきでない: {:?}",
+            agent.command
+        );
+    }
+
+    #[test]
     fn build_shell_command_includes_cd_and_prompt() {
         let cmd = build_shell_command(
             &["claude".to_string(), "-p".to_string()],
