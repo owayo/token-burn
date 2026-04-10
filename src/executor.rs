@@ -258,7 +258,11 @@ pub fn execute_plan_tmux(
                 );
                 script += &format!(
                     concat!(
-                        "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
+                        // レート制限チェックを終了コードより先に行う（レート制限時もCLIは非ゼロで終了するため）
+                        "if grep '\"type\":\"result\"' {jsonl} 2>/dev/null | tail -1 | grep -qE 'resets [0-9]+(am|pm)'; then\n",
+                        "  touch {failed}\n",
+                        "  echo '━━━ Rate limited - not marking as completed ━━━'\n",
+                        "elif [ \"$CMD_EXIT\" -ne 0 ]; then\n",
                         "  if [ $CANCELLED -eq 1 ]; then\n",
                         "    CANCELLED=0\n",
                         "    touch {failed}\n",
@@ -271,9 +275,6 @@ pub fn execute_plan_tmux(
                         "    echo '━━━ Error - stopped ━━━'\n",
                         "    exec sleep infinity\n",
                         "  fi\n",
-                        "elif grep '\"type\":\"result\"' {jsonl} 2>/dev/null | tail -1 | grep -qE 'resets [0-9]+(am|pm)'; then\n",
-                        "  touch {failed}\n",
-                        "  echo '━━━ Rate limited - not marking as completed ━━━'\n",
                         "else\n",
                         "  {mark}\n",
                         "  touch {done}\n",
