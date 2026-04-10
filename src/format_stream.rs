@@ -6,14 +6,20 @@ use std::path::Path;
 
 /// `claude -p` の stream-json 出力を読みやすいテキストに変換する。
 /// JSON以外の行はそのまま出力（任意のエージェントで動作）。
-pub fn run(raw_output: Option<&Path>) -> Result<()> {
+pub fn run(raw_output: Option<&Path>, stop_file: Option<&Path>, threshold: u8) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let out = stdout.lock();
-    process(stdin.lock(), out, raw_output)
+    process(stdin.lock(), out, raw_output, stop_file, threshold)
 }
 
-fn process(reader: impl BufRead, mut out: impl Write, raw_output: Option<&Path>) -> Result<()> {
+fn process(
+    reader: impl BufRead,
+    mut out: impl Write,
+    raw_output: Option<&Path>,
+    stop_file: Option<&Path>,
+    threshold: u8,
+) -> Result<()> {
     let mut tool_id_map: HashMap<String, String> = HashMap::new();
     let mut blocks: HashMap<usize, ContentBlockState> = HashMap::new();
     let mut summary = StreamSummary::default();
@@ -95,7 +101,7 @@ fn process(reader: impl BufRead, mut out: impl Write, raw_output: Option<&Path>)
                 handle_result(&v, &summary, &mut out)?;
             }
             "rate_limit_event" => {
-                handle_rate_limit_event(&v, &mut out)?;
+                handle_rate_limit_event(&v, &mut out, stop_file, threshold)?;
             }
             _ => {} // message_stop 等
         }
@@ -180,22 +186,38 @@ fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()
 
 /// レート制限イベントを表示する。
 /// `allowed_warning` は使用率の警告、`rejected` はリクエスト拒否を示す。
-fn handle_rate_limit_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+/// 使用率が閾値を超えた場合、stop_file を作成して後続タスクを停止する。
+fn handle_rate_limit_event(
+    v: &serde_json::Value,
+    out: &mut impl Write,
+    stop_file: Option<&Path>,
+    threshold: u8,
+) -> Result<()> {
     let info = &v["rate_limit_info"];
     let status = info["status"].as_str().unwrap_or("");
     match status {
         "allowed_warning" => {
             let utilization = info["utilization"].as_f64().unwrap_or(0.0);
+            let pct = utilization * 100.0;
             let limit_type = info["rateLimitType"].as_str().unwrap_or("");
-            writeln!(
-                out,
-                "\x1b[33m  \u{26a0} Rate limit warning: {:.0}% used ({})\x1b[0m",
-                utilization * 100.0,
-                limit_type
-            )?;
+            if pct >= threshold as f64 {
+                touch_stop_file(stop_file);
+                writeln!(
+                    out,
+                    "\x1b[31m  \u{26d4} Rate limit auto-stop: {:.0}% used ({}) >= threshold {}%\x1b[0m",
+                    pct, limit_type, threshold
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "\x1b[33m  \u{26a0} Rate limit warning: {:.0}% used ({})\x1b[0m",
+                    pct, limit_type
+                )?;
+            }
         }
         "rejected" => {
             let limit_type = info["rateLimitType"].as_str().unwrap_or("");
+            touch_stop_file(stop_file);
             writeln!(
                 out,
                 "\x1b[31m  \u{1f6ab} Rate limited: request rejected ({})\x1b[0m",
@@ -205,6 +227,13 @@ fn handle_rate_limit_event(v: &serde_json::Value, out: &mut impl Write) -> Resul
         _ => {} // "allowed" は表示不要
     }
     Ok(())
+}
+
+/// stop_file が指定されていれば作成する（全ワーカーの後続タスクを停止するシグナル）。
+fn touch_stop_file(stop_file: Option<&Path>) {
+    if let Some(path) = stop_file {
+        let _ = File::create(path);
+    }
 }
 
 fn handle_result(
@@ -948,13 +977,22 @@ mod tests {
     }
 
     fn run_process(input: &str) -> String {
-        run_process_with_raw_log(input, None)
+        run_process_with_opts(input, None, None, 95)
     }
 
     fn run_process_with_raw_log(input: &str, raw_output: Option<&std::path::Path>) -> String {
+        run_process_with_opts(input, raw_output, None, 95)
+    }
+
+    fn run_process_with_opts(
+        input: &str,
+        raw_output: Option<&std::path::Path>,
+        stop_file: Option<&std::path::Path>,
+        threshold: u8,
+    ) -> String {
         let reader = Cursor::new(input.as_bytes().to_vec());
         let mut output = Vec::new();
-        process(reader, &mut output, raw_output).unwrap();
+        process(reader, &mut output, raw_output, stop_file, threshold).unwrap();
         String::from_utf8(output).unwrap()
     }
 
@@ -2249,6 +2287,92 @@ mod tests {
         assert!(
             clean.is_empty(),
             "allowed は表示されるべきでない: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_rate_limit_auto_stop_touches_stop_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop_file = tmp.path().join("stop");
+        // 95% >= threshold 95 → stop file が作成される
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.95}}"#;
+        let output = run_process_with_opts(input, None, Some(&stop_file), 95);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("auto-stop"),
+            "auto-stop メッセージが表示されるべき: {}",
+            clean
+        );
+        assert!(clean.contains("95%"), "使用率が表示されるべき: {}", clean);
+        assert!(stop_file.exists(), "stop file が作成されるべき");
+    }
+
+    #[test]
+    fn process_rate_limit_below_threshold_no_stop_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop_file = tmp.path().join("stop");
+        // 79% < threshold 95 → 通常の警告、stop file は作成されない
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.79}}"#;
+        let output = run_process_with_opts(input, None, Some(&stop_file), 95);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("79%"),
+            "通常の警告が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            !clean.contains("auto-stop"),
+            "auto-stop は表示されるべきでない: {}",
+            clean
+        );
+        assert!(!stop_file.exists(), "stop file は作成されるべきでない");
+    }
+
+    #[test]
+    fn process_rate_limit_rejected_touches_stop_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop_file = tmp.path().join("stop");
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"}}"#;
+        let output = run_process_with_opts(input, None, Some(&stop_file), 95);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("rejected"),
+            "拒否メッセージが表示されるべき: {}",
+            clean
+        );
+        assert!(
+            stop_file.exists(),
+            "rejected 時に stop file が作成されるべき"
+        );
+    }
+
+    #[test]
+    fn process_rate_limit_custom_threshold() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop_file = tmp.path().join("stop");
+        // 80% >= threshold 80 → auto-stop
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.80}}"#;
+        let output = run_process_with_opts(input, None, Some(&stop_file), 80);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("auto-stop"),
+            "カスタム閾値で auto-stop されるべき: {}",
+            clean
+        );
+        assert!(clean.contains("80%"), "閾値が表示されるべき: {}", clean);
+        assert!(stop_file.exists(), "stop file が作成されるべき");
+    }
+
+    #[test]
+    fn process_rate_limit_no_stop_file_path_still_shows_message() {
+        // stop_file が None でも閾値超過時のメッセージは表示される
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.96}}"#;
+        let output = run_process_with_opts(input, None, None, 95);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("auto-stop"),
+            "stop_file なしでも auto-stop メッセージは表示されるべき: {}",
             clean
         );
     }

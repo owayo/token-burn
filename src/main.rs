@@ -96,6 +96,12 @@ enum Commands {
         /// 受け取った生の stream-json 入力をそのまま保存するパス
         #[arg(long)]
         raw_output: Option<PathBuf>,
+        /// レート制限閾値超過時に作成する停止ファイルのパス
+        #[arg(long)]
+        stop_file: Option<PathBuf>,
+        /// レート制限使用率の自動停止閾値（%）
+        #[arg(long, default_value_t = 95)]
+        threshold: u8,
     },
 }
 
@@ -120,8 +126,13 @@ async fn main() -> Result<()> {
         return init::run_init(&config_path, force);
     }
 
-    if let Commands::FormatStream { raw_output } = &command {
-        return format_stream::run(raw_output.as_deref());
+    if let Commands::FormatStream {
+        raw_output,
+        stop_file,
+        threshold,
+    } = &command
+    {
+        return format_stream::run(raw_output.as_deref(), stop_file.as_deref(), *threshold);
     }
 
     if let Commands::Mark {
@@ -324,6 +335,7 @@ async fn run(opts: RunOptions) -> Result<()> {
         &state_file,
         &reset_info,
         &report_dir,
+        config.settings.rate_limit_threshold,
     )?;
 
     // 古いレポートディレクトリを自動クリーンアップ
@@ -477,6 +489,7 @@ mod tests {
             report_dir: None,
             cleanup_after: None,
             limit: 10,
+            rate_limit_threshold: 95,
         };
         let dir = resolve_report_dir(&settings);
         assert!(dir.ends_with("Documents/token-burn"));
@@ -490,6 +503,7 @@ mod tests {
             report_dir: Some("~/custom-reports".to_string()),
             cleanup_after: None,
             limit: 10,
+            rate_limit_threshold: 95,
         };
         let dir = resolve_report_dir(&settings);
         // チルダが展開されていることを確認
@@ -517,6 +531,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
@@ -584,6 +599,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
@@ -627,6 +643,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
@@ -691,6 +708,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: config::Prompts {
                 default: "default".to_string(),
@@ -735,6 +753,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: config::Prompts {
                 default: "default".to_string(),
@@ -768,6 +787,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: config::Prompts {
                 default: "default".to_string(),
@@ -812,6 +832,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: config::Prompts {
                 default: "default prompt".to_string(),
@@ -858,6 +879,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: config::Prompts {
                 default: "default prompt".to_string(),
@@ -901,6 +923,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: config::Prompts {
                 default: "default prompt".to_string(),

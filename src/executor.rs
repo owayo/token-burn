@@ -124,6 +124,7 @@ pub fn execute_plan_tmux(
     state_file: &std::path::Path,
     reset_info: &str,
     report_dir: &std::path::Path,
+    rate_limit_threshold: u8,
 ) -> Result<()> {
     anyhow::ensure!(!plan.tasks.is_empty(), "No tasks to execute");
 
@@ -239,8 +240,8 @@ pub fn execute_plan_tmux(
                 );
                 let fmt_cmd = shell_escape(&exe_path.to_string_lossy());
                 script += &format!(
-                    "{} 2>&1 | {} format-stream --raw-output {} 2>&1 | tee {}\n",
-                    cmd_str, fmt_cmd, jsonl_file, log_file
+                    "{} 2>&1 | {} format-stream --raw-output {} --stop-file {} --threshold {} 2>&1 | tee {}\n",
+                    cmd_str, fmt_cmd, jsonl_file, stop_file_escaped, rate_limit_threshold, log_file
                 );
             } else {
                 // claude以外のエージェント: ログファイルに直接出力

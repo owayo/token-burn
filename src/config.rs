@@ -29,10 +29,17 @@ pub struct Settings {
     /// 1回の実行で処理する最大ターゲット数（デフォルト: 10）。
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// レート制限使用率がこの閾値（%）を超えたら自動停止する（デフォルト: 95）。
+    #[serde(default = "default_rate_limit_threshold")]
+    pub rate_limit_threshold: u8,
 }
 
 fn default_limit() -> usize {
     10
+}
+
+fn default_rate_limit_threshold() -> u8 {
+    95
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +127,9 @@ impl Config {
         }
         if self.settings.limit == 0 {
             anyhow::bail!("limit must be at least 1");
+        }
+        if self.settings.rate_limit_threshold == 0 || self.settings.rate_limit_threshold > 100 {
+            anyhow::bail!("rate_limit_threshold must be between 1 and 100");
         }
         validate_optional_duration("skip_within", self.settings.skip_within.as_deref())?;
         validate_optional_duration("cleanup_after", self.settings.cleanup_after.as_deref())?;
@@ -235,6 +245,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: Prompts {
                 default: "review".to_string(),
@@ -350,6 +361,31 @@ mod tests {
         let mut config = base_config();
         config.settings.parallelism = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_rate_limit_threshold() {
+        let mut config = base_config();
+        config.settings.rate_limit_threshold = 0;
+        let err = config.validate().expect_err("threshold=0 は拒否されるべき");
+        assert!(
+            err.to_string()
+                .contains("rate_limit_threshold must be between 1 and 100")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_over_100_rate_limit_threshold() {
+        // u8 なので最大 255 だが、101 以上は拒否される
+        let mut config = base_config();
+        config.settings.rate_limit_threshold = 101;
+        let err = config
+            .validate()
+            .expect_err("threshold=101 は拒否されるべき");
+        assert!(
+            err.to_string()
+                .contains("rate_limit_threshold must be between 1 and 100")
+        );
     }
 
     #[test]

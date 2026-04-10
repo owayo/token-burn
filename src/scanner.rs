@@ -488,6 +488,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: Prompts {
                 default: "review".to_string(),
@@ -550,6 +551,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: Prompts {
                 default: "default prompt".to_string(),
@@ -618,6 +620,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: Prompts {
                 default: "default".to_string(),
@@ -700,6 +703,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: Prompts {
                 default: "default prompt".to_string(),
@@ -775,6 +779,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: Prompts {
                 default: "default prompt".to_string(),
@@ -854,6 +859,7 @@ mod tests {
                 report_dir: None,
                 cleanup_after: None,
                 limit: 10,
+                rate_limit_threshold: 95,
             },
             prompts: Prompts {
                 default: "test".to_string(),
