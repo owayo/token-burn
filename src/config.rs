@@ -538,11 +538,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_duplicate_agent_names() {
-        // 同名エージェントは現状許容されている（バグではなく仕様確認）
+    fn validate_allows_duplicate_agent_names() {
+        // 同名エージェントは許容されている（重複禁止ルールなし）
         let mut config = base_config();
         config.agents.push(config.agents[0].clone());
-        // 同名エージェントでもバリデーションは通る（重複禁止ルールなし）
         assert!(config.validate().is_ok());
     }
 

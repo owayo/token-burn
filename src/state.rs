@@ -370,6 +370,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_rejects_negative_number() {
+        // 負の数は単位文字として '-' が拒否される
+        let err = parse_duration("-1d").expect_err("負の数は拒否されるべき");
+        assert!(err.to_string().contains("Invalid duration"));
+    }
+
+    #[test]
     fn mark_completed_atomic_creates_parent_dirs() {
         let tmp = TempDir::new().expect("temp dir should be created");
         let state_file = tmp.path().join("nested").join("dir").join("state.json");

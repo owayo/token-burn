@@ -195,6 +195,7 @@ fn handle_rate_limit_event(
 ) -> Result<()> {
     let info = &v["rate_limit_info"];
     let status = info["status"].as_str().unwrap_or("");
+    let resets_at = format_resets_at(info);
     match status {
         "allowed_warning" => {
             let utilization = info["utilization"].as_f64().unwrap_or(0.0);
@@ -204,14 +205,14 @@ fn handle_rate_limit_event(
                 touch_stop_file(stop_file);
                 writeln!(
                     out,
-                    "\x1b[31m  \u{26d4} Rate limit auto-stop: {:.0}% used ({}) >= threshold {}%\x1b[0m",
-                    pct, limit_type, threshold
+                    "\x1b[31m  \u{26d4} Rate limit auto-stop: {:.0}% used ({}) >= threshold {}%{}\x1b[0m",
+                    pct, limit_type, threshold, resets_at
                 )?;
             } else {
                 writeln!(
                     out,
-                    "\x1b[33m  \u{26a0} Rate limit warning: {:.0}% used ({})\x1b[0m",
-                    pct, limit_type
+                    "\x1b[33m  \u{26a0} Rate limit warning: {:.0}% used ({}){}\x1b[0m",
+                    pct, limit_type, resets_at
                 )?;
             }
         }
@@ -220,13 +221,28 @@ fn handle_rate_limit_event(
             touch_stop_file(stop_file);
             writeln!(
                 out,
-                "\x1b[31m  \u{1f6ab} Rate limited: request rejected ({})\x1b[0m",
-                limit_type
+                "\x1b[31m  \u{1f6ab} Rate limited: request rejected ({}){}\x1b[0m",
+                limit_type, resets_at
             )?;
         }
         _ => {} // "allowed" は表示不要
     }
     Ok(())
+}
+
+/// `resetsAt` Unix タイムスタンプをローカル時刻の文字列に整形する。
+/// フィールドが存在しない場合は空文字列を返す。
+fn format_resets_at(info: &serde_json::Value) -> String {
+    info["resetsAt"]
+        .as_i64()
+        .and_then(|ts| {
+            chrono::DateTime::from_timestamp(ts, 0).map(|dt| {
+                dt.with_timezone(&chrono::Local)
+                    .format(" resets %H:%M")
+                    .to_string()
+            })
+        })
+        .unwrap_or_default()
 }
 
 /// stop_file が指定されていれば作成する（全ワーカーの後続タスクを停止するシグナル）。
@@ -2378,6 +2394,51 @@ mod tests {
     }
 
     #[test]
+    fn process_rate_limit_warning_shows_resets_at() {
+        // resetsAt タイムスタンプがローカル時刻で表示される
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.80,"resetsAt":1776009600}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("80%"), "使用率が表示されるべ��: {}", clean);
+        assert!(
+            clean.contains("resets"),
+            "リセット時刻が表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_rate_limit_rejected_shows_resets_at() {
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1776009600}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("rejected"),
+            "拒否状態が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("resets"),
+            "リセット時刻が表示さ���るべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_rate_limit_without_resets_at() {
+        // resetsAt がない場合はリセット時刻を表示しない
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.79}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("79%"), "使用率が��示されるべき: {}", clean);
+        assert!(
+            !clean.contains("resets"),
+            "resetsAt がない場合はリセット時刻を表示しない��き: {}",
+            clean
+        );
+    }
+
+    #[test]
     fn process_api_retry_shows_attempt_info() {
         let input = r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"error":"server_error","error_status":503}"#;
         let output = run_process(input);
@@ -2414,5 +2475,32 @@ mod tests {
             "null ステータスは括弧なしで表示されるべき: {}",
             clean
         );
+    }
+
+    // --- format_resets_at の単体テスト ---
+
+    #[test]
+    fn format_resets_at_valid_timestamp() {
+        let info: serde_json::Value = serde_json::from_str(r#"{"resetsAt":1776009600}"#).unwrap();
+        let result = format_resets_at(&info);
+        assert!(
+            result.starts_with(" resets "),
+            "有効なタイムスタンプはリセット時刻を返すべき: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn format_resets_at_missing_field() {
+        let info: serde_json::Value = serde_json::from_str(r#"{"status":"allowed"}"#).unwrap();
+        let result = format_resets_at(&info);
+        assert_eq!(result, "", "resetsAt がない場合は空文字列を返すべき");
+    }
+
+    #[test]
+    fn format_resets_at_null_value() {
+        let info: serde_json::Value = serde_json::from_str(r#"{"resetsAt":null}"#).unwrap();
+        let result = format_resets_at(&info);
+        assert_eq!(result, "", "resetsAt が null の場合は空文字列を返すべき");
     }
 }

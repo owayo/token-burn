@@ -1124,6 +1124,27 @@ mod tests {
     }
 
     #[test]
+    fn strip_ansi_256_color_sequence() {
+        // 256色シーケンス（マルチパラメータ CSI）が除去される
+        let input = "\x1b[38;5;196mred text\x1b[0m";
+        assert_eq!(strip_ansi(input), "red text");
+    }
+
+    #[test]
+    fn strip_ansi_truecolor_sequence() {
+        // 24ビットトゥルーカラーシーケンスが除去される
+        let input = "\x1b[38;2;255;0;0mred\x1b[48;2;0;0;255mblue bg\x1b[0m";
+        assert_eq!(strip_ansi(input), "redblue bg");
+    }
+
+    #[test]
+    fn strip_ansi_consecutive_sequences() {
+        // テキストなしの連続シーケンスが正しく除去される
+        let input = "\x1b[1m\x1b[31m\x1b[4mformatted\x1b[0m\x1b[0m\x1b[0m";
+        assert_eq!(strip_ansi(input), "formatted");
+    }
+
+    #[test]
     fn is_claude_command_detects_bare_claude() {
         assert!(is_claude_command(&["claude".to_string()]));
         assert!(is_claude_command(&["claude".to_string(), "-p".to_string()]));

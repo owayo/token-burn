@@ -52,7 +52,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Per-model usage**: Displays token usage, cost, cache read/creation tokens, and web search counts per model (e.g., Opus, Haiku) in result summary
 - **API timing**: Shows API response time alongside wall-clock duration
 - **Fast mode indicator**: Shows fast mode state when active
-- **Rate limit alerts**: Displays utilization warnings and rejected request notifications
+- **Rate limit alerts**: Displays utilization warnings and rejected request notifications with reset time, auto-stops when threshold is exceeded
 - **API retry visibility**: Shows retry attempts with error details during transient failures
 - **Collision-safe logs**: Per-task logs are numbered to avoid overwrite when display names collide
 - **Prompt files**: Prompts can be `.md` files or inline strings
@@ -173,6 +173,7 @@ skip_within = "7d"    # optional
 | `cleanup_after` | Auto-delete report directories older than this duration | `"7d"` (default) |
 | `report_dir` | Directory to save execution logs | `~/Documents/token-burn` (default) |
 | `limit` | Maximum number of targets to process per run (`>= 1`) | `10` (default) |
+| `rate_limit_threshold` | Auto-stop when rate limit utilization exceeds this percentage (`1-100`) | `95` (default) |
 
 `skip_within` and `cleanup_after` accept duration strings using `d` (days), `h` (hours), `m` (minutes), and `s` (seconds). Invalid values are rejected when the config file is loaded. If `skip_within` is omitted, directories processed since the previous reset are skipped. Excessively large values are also rejected. Use `--fresh` to ignore saved state entirely.
 
