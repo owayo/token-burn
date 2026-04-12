@@ -1,6 +1,6 @@
 [package]
 name = "token-burn"
-version = "26.4.100"
+version = "26.4.101"
 edition = "2024"
 description = "CLI tool to consume AI coding assistant tokens before weekly reset"
 
