@@ -116,6 +116,22 @@ fn process(
 fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
     let subtype = v["subtype"].as_str().unwrap_or("");
     match subtype {
+        "task_started" => {
+            let desc = v["description"].as_str().unwrap_or("");
+            let task_type = v["task_type"].as_str().unwrap_or("");
+            if !desc.is_empty() {
+                if !task_type.is_empty() {
+                    writeln!(
+                        out,
+                        "\x1b[2m  \u{23f3} {} ({})\x1b[0m",
+                        truncate_str(desc, 80),
+                        task_type
+                    )?;
+                } else {
+                    writeln!(out, "\x1b[2m  \u{23f3} {}\x1b[0m", truncate_str(desc, 80))?;
+                }
+            }
+        }
         "task_progress" => {
             let desc = v["description"].as_str().unwrap_or("");
             let tool = v["last_tool_name"].as_str().unwrap_or("");
@@ -179,7 +195,7 @@ fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()
                 attempt, max_retries, error, status
             )?;
         }
-        _ => {} // init, hook_started, hook_response, hook_progress, task_started 等は無視
+        _ => {} // init, hook_started, hook_response, hook_progress 等は無視
     }
     Ok(())
 }
@@ -197,6 +213,33 @@ fn handle_rate_limit_event(
     let status = info["status"].as_str().unwrap_or("");
     let resets_at = format_resets_at(info);
     match status {
+        "allowed" => {
+            let limit_type = info["rateLimitType"].as_str().unwrap_or("");
+            let extras = format_rate_limit_allowed_details(info);
+            if !extras.is_empty() || !resets_at.is_empty() {
+                let details = if limit_type.is_empty() {
+                    extras
+                } else if extras.is_empty() {
+                    limit_type.to_string()
+                } else {
+                    format!("{limit_type} {extras}")
+                };
+                let details = truncate_str(&details, 80);
+                if details.is_empty() {
+                    writeln!(
+                        out,
+                        "\x1b[2m  \u{2139} Rate limit status: allowed{}\x1b[0m",
+                        resets_at
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "\x1b[2m  \u{2139} Rate limit status: allowed ({}){}\x1b[0m",
+                        details, resets_at
+                    )?;
+                }
+            }
+        }
         "allowed_warning" => {
             let utilization = info["utilization"].as_f64().unwrap_or(0.0);
             let pct = utilization * 100.0;
@@ -228,6 +271,27 @@ fn handle_rate_limit_event(
         _ => {} // "allowed" は表示不要
     }
     Ok(())
+}
+
+/// `allowed` の補足情報を 1 行表示用に連結する。
+fn format_rate_limit_allowed_details(info: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(overage_status) = info["overageStatus"].as_str()
+        && !overage_status.is_empty()
+    {
+        parts.push(format!("overage:{overage_status}"));
+    }
+    if info["isUsingOverage"].as_bool() == Some(true) {
+        parts.push("using_overage".to_string());
+    }
+    if let Some(reason) = info["overageDisabledReason"].as_str()
+        && !reason.is_empty()
+    {
+        parts.push(format!("reason:{reason}"));
+    }
+
+    parts.join(" ")
 }
 
 /// `resetsAt` Unix タイムスタンプをローカル時刻の文字列に整形する。
@@ -1374,8 +1438,8 @@ mod tests {
     }
 
     #[test]
-    fn process_system_task_started_skipped() {
-        // subtype が task_started の system イベントは黙って無視する
+    fn process_system_task_started_shows_description() {
+        // 実データに出る task_started は開始通知として表示する
         let input = [
             r#"{"type":"system","subtype":"init","cwd":"/tmp","session_id":"s1"}"#,
             r#"{"type":"system","subtype":"task_started","task_type":"in_process_teammate","task_id":"abc-123","tool_use_id":"tu_1","description":"implement feature"}"#,
@@ -1388,9 +1452,8 @@ mod tests {
         let output = run_process(&input);
         let clean = strip_ansi(&output);
 
-        // system イベントは表示しない
-        assert!(!clean.contains("task_started"));
-        assert!(!clean.contains("in_process_teammate"));
+        assert!(clean.contains("implement feature"));
+        assert!(clean.contains("in_process_teammate"));
         // テキストは表示される
         assert!(clean.contains("Hello"));
     }
@@ -2308,6 +2371,34 @@ mod tests {
     }
 
     #[test]
+    fn process_rate_limit_allowed_with_details_is_shown() {
+        // 実データにある overage 情報付き allowed は補足情報を表示する
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":1776009600,"overageStatus":"rejected","overageDisabledReason":"org_level_disabled_until","isUsingOverage":false}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("allowed"),
+            "allowed 状態が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("five_hour"),
+            "制限タイプが表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("overage:rejected"),
+            "overage 状態が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("resets"),
+            "リセット時刻が表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
     fn process_rate_limit_auto_stop_touches_stop_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         let stop_file = tmp.path().join("stop");
@@ -2399,7 +2490,7 @@ mod tests {
         let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.80,"resetsAt":1776009600}}"#;
         let output = run_process(input);
         let clean = strip_ansi(&output);
-        assert!(clean.contains("80%"), "使用率が表示されるべ��: {}", clean);
+        assert!(clean.contains("80%"), "使用率が表示されるべき: {}", clean);
         assert!(
             clean.contains("resets"),
             "リセット時刻が表示されるべき: {}",
@@ -2419,7 +2510,7 @@ mod tests {
         );
         assert!(
             clean.contains("resets"),
-            "リセット時刻が表示さ���るべき: {}",
+            "リセット時刻が表示されるべき: {}",
             clean
         );
     }
@@ -2430,10 +2521,10 @@ mod tests {
         let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.79}}"#;
         let output = run_process(input);
         let clean = strip_ansi(&output);
-        assert!(clean.contains("79%"), "使用率が��示されるべき: {}", clean);
+        assert!(clean.contains("79%"), "使用率が表示されるべき: {}", clean);
         assert!(
             !clean.contains("resets"),
-            "resetsAt がない場合はリセット時刻を表示しない��き: {}",
+            "resetsAt がない場合はリセット時刻が表示されるべきでない: {}",
             clean
         );
     }

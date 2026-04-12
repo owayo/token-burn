@@ -57,12 +57,12 @@ make release  # リリースビルド
 - テキスト応答のストリーミング表示
 - 思考ブロック（`thinking`）のプログレスインジケーター
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`/`Agent`/`Task`/`TeamCreate`/`Skill`/`TodoWrite` 等）の詳細表示と差分出力
-- サブエージェントの進捗通知（`task_progress`）と完了通知（`task_notification`）
+- サブエージェントの開始・進捗・完了通知（`task_started` / `task_progress` / `task_notification`）
 - トークン使用量、コスト、キャッシュ内訳、Web検索/フェッチ回数の集計表示
 - モデル別使用量（`modelUsage`）の内訳表示（キャッシュ読み取り/書き込みトークン、Web検索回数を含む）
 - API応答時間（`duration_api_ms`）の表示
 - fast mode 状態の表示（`fast_mode_state` が `off` 以外の場合）
-- レート制限警告（`rate_limit_event`）の使用率表示とリクエスト拒否通知（`resetsAt` がある場合はリセット時刻も表示）
+- レート制限警告（`rate_limit_event`）の使用率表示、リクエスト拒否通知、および `allowed` 時の補足情報表示（`resetsAt` / overage 情報がある場合）
 - レート制限使用率が `rate_limit_threshold`（デフォルト: 95%）を超えた場合、stop file を作成して後続タスクを自動停止
 - APIリトライ（`api_retry`）の試行回数とエラー情報の表示
 
