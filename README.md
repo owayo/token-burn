@@ -49,6 +49,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Deadline enforcement**: Kills all child processes when the reset time arrives
 - **Parallel execution**: Runs multiple prompts concurrently in tmux split panes with progress monitor
 - **Sub-agent monitoring**: Real-time start, progress, and completion notifications for Claude Code team/agent tasks
+- **Richer tool details**: Shows search pattern/path for `Grep` and delay/reason for `ScheduleWakeup` when those fields are present in Claude stream-json
 - **Per-model usage**: Displays token usage, cost, cache read/creation tokens, and web search counts per model (e.g., Opus, Haiku) in result summary
 - **API timing**: Shows API response time alongside wall-clock duration
 - **Fast mode indicator**: Shows fast mode state when active

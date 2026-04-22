@@ -838,6 +838,19 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             }
             return truncate_str(cmd, 100).to_string();
         }
+        "Grep" | "Glob" => {
+            let pattern = v["pattern"].as_str().unwrap_or("");
+            let path = v["path"].as_str().unwrap_or("");
+            if !pattern.is_empty() && !path.is_empty() {
+                return format!("{} @ {}", truncate_str(pattern, 60), truncate_str(path, 50));
+            }
+            if !pattern.is_empty() {
+                return truncate_str(pattern, 100).to_string();
+            }
+            if !path.is_empty() {
+                return truncate_str(path, 100).to_string();
+            }
+        }
         "Task" | "Agent" => {
             let desc = v["description"].as_str().unwrap_or("");
             let name = v["name"].as_str().unwrap_or("");
@@ -879,6 +892,24 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
                     .filter(|t| t["status"].as_str() == Some("completed"))
                     .count();
                 return format!("{}/{} completed", done, total);
+            }
+        }
+        "ScheduleWakeup" => {
+            let delay = v["delaySeconds"].as_u64();
+            let reason = v["reason"].as_str().unwrap_or("");
+            let prompt = v["prompt"].as_str().unwrap_or("");
+            if let Some(delay) = delay {
+                let note = if !reason.is_empty() { reason } else { prompt };
+                if note.is_empty() {
+                    return format!("{delay}s");
+                }
+                return format!("{delay}s ({})", truncate_str(note, 60));
+            }
+            if !reason.is_empty() {
+                return truncate_str(reason, 80).to_string();
+            }
+            if !prompt.is_empty() {
+                return truncate_str(prompt, 80).to_string();
             }
         }
         _ => {}
@@ -1094,6 +1125,33 @@ mod tests {
         assert_eq!(
             extract_tool_detail("Bash", input),
             "pnpm install (Install deps)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_grep_shows_pattern_and_path() {
+        let input = r#"{"pattern":"\"scripts\"","path":"/Users/owa/GitHub/vscode-git-smart-commit/package.json"}"#;
+        let result = extract_tool_detail("Grep", input);
+        assert!(result.starts_with("\"scripts\" @ "));
+        assert!(result.contains("vscode-git-smart-commit"));
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn extract_tool_detail_glob_pattern_only() {
+        let input = r#"{"pattern":"{AGENTS.md,README.md,README.ja.md}"}"#;
+        assert_eq!(
+            extract_tool_detail("Glob", input),
+            "{AGENTS.md,README.md,README.ja.md}"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_schedule_wakeup_shows_delay_and_reason() {
+        let input = r#"{"delaySeconds":90,"reason":"codex レビュー結果を待つため少し待機","prompt":"codex レビューの結果を確認して、テスト追加に進む"}"#;
+        assert_eq!(
+            extract_tool_detail("ScheduleWakeup", input),
+            "90s (codex レビュー結果を待つため少し待機)"
         );
     }
 
@@ -2082,6 +2140,22 @@ mod tests {
 
         assert!(!clean.contains("hook"), "hook events should be silent");
         assert!(clean.contains("OK"), "text should still appear");
+    }
+
+    #[test]
+    fn process_schedule_wakeup_shows_detail_from_partial_json() {
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"ScheduleWakeup","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"delaySeconds\":90,\"reason\":\"codex レビュー結果を待つため少し待機\",\"prompt\":\"codex レビューの結果を確認して、テスト追加に進む\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(clean.contains("ScheduleWakeup"));
+        assert!(clean.contains("90s (codex レビュー結果を待つため少し待機)"));
     }
 
     #[test]
