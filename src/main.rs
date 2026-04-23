@@ -1,3 +1,4 @@
+mod classify;
 mod cleanup;
 mod config;
 mod display;
@@ -103,6 +104,12 @@ enum Commands {
         #[arg(long, default_value_t = 95)]
         threshold: u8,
     },
+    /// jsonl を分類して終了コード (0=success,1=failed,2=rate-limited,3=retryable) を返す（ワーカースクリプト専用）
+    #[command(hide = true, name = "classify-result")]
+    ClassifyResult {
+        /// 分類対象の jsonl ファイル
+        jsonl: PathBuf,
+    },
 }
 
 fn parse_positive_limit(value: &str) -> Result<usize, String> {
@@ -145,6 +152,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Commands::ClassifyResult { jsonl } = &command {
+        let class = classify::classify_jsonl(jsonl);
+        if let Some(msg) = class.message() {
+            println!("{msg}");
+        }
+        std::process::exit(class.exit_code());
+    }
+
     let config_path = cli.config.unwrap_or_else(config::default_config_path);
     let config = config::Config::load(&config_path)?;
 
@@ -181,6 +196,7 @@ async fn main() -> Result<()> {
         Commands::Mark { .. } => unreachable!(),
         Commands::Init { .. } => unreachable!(),
         Commands::FormatStream { .. } => unreachable!(),
+        Commands::ClassifyResult { .. } => unreachable!(),
     }
 
     Ok(())

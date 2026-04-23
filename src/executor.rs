@@ -213,6 +213,8 @@ pub fn execute_plan_tmux(
                 shell_escape(&marker_dir.join(format!("done-{}", idx)).to_string_lossy());
             let failed_marker =
                 shell_escape(&marker_dir.join(format!("failed-{}", idx)).to_string_lossy());
+            let retry_marker =
+                shell_escape(&marker_dir.join(format!("retry-{}", idx)).to_string_lossy());
             let error_prefix = shell_escape(&format!("[{}] ", task.display_name));
             let log_base = task_log_base(idx, &task.display_name);
             let log_file =
@@ -257,37 +259,68 @@ pub fn execute_plan_tmux(
                         .join(format!("{}.jsonl", log_base))
                         .to_string_lossy(),
                 );
+                let tb_cmd = shell_escape(&exe_path.to_string_lossy());
                 script += &format!(
                     concat!(
-                        // レート制限チェックを終了コードより先に行う（レート制限時もCLIは非ゼロで終了するため）
-                        "if grep '\"type\":\"result\"' {jsonl} 2>/dev/null | tail -1 | grep -qE 'resets [0-9]+(am|pm)'; then\n",
-                        "  touch {failed}\n",
-                        "  echo '━━━ Rate limited - not marking as completed ━━━'\n",
-                        "elif [ \"$CMD_EXIT\" -ne 0 ]; then\n",
-                        "  if [ $CANCELLED -eq 1 ]; then\n",
-                        "    CANCELLED=0\n",
+                        // jsonl の最後の result イベントで分類する
+                        // 終了コード: 0=success/未判定, 1=failed, 2=rate-limited, 3=retryable
+                        "CLASSIFIED=$({tb} classify-result {jsonl} 2>/dev/null)\n",
+                        "CLASS_CODE=$?\n",
+                        "case $CLASS_CODE in\n",
+                        "  2)\n",
                         "    touch {failed}\n",
-                        "    echo '━━━ Cancelled ━━━'\n",
-                        "  else\n",
-                        "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
-                        "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
-                        "    touch {failed}; touch {wdone}\n",
-                        "    printf '\\033]2;Worker {w} error\\033\\\\'\n",
-                        "    echo '━━━ Error - stopped ━━━'\n",
-                        "    exec sleep infinity\n",
-                        "  fi\n",
-                        "else\n",
-                        "  {mark}\n",
-                        "  touch {done}\n",
-                        "fi\n",
+                        "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
+                        "    ;;\n",
+                        "  3)\n",
+                        "    if [ -n \"$CLASSIFIED\" ]; then\n",
+                        "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+                        "    fi\n",
+                        "    touch {retry}\n",
+                        "    echo \"━━━ Retryable error (will retry next run): $CLASSIFIED ━━━\"\n",
+                        "    ;;\n",
+                        "  1)\n",
+                        "    if [ $CANCELLED -eq 1 ]; then\n",
+                        "      CANCELLED=0\n",
+                        "      touch {failed}\n",
+                        "      echo '━━━ Cancelled ━━━'\n",
+                        "    else\n",
+                        "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+                        "      touch {failed}; touch {wdone}\n",
+                        "      printf '\\033]2;Worker {w} error\\033\\\\'\n",
+                        "      echo '━━━ Error - stopped ━━━'\n",
+                        "      exec sleep infinity\n",
+                        "    fi\n",
+                        "    ;;\n",
+                        "  *)\n",
+                        "    if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
+                        "      if [ $CANCELLED -eq 1 ]; then\n",
+                        "        CANCELLED=0\n",
+                        "        touch {failed}\n",
+                        "        echo '━━━ Cancelled ━━━'\n",
+                        "      else\n",
+                        "        ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+                        "        printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
+                        "        touch {failed}; touch {wdone}\n",
+                        "        printf '\\033]2;Worker {w} error\\033\\\\'\n",
+                        "        echo '━━━ Error - stopped ━━━'\n",
+                        "        exec sleep infinity\n",
+                        "      fi\n",
+                        "    else\n",
+                        "      {mark}\n",
+                        "      touch {done}\n",
+                        "    fi\n",
+                        "    ;;\n",
+                        "esac\n",
                     ),
                     prefix = error_prefix,
                     error = error_file,
                     failed = failed_marker,
+                    retry = retry_marker,
                     wdone = worker_done_marker,
                     w = w + 1,
                     done = done_marker,
                     jsonl = jsonl_file,
+                    tb = tb_cmd,
                     mark = mark_cmd,
                 );
             } else {
@@ -536,7 +569,8 @@ while true; do
     REMAINING=$((END - NOW))
     DONE=$(find "$MARKER_DIR" -name 'done-*' 2>/dev/null | wc -l | tr -d ' ')
     FAILED=$(find "$MARKER_DIR" -name 'failed-*' 2>/dev/null | wc -l | tr -d ' ')
-    PROCESSED=$((DONE + FAILED))
+    RETRY=$(find "$MARKER_DIR" -name 'retry-*' 2>/dev/null | wc -l | tr -d ' ')
+    PROCESSED=$((DONE + FAILED + RETRY))
 
     # Deadline check
     if [ $REMAINING -le 0 ] && [ $STOPPED -eq 0 ]; then
@@ -548,10 +582,10 @@ while true; do
         echo "    Press Ctrl-C to force kill."
     fi
 
-    # All tasks processed (including failures)
+    # All tasks processed (including failures and retries)
     if [ "$PROCESSED" -ge "$TOTAL" ]; then
-        if [ "$FAILED" -gt 0 ]; then
-            printf "\r\033[2K ❌ Completed with failures: %d succeeded / %d failed\n" "$DONE" "$FAILED"
+        if [ "$FAILED" -gt 0 ] || [ "$RETRY" -gt 0 ]; then
+            printf "\r\033[2K ⚠  Completed: %d succeeded / %d failed / %d retry\n" "$DONE" "$FAILED" "$RETRY"
         else
             printf "\r\033[2K ✅ All %d/%d tasks completed!\n" "$DONE" "$TOTAL"
         fi
@@ -566,7 +600,7 @@ while true; do
     if [ $STOPPED -eq 1 ]; then
         WORKERS_DONE=$(find "$MARKER_DIR" -name 'worker-done-*' 2>/dev/null | wc -l | tr -d ' ')
         if [ "$WORKERS_DONE" -ge "$WORKER_COUNT" ]; then
-            printf "\r\033[2K ⏹ Stopped: %d/%d processed (%d failed)\n" "$PROCESSED" "$TOTAL" "$FAILED"
+            printf "\r\033[2K ⏹ Stopped: %d/%d processed (fail:%d retry:%d)\n" "$PROCESSED" "$TOTAL" "$FAILED" "$RETRY"
             echo ""
             echo " 📁 Logs: $REPORT_DIR"
             echo ""
@@ -607,11 +641,11 @@ while true; do
         H=$(((REMAINING % 86400) / 3600))
         M=$(((REMAINING % 3600) / 60))
         S=$((REMAINING % 60))
-        printf "\r\033[2K ⏱ %dd %02dh %02dm %02ds  [%s] %d/%d (%d%%, fail:%d)" \
-            "$D" "$H" "$M" "$S" "$BAR" "$PROCESSED" "$TOTAL" "$PCT" "$FAILED"
+        printf "\r\033[2K ⏱ %dd %02dh %02dm %02ds  [%s] %d/%d (%d%%, fail:%d retry:%d)" \
+            "$D" "$H" "$M" "$S" "$BAR" "$PROCESSED" "$TOTAL" "$PCT" "$FAILED" "$RETRY"
     else
-        printf "\r\033[2K ⏳ Stopping...  [%s] %d/%d (%d%%, fail:%d)" \
-            "$BAR" "$PROCESSED" "$TOTAL" "$PCT" "$FAILED"
+        printf "\r\033[2K ⏳ Stopping...  [%s] %d/%d (%d%%, fail:%d retry:%d)" \
+            "$BAR" "$PROCESSED" "$TOTAL" "$PCT" "$FAILED" "$RETRY"
     fi
 
     sleep 1
@@ -781,8 +815,10 @@ mod tests {
         assert!(script.contains("DISPLAYED_ERRORS=\":\""));
         assert!(script.contains("*\":$EFILE:\"*"));
         assert!(script.contains("FAILED=$(find \"$MARKER_DIR\" -name 'failed-*'"));
-        assert!(script.contains("PROCESSED=$((DONE + FAILED))"));
-        assert!(script.contains("Completed with failures"));
+        assert!(script.contains("RETRY=$(find \"$MARKER_DIR\" -name 'retry-*'"));
+        assert!(script.contains("PROCESSED=$((DONE + FAILED + RETRY))"));
+        assert!(script.contains("Completed: %d succeeded / %d failed / %d retry"));
+        assert!(script.contains("fail:%d retry:%d"));
     }
 
     #[test]
