@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::config::Agent;
@@ -155,211 +156,58 @@ pub fn execute_plan_tmux(
     std::fs::create_dir_all(&run_dir)?;
 
     let total = plan.tasks.len();
-
-    // タスクをラウンドロビンでワーカーに分配
     let worker_count = parallelism.min(total);
-    let mut worker_tasks: Vec<Vec<(usize, &ResolvedTarget)>> = vec![vec![]; worker_count];
-    for (i, task) in plan.tasks.iter().enumerate() {
-        worker_tasks[i % worker_count].push((i + 1, task));
-    }
 
-    // ワーカースクリプトを生成（各タスク完了時にマーカーファイルを作成）
+    // ワーカー間で共有するタスクキュー
     let marker_dir = tmp_dir.join("markers");
     std::fs::create_dir_all(&marker_dir)?;
+    let queue_dir = tmp_dir.join("queue");
+    std::fs::create_dir_all(&queue_dir)?;
+    let task_dir = tmp_dir.join("tasks");
+    std::fs::create_dir_all(&task_dir)?;
 
     let exe_path =
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("token-burn"));
     let stop_file = tmp_dir.join("stop");
+    let is_claude = is_claude_command(&plan.agent.command);
+
+    // 各タスクの実行スクリプトと pending マーカーを書き出す
+    for (idx_zero, task) in plan.tasks.iter().enumerate() {
+        let idx = idx_zero + 1;
+        let prompt_file = tmp_dir.join(format!("prompt-{}.txt", idx));
+        std::fs::write(&prompt_file, &task.prompt)?;
+
+        let task_script = build_task_script(&TaskCtx {
+            idx,
+            total,
+            task,
+            agent: &plan.agent,
+            prompt_file: &prompt_file,
+            run_dir: &run_dir,
+            marker_dir: &marker_dir,
+            exe_path: &exe_path,
+            state_file,
+            stop_file: &stop_file,
+            rate_limit_threshold,
+            is_claude,
+        });
+        let task_path = task_dir.join(format!("task-{:04}.sh", idx));
+        std::fs::write(&task_path, &task_script)?;
+
+        std::fs::write(queue_dir.join(format!("pending-{:04}", idx)), "")?;
+    }
 
     let mut script_paths = Vec::new();
-    for (w, tasks) in worker_tasks.iter().enumerate() {
+    for w in 0..worker_count {
         let script_path = tmp_dir.join(format!("worker-{}.sh", w));
-        let mut script = String::from("#!/bin/bash\n");
-        let worker_done_marker = shell_escape(
-            &marker_dir
-                .join(format!("worker-done-{}", w))
-                .to_string_lossy(),
-        );
-        let stop_file_escaped = shell_escape(&stop_file.to_string_lossy());
-        let error_file = shell_escape(&marker_dir.join(format!("error-{}", w)).to_string_lossy());
-
-        // シグナルハンドラ: フラグ設定のみ。実際の処理は各コマンド後のエラーチェックで行う
-        script += concat!(
-            "CURRENT_FAILED_MARKER=\"\"\n",
-            "CANCELLED=0\n",
-            "handle_cancel() {\n",
-            "  CANCELLED=1\n",
-            "  if [ -n \"$CURRENT_FAILED_MARKER\" ]; then touch \"$CURRENT_FAILED_MARKER\"; fi\n",
-            "}\n",
-            "trap handle_cancel INT TERM\n",
-        );
-
-        for (i, (idx, task)) in tasks.iter().enumerate() {
-            let idx = *idx;
-            // 次のタスク開始前に停止シグナルを確認（最初のタスクはスキップ）
-            if i > 0 {
-                script += &format!(
-                    "if [ -f {} ]; then printf '\\033]2;Worker {} stopped\\033\\\\'; echo '━━━ Stopped ━━━'; touch {}; exec sleep infinity; fi\n",
-                    stop_file_escaped,
-                    w + 1,
-                    worker_done_marker,
-                );
-            }
-            // プロンプトを一時ファイルに書き出し、コマンド置換で渡す
-            let prompt_file = tmp_dir.join(format!("prompt-{}.txt", idx));
-            std::fs::write(&prompt_file, &task.prompt)?;
-            let cmd_str = build_shell_command(&plan.agent.command, &prompt_file, &task.directory);
-            let done_marker =
-                shell_escape(&marker_dir.join(format!("done-{}", idx)).to_string_lossy());
-            let failed_marker =
-                shell_escape(&marker_dir.join(format!("failed-{}", idx)).to_string_lossy());
-            let retry_marker =
-                shell_escape(&marker_dir.join(format!("retry-{}", idx)).to_string_lossy());
-            let error_prefix = shell_escape(&format!("[{}] ", task.display_name));
-            let log_base = task_log_base(idx, &task.display_name);
-            let log_file =
-                shell_escape(&run_dir.join(format!("{}.log", log_base)).to_string_lossy());
-
-            // シグナルハンドラ用に現タスクの失敗マーカーを設定
-            script += &format!("CURRENT_FAILED_MARKER={}\n", failed_marker);
-
-            let mark_cmd = format!(
-                "{} mark {} {} {}",
-                shell_escape(&exe_path.to_string_lossy()),
-                shell_escape(&plan.agent.name),
-                shell_escape(&task.directory.to_string_lossy()),
-                shell_escape(&state_file.to_string_lossy()),
-            );
-
-            script += &build_task_header_script(idx, total, &task.display_name);
-            let is_claude = is_claude_command(&plan.agent.command);
-            if is_claude {
-                // format-stream 自身に生入力を .jsonl 保存させつつ、整形済みログを .log に出力
-                let jsonl_file = shell_escape(
-                    &run_dir
-                        .join(format!("{}.jsonl", log_base))
-                        .to_string_lossy(),
-                );
-                let fmt_cmd = shell_escape(&exe_path.to_string_lossy());
-                script += &format!(
-                    "{} 2>&1 | {} format-stream --raw-output {} --stop-file {} --threshold {} 2>&1 | tee {}\n",
-                    cmd_str, fmt_cmd, jsonl_file, stop_file_escaped, rate_limit_threshold, log_file
-                );
-            } else {
-                // claude以外のエージェント: ログファイルに直接出力
-                script += &format!("{} 2>&1 | tee {}\n", cmd_str, log_file);
-            }
-            script += "CMD_EXIT=${PIPESTATUS[0]}\n";
-            // シグナルハンドラのターゲットをクリア（終了コード取得済み、通常フローで処理）
-            script += "CURRENT_FAILED_MARKER=\"\"\n";
-            // 終了コードを確認
-            if is_claude {
-                let jsonl_file = shell_escape(
-                    &run_dir
-                        .join(format!("{}.jsonl", log_base))
-                        .to_string_lossy(),
-                );
-                let tb_cmd = shell_escape(&exe_path.to_string_lossy());
-                script += &format!(
-                    concat!(
-                        // jsonl の最後の result イベントで分類する
-                        // 終了コード: 0=success/未判定, 1=failed, 2=rate-limited, 3=retryable
-                        "CLASSIFIED=$({tb} classify-result {jsonl} 2>/dev/null)\n",
-                        "CLASS_CODE=$?\n",
-                        "case $CLASS_CODE in\n",
-                        "  2)\n",
-                        "    touch {failed}\n",
-                        "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
-                        "    ;;\n",
-                        "  3)\n",
-                        "    if [ -n \"$CLASSIFIED\" ]; then\n",
-                        "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
-                        "    fi\n",
-                        "    touch {retry}\n",
-                        "    echo \"━━━ Retryable error (will retry next run): $CLASSIFIED ━━━\"\n",
-                        "    ;;\n",
-                        "  1)\n",
-                        "    if [ $CANCELLED -eq 1 ]; then\n",
-                        "      CANCELLED=0\n",
-                        "      touch {failed}\n",
-                        "      echo '━━━ Cancelled ━━━'\n",
-                        "    else\n",
-                        "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
-                        "      touch {failed}; touch {wdone}\n",
-                        "      printf '\\033]2;Worker {w} error\\033\\\\'\n",
-                        "      echo '━━━ Error - stopped ━━━'\n",
-                        "      exec sleep infinity\n",
-                        "    fi\n",
-                        "    ;;\n",
-                        "  *)\n",
-                        "    if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
-                        "      if [ $CANCELLED -eq 1 ]; then\n",
-                        "        CANCELLED=0\n",
-                        "        touch {failed}\n",
-                        "        echo '━━━ Cancelled ━━━'\n",
-                        "      else\n",
-                        "        ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
-                        "        printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
-                        "        touch {failed}; touch {wdone}\n",
-                        "        printf '\\033]2;Worker {w} error\\033\\\\'\n",
-                        "        echo '━━━ Error - stopped ━━━'\n",
-                        "        exec sleep infinity\n",
-                        "      fi\n",
-                        "    else\n",
-                        "      {mark}\n",
-                        "      touch {done}\n",
-                        "    fi\n",
-                        "    ;;\n",
-                        "esac\n",
-                    ),
-                    prefix = error_prefix,
-                    error = error_file,
-                    failed = failed_marker,
-                    retry = retry_marker,
-                    wdone = worker_done_marker,
-                    w = w + 1,
-                    done = done_marker,
-                    jsonl = jsonl_file,
-                    tb = tb_cmd,
-                    mark = mark_cmd,
-                );
-            } else {
-                script += &format!(
-                    concat!(
-                        "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
-                        "  if [ $CANCELLED -eq 1 ]; then\n",
-                        "    CANCELLED=0\n",
-                        "    touch {failed}\n",
-                        "    echo '━━━ Cancelled ━━━'\n",
-                        "  else\n",
-                        "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
-                        "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
-                        "    touch {failed}; touch {wdone}\n",
-                        "    printf '\\033]2;Worker {w} error\\033\\\\'\n",
-                        "    echo '━━━ Error - stopped ━━━'\n",
-                        "    exec sleep infinity\n",
-                        "  fi\n",
-                        "else\n",
-                        "  {mark}\n",
-                        "  touch {done}\n",
-                        "fi\n",
-                    ),
-                    prefix = error_prefix,
-                    error = error_file,
-                    failed = failed_marker,
-                    wdone = worker_done_marker,
-                    w = w + 1,
-                    done = done_marker,
-                    mark = mark_cmd,
-                );
-            }
-            script += "echo ''\n";
-        }
-        script += &format!("printf '\\033]2;Worker {} done\\033\\\\'\n", w + 1);
-        script += "echo '━━━ All tasks completed ━━━'\n";
-        script += &format!("touch {}\n", worker_done_marker);
-        script += "exec sleep infinity\n";
-        std::fs::write(&script_path, &script)?;
+        let worker_script = build_worker_script(&WorkerCtx {
+            worker_id: w,
+            queue_dir: &queue_dir,
+            task_dir: &task_dir,
+            marker_dir: &marker_dir,
+            stop_file: &stop_file,
+        });
+        std::fs::write(&script_path, &worker_script)?;
         std::process::Command::new("chmod")
             .args(["+x", &script_path.to_string_lossy()])
             .output()?;
@@ -664,6 +512,244 @@ done
     )
 }
 
+struct TaskCtx<'a> {
+    idx: usize,
+    total: usize,
+    task: &'a ResolvedTarget,
+    agent: &'a Agent,
+    prompt_file: &'a Path,
+    run_dir: &'a Path,
+    marker_dir: &'a Path,
+    exe_path: &'a Path,
+    state_file: &'a Path,
+    stop_file: &'a Path,
+    rate_limit_threshold: u8,
+    is_claude: bool,
+}
+
+struct WorkerCtx<'a> {
+    worker_id: usize,
+    queue_dir: &'a Path,
+    task_dir: &'a Path,
+    marker_dir: &'a Path,
+    stop_file: &'a Path,
+}
+
+/// キューから claim したワーカーが source して実行する、タスク単位のシェルスクリプトを生成する。
+fn build_task_script(ctx: &TaskCtx<'_>) -> String {
+    let log_base = task_log_base(ctx.idx, &ctx.task.display_name);
+    let log_file = shell_escape(
+        &ctx.run_dir
+            .join(format!("{log_base}.log"))
+            .to_string_lossy(),
+    );
+    let jsonl_file = shell_escape(
+        &ctx.run_dir
+            .join(format!("{log_base}.jsonl"))
+            .to_string_lossy(),
+    );
+    let done_marker = shell_escape(
+        &ctx.marker_dir
+            .join(format!("done-{}", ctx.idx))
+            .to_string_lossy(),
+    );
+    let failed_marker = shell_escape(
+        &ctx.marker_dir
+            .join(format!("failed-{}", ctx.idx))
+            .to_string_lossy(),
+    );
+    let retry_marker = shell_escape(
+        &ctx.marker_dir
+            .join(format!("retry-{}", ctx.idx))
+            .to_string_lossy(),
+    );
+    let error_file = shell_escape(
+        &ctx.marker_dir
+            .join(format!("error-{}", ctx.idx))
+            .to_string_lossy(),
+    );
+    let error_prefix = shell_escape(&format!("[{}] ", ctx.task.display_name));
+    let stop_file_escaped = shell_escape(&ctx.stop_file.to_string_lossy());
+    let cmd_str = build_shell_command(&ctx.agent.command, ctx.prompt_file, &ctx.task.directory);
+    let mark_cmd = format!(
+        "{} mark {} {} {}",
+        shell_escape(&ctx.exe_path.to_string_lossy()),
+        shell_escape(&ctx.agent.name),
+        shell_escape(&ctx.task.directory.to_string_lossy()),
+        shell_escape(&ctx.state_file.to_string_lossy()),
+    );
+
+    let mut script = String::new();
+    // 現在処理中のタスクをシグナルハンドラから参照できるようにする
+    script += &format!("CURRENT_FAILED_MARKER={failed_marker}\n");
+    script += &build_task_header_script(ctx.idx, ctx.total, &ctx.task.display_name);
+
+    if ctx.is_claude {
+        let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
+        script += &format!(
+            "{cmd_str} 2>&1 | {tb_cmd} format-stream --raw-output {jsonl_file} --stop-file {stop_file_escaped} --threshold {rate_limit_threshold} 2>&1 | tee {log_file}\n",
+            rate_limit_threshold = ctx.rate_limit_threshold,
+        );
+    } else {
+        script += &format!("{cmd_str} 2>&1 | tee {log_file}\n");
+    }
+    script += "CMD_EXIT=${PIPESTATUS[0]}\n";
+    script += "CURRENT_FAILED_MARKER=\"\"\n";
+
+    if ctx.is_claude {
+        let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
+        script += &format!(
+            concat!(
+                "CLASSIFIED=$({tb} classify-result {jsonl} 2>/dev/null)\n",
+                "CLASS_CODE=$?\n",
+                "case $CLASS_CODE in\n",
+                "  2)\n",
+                "    touch {failed}\n",
+                "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
+                "    ;;\n",
+                "  3)\n",
+                "    if [ -n \"$CLASSIFIED\" ]; then\n",
+                "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+                "    fi\n",
+                "    touch {retry}\n",
+                "    echo \"━━━ Retryable error (will retry next run): $CLASSIFIED ━━━\"\n",
+                "    ;;\n",
+                "  1)\n",
+                "    if [ $CANCELLED -eq 1 ]; then\n",
+                "      CANCELLED=0\n",
+                "      touch {failed}\n",
+                "      echo '━━━ Cancelled ━━━'\n",
+                "    else\n",
+                "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+                "      touch {failed}\n",
+                "      echo '━━━ Error - continuing ━━━'\n",
+                "    fi\n",
+                "    ;;\n",
+                "  *)\n",
+                "    if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
+                "      if [ $CANCELLED -eq 1 ]; then\n",
+                "        CANCELLED=0\n",
+                "        touch {failed}\n",
+                "        echo '━━━ Cancelled ━━━'\n",
+                "      else\n",
+                "        ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+                "        printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
+                "        touch {failed}\n",
+                "        echo '━━━ Error - continuing ━━━'\n",
+                "      fi\n",
+                "    else\n",
+                "      {mark}\n",
+                "      touch {done}\n",
+                "    fi\n",
+                "    ;;\n",
+                "esac\n",
+            ),
+            prefix = error_prefix,
+            error = error_file,
+            failed = failed_marker,
+            retry = retry_marker,
+            done = done_marker,
+            jsonl = jsonl_file,
+            tb = tb_cmd,
+            mark = mark_cmd,
+        );
+    } else {
+        script += &format!(
+            concat!(
+                "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
+                "  if [ $CANCELLED -eq 1 ]; then\n",
+                "    CANCELLED=0\n",
+                "    touch {failed}\n",
+                "    echo '━━━ Cancelled ━━━'\n",
+                "  else\n",
+                "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+                "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
+                "    touch {failed}\n",
+                "    echo '━━━ Error - continuing ━━━'\n",
+                "  fi\n",
+                "else\n",
+                "  {mark}\n",
+                "  touch {done}\n",
+                "fi\n",
+            ),
+            prefix = error_prefix,
+            error = error_file,
+            failed = failed_marker,
+            done = done_marker,
+            mark = mark_cmd,
+        );
+    }
+    script += "echo ''\n";
+    script
+}
+
+/// 共通ワーカースクリプト: queue_dir/pending-* をアトミックに claim しつつタスクを逐次実行する。
+fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
+    let w = ctx.worker_id + 1;
+    let queue_dir = shell_escape(&ctx.queue_dir.to_string_lossy());
+    let task_dir = shell_escape(&ctx.task_dir.to_string_lossy());
+    let stop_file = shell_escape(&ctx.stop_file.to_string_lossy());
+    let worker_done = shell_escape(
+        &ctx.marker_dir
+            .join(format!("worker-done-{}", ctx.worker_id))
+            .to_string_lossy(),
+    );
+
+    format!(
+        concat!(
+            "#!/bin/bash\n",
+            "CURRENT_FAILED_MARKER=\"\"\n",
+            "CANCELLED=0\n",
+            "handle_cancel() {{\n",
+            "  CANCELLED=1\n",
+            "  if [ -n \"$CURRENT_FAILED_MARKER\" ]; then touch \"$CURRENT_FAILED_MARKER\"; fi\n",
+            "}}\n",
+            "trap handle_cancel INT TERM\n",
+            "\n",
+            "QUEUE_DIR={queue_dir}\n",
+            "TASK_DIR={task_dir}\n",
+            "\n",
+            "while true; do\n",
+            "  if [ -f {stop_file} ]; then\n",
+            "    printf '\\033]2;Worker {w} stopped\\033\\\\'\n",
+            "    echo '━━━ Stopped ━━━'\n",
+            "    break\n",
+            "  fi\n",
+            "  CLAIMED=\"\"\n",
+            "  for pending in \"$QUEUE_DIR\"/pending-*; do\n",
+            "    [ -e \"$pending\" ] || continue\n",
+            "    base=$(basename \"$pending\")\n",
+            "    idx=${{base#pending-}}\n",
+            "    if mv \"$pending\" \"$QUEUE_DIR/claimed-$idx\" 2>/dev/null; then\n",
+            "      CLAIMED=\"$idx\"\n",
+            "      break\n",
+            "    fi\n",
+            "  done\n",
+            "  if [ -z \"$CLAIMED\" ]; then\n",
+            "    break\n",
+            "  fi\n",
+            "  TASK_SCRIPT=\"$TASK_DIR/task-$CLAIMED.sh\"\n",
+            "  if [ ! -f \"$TASK_SCRIPT\" ]; then\n",
+            "    echo \"━━━ Missing task script: $TASK_SCRIPT ━━━\"\n",
+            "    continue\n",
+            "  fi\n",
+            "  # shellcheck disable=SC1090\n",
+            "  source \"$TASK_SCRIPT\"\n",
+            "done\n",
+            "\n",
+            "printf '\\033]2;Worker {w} done\\033\\\\'\n",
+            "echo '━━━ All tasks completed ━━━'\n",
+            "touch {worker_done}\n",
+            "exec sleep infinity\n",
+        ),
+        queue_dir = queue_dir,
+        task_dir = task_dir,
+        stop_file = stop_file,
+        w = w,
+        worker_done = worker_done,
+    )
+}
+
 fn build_task_header_script(idx: usize, total: usize, display_name: &str) -> String {
     let pane_title = format!("[{}/{}] {}", idx, total, display_name);
     let section_title = format!("━━━ [{}/{}] {} ━━━", idx, total, display_name);
@@ -794,6 +880,128 @@ mod tests {
             script.contains("printf '\\033]2;%s\\033\\\\' '[1/3] repo'\\''; touch /tmp/pwn #'")
         );
         assert!(script.contains("echo '━━━ [1/3] repo'\\''; touch /tmp/pwn # ━━━'"));
+    }
+
+    fn task_ctx_for_test<'a>(
+        idx: usize,
+        agent: &'a Agent,
+        task: &'a ResolvedTarget,
+        tmp: &'a std::path::Path,
+        is_claude: bool,
+    ) -> TaskCtx<'a> {
+        TaskCtx {
+            idx,
+            total: 3,
+            task,
+            agent,
+            prompt_file: std::path::Path::new("/tmp/prompt.txt"),
+            run_dir: tmp,
+            marker_dir: tmp,
+            exe_path: std::path::Path::new("/usr/local/bin/token-burn"),
+            state_file: std::path::Path::new("/tmp/state.json"),
+            stop_file: std::path::Path::new("/tmp/stop"),
+            rate_limit_threshold: 95,
+            is_claude,
+        }
+    }
+
+    #[test]
+    fn build_task_script_for_claude_uses_classify_result_and_no_sleep_infinity() {
+        let agent = Agent {
+            name: "claude".to_string(),
+            command: vec!["claude".to_string(), "-p".to_string()],
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        let task = ResolvedTarget {
+            directory: std::path::PathBuf::from("/tmp/repo"),
+            display_name: "repo".to_string(),
+            prompt: "review".to_string(),
+            visibility: Visibility::Public,
+        };
+        let tmp = std::path::PathBuf::from("/tmp");
+        let ctx = task_ctx_for_test(7, &agent, &task, &tmp, true);
+        let script = build_task_script(&ctx);
+
+        // キュー方式ではエラー時にワーカーを止めない
+        assert!(
+            !script.contains("exec sleep infinity"),
+            "タスクスクリプトは sleep infinity せず次タスクに進むべき: {script}"
+        );
+        assert!(!script.contains("touch {wdone}"));
+        assert!(!script.contains("touch ") || !script.contains("worker-done"));
+        // jsonl 分類呼び出し
+        assert!(script.contains("classify-result"));
+        assert!(script.contains("Error - continuing"));
+        // error マーカーは task idx 単位
+        assert!(script.contains("/error-7"));
+        assert!(script.contains("/failed-7"));
+        assert!(script.contains("/retry-7"));
+        assert!(script.contains("/done-7"));
+    }
+
+    #[test]
+    fn build_task_script_for_non_claude_skips_classify() {
+        let agent = Agent {
+            name: "codex".to_string(),
+            command: vec!["codex".to_string(), "exec".to_string()],
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        let task = ResolvedTarget {
+            directory: std::path::PathBuf::from("/tmp/repo"),
+            display_name: "repo".to_string(),
+            prompt: "review".to_string(),
+            visibility: Visibility::Public,
+        };
+        let tmp = std::path::PathBuf::from("/tmp");
+        let ctx = task_ctx_for_test(2, &agent, &task, &tmp, false);
+        let script = build_task_script(&ctx);
+
+        assert!(!script.contains("classify-result"));
+        assert!(!script.contains("exec sleep infinity"));
+        assert!(script.contains("Error - continuing"));
+    }
+
+    #[test]
+    fn build_worker_script_consumes_queue_atomically() {
+        let tmp = std::path::PathBuf::from("/tmp/burn");
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &tmp.join("queue"),
+            task_dir: &tmp.join("tasks"),
+            marker_dir: &tmp.join("markers"),
+            stop_file: &tmp.join("stop"),
+        });
+
+        assert!(script.contains("#!/bin/bash"));
+        // mv でアトミック claim
+        assert!(script.contains("mv \"$pending\" \"$QUEUE_DIR/claimed-$idx\""));
+        // source で個別タスクを取り込む
+        assert!(script.contains("source \"$TASK_SCRIPT\""));
+        // ワーカー完了マーカー
+        assert!(script.contains("worker-done-0"));
+        // 停止シグナル対応
+        assert!(script.contains("trap handle_cancel INT TERM"));
+    }
+
+    #[test]
+    fn build_worker_script_escapes_paths_with_spaces() {
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 1,
+            queue_dir: std::path::Path::new("/tmp/my queue"),
+            task_dir: std::path::Path::new("/tmp/my tasks"),
+            marker_dir: std::path::Path::new("/tmp/my markers"),
+            stop_file: std::path::Path::new("/tmp/my stop"),
+        });
+        assert!(script.contains("QUEUE_DIR='/tmp/my queue'"));
+        assert!(script.contains("TASK_DIR='/tmp/my tasks'"));
+        assert!(script.contains("'/tmp/my stop'"));
+        assert!(script.contains("'/tmp/my markers/worker-done-1'"));
     }
 
     #[test]
