@@ -112,7 +112,7 @@ fn process(
     Ok(())
 }
 
-/// system イベントのうち、サブエージェント進捗・完了通知を表示する。
+/// system イベントのうち、サブエージェント進捗・通知・完了通知を表示する。
 fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
     let subtype = v["subtype"].as_str().unwrap_or("");
     match subtype {
@@ -179,6 +179,37 @@ fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()
                     "\x1b[31m  \u{274c} Task {} ({}m {}s)\x1b[0m",
                     status, m, s
                 )?;
+            }
+        }
+        "task_updated" => {
+            let status = v["patch"]["status"].as_str().unwrap_or("");
+            match status {
+                "completed" => {
+                    writeln!(out, "\x1b[32m  \u{2705} Task completed\x1b[0m")?;
+                }
+                "failed" | "cancelled" => {
+                    writeln!(out, "\x1b[31m  \u{274c} Task {}\x1b[0m", status)?;
+                }
+                status if !status.is_empty() => {
+                    writeln!(out, "\x1b[2m  \u{2139} Task {}\x1b[0m", status)?;
+                }
+                _ => {}
+            }
+        }
+        "notification" => {
+            let text = v["text"].as_str().unwrap_or("");
+            if !text.is_empty() {
+                let key = v["key"].as_str().unwrap_or("");
+                let detail = if key.is_empty() {
+                    truncate_str(text, 100)
+                } else {
+                    format!("{} ({})", truncate_str(text, 80), truncate_str(key, 40))
+                };
+                if v["priority"].as_str() == Some("immediate") {
+                    writeln!(out, "\x1b[31m  \u{26a0} Notification: {}\x1b[0m", detail)?;
+                } else {
+                    writeln!(out, "\x1b[33m  \u{26a0} Notification: {}\x1b[0m", detail)?;
+                }
             }
         }
         "api_retry" => {
@@ -2090,6 +2121,39 @@ mod tests {
         assert!(
             clean.contains("\u{274c} Task failed"),
             "expected failure mark in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_task_updated_completed_shows_status() {
+        // 実データに出る task_updated は task_notification とは別の完了通知として表示する
+        let input = r#"{"type":"system","subtype":"task_updated","task_id":"abc","patch":{"status":"completed","end_time":1776959941297}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("\u{2705} Task completed"),
+            "expected task_updated completion in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_system_notification_shows_text_and_key() {
+        // stop hook などの即時通知は無視せずエラーとして見えるようにする
+        let input = r#"{"type":"system","subtype":"notification","key":"stop-hook-error","text":"Stop hook error occurred","priority":"immediate"}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("Notification: Stop hook error occurred"),
+            "expected notification text in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("stop-hook-error"),
+            "expected notification key in: {}",
             clean
         );
     }

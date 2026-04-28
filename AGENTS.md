@@ -79,7 +79,8 @@ make release  # リリースビルド
 - 思考ブロック（`thinking`）のプログレスインジケーター
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`/`Agent`/`Task`/`TeamCreate`/`Skill`/`TodoWrite`/`Grep`/`Glob`/`ScheduleWakeup` 等）の詳細表示と差分出力
 - `Grep` の検索パターンと対象パス、`ScheduleWakeup` の待機時間と理由を表示
-- サブエージェントの開始・進捗・完了通知（`task_started` / `task_progress` / `task_notification`）
+- サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）
+- Claude Code のシステム通知（`notification`。例: stop hook エラー）
 - トークン使用量、コスト、キャッシュ内訳、Web検索/フェッチ回数の集計表示
 - モデル別使用量（`modelUsage`）の内訳表示（キャッシュ読み取り/書き込みトークン、Web検索回数を含む）
 - API応答時間（`duration_api_ms`）の表示
