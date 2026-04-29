@@ -1010,6 +1010,74 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
                 return truncate_str(query, 100).to_string();
             }
         }
+        "Monitor" => {
+            let desc = v["description"].as_str().unwrap_or("");
+            let cmd = v["command"].as_str().unwrap_or("");
+            let timeout_ms = v["timeout_ms"].as_u64();
+            let persistent = v["persistent"].as_bool().unwrap_or(false);
+
+            let mut detail = if !desc.is_empty() {
+                truncate_str(desc, 80)
+            } else if !cmd.is_empty() {
+                truncate_str(cmd, 80)
+            } else {
+                String::new()
+            };
+
+            let mut attrs = Vec::new();
+            if let Some(ms) = timeout_ms {
+                attrs.push(format!("timeout={}s", ms / 1000));
+            }
+            if persistent {
+                attrs.push("persistent".to_string());
+            }
+            if !detail.is_empty() && !attrs.is_empty() {
+                detail = format!("{} ({})", detail, attrs.join(", "));
+            }
+
+            return detail;
+        }
+        "TaskStop" => {
+            if let Some(task_id) = v["task_id"].as_str()
+                && !task_id.is_empty()
+            {
+                return format!("task {}", truncate_str(task_id, 80));
+            }
+        }
+        name if name.starts_with("mcp__context7__resolve-library-id") => {
+            let library = v["libraryName"].as_str().unwrap_or("");
+            let query = v["query"].as_str().unwrap_or("");
+            if !library.is_empty() && !query.is_empty() {
+                return format!(
+                    "{} ({})",
+                    truncate_str(library, 50),
+                    truncate_str(query, 60)
+                );
+            }
+            if !library.is_empty() {
+                return truncate_str(library, 100).to_string();
+            }
+            if !query.is_empty() {
+                return truncate_str(query, 100).to_string();
+            }
+        }
+        name if name.starts_with("mcp__context7__query-docs") => {
+            let library_id = v["libraryId"].as_str().unwrap_or("");
+            let query = v["query"].as_str().unwrap_or("");
+            if !library_id.is_empty() && !query.is_empty() {
+                return format!(
+                    "{} ({})",
+                    truncate_str(library_id, 50),
+                    truncate_str(query, 60)
+                );
+            }
+            if !library_id.is_empty() {
+                return truncate_str(library_id, 100).to_string();
+            }
+            if !query.is_empty() {
+                return truncate_str(query, 100).to_string();
+            }
+        }
         _ => {}
     }
 
@@ -1021,8 +1089,11 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
         "command",
         "query",
         "url",
+        "libraryName",
+        "libraryId",
         "description",
         "name",
+        "task_id",
     ] {
         if let Some(val) = v[key].as_str() {
             return truncate_str(val, 100).to_string();
@@ -1334,6 +1405,48 @@ mod tests {
     fn extract_tool_detail_tool_search_query_only() {
         let input = r#"{"query":"select:Monitor"}"#;
         assert_eq!(extract_tool_detail("ToolSearch", input), "select:Monitor");
+    }
+
+    #[test]
+    fn extract_tool_detail_monitor_prefers_description() {
+        let input = r#"{"description":"codexレビュー完了を待機","timeout_ms":600000,"persistent":false,"command":"until grep -q \"tokens used\" /tmp/codex-review-output.log; do sleep 5; done"}"#;
+        assert_eq!(
+            extract_tool_detail("Monitor", input),
+            "codexレビュー完了を待機 (timeout=600s)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_monitor_falls_back_to_command() {
+        let input = r#"{"command":"until test -s /tmp/output; do sleep 5; done","timeout_ms":300000,"persistent":true}"#;
+        assert_eq!(
+            extract_tool_detail("Monitor", input),
+            "until test -s /tmp/output; do sleep 5; done (timeout=300s, persistent)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_task_stop_shows_task_id() {
+        let input = r#"{"task_id":"b0mfly525"}"#;
+        assert_eq!(extract_tool_detail("TaskStop", input), "task b0mfly525");
+    }
+
+    #[test]
+    fn extract_tool_detail_context7_resolve_library() {
+        let input = r#"{"libraryName":"keyring","query":"keyring rust crate v4 migration breaking changes"}"#;
+        assert_eq!(
+            extract_tool_detail("mcp__context7__resolve-library-id", input),
+            "keyring (keyring rust crate v4 migration breaking changes)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_context7_query_docs() {
+        let input = r#"{"libraryId":"/open-source-cooperative/keyring-rs","query":"keyring v4 breaking changes migration guide"}"#;
+        assert_eq!(
+            extract_tool_detail("mcp__context7__query-docs", input),
+            "/open-source-cooperative/keyring-rs (keyring v4 breaking changes migration guide)"
+        );
     }
 
     #[test]

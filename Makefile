@@ -1,50 +1,50 @@
 .PHONY: build release install clean test fmt check help
 
-# Default target
+# デフォルトターゲット
 .DEFAULT_GOAL := help
 
-# Variables
+# 変数
 BINARY_NAME := token-burn
 INSTALL_PATH := /usr/local/bin
 
-## Build Commands
+## ビルドコマンド
 
-build: ## Build debug version
+build: ## デバッグビルド
 	cargo build
 
-release: ## Build release version
+release: ## リリースビルド
 	cargo build --release
 
-## Installation
+## インストール
 
-install: release ## Build release and install to /usr/local/bin
+install: release ## リリースビルドして /usr/local/bin にインストール
 	cp target/release/$(BINARY_NAME) $(INSTALL_PATH)/
 
-## Development
+## 開発
 
-test: ## Run tests
+test: ## テストを実行
 	cargo test
 
-fmt: ## Format code
+fmt: ## コードをフォーマット
 	cargo fmt
 
-check: ## Run clippy and format check
+check: ## clippy とフォーマットチェックを実行
 	cargo fmt -- --check
 	cargo clippy -- -D warnings
 	cargo check
 
-clean: ## Clean build artifacts
+clean: ## ビルド成果物を削除
 	cargo clean
 
-## Help
+## ヘルプ
 
-help: ## Show this help message
-	@echo "$(BINARY_NAME) Build Commands"
+help: ## このヘルプを表示
+	@echo "$(BINARY_NAME) ビルドコマンド"
 	@echo ""
-	@echo "Usage: make [target]"
+	@echo "使い方: make [target]"
 	@echo ""
-	@echo "Targets:"
+	@echo "ターゲット:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
-	@echo "Release:"
-	@echo "  Use GitHub Actions > Release > Run workflow"
+	@echo "リリース:"
+	@echo "  GitHub Actions > Release > Run workflow を使用"

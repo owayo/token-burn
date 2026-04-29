@@ -420,7 +420,7 @@ while true; do
     RETRY=$(find "$MARKER_DIR" -name 'retry-*' 2>/dev/null | wc -l | tr -d ' ')
     PROCESSED=$((DONE + FAILED + RETRY))
 
-    # Deadline check
+    # デッドライン到達確認
     if [ $REMAINING -le 0 ] && [ $STOPPED -eq 0 ]; then
         STOPPED=1
         touch "$STOP_FILE"
@@ -430,7 +430,7 @@ while true; do
         echo "    Press Ctrl-C to force kill."
     fi
 
-    # All tasks processed (including failures and retries)
+    # 失敗・リトライを含め、全タスクが処理済みか確認
     if [ "$PROCESSED" -ge "$TOTAL" ]; then
         if [ "$FAILED" -gt 0 ] || [ "$RETRY" -gt 0 ]; then
             printf "\r\033[2K ⚠  Completed: %d succeeded / %d failed / %d retry\n" "$DONE" "$FAILED" "$RETRY"
@@ -444,7 +444,7 @@ while true; do
         exec sleep infinity
     fi
 
-    # If stopped, check if all workers have finished
+    # 停止中の場合は全ワーカーの終了を確認
     if [ $STOPPED -eq 1 ]; then
         WORKERS_DONE=$(find "$MARKER_DIR" -name 'worker-done-*' 2>/dev/null | wc -l | tr -d ' ')
         if [ "$WORKERS_DONE" -ge "$WORKER_COUNT" ]; then
@@ -457,7 +457,7 @@ while true; do
         fi
     fi
 
-    # Display new errors
+    # 新規エラーを表示
     for f in $(find "$MARKER_DIR" -name 'error-*' 2>/dev/null); do
         EFILE=$(basename "$f")
         case "$DISPLAYED_ERRORS" in
@@ -470,7 +470,7 @@ while true; do
         esac
     done
 
-    # Progress bar
+    # 進捗バー
     if [ $TOTAL -gt 0 ]; then
         PCT=$((PROCESSED * 100 / TOTAL))
         BAR_W=20
