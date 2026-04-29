@@ -604,10 +604,14 @@ fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "CLASS_CODE=$?\n",
                 "case $CLASS_CODE in\n",
                 "  2)\n",
+                // 後続タスクが誤って「Cancelled」と判定されないよう、ここでフラグを必ずリセットする
+                "    CANCELLED=0\n",
                 "    touch {failed}\n",
                 "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
                 "    ;;\n",
                 "  3)\n",
+                // 後続タスクが誤って「Cancelled」と判定されないよう、ここでフラグを必ずリセットする
+                "    CANCELLED=0\n",
                 "    if [ -n \"$CLASSIFIED\" ]; then\n",
                 "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
                 "    fi\n",
@@ -940,6 +944,54 @@ mod tests {
         assert!(script.contains("/failed-7"));
         assert!(script.contains("/retry-7"));
         assert!(script.contains("/done-7"));
+    }
+
+    #[test]
+    fn build_task_script_resets_cancelled_in_rate_limited_and_retry_branches() {
+        // SIGINT で CANCELLED=1 になった後、レート制限 (CLASS_CODE=2) や
+        // リトライ可能エラー (CLASS_CODE=3) で終了したタスクは CANCELLED を
+        // リセットしないと、後続タスクで誤って Cancelled と判定されてしまう。
+        let agent = Agent {
+            name: "claude".to_string(),
+            command: vec!["claude".to_string(), "-p".to_string()],
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        let task = ResolvedTarget {
+            directory: std::path::PathBuf::from("/tmp/repo"),
+            display_name: "repo".to_string(),
+            prompt: "review".to_string(),
+            visibility: Visibility::Public,
+        };
+        let tmp = std::path::PathBuf::from("/tmp");
+        let ctx = task_ctx_for_test(1, &agent, &task, &tmp, true);
+        let script = build_task_script(&ctx);
+
+        // CLASS_CODE=2 (レート制限) ブランチで CANCELLED をリセットすること
+        let rate_limited_idx = script
+            .find("Rate limited - not marking as completed")
+            .expect("rate limited branch missing");
+        let preceding = &script[..rate_limited_idx];
+        let last_case2 = preceding.rfind("  2)\n").expect("case 2 branch missing");
+        assert!(
+            script[last_case2..rate_limited_idx].contains("CANCELLED=0"),
+            "CLASS_CODE=2 branch must reset CANCELLED:\n{}",
+            &script[last_case2..rate_limited_idx]
+        );
+
+        // CLASS_CODE=3 (リトライ可能) ブランチで CANCELLED をリセットすること
+        let retry_idx = script
+            .find("Retryable error (will retry next run)")
+            .expect("retry branch missing");
+        let preceding = &script[..retry_idx];
+        let last_case3 = preceding.rfind("  3)\n").expect("case 3 branch missing");
+        assert!(
+            script[last_case3..retry_idx].contains("CANCELLED=0"),
+            "CLASS_CODE=3 branch must reset CANCELLED:\n{}",
+            &script[last_case3..retry_idx]
+        );
     }
 
     #[test]

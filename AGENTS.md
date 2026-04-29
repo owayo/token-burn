@@ -77,17 +77,21 @@ make release  # リリースビルド
 `format-stream` は以下の stream-json イベントを処理します:
 - テキスト応答のストリーミング表示
 - 思考ブロック（`thinking`）のプログレスインジケーター
-- ツール使用（`Read`/`Edit`/`Write`/`Bash`/`Agent`/`Task`/`TeamCreate`/`Skill`/`TodoWrite`/`Grep`/`Glob`/`ScheduleWakeup` 等）の詳細表示と差分出力
+- ツール使用（`Read`/`Edit`/`Write`/`Bash`/`Agent`/`Task`/`TeamCreate`/`Skill`/`TodoWrite`/`Grep`/`Glob`/`ScheduleWakeup`/`WebFetch`/`WebSearch`/`ToolSearch` 等）の詳細表示と差分出力
 - `Grep` の検索パターンと対象パス、`ScheduleWakeup` の待機時間と理由を表示
+- `WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results` を表示
 - サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）
 - Claude Code のシステム通知（`notification`。例: stop hook エラー）
 - トークン使用量、コスト、キャッシュ内訳、Web検索/フェッチ回数の集計表示
 - モデル別使用量（`modelUsage`）の内訳表示（キャッシュ読み取り/書き込みトークン、Web検索回数を含む）
 - API応答時間（`duration_api_ms`）の表示
 - fast mode 状態の表示（`fast_mode_state` が `off` 以外の場合）
+- 異常終了時の `terminal_reason`（`completed` 以外の場合）と `permission_denials` の件数表示
 - レート制限警告（`rate_limit_event`）の使用率表示、リクエスト拒否通知、および `allowed` 時の補足情報表示（`resetsAt` / overage 情報がある場合）
 - レート制限使用率が `rate_limit_threshold`（デフォルト: 95%）を超えた場合、stop file を作成して後続タスクを自動停止
 - APIリトライ（`api_retry`）の試行回数とエラー情報の表示
+
+なお `usage` フィールドは各 `message_start` / `message_delta` でその API 呼び出し単独の値を返し、`result` イベントに最終累計が入るため、`format-stream` は `result` の値を最終出力として優先します。
 
 処理済み状態は有効な設定ファイルと同じディレクトリの `state.json` に保存されます（デフォルト: `~/.config/token-burn/state.json`）。
 

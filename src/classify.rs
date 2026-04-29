@@ -251,4 +251,58 @@ mod tests {
         assert!(is_retryable_status(408));
         assert!(is_retryable_status(429));
     }
+
+    #[test]
+    fn classify_rate_limit_takes_precedence_over_retryable_status() {
+        // usage limit reached メッセージは api_error_status=429 より優先される
+        let input = r#"{"type":"result","is_error":true,"api_error_status":429,"result":"Claude AI usage limit reached"}"#;
+        assert_eq!(classify_content(input), ResultClass::RateLimited);
+    }
+
+    #[test]
+    fn classify_is_error_without_status_falls_to_failed() {
+        // api_error_status がなく、レート制限でもないエラーは Failed
+        let input = r#"{"type":"result","is_error":true,"result":"unexpected error"}"#;
+        match classify_content(input) {
+            ResultClass::Failed(msg) => assert_eq!(msg, "unexpected error"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_is_error_without_message_uses_empty_string() {
+        // result フィールドが欠けている場合は空文字列の Failed メッセージ
+        let input = r#"{"type":"result","is_error":true}"#;
+        match classify_content(input) {
+            ResultClass::Failed(msg) => assert_eq!(msg, ""),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_rate_limit_message_requires_digit_after_resets() {
+        // "resets " の直後が数字でない場合は誤検知しない
+        assert!(!is_rate_limit_message("resets soon — please retry pm"));
+    }
+
+    #[test]
+    fn is_rate_limit_message_requires_am_or_pm_marker() {
+        // "resets <digit>" だけでは時刻表記とみなされない
+        assert!(!is_rate_limit_message("resets 5 minutes from now"));
+    }
+
+    #[test]
+    fn is_rate_limit_message_case_insensitive() {
+        // 大文字メッセージでも検出する
+        assert!(is_rate_limit_message("CLAUDE AI USAGE LIMIT REACHED"));
+        assert!(is_rate_limit_message("Resets 11PM"));
+    }
+
+    #[test]
+    fn is_retryable_status_excludes_other_4xx() {
+        // 408/429 以外の 4xx は再試行対象外
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(404));
+    }
 }

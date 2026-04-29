@@ -471,6 +471,23 @@ fn handle_result(
     {
         writeln!(out, "\x1b[2m   fast_mode {}\x1b[0m", fast_mode)?;
     }
+    // 異常終了時の終了理由（completed 以外）を表示
+    if let Some(reason) = v["terminal_reason"].as_str()
+        && !reason.is_empty()
+        && reason != "completed"
+    {
+        writeln!(out, "\x1b[33m   terminal {}\x1b[0m", reason)?;
+    }
+    // 権限拒否されたツール呼び出しの件数を表示
+    if let Some(denials) = v["permission_denials"].as_array()
+        && !denials.is_empty()
+    {
+        writeln!(
+            out,
+            "\x1b[33m   permission_denials {}\x1b[0m",
+            denials.len()
+        )?;
+    }
     Ok(())
 }
 
@@ -544,6 +561,11 @@ struct UsageSummary {
 }
 
 impl UsageSummary {
+    /// `usage` ペイロードからフィールドを取り込む。
+    /// Claude Code の stream-json は各 message_start / message_delta が
+    /// その API 呼び出し単独の usage を返し、`result` イベントに最終累計が入る。
+    /// そのため最後に `update_from_result` が呼ばれた時点で正しい合計値となる。
+    /// 各フィールドは累積ではなく上書き代入することで `result` の値を最終値として優先する。
     fn merge_from_value(&mut self, value: Option<&serde_json::Value>) {
         let Some(value) = value else {
             return;
@@ -943,6 +965,51 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
                 return truncate_str(prompt, 80).to_string();
             }
         }
+        "WebFetch" => {
+            let url = v["url"].as_str().unwrap_or("");
+            let prompt = v["prompt"].as_str().unwrap_or("");
+            if !url.is_empty() && !prompt.is_empty() {
+                return format!("{} ({})", truncate_str(url, 70), truncate_str(prompt, 40));
+            }
+            if !url.is_empty() {
+                return truncate_str(url, 100).to_string();
+            }
+        }
+        "WebSearch" => {
+            let query = v["query"].as_str().unwrap_or("");
+            let allowed = v["allowed_domains"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let blocked = v["blocked_domains"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if !query.is_empty() {
+                let mut detail = truncate_str(query, 80);
+                if allowed > 0 || blocked > 0 {
+                    let mut filters = Vec::new();
+                    if allowed > 0 {
+                        filters.push(format!("allow:{allowed}"));
+                    }
+                    if blocked > 0 {
+                        filters.push(format!("block:{blocked}"));
+                    }
+                    detail = format!("{} ({})", detail, filters.join(", "));
+                }
+                return detail;
+            }
+        }
+        "ToolSearch" => {
+            let query = v["query"].as_str().unwrap_or("");
+            let max_results = v["max_results"].as_u64();
+            if !query.is_empty() {
+                if let Some(n) = max_results {
+                    return format!("{} (max={})", truncate_str(query, 80), n);
+                }
+                return truncate_str(query, 100).to_string();
+            }
+        }
         _ => {}
     }
 
@@ -1217,6 +1284,89 @@ mod tests {
     #[test]
     fn extract_tool_detail_no_known_fields() {
         assert_eq!(extract_tool_detail("Unknown", r#"{"foo":"bar"}"#), "");
+    }
+
+    #[test]
+    fn extract_tool_detail_web_fetch_shows_url_and_prompt() {
+        let input = r#"{"url":"https://example.com/docs","prompt":"Summarize the key points of this article"}"#;
+        let result = extract_tool_detail("WebFetch", input);
+        assert!(
+            result.starts_with("https://example.com/docs"),
+            "got: {result}"
+        );
+        assert!(result.contains("Summarize"), "got: {result}");
+    }
+
+    #[test]
+    fn extract_tool_detail_web_fetch_url_only() {
+        let input = r#"{"url":"https://example.com"}"#;
+        assert_eq!(
+            extract_tool_detail("WebFetch", input),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_web_search_with_filters() {
+        let input = r#"{"query":"latest rust release","allowed_domains":["rust-lang.org","github.com"],"blocked_domains":["spam.example"]}"#;
+        let result = extract_tool_detail("WebSearch", input);
+        assert!(result.starts_with("latest rust release"), "got: {result}");
+        assert!(result.contains("allow:2"), "got: {result}");
+        assert!(result.contains("block:1"), "got: {result}");
+    }
+
+    #[test]
+    fn extract_tool_detail_web_search_query_only() {
+        let input = r#"{"query":"how to use tokio"}"#;
+        assert_eq!(extract_tool_detail("WebSearch", input), "how to use tokio");
+    }
+
+    #[test]
+    fn extract_tool_detail_tool_search_with_max_results() {
+        let input = r#"{"query":"select:TodoWrite,WebFetch","max_results":3}"#;
+        assert_eq!(
+            extract_tool_detail("ToolSearch", input),
+            "select:TodoWrite,WebFetch (max=3)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_tool_search_query_only() {
+        let input = r#"{"query":"select:Monitor"}"#;
+        assert_eq!(extract_tool_detail("ToolSearch", input), "select:Monitor");
+    }
+
+    #[test]
+    fn process_result_shows_terminal_reason_when_not_completed() {
+        // terminal_reason が "completed" 以外の場合だけ表示する
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.05,"duration_ms":5000,"usage":{"input_tokens":100,"output_tokens":50},"terminal_reason":"interrupted","permission_denials":[]}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("terminal interrupted"), "got: {clean}");
+    }
+
+    #[test]
+    fn process_result_hides_terminal_reason_when_completed() {
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.05,"duration_ms":5000,"usage":{"input_tokens":100,"output_tokens":50},"terminal_reason":"completed","permission_denials":[]}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(!clean.contains("terminal"), "got: {clean}");
+    }
+
+    #[test]
+    fn process_result_shows_permission_denials_count() {
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.05,"duration_ms":5000,"usage":{"input_tokens":100,"output_tokens":50},"terminal_reason":"completed","permission_denials":[{"tool_name":"Bash"},{"tool_name":"Edit"}]}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("permission_denials 2"), "got: {clean}");
+    }
+
+    #[test]
+    fn process_result_hides_permission_denials_when_empty() {
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.05,"duration_ms":5000,"usage":{"input_tokens":100,"output_tokens":50},"terminal_reason":"completed","permission_denials":[]}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(!clean.contains("permission_denials"), "got: {clean}");
     }
 
     #[test]
