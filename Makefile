@@ -19,6 +19,9 @@ release: ## リリースビルド
 
 install: release ## リリースビルドして /usr/local/bin にインストール
 	cp target/release/$(BINARY_NAME) $(INSTALL_PATH)/
+	@if command -v codesign >/dev/null 2>&1; then \
+		codesign --force --sign - $(INSTALL_PATH)/$(BINARY_NAME); \
+	fi
 
 ## 開発
 
