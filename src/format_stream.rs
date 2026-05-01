@@ -875,8 +875,8 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
     match tool_name {
         "Edit" => {
             let file = v["file_path"].as_str().unwrap_or("");
-            let old = v["old_string"].as_str().unwrap_or("");
-            let new = v["new_string"].as_str().unwrap_or("");
+            let old = first_string(&v, &["old_string", "old_str"]);
+            let new = first_string(&v, &["new_string", "new_str"]);
             let old_lines = old.lines().count();
             let new_lines = new.lines().count();
             let added = new_lines.saturating_sub(old_lines);
@@ -1037,11 +1037,74 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
 
             return detail;
         }
+        "SendMessage" => {
+            let to = v["to"].as_str().unwrap_or("");
+            let summary = v["summary"].as_str().unwrap_or("");
+            let message = v["message"].as_str().unwrap_or("");
+            let label = if !summary.is_empty() {
+                summary
+            } else {
+                message
+            };
+            if !to.is_empty() && !label.is_empty() {
+                return format!(
+                    "{} -> {}",
+                    truncate_inline(label, 70),
+                    truncate_inline(to, 40)
+                );
+            }
+            if !label.is_empty() {
+                return truncate_inline(label, 100);
+            }
+            if !to.is_empty() {
+                return format!("to {}", truncate_inline(to, 80));
+            }
+        }
         "TaskStop" => {
             if let Some(task_id) = v["task_id"].as_str()
                 && !task_id.is_empty()
             {
                 return format!("task {}", truncate_str(task_id, 80));
+            }
+        }
+        "mcp__tavily__tavily-search" => {
+            let query = v["query"].as_str().unwrap_or("");
+            if !query.is_empty() {
+                let mut attrs = Vec::new();
+                if let Some(max_results) = v["max_results"].as_u64() {
+                    attrs.push(format!("max={max_results}"));
+                }
+                if let Some(time_range) = v["time_range"].as_str()
+                    && !time_range.is_empty()
+                {
+                    attrs.push(format!("range={time_range}"));
+                }
+                if let Some(search_depth) = v["search_depth"].as_str()
+                    && !search_depth.is_empty()
+                {
+                    attrs.push(format!("depth={search_depth}"));
+                }
+                if attrs.is_empty() {
+                    return truncate_inline(query, 100);
+                }
+                return format!("{} ({})", truncate_inline(query, 80), attrs.join(", "));
+            }
+        }
+        "mcp__codex__codex" => {
+            let prompt = v["prompt"].as_str().unwrap_or("");
+            let cwd = v["cwd"].as_str().unwrap_or("");
+            if !cwd.is_empty() && !prompt.is_empty() {
+                return format!(
+                    "{} ({})",
+                    truncate_inline(prompt, 70),
+                    truncate_inline(cwd, 50)
+                );
+            }
+            if !prompt.is_empty() {
+                return truncate_inline(prompt, 100);
+            }
+            if !cwd.is_empty() {
+                return truncate_inline(cwd, 100);
             }
         }
         name if name.starts_with("mcp__context7__resolve-library-id") => {
@@ -1092,15 +1155,30 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
         "libraryName",
         "libraryId",
         "description",
+        "prompt",
+        "summary",
+        "message",
         "name",
+        "to",
         "task_id",
     ] {
         if let Some(val) = v[key].as_str() {
-            return truncate_str(val, 100).to_string();
+            return truncate_inline(val, 100);
         }
     }
 
     String::new()
+}
+
+fn first_string<'a>(value: &'a serde_json::Value, keys: &[&str]) -> &'a str {
+    keys.iter()
+        .find_map(|key| value[*key].as_str())
+        .unwrap_or("")
+}
+
+fn truncate_inline(s: &str, max: usize) -> String {
+    let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_str(&normalized, max)
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -1124,8 +1202,8 @@ fn format_tool_diff(tool_name: &str, input_json: &str) -> Option<String> {
 
     match tool_name {
         "Edit" => {
-            let old = v["old_string"].as_str().unwrap_or("");
-            let new = v["new_string"].as_str().unwrap_or("");
+            let old = first_string(&v, &["old_string", "old_str"]);
+            let new = first_string(&v, &["new_string", "new_str"]);
             if old.is_empty() && new.is_empty() {
                 return None;
             }
@@ -1340,6 +1418,13 @@ mod tests {
     }
 
     #[test]
+    fn extract_tool_detail_edit_accepts_new_str_alias() {
+        let input = r#"{"file_path":"/src/main.rs","old_string":"a","new_str":"a\nb"}"#;
+        let result = extract_tool_detail("Edit", input);
+        assert!(result.contains("(+1/-0)"), "got: {result}");
+    }
+
+    #[test]
     fn extract_tool_detail_truncates_long_values() {
         let long_path = format!(r#"{{"file_path":"{}"}}"#, "a".repeat(200));
         let result = extract_tool_detail("Read", &long_path);
@@ -1408,6 +1493,15 @@ mod tests {
     }
 
     #[test]
+    fn extract_tool_detail_tavily_search_with_attrs() {
+        let input = r#"{"query":"Android Gradle Plugin latest stable","max_results":5,"time_range":"month","search_depth":"advanced"}"#;
+        assert_eq!(
+            extract_tool_detail("mcp__tavily__tavily-search", input),
+            "Android Gradle Plugin latest stable (max=5, range=month, depth=advanced)"
+        );
+    }
+
+    #[test]
     fn extract_tool_detail_monitor_prefers_description() {
         let input = r#"{"description":"codexレビュー完了を待機","timeout_ms":600000,"persistent":false,"command":"until grep -q \"tokens used\" /tmp/codex-review-output.log; do sleep 5; done"}"#;
         assert_eq!(
@@ -1429,6 +1523,29 @@ mod tests {
     fn extract_tool_detail_task_stop_shows_task_id() {
         let input = r#"{"task_id":"b0mfly525"}"#;
         assert_eq!(extract_tool_detail("TaskStop", input), "task b0mfly525");
+    }
+
+    #[test]
+    fn extract_tool_detail_send_message_shows_summary_and_target() {
+        let input = r#"{"to":"a15c8b054dbf603c9","message":"詳細を再送してください","summary":"Request full bug details"}"#;
+        assert_eq!(
+            extract_tool_detail("SendMessage", input),
+            "Request full bug details -> a15c8b054dbf603c9"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_codex_shows_prompt_and_cwd() {
+        let input = r#"{"prompt":"レビューしてください\n詳細は git diff を確認してください","cwd":"/Users/owa/git/strategic-task-manager","sandbox":"read-only"}"#;
+        let result = extract_tool_detail("mcp__codex__codex", input);
+        assert!(
+            result.starts_with("レビューしてください 詳細は git diff"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("/Users/owa/git/strategic-task-manager"),
+            "got: {result}"
+        );
     }
 
     #[test]
@@ -1790,6 +1907,15 @@ mod tests {
     }
 
     #[test]
+    fn extract_tool_detail_generic_prompt_fallback_is_single_line() {
+        let input = r#"{"prompt":"1行目\n2行目"}"#;
+        assert_eq!(
+            extract_tool_detail("UnknownPromptTool", input),
+            "1行目 2行目"
+        );
+    }
+
+    #[test]
     fn process_system_task_started_shows_description() {
         // 実データに出る task_started は開始通知として表示する
         let input = [
@@ -2001,6 +2127,16 @@ mod tests {
     fn format_tool_diff_edit() {
         let input =
             r#"{"file_path":"/src/main.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#;
+        let diff = format_tool_diff("Edit", input).unwrap();
+        let clean = strip_ansi(&diff);
+        assert!(clean.contains("- let x = 1;"));
+        assert!(clean.contains("+ let x = 2;"));
+    }
+
+    #[test]
+    fn format_tool_diff_edit_accepts_new_str_alias() {
+        let input =
+            r#"{"file_path":"/src/main.rs","old_string":"let x = 1;","new_str":"let x = 2;"}"#;
         let diff = format_tool_diff("Edit", input).unwrap();
         let clean = strip_ansi(&diff);
         assert!(clean.contains("- let x = 1;"));

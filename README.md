@@ -50,7 +50,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Parallel execution**: Runs multiple prompts concurrently in tmux split panes with progress monitor
 - **Sub-agent monitoring**: Real-time start, progress, status updates, and completion notifications for Claude Code team/agent tasks
 - **System notification visibility**: Shows Claude Code system notifications such as stop-hook errors instead of silently dropping them
-- **Richer tool details**: Shows search pattern/path for `Grep`, delay/reason for `ScheduleWakeup`, URL/prompt summary for `WebFetch`, query/domain filters for `WebSearch`, query/`max_results` for `ToolSearch`, monitor description/timeout for `Monitor`, stopped task ID for `TaskStop`, and library/query details for Context7 MCP tools
+- **Richer tool details**: Shows search pattern/path for `Grep`, delay/reason for `ScheduleWakeup`, URL/prompt summary for `WebFetch`, query/domain filters for `WebSearch`, query/`max_results` for `ToolSearch`, monitor description/timeout for `Monitor`, stopped task ID for `TaskStop`, `SendMessage` summaries, Tavily/Codex MCP details, and library/query details for Context7 MCP tools
 - **Per-model usage**: Displays token usage, cost, cache read/creation tokens, and web search counts per model (e.g., Opus, Haiku) in result summary
 - **API timing**: Shows API response time alongside wall-clock duration
 - **Fast mode indicator**: Shows fast mode state when active
