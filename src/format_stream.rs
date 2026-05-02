@@ -108,6 +108,10 @@ fn process(
     }
 
     finalize_open_blocks(&mut out, &mut blocks)?;
+    out.flush()?;
+    if let Some(writer) = raw_writer.as_mut() {
+        writer.flush()?;
+    }
 
     Ok(())
 }
@@ -873,6 +877,22 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
     };
 
     match tool_name {
+        "Read" => {
+            let file = first_string(&v, &["file_path", "path"]);
+            let mut attrs = Vec::new();
+            if let Some(offset) = v["offset"].as_u64() {
+                attrs.push(format!("offset={offset}"));
+            }
+            if let Some(limit) = v["limit"].as_u64() {
+                attrs.push(format!("limit={limit}"));
+            }
+            if !file.is_empty() && !attrs.is_empty() {
+                return format!("{} ({})", truncate_str(file, 80), attrs.join(", "));
+            }
+            if !file.is_empty() {
+                return truncate_str(file, 100).to_string();
+            }
+        }
         "Edit" => {
             let file = v["file_path"].as_str().unwrap_or("");
             let old = first_string(&v, &["old_string", "old_str"]);
@@ -886,22 +906,73 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
         "Bash" => {
             let cmd = v["command"].as_str().unwrap_or("");
             let desc = v["description"].as_str().unwrap_or("");
-            if !desc.is_empty() {
-                return format!("{} ({})", truncate_str(cmd, 60), truncate_str(desc, 40));
+            let mut attrs = Vec::new();
+            if let Some(timeout) = v["timeout"].as_u64() {
+                attrs.push(format!("timeout={}s", timeout / 1000));
             }
-            return truncate_str(cmd, 100).to_string();
+            if v["run_in_background"].as_bool() == Some(true) {
+                attrs.push("background".to_string());
+            }
+            let attr_text = if attrs.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", attrs.join(", "))
+            };
+            if !desc.is_empty() {
+                return format!(
+                    "{}{} ({})",
+                    truncate_str(cmd, 60),
+                    attr_text,
+                    truncate_str(desc, 40)
+                );
+            }
+            return format!("{}{}", truncate_str(cmd, 100), attr_text);
         }
         "Grep" | "Glob" => {
             let pattern = v["pattern"].as_str().unwrap_or("");
             let path = v["path"].as_str().unwrap_or("");
+            let glob = v["glob"].as_str().unwrap_or("");
+            let mut attrs = Vec::new();
+            if let Some(output_mode) = v["output_mode"].as_str()
+                && !output_mode.is_empty()
+            {
+                attrs.push(format!("mode:{output_mode}"));
+            }
+            if !glob.is_empty() {
+                attrs.push(format!("glob:{}", truncate_str(glob, 40)));
+            }
+            if let Some(head_limit) = v["head_limit"].as_u64() {
+                attrs.push(format!("head:{head_limit}"));
+            }
+            if let Some(context) = v["context"].as_u64() {
+                attrs.push(format!("ctx:{context}"));
+            }
+            for key in ["-A", "-B", "-C"] {
+                if let Some(value) = v[key].as_u64() {
+                    attrs.push(format!("{}:{value}", key.trim_start_matches('-')));
+                }
+            }
+            if v["-n"].as_bool() == Some(true) {
+                attrs.push("line".to_string());
+            }
+            let attr_text = if attrs.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", attrs.join(", "))
+            };
             if !pattern.is_empty() && !path.is_empty() {
-                return format!("{} @ {}", truncate_str(pattern, 60), truncate_str(path, 50));
+                return format!(
+                    "{} @ {}{}",
+                    truncate_str(pattern, 60),
+                    truncate_str(path, 50),
+                    attr_text
+                );
             }
             if !pattern.is_empty() {
-                return truncate_str(pattern, 100).to_string();
+                return format!("{}{}", truncate_str(pattern, 100), attr_text);
             }
             if !path.is_empty() {
-                return truncate_str(path, 100).to_string();
+                return format!("{}{}", truncate_str(path, 100), attr_text);
             }
         }
         "Task" | "Agent" => {
@@ -1038,9 +1109,9 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             return detail;
         }
         "SendMessage" => {
-            let to = v["to"].as_str().unwrap_or("");
+            let to = first_string(&v, &["to", "recipient"]);
             let summary = v["summary"].as_str().unwrap_or("");
-            let message = v["message"].as_str().unwrap_or("");
+            let message = first_string(&v, &["message", "content"]);
             let label = if !summary.is_empty() {
                 summary
             } else {
@@ -1361,9 +1432,27 @@ mod tests {
     }
 
     #[test]
+    fn extract_tool_detail_read_shows_offset_and_limit() {
+        let input = r#"{"file_path":"/src/main.rs","offset":120,"limit":40}"#;
+        assert_eq!(
+            extract_tool_detail("Read", input),
+            "/src/main.rs (offset=120, limit=40)"
+        );
+    }
+
+    #[test]
     fn extract_tool_detail_command() {
         let input = r#"{"command":"cargo test"}"#;
         assert_eq!(extract_tool_detail("Bash", input), "cargo test");
+    }
+
+    #[test]
+    fn extract_tool_detail_bash_shows_runtime_attrs() {
+        let input = r#"{"command":"cargo test","description":"Run tests","timeout":300000,"run_in_background":true}"#;
+        assert_eq!(
+            extract_tool_detail("Bash", input),
+            "cargo test [timeout=300s, background] (Run tests)"
+        );
     }
 
     #[test]
@@ -1382,6 +1471,15 @@ mod tests {
         assert!(result.starts_with("\"scripts\" @ "));
         assert!(result.contains("vscode-git-smart-commit"));
         assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn extract_tool_detail_grep_shows_filters_and_limits() {
+        let input = r#"{"pattern":"console\\.error","path":"/repo/src","output_mode":"content","glob":"*.ts","head_limit":20,"context":2,"-n":true}"#;
+        assert_eq!(
+            extract_tool_detail("Grep", input),
+            "console\\.error @ /repo/src (mode:content, glob:*.ts, head:20, ctx:2, line)"
+        );
     }
 
     #[test]
@@ -1531,6 +1629,15 @@ mod tests {
         assert_eq!(
             extract_tool_detail("SendMessage", input),
             "Request full bug details -> a15c8b054dbf603c9"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_send_message_accepts_recipient_alias() {
+        let input = r#"{"recipient":"agent-1","content":"詳細な依頼本文"}"#;
+        assert_eq!(
+            extract_tool_detail("SendMessage", input),
+            "詳細な依頼本文 -> agent-1"
         );
     }
 

@@ -148,10 +148,11 @@ pub fn execute_plan_tmux(
 
     // 今回の実行用レポートディレクトリを作成
     let now = chrono::Local::now();
+    let safe_agent_name = sanitize_filename(&plan.agent.name);
     let run_dir = report_dir.join(format!(
         "{}_{}",
         now.format("%Y%m%d_%H%M%S"),
-        plan.agent.name
+        safe_agent_name
     ));
     std::fs::create_dir_all(&run_dir)?;
 
@@ -324,6 +325,28 @@ pub fn execute_plan_tmux(
         .args(["attach-session", "-t", session])
         .status()
         .context("Failed to attach to tmux session")?;
+
+    let session_alive = std::process::Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+
+    if session_alive {
+        println!();
+        println!(
+            "{} {}",
+            "Detached from tmux session:".bold(),
+            session.cyan()
+        );
+        println!("  {} tmux attach -t {}", "Reattach:".dimmed(), session);
+        println!(
+            "  {} {}",
+            "Runtime files kept:".dimmed(),
+            tmp_dir.display().to_string().cyan()
+        );
+        return Ok(());
+    }
 
     // クリーンアップ
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -590,11 +613,47 @@ fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             "{cmd_str} 2>&1 | {tb_cmd} format-stream --raw-output {jsonl_file} --stop-file {stop_file_escaped} --threshold {rate_limit_threshold} 2>&1 | tee {log_file}\n",
             rate_limit_threshold = ctx.rate_limit_threshold,
         );
+        script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
+        script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
+        script += "FORMAT_EXIT=${PIPE_STATUS[1]}\n";
+        script += "TEE_EXIT=${PIPE_STATUS[2]}\n";
+        script += "CURRENT_FAILED_MARKER=\"\"\n";
+        script += &format!(
+            concat!(
+                "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ] || [ ! -s {jsonl} ]; then\n",
+                "  printf '%slogging/classification pipeline failed (format=%s tee=%s)\\n' {prefix} \"$FORMAT_EXIT\" \"$TEE_EXIT\" > {error}\n",
+                "  touch {failed}\n",
+                "  echo '━━━ Error - logging pipeline failed ━━━'\n",
+                "  echo ''\n",
+                "  return 0\n",
+                "fi\n",
+            ),
+            prefix = error_prefix,
+            error = error_file,
+            failed = failed_marker,
+            jsonl = jsonl_file,
+        );
     } else {
         script += &format!("{cmd_str} 2>&1 | tee {log_file}\n");
+        script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
+        script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
+        script += "TEE_EXIT=${PIPE_STATUS[1]}\n";
+        script += "CURRENT_FAILED_MARKER=\"\"\n";
+        script += &format!(
+            concat!(
+                "if [ \"$TEE_EXIT\" -ne 0 ]; then\n",
+                "  printf '%slogging pipeline failed (tee=%s)\\n' {prefix} \"$TEE_EXIT\" > {error}\n",
+                "  touch {failed}\n",
+                "  echo '━━━ Error - logging pipeline failed ━━━'\n",
+                "  echo ''\n",
+                "  return 0\n",
+                "fi\n",
+            ),
+            prefix = error_prefix,
+            error = error_file,
+            failed = failed_marker,
+        );
     }
-    script += "CMD_EXIT=${PIPESTATUS[0]}\n";
-    script += "CURRENT_FAILED_MARKER=\"\"\n";
 
     if ctx.is_claude {
         let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
@@ -939,6 +998,11 @@ mod tests {
         // jsonl 分類呼び出し
         assert!(script.contains("classify-result"));
         assert!(script.contains("Error - continuing"));
+        assert!(script.contains("PIPE_STATUS=(\"${PIPESTATUS[@]}\")"));
+        assert!(script.contains("FORMAT_EXIT=${PIPE_STATUS[1]}"));
+        assert!(script.contains("TEE_EXIT=${PIPE_STATUS[2]}"));
+        assert!(script.contains("logging/classification pipeline failed"));
+        assert!(script.contains("[ ! -s '/tmp/0007_repo.jsonl' ]"));
         // error マーカーは task idx 単位
         assert!(script.contains("/error-7"));
         assert!(script.contains("/failed-7"));
@@ -1017,6 +1081,8 @@ mod tests {
         assert!(!script.contains("classify-result"));
         assert!(!script.contains("exec sleep infinity"));
         assert!(script.contains("Error - continuing"));
+        assert!(script.contains("TEE_EXIT=${PIPE_STATUS[1]}"));
+        assert!(script.contains("logging pipeline failed"));
     }
 
     #[test]

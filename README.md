@@ -48,9 +48,11 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
 - **Deadline enforcement**: Kills all child processes when the reset time arrives
 - **Parallel execution**: Runs multiple prompts concurrently in tmux split panes with progress monitor
+- **Detach-safe tmux runtime**: Keeps worker scripts and queues when you detach, so background tasks continue safely until the tmux session ends
 - **Sub-agent monitoring**: Real-time start, progress, status updates, and completion notifications for Claude Code team/agent tasks
 - **System notification visibility**: Shows Claude Code system notifications such as stop-hook errors instead of silently dropping them
-- **Richer tool details**: Shows search pattern/path for `Grep`, delay/reason for `ScheduleWakeup`, URL/prompt summary for `WebFetch`, query/domain filters for `WebSearch`, query/`max_results` for `ToolSearch`, monitor description/timeout for `Monitor`, stopped task ID for `TaskStop`, `SendMessage` summaries, Tavily/Codex MCP details, and library/query details for Context7 MCP tools
+- **Richer tool details**: Shows `Read` offset/limit, `Bash` timeout/background state, `Grep`/`Glob` output mode, glob, head/context limits, delay/reason for `ScheduleWakeup`, URL/prompt summary for `WebFetch`, query/domain filters for `WebSearch`, query/`max_results` for `ToolSearch`, monitor description/timeout for `Monitor`, stopped task ID for `TaskStop`, `SendMessage` summaries, Tavily/Codex MCP details, and library/query details for Context7 MCP tools
+- **Logging pipeline safety**: Marks a task failed if `format-stream`, `tee`, or raw jsonl capture fails instead of recording it as completed
 - **Per-model usage**: Displays token usage, cost, cache read/creation tokens, and web search counts per model (e.g., Opus, Haiku) in result summary
 - **API timing**: Shows API response time alongside wall-clock duration
 - **Fast mode indicator**: Shows fast mode state when active
