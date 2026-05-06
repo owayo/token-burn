@@ -183,6 +183,23 @@ fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()
                     "\x1b[31m  \u{274c} Task {} ({}m {}s)\x1b[0m",
                     status, m, s
                 )?;
+            } else if status == "stopped" {
+                // TaskStop で停止された場合
+                if !summary.is_empty() {
+                    writeln!(
+                        out,
+                        "\x1b[33m  \u{23f9} Task stopped: {} ({}m {}s)\x1b[0m",
+                        truncate_str(summary, 60),
+                        m,
+                        s
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "\x1b[33m  \u{23f9} Task stopped ({}m {}s)\x1b[0m",
+                        m, s
+                    )?;
+                }
             }
         }
         "task_updated" => {
@@ -1138,6 +1155,30 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
                 return format!("task {}", truncate_str(task_id, 80));
             }
         }
+        "TaskOutput" => {
+            // TaskOutput はサブエージェント完了を待つために呼ばれる
+            // input 例: {"task_id":"b9x7zeewd","block":true,"timeout":300000}
+            let task_id = v["task_id"].as_str().unwrap_or("");
+            let block = v["block"].as_bool().unwrap_or(false);
+            let timeout_ms = v["timeout"].as_u64();
+            let mut attrs = Vec::new();
+            if block {
+                attrs.push("block".to_string());
+            }
+            if let Some(ms) = timeout_ms {
+                let secs = ms / 1000;
+                attrs.push(format!("timeout={secs}s"));
+            }
+            if !task_id.is_empty() {
+                if attrs.is_empty() {
+                    return format!("task {}", truncate_str(task_id, 80));
+                }
+                return format!("task {} ({})", truncate_str(task_id, 60), attrs.join(", "));
+            }
+            if !attrs.is_empty() {
+                return attrs.join(", ");
+            }
+        }
         "mcp__tavily__tavily-search" => {
             let query = v["query"].as_str().unwrap_or("");
             if !query.is_empty() {
@@ -1621,6 +1662,40 @@ mod tests {
     fn extract_tool_detail_task_stop_shows_task_id() {
         let input = r#"{"task_id":"b0mfly525"}"#;
         assert_eq!(extract_tool_detail("TaskStop", input), "task b0mfly525");
+    }
+
+    #[test]
+    fn extract_tool_detail_task_output_shows_task_with_block_and_timeout() {
+        // TaskOutput: task_id + block + timeout 全て指定
+        let input = r#"{"task_id":"b9x7zeewd","block":true,"timeout":300000}"#;
+        assert_eq!(
+            extract_tool_detail("TaskOutput", input),
+            "task b9x7zeewd (block, timeout=300s)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_task_output_with_only_task_id() {
+        // TaskOutput: task_id のみ
+        let input = r#"{"task_id":"abc123"}"#;
+        assert_eq!(extract_tool_detail("TaskOutput", input), "task abc123");
+    }
+
+    #[test]
+    fn extract_tool_detail_task_output_empty_input_returns_empty() {
+        // TaskOutput: input が空の場合
+        let input = r#"{}"#;
+        assert_eq!(extract_tool_detail("TaskOutput", input), "");
+    }
+
+    #[test]
+    fn extract_tool_detail_task_output_block_false_omits_block_attr() {
+        // block:false の場合は属性表示しない
+        let input = r#"{"task_id":"t1","block":false,"timeout":60000}"#;
+        assert_eq!(
+            extract_tool_detail("TaskOutput", input),
+            "task t1 (timeout=60s)"
+        );
     }
 
     #[test]
@@ -2629,6 +2704,41 @@ mod tests {
             "expected failure mark in: {}",
             clean
         );
+    }
+
+    #[test]
+    fn process_task_notification_stopped_with_summary() {
+        // TaskStop 経由で停止された場合: summary 付きで表示する
+        let input = r#"{"type":"system","subtype":"task_notification","task_id":"bnrpvucd1","tool_use_id":"tu1","status":"stopped","output_file":"","summary":"Codex review completion (output file growth)","usage":{"total_tokens":1000,"tool_uses":2,"duration_ms":12000}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("\u{23f9} Task stopped:"),
+            "expected stop mark in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("Codex review completion"),
+            "expected summary in: {}",
+            clean
+        );
+        assert!(clean.contains("0m 12s"), "expected duration in: {}", clean);
+    }
+
+    #[test]
+    fn process_task_notification_stopped_without_summary() {
+        // summary が無くても停止イベントは表示する
+        let input = r#"{"type":"system","subtype":"task_notification","task_id":"x","tool_use_id":"t","status":"stopped","summary":"","usage":{"total_tokens":0,"tool_uses":0,"duration_ms":3000}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("\u{23f9} Task stopped"),
+            "expected stop mark in: {}",
+            clean
+        );
+        assert!(clean.contains("0m 3s"), "expected duration in: {}", clean);
     }
 
     #[test]

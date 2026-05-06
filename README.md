@@ -51,7 +51,8 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Detach-safe tmux runtime**: Keeps worker scripts and queues when you detach, so background tasks continue safely until the tmux session ends
 - **Sub-agent monitoring**: Real-time start, progress, status updates, and completion notifications for Claude Code team/agent tasks
 - **System notification visibility**: Shows Claude Code system notifications such as stop-hook errors instead of silently dropping them
-- **Richer tool details**: Shows `Read` offset/limit, `Bash` timeout/background state, `Grep`/`Glob` output mode, glob, head/context limits, delay/reason for `ScheduleWakeup`, URL/prompt summary for `WebFetch`, query/domain filters for `WebSearch`, query/`max_results` for `ToolSearch`, monitor description/timeout for `Monitor`, stopped task ID for `TaskStop`, `SendMessage` summaries, Tavily/Codex MCP details, and library/query details for Context7 MCP tools
+- **Richer tool details**: Shows `Read` offset/limit, `Bash` timeout/background state, `Grep`/`Glob` output mode, glob, head/context limits, delay/reason for `ScheduleWakeup`, URL/prompt summary for `WebFetch`, query/domain filters for `WebSearch`, query/`max_results` for `ToolSearch`, monitor description/timeout for `Monitor`, stopped task ID for `TaskStop`, task ID/block/timeout for `TaskOutput`, `SendMessage` summaries, Tavily/Codex MCP details, and library/query details for Context7 MCP tools
+- **Sub-agent stop visibility**: `task_notification` events with `status="stopped"` (e.g. forced via `TaskStop`) are now surfaced in the live monitor
 - **Logging pipeline safety**: Marks a task failed if `format-stream`, `tee`, or raw jsonl capture fails instead of recording it as completed
 - **Per-model usage**: Displays token usage, cost, cache read/creation tokens, and web search counts per model (e.g., Opus, Haiku) in result summary
 - **API timing**: Shows API response time alongside wall-clock duration

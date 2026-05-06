@@ -81,14 +81,14 @@ make release  # リリースビルド
 `format-stream` は以下の stream-json イベントを処理します:
 - テキスト応答のストリーミング表示
 - 思考ブロック（`thinking`）のプログレスインジケーター
-- ツール使用（`Read`/`Edit`/`Write`/`Bash`/`Agent`/`Task`/`TaskStop`/`TeamCreate`/`Skill`/`TodoWrite`/`Monitor`/`Grep`/`Glob`/`ScheduleWakeup`/`WebFetch`/`WebSearch`/`ToolSearch`/`SendMessage`/Context7・Tavily・Codex MCP 等）の詳細表示と差分出力
+- ツール使用（`Read`/`Edit`/`Write`/`Bash`/`Agent`/`Task`/`TaskStop`/`TaskOutput`/`TeamCreate`/`Skill`/`TodoWrite`/`Monitor`/`Grep`/`Glob`/`ScheduleWakeup`/`WebFetch`/`WebSearch`/`ToolSearch`/`SendMessage`/Context7・Tavily・Codex MCP 等）の詳細表示と差分出力
 - `Read` の `file_path` と `offset` / `limit`、`Bash` の `timeout` / `run_in_background` を表示
 - `Edit` は `new_string` に加えて実データで確認された `new_str` 入力も差分表示に使用する
 - `Grep` / `Glob` の検索パターン、対象パス、`output_mode`、`glob`、`head_limit`、`context`、`-A` / `-B` / `-C` / `-n` を表示
 - `ScheduleWakeup` の待機時間と理由を表示
 - `WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results` を表示
-- `Monitor` の説明とタイムアウト、`TaskStop` の task id、`SendMessage` の送信先/要約、Tavily の query/max/time range/search depth、Codex MCP の prompt/cwd、Context7 MCP ツールの library/query を表示
-- サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）
+- `Monitor` の説明とタイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`SendMessage` の送信先/要約、Tavily の query/max/time range/search depth、Codex MCP の prompt/cwd、Context7 MCP ツールの library/query を表示
+- サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）。`task_notification` は `completed` / `failed` に加え `stopped` も表示する
 - Claude Code のシステム通知（`notification`。例: stop hook エラー）
 - トークン使用量、コスト、キャッシュ内訳、Web検索/フェッチ回数の集計表示
 - モデル別使用量（`modelUsage`）の内訳表示（キャッシュ読み取り/書き込みトークン、Web検索回数を含む）
