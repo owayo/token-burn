@@ -78,6 +78,9 @@ fn default_true() -> bool {
 pub struct Target {
     pub directory: String,
     pub prompt: Option<String>,
+    /// true の場合、このターゲットを実行リストの末尾に回す（既存順序は安定ソートで維持）
+    #[serde(default)]
+    pub defer: bool,
 }
 
 impl Config {
@@ -262,6 +265,7 @@ mod tests {
             targets: vec![Target {
                 directory: ".".to_string(),
                 prompt: None,
+                defer: false,
             }],
         }
     }
@@ -617,6 +621,7 @@ mod tests {
         config.targets = vec![Target {
             directory: ".".to_string(),
             prompt: None,
+            defer: false,
         }];
         config
             .validate()

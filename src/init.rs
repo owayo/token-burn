@@ -52,6 +52,13 @@ exclude = []                       # 除外するディレクトリ名
 # [[targets]]
 # directory = "~/GitHub/important-project"
 # prompt = "prompts/test-coverage.md"
+
+# defer = true を指定すると、そのターゲットは実行リストの末尾に回されます
+# （sort_by_key による安定ソート、scan の Visibility 順や追加順は維持されます）
+# [[targets]]
+# directory = "~/GitHub/heavy-repo"
+# prompt = "prompts/heavy-repo.md"
+# defer = true
 "#;
 
 const DEFAULT_PROMPT: &str = r#"Thoroughly review the entire codebase of this project.

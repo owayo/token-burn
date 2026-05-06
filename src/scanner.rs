@@ -12,6 +12,7 @@ pub struct ResolvedTarget {
     pub display_name: String,
     pub prompt: String,
     pub visibility: Visibility,
+    pub defer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -97,6 +98,7 @@ pub async fn resolve_targets(
             display_name,
             prompt,
             visibility: Visibility::Unknown,
+            defer: target.defer,
         };
 
         if let Some(pos) = targets.iter().position(|t| t.directory == path) {
@@ -114,6 +116,11 @@ pub async fn resolve_targets(
     if targets.is_empty() {
         anyhow::bail!("No targets found");
     }
+
+    // `defer = true` のターゲットを末尾に寄せる。
+    // sort_by_key は安定ソートなので、scan の Visibility 順や [[targets]] の追加順は
+    // それぞれのグループ (defer=false / defer=true) 内で維持される。
+    targets.sort_by_key(|t| t.defer);
 
     Ok(targets)
 }
@@ -229,6 +236,7 @@ fn check_repo(
         display_name: dir_name.to_string(),
         prompt: String::new(),
         visibility,
+        defer: false,
     })
 }
 
@@ -506,10 +514,12 @@ mod tests {
                 Target {
                     directory: file_target.to_string_lossy().to_string(),
                     prompt: None,
+                    defer: false,
                 },
                 Target {
                     directory: repo_dir.to_string_lossy().to_string(),
                     prompt: Some("target prompt".to_string()),
+                    defer: false,
                 },
             ],
         };
@@ -569,14 +579,17 @@ mod tests {
                 Target {
                     directory: dir_a.to_string_lossy().to_string(),
                     prompt: None,
+                    defer: false,
                 },
                 Target {
                     directory: dir_b.to_string_lossy().to_string(),
                     prompt: Some("override prompt".to_string()),
+                    defer: false,
                 },
                 Target {
                     directory: dir_c.to_string_lossy().to_string(),
                     prompt: None,
+                    defer: false,
                 },
             ],
         };
@@ -639,14 +652,17 @@ mod tests {
                 Target {
                     directory: dir_a.to_string_lossy().to_string(),
                     prompt: None,
+                    defer: false,
                 },
                 Target {
                     directory: dir_b.to_string_lossy().to_string(),
                     prompt: None,
+                    defer: false,
                 },
                 Target {
                     directory: dir_b.to_string_lossy().to_string(),
                     prompt: Some("overridden".to_string()),
+                    defer: false,
                 },
             ],
         };
@@ -802,6 +818,7 @@ mod tests {
             targets: vec![Target {
                 directory: "repo".to_string(),
                 prompt: Some("target prompt".to_string()),
+                defer: false,
             }],
         };
 
@@ -887,6 +904,248 @@ mod tests {
             resolved.iter().map(|r| &r.display_name).collect::<Vec<_>>()
         );
         assert_eq!(resolved[0].display_name, "real-repo");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_targets_defers_marked_targets_to_end() {
+        // defer=true のターゲットは末尾に集まり、defer=false 同士の順序は維持される。
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("token-burn-scanner-defer-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+
+        let dir_a = temp_dir.join("aaa");
+        let dir_b = temp_dir.join("bbb");
+        let dir_c = temp_dir.join("ccc");
+        let dir_d = temp_dir.join("ddd");
+        for d in [&dir_a, &dir_b, &dir_c, &dir_d] {
+            std::fs::create_dir_all(d).expect("dir should be created");
+        }
+
+        let config = Config {
+            config_dir: temp_dir.clone(),
+            settings: Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+                rate_limit_threshold: 95,
+            },
+            prompts: Prompts {
+                default: "default".to_string(),
+            },
+            agents: vec![Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![],
+            // a (defer), b, c (defer), d の順で定義 → 結果は b, d, a, c
+            targets: vec![
+                Target {
+                    directory: dir_a.to_string_lossy().to_string(),
+                    prompt: None,
+                    defer: true,
+                },
+                Target {
+                    directory: dir_b.to_string_lossy().to_string(),
+                    prompt: None,
+                    defer: false,
+                },
+                Target {
+                    directory: dir_c.to_string_lossy().to_string(),
+                    prompt: None,
+                    defer: true,
+                },
+                Target {
+                    directory: dir_d.to_string_lossy().to_string(),
+                    prompt: None,
+                    defer: false,
+                },
+            ],
+        };
+
+        let resolved = resolve_targets(&config, &config.agents[0])
+            .await
+            .expect("targets should resolve");
+
+        assert_eq!(resolved.len(), 4);
+        // 非 defer グループ (b, d) → defer グループ (a, c) の順で、各グループ内の順序は維持
+        assert_eq!(resolved[0].directory, dir_b);
+        assert_eq!(resolved[1].directory, dir_d);
+        assert_eq!(resolved[2].directory, dir_a);
+        assert_eq!(resolved[3].directory, dir_c);
+        assert!(!resolved[0].defer);
+        assert!(!resolved[1].defer);
+        assert!(resolved[2].defer);
+        assert!(resolved[3].defer);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_targets_defers_after_scan_visibility_sort() {
+        // scan 由来の ResolvedTarget は常に defer=false。
+        // [[targets]] の defer=true は最終リストの末尾に来るため、
+        // scan の Visibility 順より後ろになる。
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("token-burn-scanner-defer-after-scan-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+
+        // scan で見つかる git リポジトリ
+        let scan_repo = temp_dir.join("scanned-repo");
+        std::fs::create_dir_all(&scan_repo).expect("scanned repo dir should be created");
+        let status = std::process::Command::new("git")
+            .args(["-C", &scan_repo.to_string_lossy(), "init", "--quiet"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        // [[targets]] で defer=true なディレクトリ (git でなくてもよい)
+        let deferred = temp_dir.join("deferred-dir");
+        std::fs::create_dir_all(&deferred).expect("deferred dir should be created");
+
+        let config = Config {
+            config_dir: temp_dir.clone(),
+            settings: Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+                rate_limit_threshold: 95,
+            },
+            prompts: Prompts {
+                default: "default".to_string(),
+            },
+            agents: vec![Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![Scan {
+                base_dirs: vec![temp_dir.to_string_lossy().to_string()],
+                recursive: false,
+                username: None,
+                public_first: true,
+                exclude: vec!["deferred-dir".to_string()],
+            }],
+            targets: vec![Target {
+                directory: deferred.to_string_lossy().to_string(),
+                prompt: None,
+                defer: true,
+            }],
+        };
+
+        let resolved = resolve_targets(&config, &config.agents[0])
+            .await
+            .expect("targets should resolve");
+
+        assert_eq!(resolved.len(), 2);
+        // scan 由来 (defer=false) が先、[[targets]] の defer=true が末尾
+        assert_eq!(resolved[0].directory, scan_repo);
+        assert!(!resolved[0].defer);
+        assert_eq!(resolved[1].directory, deferred);
+        assert!(resolved[1].defer);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_targets_defer_overrides_when_target_matches_scan() {
+        // scan 結果と [[targets]] が同じディレクトリを指す場合、
+        // [[targets]] の defer=true が反映され、Visibility は scan の値が維持される。
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("token-burn-scanner-defer-override-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+
+        let repo_dir = temp_dir.join("shared-repo");
+        std::fs::create_dir_all(&repo_dir).expect("repo dir should be created");
+        let status = std::process::Command::new("git")
+            .args(["-C", &repo_dir.to_string_lossy(), "init", "--quiet"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        // 同列に [[targets]] でない普通のディレクトリも置いて、defer の挙動を比較する
+        let normal_repo = temp_dir.join("normal-repo");
+        std::fs::create_dir_all(&normal_repo).expect("normal repo dir should be created");
+        let status = std::process::Command::new("git")
+            .args(["-C", &normal_repo.to_string_lossy(), "init", "--quiet"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        let config = Config {
+            config_dir: temp_dir.clone(),
+            settings: Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+                rate_limit_threshold: 95,
+            },
+            prompts: Prompts {
+                default: "default".to_string(),
+            },
+            agents: vec![Agent {
+                name: "agent".to_string(),
+                command: vec!["echo".to_string()],
+                reset_weekday: "monday".to_string(),
+                reset_time: "09:00".to_string(),
+                timezone: "UTC".to_string(),
+                prompt: None,
+            }],
+            scan: vec![Scan {
+                base_dirs: vec![temp_dir.to_string_lossy().to_string()],
+                recursive: false,
+                username: None,
+                public_first: true,
+                exclude: vec![],
+            }],
+            // shared-repo は scan で見つかるが、[[targets]] でも defer=true 指定する
+            targets: vec![Target {
+                directory: repo_dir.to_string_lossy().to_string(),
+                prompt: Some("override".to_string()),
+                defer: true,
+            }],
+        };
+
+        let resolved = resolve_targets(&config, &config.agents[0])
+            .await
+            .expect("targets should resolve");
+
+        assert_eq!(resolved.len(), 2);
+        // normal-repo は defer=false なので先頭
+        let normal = resolved
+            .iter()
+            .find(|t| t.directory == normal_repo)
+            .expect("normal-repo should be resolved");
+        assert!(!normal.defer);
+        // shared-repo は [[targets]] の defer=true が反映されて末尾
+        assert_eq!(resolved.last().unwrap().directory, repo_dir);
+        assert!(resolved.last().unwrap().defer);
+        assert_eq!(resolved.last().unwrap().prompt, "override");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

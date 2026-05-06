@@ -983,6 +983,7 @@ mod tests {
             display_name: "repo".to_string(),
             prompt: "review".to_string(),
             visibility: Visibility::Public,
+            defer: false,
         };
         let tmp = std::path::PathBuf::from("/tmp");
         let ctx = task_ctx_for_test(7, &agent, &task, &tmp, true);
@@ -1028,6 +1029,7 @@ mod tests {
             display_name: "repo".to_string(),
             prompt: "review".to_string(),
             visibility: Visibility::Public,
+            defer: false,
         };
         let tmp = std::path::PathBuf::from("/tmp");
         let ctx = task_ctx_for_test(1, &agent, &task, &tmp, true);
@@ -1073,6 +1075,7 @@ mod tests {
             display_name: "repo".to_string(),
             prompt: "review".to_string(),
             visibility: Visibility::Public,
+            defer: false,
         };
         let tmp = std::path::PathBuf::from("/tmp");
         let ctx = task_ctx_for_test(2, &agent, &task, &tmp, false);
@@ -1353,6 +1356,7 @@ mod tests {
             display_name: "repo".to_string(),
             prompt: "review".to_string(),
             visibility: Visibility::Public,
+            defer: false,
         }];
         let plan = build_plan(&agent, targets);
         assert_eq!(plan.tasks.len(), 1);

@@ -433,11 +433,14 @@ fn resolve_force_paths(
             .transpose()?
             .unwrap_or_else(|| default_prompt.clone());
 
+        // CLI で明示的に指定されたパスはユーザー指定順を維持するため、
+        // [[targets]] の `defer` フラグは反映しない。
         targets.push(scanner::ResolvedTarget {
             directory: resolved,
             display_name,
             prompt,
             visibility: scanner::Visibility::Unknown,
+            defer: false,
         });
     }
 
@@ -565,12 +568,14 @@ mod tests {
                 display_name: "processed-repo".to_string(),
                 prompt: "review".to_string(),
                 visibility: scanner::Visibility::Unknown,
+                defer: false,
             },
             scanner::ResolvedTarget {
                 directory: std::path::PathBuf::from("/tmp/new-repo"),
                 display_name: "new-repo".to_string(),
                 prompt: "review".to_string(),
                 visibility: scanner::Visibility::Unknown,
+                defer: false,
             },
         ];
 
@@ -594,6 +599,7 @@ mod tests {
             display_name: "repo".to_string(),
             prompt: "review".to_string(),
             visibility: scanner::Visibility::Unknown,
+            defer: false,
         }];
         // fresh=true の場合はスキップ数0、全ターゲット保持
         let original_len = targets.len();
@@ -676,12 +682,14 @@ mod tests {
                 display_name: "recent-repo".to_string(),
                 prompt: "review".to_string(),
                 visibility: scanner::Visibility::Unknown,
+                defer: false,
             },
             scanner::ResolvedTarget {
                 directory: std::path::PathBuf::from("/tmp/old-repo"),
                 display_name: "old-repo".to_string(),
                 prompt: "review".to_string(),
                 visibility: scanner::Visibility::Unknown,
+                defer: false,
             },
         ];
 
@@ -912,6 +920,7 @@ mod tests {
             targets: vec![config::Target {
                 directory: repo_dir.to_string_lossy().to_string(),
                 prompt: Some("custom target prompt".to_string()),
+                defer: false,
             }],
         };
 
