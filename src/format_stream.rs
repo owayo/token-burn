@@ -750,7 +750,15 @@ fn finalize_block(out: &mut impl Write, block: ContentBlockState) -> Result<()> 
                 write!(out, "{}", diff)?;
             }
         }
-        BlockKind::Text | BlockKind::Unknown => {}
+        BlockKind::Text => {
+            // テキストデルタは改行なしで逐次書き出すため、ブロック終了時に
+            // 末尾が改行で終わっていなければ改行を補う。次に続くツール使用や
+            // 思考ブロックが同じ行に連結されるのを防ぐ。
+            if !block.text.is_empty() && !block.text.ends_with('\n') {
+                writeln!(out)?;
+            }
+        }
+        BlockKind::Unknown => {}
     }
 
     Ok(())
@@ -1860,6 +1868,58 @@ mod tests {
         let output = run_process(input);
         assert!(output.contains("plain text line"));
         assert!(output.contains("another line"));
+    }
+
+    #[test]
+    fn process_text_then_tool_use_inserts_newline() {
+        // テキストブロックが改行なしで終わった直後にツール使用が来ても、
+        // 同じ行に "...します。🔧 WebFetch" のように連結されないこと。
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"公式ドキュメントを並列で取得します。"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t_wf","name":"WebFetch","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"url\":\"https://example.com\",\"prompt\":\"summarize\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":1}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            !clean.contains("します。\u{1f527} WebFetch"),
+            "text and tool emoji must not be on the same line: {}",
+            clean
+        );
+        assert!(
+            clean.contains("します。\n"),
+            "expected newline after text block: {}",
+            clean
+        );
+        assert!(clean.contains("\u{1f527} WebFetch"));
+    }
+
+    #[test]
+    fn process_text_already_ending_with_newline_no_double_newline() {
+        // テキスト自体が改行で終わっている場合は改行を二重に出さない。
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"line1\n"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"Read","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/x.rs\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":1}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+        assert!(
+            !clean.contains("line1\n\n\u{1f527}"),
+            "double newline detected: {clean:?}"
+        );
+        assert!(clean.contains("line1\n\u{1f527} Read"));
     }
 
     #[test]
