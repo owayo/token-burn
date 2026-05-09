@@ -342,6 +342,9 @@ fn format_rate_limit_allowed_details(info: &serde_json::Value) -> String {
     {
         parts.push(format!("reason:{reason}"));
     }
+    if let Some(overage_resets) = format_timestamp_clock(info, "overageResetsAt") {
+        parts.push(format!("overage_resets:{overage_resets}"));
+    }
 
     parts.join(" ")
 }
@@ -349,16 +352,16 @@ fn format_rate_limit_allowed_details(info: &serde_json::Value) -> String {
 /// `resetsAt` Unix タイムスタンプをローカル時刻の文字列に整形する。
 /// フィールドが存在しない場合は空文字列を返す。
 fn format_resets_at(info: &serde_json::Value) -> String {
-    info["resetsAt"]
-        .as_i64()
-        .and_then(|ts| {
-            chrono::DateTime::from_timestamp(ts, 0).map(|dt| {
-                dt.with_timezone(&chrono::Local)
-                    .format(" resets %H:%M")
-                    .to_string()
-            })
-        })
+    format_timestamp_clock(info, "resetsAt")
+        .map(|time| format!(" resets {time}"))
         .unwrap_or_default()
+}
+
+fn format_timestamp_clock(info: &serde_json::Value, key: &str) -> Option<String> {
+    info[key]
+        .as_i64()
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
 }
 
 /// stop_file が指定されていれば作成する（全ワーカーの後続タスクを停止するシグナル）。
@@ -926,7 +929,11 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             let new_lines = new.lines().count();
             let added = new_lines.saturating_sub(old_lines);
             let removed = old_lines.saturating_sub(new_lines);
-            return format!("{} (+{}/-{})", truncate_str(file, 80), added, removed);
+            let mut attrs = vec![format!("+{added}/-{removed}")];
+            if v["replace_all"].as_bool() == Some(true) {
+                attrs.push("replace_all".to_string());
+            }
+            return format!("{} ({})", truncate_str(file, 80), attrs.join(", "));
         }
         "Bash" => {
             let cmd = v["command"].as_str().unwrap_or("");
@@ -980,6 +987,9 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             if v["-n"].as_bool() == Some(true) {
                 attrs.push("line".to_string());
             }
+            if v["-i"].as_bool() == Some(true) {
+                attrs.push("ignore-case".to_string());
+            }
             let attr_text = if attrs.is_empty() {
                 String::new()
             } else {
@@ -1004,12 +1014,31 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             let desc = v["description"].as_str().unwrap_or("");
             let name = v["name"].as_str().unwrap_or("");
             let agent_type = v["subagent_type"].as_str().unwrap_or("");
-            if !name.is_empty() && !agent_type.is_empty() {
-                return format!("{} ({})", name, agent_type);
+            let prompt = v["prompt"].as_str().unwrap_or("");
+            let detail = if !name.is_empty() {
+                name.to_string()
             } else if !desc.is_empty() {
-                return truncate_str(desc, 80).to_string();
-            } else if !name.is_empty() {
-                return name.to_string();
+                truncate_str(desc, 80)
+            } else if !prompt.is_empty() {
+                truncate_inline(prompt, 80)
+            } else {
+                String::new()
+            };
+            let mut attrs = Vec::new();
+            if !agent_type.is_empty() {
+                attrs.push(agent_type.to_string());
+            }
+            if v["run_in_background"].as_bool() == Some(true) {
+                attrs.push("background".to_string());
+            }
+            if !detail.is_empty() && !attrs.is_empty() {
+                return format!("{} ({})", detail, attrs.join(", "));
+            }
+            if !detail.is_empty() {
+                return detail;
+            }
+            if !attrs.is_empty() {
+                return attrs.join(", ");
             }
         }
         "TeamCreate" => {
@@ -1213,18 +1242,26 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
         "mcp__codex__codex" => {
             let prompt = v["prompt"].as_str().unwrap_or("");
             let cwd = v["cwd"].as_str().unwrap_or("");
-            if !cwd.is_empty() && !prompt.is_empty() {
-                return format!(
-                    "{} ({})",
-                    truncate_inline(prompt, 70),
-                    truncate_inline(cwd, 50)
-                );
+            let sandbox = v["sandbox"].as_str().unwrap_or("");
+            let approval_policy = v["approval-policy"].as_str().unwrap_or("");
+            let mut attrs = Vec::new();
+            if !cwd.is_empty() {
+                attrs.push(truncate_inline(cwd, 50));
+            }
+            if !sandbox.is_empty() {
+                attrs.push(format!("sandbox:{sandbox}"));
+            }
+            if !approval_policy.is_empty() {
+                attrs.push(format!("approval:{approval_policy}"));
+            }
+            if !attrs.is_empty() && !prompt.is_empty() {
+                return format!("{} ({})", truncate_inline(prompt, 70), attrs.join(", "));
             }
             if !prompt.is_empty() {
                 return truncate_inline(prompt, 100);
             }
-            if !cwd.is_empty() {
-                return truncate_inline(cwd, 100);
+            if !attrs.is_empty() {
+                return attrs.join(", ");
             }
         }
         name if name.starts_with("mcp__context7__resolve-library-id") => {
@@ -1532,6 +1569,15 @@ mod tests {
     }
 
     #[test]
+    fn extract_tool_detail_grep_shows_ignore_case() {
+        let input = r#"{"pattern":"gpt-5\\.4","path":"/repo/src","output_mode":"content","-n":true,"-i":true}"#;
+        assert_eq!(
+            extract_tool_detail("Grep", input),
+            "gpt-5\\.4 @ /repo/src (mode:content, line, ignore-case)"
+        );
+    }
+
+    #[test]
     fn extract_tool_detail_glob_pattern_only() {
         let input = r#"{"pattern":"{AGENTS.md,README.md,README.ja.md}"}"#;
         assert_eq!(
@@ -1569,6 +1615,15 @@ mod tests {
         let input = r#"{"file_path":"/src/main.rs","old_string":"a","new_str":"a\nb"}"#;
         let result = extract_tool_detail("Edit", input);
         assert!(result.contains("(+1/-0)"), "got: {result}");
+    }
+
+    #[test]
+    fn extract_tool_detail_edit_shows_replace_all() {
+        let input =
+            r#"{"file_path":"/src/main.rs","old_string":"a","new_string":"b","replace_all":true}"#;
+        let result = extract_tool_detail("Edit", input);
+        assert!(result.contains("+0/-0"), "got: {result}");
+        assert!(result.contains("replace_all"), "got: {result}");
     }
 
     #[test]
@@ -1726,7 +1781,7 @@ mod tests {
 
     #[test]
     fn extract_tool_detail_codex_shows_prompt_and_cwd() {
-        let input = r#"{"prompt":"レビューしてください\n詳細は git diff を確認してください","cwd":"/Users/owa/git/strategic-task-manager","sandbox":"read-only"}"#;
+        let input = r#"{"prompt":"レビューしてください\n詳細は git diff を確認してください","cwd":"/Users/owa/git/strategic-task-manager","sandbox":"read-only","approval-policy":"never"}"#;
         let result = extract_tool_detail("mcp__codex__codex", input);
         assert!(
             result.starts_with("レビューしてください 詳細は git diff"),
@@ -1736,6 +1791,8 @@ mod tests {
             result.contains("/Users/owa/git/strategic-task-manager"),
             "got: {result}"
         );
+        assert!(result.contains("sandbox:read-only"), "got: {result}");
+        assert!(result.contains("approval:never"), "got: {result}");
     }
 
     #[test]
@@ -2123,6 +2180,15 @@ mod tests {
     fn extract_tool_detail_task_name_only() {
         let input = r#"{"name":"explorer","prompt":"Find files"}"#;
         assert_eq!(extract_tool_detail("Task", input), "explorer");
+    }
+
+    #[test]
+    fn extract_tool_detail_agent_shows_background_and_type() {
+        let input = r#"{"description":"Code correctness review","subagent_type":"feature-dev:code-reviewer","prompt":"レビューしてください","run_in_background":true}"#;
+        assert_eq!(
+            extract_tool_detail("Agent", input),
+            "Code correctness review (feature-dev:code-reviewer, background)"
+        );
     }
 
     #[test]
@@ -3187,7 +3253,7 @@ mod tests {
     #[test]
     fn process_rate_limit_allowed_with_details_is_shown() {
         // 実データにある overage 情報付き allowed は補足情報を表示する
-        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":1776009600,"overageStatus":"rejected","overageDisabledReason":"org_level_disabled_until","isUsingOverage":false}}"#;
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":1776009600,"overageStatus":"rejected","overageResetsAt":1776006000,"overageDisabledReason":"org_level_disabled_until","isUsingOverage":false}}"#;
         let output = run_process(input);
         let clean = strip_ansi(&output);
         assert!(
@@ -3203,6 +3269,11 @@ mod tests {
         assert!(
             clean.contains("overage:rejected"),
             "overage 状態が表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("overage_resets"),
+            "overage のリセット時刻が表示されるべき: {}",
             clean
         );
         assert!(

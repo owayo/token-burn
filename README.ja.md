@@ -51,14 +51,14 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **tmux デタッチ安全性**: デタッチ時はワーカースクリプトとキューを保持し、tmux セッション終了までバックグラウンドタスクを安全に継続
 - **サブエージェント監視**: Claude Codeのチーム/エージェントタスクの開始・進捗・状態更新・完了をリアルタイム表示
 - **システム通知の可視化**: stop hook エラーなどの Claude Code システム通知を無視せず表示
-- **ツール詳細の強化**: Claude の stream-json に含まれる `Read` の offset/limit、`Bash` の timeout/background 状態、`Grep`/`Glob` の output mode・glob・head/context 制限、`ScheduleWakeup` の待機時間/理由、`WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results`、`Monitor` の説明/タイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`SendMessage` の要約、Tavily/Codex MCP 詳細、Context7 MCP ツールの library/query を表示
+- **ツール詳細の強化**: Claude の stream-json に含まれる `Read` の offset/limit、`Edit` の一括置換状態、`Bash` の timeout/background 状態、`Agent` のバックグラウンド状態、`Grep`/`Glob` の output mode・ignore-case・glob・head/context 制限、`ScheduleWakeup` の待機時間/理由、`WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results`、`Monitor` の説明/タイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`SendMessage` の要約、Tavily/Codex MCP の sandbox/approval 詳細、Context7 MCP ツールの library/query を表示
 - **サブエージェント停止の可視化**: `task_notification` の `status="stopped"`（`TaskStop` 等で停止された場合）もモニターに表示
 - **ログパイプラインの安全性**: `format-stream`、`tee`、raw jsonl 保存に失敗したタスクを完了扱いにせず失敗として記録
 - **モデル別使用量**: 結果サマリーにモデルごと（Opus、Haiku等）のトークン使用量・コスト・キャッシュ読み取り/書き込み・Web検索回数を表示
 - **API応答時間**: 実行時間に加えてAPI応答時間を表示
 - **fast mode 表示**: fast mode が有効な場合にその状態を表示
 - **terminal_reason / permission_denials**: 異常終了時の `terminal_reason`（`completed` 以外）と権限拒否されたツール呼び出しの件数を結果サマリーに表示
-- **レート制限通知**: 使用率の警告、リクエスト拒否、`allowed` 時のリセット時刻/overage補足情報を表示し、閾値超過時に後続タスクを自動停止
+- **レート制限通知**: 使用率の警告、リクエスト拒否、`allowed` 時のリセット時刻/overageリセット補足情報を表示し、閾値超過時に後続タスクを自動停止
 - **APIリトライ表示**: 一時的な障害時のリトライ試行回数とエラー情報を表示
 - **ログ衝突回避**: タスクごとのログに連番を付け、同名リポジトリでも上書きしない
 - **プロンプトファイル**: `.md` ファイルまたはインライン文字列でプロンプトを指定可能

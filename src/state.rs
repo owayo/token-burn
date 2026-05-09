@@ -240,16 +240,13 @@ mod tests {
 
     #[test]
     fn state_path_resolves_relative_config_to_absolute_path() {
-        let old_cwd = std::env::current_dir().expect("cwd should be available");
         let tmp = TempDir::new().expect("temp dir should be created");
-        std::env::set_current_dir(tmp.path()).expect("should switch cwd");
+        let _cwd_guard = crate::test_support::CwdGuard::switch_to(tmp.path());
 
         let cwd = std::env::current_dir().expect("cwd should be available");
         let path = state_path(Path::new("cfg/config.toml"));
         assert_eq!(path, cwd.join("cfg").join("state.json"));
         assert!(path.is_absolute());
-
-        std::env::set_current_dir(old_cwd).expect("should restore cwd");
     }
 
     #[test]

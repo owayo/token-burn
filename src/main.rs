@@ -9,6 +9,40 @@ mod scanner;
 mod schedule;
 mod state;
 
+#[cfg(test)]
+mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard};
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    pub struct CwdGuard {
+        original: PathBuf,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl CwdGuard {
+        pub fn switch_to(path: &Path) -> Self {
+            // current dir はプロセス全体の状態なので、変更するテストは必ず直列化する。
+            let lock = CWD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original = std::env::current_dir().expect("cwd should be available");
+            std::env::set_current_dir(path).expect("should switch cwd");
+            Self {
+                original,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+}
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -843,43 +877,44 @@ mod tests {
         let repo_dir = temp_dir.join("repo");
         std::fs::create_dir_all(&repo_dir).expect("repo dir should be created");
 
-        let old_cwd = std::env::current_dir().expect("cwd should be available");
-        std::env::set_current_dir(&temp_dir).expect("should switch cwd");
-        let expected_repo_dir =
-            config::resolve_directory("repo").expect("repo path should resolve");
+        let resolved = {
+            let _cwd_guard = crate::test_support::CwdGuard::switch_to(&temp_dir);
+            let expected_repo_dir =
+                config::resolve_directory("repo").expect("repo path should resolve");
 
-        let config = config::Config {
-            config_dir: temp_dir.clone(),
-            settings: config::Settings {
-                parallelism: 1,
-                skip_within: None,
-                report_dir: None,
-                cleanup_after: None,
-                limit: 10,
-                rate_limit_threshold: 95,
-            },
-            prompts: config::Prompts {
-                default: "default prompt".to_string(),
-            },
-            agents: vec![config::Agent {
-                name: "agent".to_string(),
-                command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
-                prompt: None,
-            }],
-            scan: vec![],
-            targets: vec![],
+            let config = config::Config {
+                config_dir: temp_dir.clone(),
+                settings: config::Settings {
+                    parallelism: 1,
+                    skip_within: None,
+                    report_dir: None,
+                    cleanup_after: None,
+                    limit: 10,
+                    rate_limit_threshold: 95,
+                },
+                prompts: config::Prompts {
+                    default: "default prompt".to_string(),
+                },
+                agents: vec![config::Agent {
+                    name: "agent".to_string(),
+                    command: vec!["echo".to_string()],
+                    reset_weekday: "monday".to_string(),
+                    reset_time: "09:00".to_string(),
+                    timezone: "UTC".to_string(),
+                    prompt: None,
+                }],
+                scan: vec![],
+                targets: vec![],
+            };
+
+            let resolved = resolve_force_paths(
+                &config,
+                &config.agents[0],
+                &[PathBuf::from("repo"), PathBuf::from("./repo")],
+            );
+            (expected_repo_dir, resolved)
         };
-
-        let resolved = resolve_force_paths(
-            &config,
-            &config.agents[0],
-            &[PathBuf::from("repo"), PathBuf::from("./repo")],
-        );
-
-        std::env::set_current_dir(old_cwd).expect("should restore cwd");
+        let (expected_repo_dir, resolved) = resolved;
         let resolved = resolved.expect("same directory should be deduplicated");
 
         assert_eq!(resolved.len(), 1);

@@ -762,7 +762,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn resolve_targets_deduplicates_relative_target_and_scan_path() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -781,49 +781,50 @@ mod tests {
             .expect("git init should run");
         assert!(status.success(), "git init should succeed");
 
-        let old_cwd = std::env::current_dir().expect("cwd should be available");
-        std::env::set_current_dir(&temp_dir).expect("should switch cwd");
-        let expected_repo_dir = std::env::current_dir()
-            .expect("cwd should be available")
-            .join("repo");
+        let (expected_repo_dir, resolved) = {
+            let _cwd_guard = crate::test_support::CwdGuard::switch_to(&temp_dir);
+            let expected_repo_dir = std::env::current_dir()
+                .expect("cwd should be available")
+                .join("repo");
 
-        let config = Config {
-            config_dir: temp_dir.clone(),
-            settings: Settings {
-                parallelism: 1,
-                skip_within: None,
-                report_dir: None,
-                cleanup_after: None,
-                limit: 10,
-                rate_limit_threshold: 95,
-            },
-            prompts: Prompts {
-                default: "default prompt".to_string(),
-            },
-            agents: vec![Agent {
-                name: "agent".to_string(),
-                command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
-                prompt: None,
-            }],
-            scan: vec![Scan {
-                base_dirs: vec![".".to_string()],
-                recursive: false,
-                username: None,
-                public_first: true,
-                exclude: vec![],
-            }],
-            targets: vec![Target {
-                directory: "repo".to_string(),
-                prompt: Some("target prompt".to_string()),
-                defer: false,
-            }],
+            let config = Config {
+                config_dir: temp_dir.clone(),
+                settings: Settings {
+                    parallelism: 1,
+                    skip_within: None,
+                    report_dir: None,
+                    cleanup_after: None,
+                    limit: 10,
+                    rate_limit_threshold: 95,
+                },
+                prompts: Prompts {
+                    default: "default prompt".to_string(),
+                },
+                agents: vec![Agent {
+                    name: "agent".to_string(),
+                    command: vec!["echo".to_string()],
+                    reset_weekday: "monday".to_string(),
+                    reset_time: "09:00".to_string(),
+                    timezone: "UTC".to_string(),
+                    prompt: None,
+                }],
+                scan: vec![Scan {
+                    base_dirs: vec![".".to_string()],
+                    recursive: false,
+                    username: None,
+                    public_first: true,
+                    exclude: vec![],
+                }],
+                targets: vec![Target {
+                    directory: "repo".to_string(),
+                    prompt: Some("target prompt".to_string()),
+                    defer: false,
+                }],
+            };
+
+            let resolved = resolve_targets(&config, &config.agents[0]).await;
+            (expected_repo_dir, resolved)
         };
-
-        let resolved = resolve_targets(&config, &config.agents[0]).await;
-        std::env::set_current_dir(old_cwd).expect("should restore cwd");
         let resolved = resolved.expect("same directory should be deduplicated");
 
         assert_eq!(resolved.len(), 1);

@@ -579,15 +579,13 @@ mod tests {
 
     #[test]
     fn resolve_directory_normalizes_relative_segments() {
-        let old_cwd = std::env::current_dir().expect("cwd should be available");
         let tmp = TempDir::new().expect("temp dir should be created");
-        std::env::set_current_dir(tmp.path()).expect("should switch cwd");
+        let _cwd_guard = crate::test_support::CwdGuard::switch_to(tmp.path());
 
         let expected = std::env::current_dir()
             .expect("cwd should be available")
             .join("repo");
         let path = resolve_directory("./nested/../repo").expect("relative path should resolve");
-        std::env::set_current_dir(old_cwd).expect("should restore cwd");
 
         assert_eq!(path, expected);
         assert!(path.is_absolute());
