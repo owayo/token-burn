@@ -50,7 +50,7 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **並列実行**: tmuxペイン分割とプログレスモニター付きで複数プロンプトを同時実行
 - **tmux デタッチ安全性**: デタッチ時はワーカースクリプトとキューを保持し、tmux セッション終了までバックグラウンドタスクを安全に継続
 - **サブエージェント監視**: Claude Codeのチーム/エージェントタスクの開始・進捗・状態更新・完了をリアルタイム表示
-- **システム通知の可視化**: stop hook エラーなどの Claude Code システム通知を無視せず表示
+- **システム通知の可視化**: stop hook エラーなどの Claude Code システム通知に加え、`hook_progress` / `hook_response` に stderr や output が含まれる場合のフック診断も表示
 - **ツール詳細の強化**: Claude の stream-json に含まれる `Read` の offset/limit、`Edit` の一括置換状態、`Bash` の timeout/background 状態、`Agent` のバックグラウンド状態、`Grep`/`Glob` の output mode・ignore-case・glob・head/context 制限、`ScheduleWakeup` の待機時間/理由、`WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results`、`Monitor` の説明/タイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`SendMessage` の要約、Tavily/Codex MCP の sandbox/approval 詳細、Context7 MCP ツールの library/query を表示
 - **サブエージェント停止の可視化**: `task_notification` の `status="stopped"`（`TaskStop` 等で停止された場合）もモニターに表示
 - **ログパイプラインの安全性**: `format-stream`、`tee`、raw jsonl 保存に失敗したタスクを完了扱いにせず失敗として記録

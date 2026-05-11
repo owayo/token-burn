@@ -247,8 +247,52 @@ fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()
                 attempt, max_retries, error, status
             )?;
         }
-        _ => {} // init, hook_started, hook_response, hook_progress 等は無視
+        "hook_progress" | "hook_response" => {
+            handle_hook_output(v, out)?;
+        }
+        _ => {} // init, hook_started 等は無視
     }
+    Ok(())
+}
+
+/// フックの stderr/output がある場合だけ表示する。
+/// 成功して何も出力していない通常フックはノイズになるため表示しない。
+fn handle_hook_output(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    let detail = first_string(v, &["output", "stderr", "stdout"]);
+    let outcome = v["outcome"].as_str().unwrap_or("");
+    let exit_code = v["exit_code"].as_i64();
+    let has_failure =
+        outcome != "success" && !outcome.is_empty() || exit_code.is_some_and(|code| code != 0);
+
+    if detail.is_empty() && !has_failure {
+        return Ok(());
+    }
+
+    let hook = first_string(v, &["hook_name", "hook_event"]);
+    let hook = if hook.is_empty() { "hook" } else { hook };
+    let mut attrs = Vec::new();
+    if !outcome.is_empty() {
+        attrs.push(format!("outcome:{outcome}"));
+    }
+    if let Some(code) = exit_code {
+        attrs.push(format!("exit:{code}"));
+    }
+    let attr_text = if attrs.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", attrs.join(", "))
+    };
+    let message = if detail.is_empty() {
+        "no output".to_string()
+    } else {
+        truncate_inline(detail, 100)
+    };
+    let color = if has_failure { "\x1b[31m" } else { "\x1b[33m" };
+    writeln!(
+        out,
+        "{}  \u{26a0} Hook {}{}: {}\x1b[0m",
+        color, hook, attr_text, message
+    )?;
     Ok(())
 }
 
@@ -2897,6 +2941,61 @@ mod tests {
             clean.contains("stop-hook-error"),
             "expected notification key in: {}",
             clean
+        );
+    }
+
+    #[test]
+    fn process_hook_progress_shows_output() {
+        // 実データでは hook_progress にタイムアウトなどの stderr が入る
+        let input = r#"{"type":"system","subtype":"hook_progress","hook_name":"SessionStart:startup","hook_event":"SessionStart","stderr":"[ai-analytics-hook] request timeout\n","output":"[ai-analytics-hook] request timeout\n"}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("Hook SessionStart:startup"),
+            "expected hook name in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("[ai-analytics-hook] request timeout"),
+            "expected hook output in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_hook_response_shows_success_with_stderr() {
+        // exit_code 0 でも stderr/output がある場合は診断情報として表示する
+        let input = r#"{"type":"system","subtype":"hook_response","hook_name":"SessionStart:startup","hook_event":"SessionStart","outcome":"success","exit_code":0,"stderr":"[ai-analytics-hook] Error: socket hang up\n","output":"[ai-analytics-hook] Error: socket hang up\n"}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("outcome:success"),
+            "expected hook outcome in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("exit:0"),
+            "expected hook exit code in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("socket hang up"),
+            "expected hook stderr in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_hook_response_success_without_output_is_silent() {
+        let input = r#"{"type":"system","subtype":"hook_response","hook_name":"SessionStart:startup","hook_event":"SessionStart","outcome":"success","exit_code":0,"stdout":"","stderr":"","output":""}"#;
+        let output = run_process(input);
+
+        assert!(
+            output.is_empty(),
+            "expected silent hook response: {}",
+            output
         );
     }
 
