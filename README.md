@@ -54,11 +54,11 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Richer tool details**: Shows `Read` offset/limit, `Edit` replace-all state, `Bash` timeout/background state, `Agent` background state, `Grep`/`Glob` output mode, ignore-case, glob, head/context limits, delay/reason for `ScheduleWakeup`, URL/prompt summary for `WebFetch`, query/domain filters for `WebSearch`, query/`max_results` for `ToolSearch`, monitor description/timeout for `Monitor`, stopped task ID for `TaskStop`, task ID/block/timeout for `TaskOutput`, `SendMessage` summaries, Tavily/Codex MCP sandbox/approval details, and library/query details for Context7 MCP tools
 - **Sub-agent stop visibility**: `task_notification` events with `status="stopped"` (e.g. forced via `TaskStop`) are now surfaced in the live monitor
 - **Logging pipeline safety**: Marks a task failed if `format-stream`, `tee`, or raw jsonl capture fails instead of recording it as completed
-- **Per-model usage**: Displays token usage, cost, cache read/creation tokens, and web search counts per model (e.g., Opus, Haiku) in result summary
+- **Per-model usage**: Displays token usage, cost, cache read/creation tokens, web search counts, and the model's context window / max output limits (e.g. `ctx:1M`, `max_out:64K`) per model in the result summary
 - **API timing**: Shows API response time alongside wall-clock duration
 - **Fast mode indicator**: Shows fast mode state when active
 - **Terminal reason & permission denials**: Surfaces non-`completed` `terminal_reason` and the count of denied tool calls in the result summary
-- **Rate limit alerts**: Displays utilization warnings, rejected request notifications, and allowed-event reset/overage reset details when present, auto-stops when threshold is exceeded
+- **Rate limit alerts**: Displays utilization warnings, rejected request notifications, allowed-event reset/overage reset details when present, and the server-side warning threshold that was crossed (e.g. `warning at 90%`) for `allowed_warning` events; auto-stops when the configured threshold is exceeded
 - **API retry visibility**: Shows retry attempts with error details during transient failures
 - **Collision-safe logs**: Per-task logs are numbered to avoid overwrite when display names collide
 - **Prompt files**: Prompts can be `.md` files or inline strings

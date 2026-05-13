@@ -91,11 +91,11 @@ make release  # リリースビルド
 - サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）。`task_notification` は `completed` / `failed` に加え `stopped` も表示する
 - Claude Code のシステム通知（`notification`。例: stop hook エラー）と、出力を伴う hook 診断（`hook_progress` / `hook_response` の stderr / output）
 - トークン使用量、コスト、キャッシュ内訳、Web検索/フェッチ回数の集計表示
-- モデル別使用量（`modelUsage`）の内訳表示（キャッシュ読み取り/書き込みトークン、Web検索回数を含む）
+- モデル別使用量（`modelUsage`）の内訳表示（キャッシュ読み取り/書き込みトークン、Web検索回数、`contextWindow` / `maxOutputTokens` を `ctx:1M` / `max_out:64K` のような単位付きで表示）
 - API応答時間（`duration_api_ms`）の表示
 - fast mode 状態の表示（`fast_mode_state` が `off` 以外の場合）
 - 異常終了時の `terminal_reason`（`completed` 以外の場合）と `permission_denials` の件数表示
-- レート制限警告（`rate_limit_event`）の使用率表示、リクエスト拒否通知、および `allowed` 時の補足情報表示（`resetsAt` / `overageResetsAt` / overage 情報がある場合）
+- レート制限警告（`rate_limit_event`）の使用率表示、リクエスト拒否通知、および `allowed` 時の補足情報表示（`resetsAt` / `overageResetsAt` / overage 情報がある場合）。`allowed_warning` 時に `surpassedThreshold` が含まれている場合は通過済み警告閾値（例: `warning at 90%`）を併記する
 - レート制限使用率が `rate_limit_threshold`（デフォルト: 95%）を超えた場合、stop file を作成して後続タスクを自動停止
 - APIリトライ（`api_retry`）の試行回数とエラー情報の表示
 

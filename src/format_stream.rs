@@ -340,18 +340,24 @@ fn handle_rate_limit_event(
             let utilization = info["utilization"].as_f64().unwrap_or(0.0);
             let pct = utilization * 100.0;
             let limit_type = info["rateLimitType"].as_str().unwrap_or("");
+            // サーバー側が利用率を判定した閾値 (例: 0.9 → 通過済み警告閾値 90%)
+            let surpassed = info["surpassedThreshold"]
+                .as_f64()
+                .filter(|v| *v > 0.0)
+                .map(|v| format!(" (warning at {:.0}%)", v * 100.0))
+                .unwrap_or_default();
             if pct >= threshold as f64 {
                 touch_stop_file(stop_file);
                 writeln!(
                     out,
-                    "\x1b[31m  \u{26d4} Rate limit auto-stop: {:.0}% used ({}) >= threshold {}%{}\x1b[0m",
-                    pct, limit_type, threshold, resets_at
+                    "\x1b[31m  \u{26d4} Rate limit auto-stop: {:.0}% used ({}){} >= threshold {}%{}\x1b[0m",
+                    pct, limit_type, surpassed, threshold, resets_at
                 )?;
             } else {
                 writeln!(
                     out,
-                    "\x1b[33m  \u{26a0} Rate limit warning: {:.0}% used ({}){}\x1b[0m",
-                    pct, limit_type, resets_at
+                    "\x1b[33m  \u{26a0} Rate limit warning: {:.0}% used ({}){}{}\x1b[0m",
+                    pct, limit_type, surpassed, resets_at
                 )?;
             }
         }
@@ -515,6 +521,17 @@ fn handle_result(
                 }
                 if web_search > 0 {
                     extras.push(format!("web:{}", web_search));
+                }
+                // モデル別の使用枠（contextWindow / maxOutputTokens）が含まれていれば併記する
+                if let Some(window) = usage["contextWindow"].as_u64()
+                    && window > 0
+                {
+                    extras.push(format!("ctx:{}", format_token_size(window)));
+                }
+                if let Some(max_output) = usage["maxOutputTokens"].as_u64()
+                    && max_output > 0
+                {
+                    extras.push(format!("max_out:{}", format_token_size(max_output)));
                 }
                 let extra_str = if extras.is_empty() {
                     String::new()
@@ -1507,6 +1524,18 @@ fn format_number(n: u64) -> String {
         result.push(c);
     }
     result.chars().rev().collect()
+}
+
+/// トークン上限などのサイズを `1M` / `200K` / `64K` の単位で表現する。
+/// 1000 未満や端数のあるサイズはカンマ区切りの数値にフォールバックする。
+fn format_token_size(n: u64) -> String {
+    if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 && n.is_multiple_of(1_000) {
+        format!("{}K", n / 1_000)
+    } else {
+        format_number(n)
+    }
 }
 
 #[cfg(test)]
@@ -3550,6 +3579,133 @@ mod tests {
             "null ステータスは括弧なしで表示されるべき: {}",
             clean
         );
+    }
+
+    #[test]
+    fn process_result_with_context_window_and_max_output() {
+        // modelUsage に contextWindow / maxOutputTokens が含まれる場合に併記される
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":1.5,"duration_ms":60000,"modelUsage":{"claude-opus-4-7[1m]":{"inputTokens":100,"outputTokens":5000,"costUSD":1.5,"contextWindow":1000000,"maxOutputTokens":64000}}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("ctx:1M"),
+            "contextWindow が単位付きで表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("max_out:64K"),
+            "maxOutputTokens が単位付きで表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_without_context_window_or_max_output() {
+        // contextWindow / maxOutputTokens がない場合は表示されない
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":1.0,"duration_ms":60000,"modelUsage":{"claude-opus-4-6":{"inputTokens":30000,"outputTokens":5000,"costUSD":1.0}}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            !clean.contains("ctx:"),
+            "contextWindow がない場合は表示されるべきでない: {}",
+            clean
+        );
+        assert!(
+            !clean.contains("max_out:"),
+            "maxOutputTokens がない場合は表示されるべきでない: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_result_context_window_zero_is_hidden() {
+        // contextWindow=0 は表示されない (実データ非互換だが防御的に確認)
+        let input = r#"{"type":"result","subtype":"success","total_cost_usd":1.0,"duration_ms":60000,"modelUsage":{"claude-opus-4-6":{"inputTokens":10,"outputTokens":5000,"costUSD":1.0,"contextWindow":0,"maxOutputTokens":0}}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            !clean.contains("ctx:"),
+            "contextWindow=0 は表示されるべきでない: {}",
+            clean
+        );
+        assert!(
+            !clean.contains("max_out:"),
+            "maxOutputTokens=0 は表示されるべきでない: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_rate_limit_warning_shows_surpassed_threshold() {
+        // surpassedThreshold (0.9) が含まれる場合は警告閾値が併記される
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","utilization":0.91,"surpassedThreshold":0.9}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("91%"), "使用率が表示されるべき: {}", clean);
+        assert!(
+            clean.contains("warning at 90%"),
+            "通過済み警告閾値が表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_rate_limit_auto_stop_shows_surpassed_threshold() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop_file = tmp.path().join("stop");
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.96,"surpassedThreshold":0.95}}"#;
+        let output = run_process_with_opts(input, None, Some(&stop_file), 95);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("auto-stop"),
+            "auto-stop メッセージが表示されるべき: {}",
+            clean
+        );
+        assert!(
+            clean.contains("warning at 95%"),
+            "auto-stop 時も通過済み警告閾値が表示されるべき: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_rate_limit_warning_without_surpassed_threshold() {
+        // surpassedThreshold がない場合は併記されない
+        let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","utilization":0.80}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            !clean.contains("warning at"),
+            "surpassedThreshold がない場合は表示されるべきでない: {}",
+            clean
+        );
+    }
+
+    // --- format_token_size の単体テスト ---
+
+    #[test]
+    fn format_token_size_million() {
+        assert_eq!(format_token_size(1_000_000), "1M");
+        assert_eq!(format_token_size(2_000_000), "2M");
+    }
+
+    #[test]
+    fn format_token_size_thousands() {
+        assert_eq!(format_token_size(64_000), "64K");
+        assert_eq!(format_token_size(200_000), "200K");
+    }
+
+    #[test]
+    fn format_token_size_non_round_falls_back_to_number() {
+        // ちょうど割り切れない値はカンマ区切りの数値表示にフォールバック
+        assert_eq!(format_token_size(64_500), "64,500");
+        assert_eq!(format_token_size(1_500_500), "1,500,500");
+    }
+
+    #[test]
+    fn format_token_size_small_value() {
+        assert_eq!(format_token_size(500), "500");
+        assert_eq!(format_token_size(0), "0");
     }
 
     // --- format_resets_at の単体テスト ---
