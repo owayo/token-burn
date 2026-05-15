@@ -1277,6 +1277,53 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
                 return attrs.join(", ");
             }
         }
+        "AskUserQuestion" => {
+            if let Some(questions) = v["questions"].as_array() {
+                let total = questions.len();
+                let Some(first) = questions.first() else {
+                    return "0 questions".to_string();
+                };
+
+                let header = first["header"].as_str().unwrap_or("");
+                let question = first["question"].as_str().unwrap_or("");
+                let options = first["options"]
+                    .as_array()
+                    .map(|options| options.len())
+                    .unwrap_or(0);
+                let mut detail = if !header.is_empty() && !question.is_empty() {
+                    format!(
+                        "{}: {}",
+                        truncate_inline(header, 24),
+                        truncate_inline(question, 70)
+                    )
+                } else if !question.is_empty() {
+                    truncate_inline(question, 90)
+                } else if !header.is_empty() {
+                    truncate_inline(header, 90)
+                } else {
+                    String::new()
+                };
+
+                let mut attrs = Vec::new();
+                if total > 1 {
+                    attrs.push(format!("{total} questions"));
+                }
+                if options > 0 {
+                    attrs.push(format!("{options} options"));
+                }
+                if first["multiSelect"].as_bool() == Some(true) {
+                    attrs.push("multi-select".to_string());
+                }
+
+                if detail.is_empty() {
+                    detail = format!("{total} question{}", if total == 1 { "" } else { "s" });
+                }
+                if attrs.is_empty() {
+                    return detail;
+                }
+                return format!("{} ({})", detail, attrs.join(", "));
+            }
+        }
         "mcp__tavily__tavily-search" => {
             let query = v["query"].as_str().unwrap_or("");
             if !query.is_empty() {
@@ -1832,6 +1879,30 @@ mod tests {
             extract_tool_detail("TaskOutput", input),
             "task t1 (timeout=60s)"
         );
+    }
+
+    #[test]
+    fn extract_tool_detail_ask_user_question_shows_question_and_options() {
+        let input = r#"{"questions":[{"question":"Codexから3件の確実なバグ指摘を受けました。修正範囲はどうしますか？","header":"修正範囲","multiSelect":false,"options":[{"label":"確実なバグ3件のみ修正 (推奨)"},{"label":"Trusted origin allowlist方式まで実装"},{"label":"1と2のみ修正"}]}]}"#;
+        assert_eq!(
+            extract_tool_detail("AskUserQuestion", input),
+            "修正範囲: Codexから3件の確実なバグ指摘を受けました。修正範囲はどうしますか？ (3 options)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_ask_user_question_shows_multiple_and_multiselect() {
+        let input = r#"{"questions":[{"question":"対象を選択","header":"Deploy","multiSelect":true,"options":[{"label":"staging"},{"label":"production"}]},{"question":"実行しますか？","header":"Confirm","options":[{"label":"はい"}]}]}"#;
+        assert_eq!(
+            extract_tool_detail("AskUserQuestion", input),
+            "Deploy: 対象を選択 (2 questions, 2 options, multi-select)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_ask_user_question_empty_questions() {
+        let input = r#"{"questions":[]}"#;
+        assert_eq!(extract_tool_detail("AskUserQuestion", input), "0 questions");
     }
 
     #[test]
