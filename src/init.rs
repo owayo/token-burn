@@ -22,12 +22,25 @@ name = "claude"
 # 対話モード起動: 2026-06-15 以降の Agent SDK クレジット分離を回避し、プラン使用枠を消費する。
 # `-p` / `--print` / `--output-format` などの print 系フラグを含めると mode='claude-interactive'
 # では validate 段階で拒否される。
+# `--settings` を command 内に直接書くことも禁止。代わりに claude_settings = [...] を使う。
 command = ["claude", "--dangerously-skip-permissions", "--model", "opus"]
 mode = "claude-interactive"         # auto / generic / claude-print / claude-interactive
 reset_weekday = "monday"           # リセット曜日
 reset_time = "09:00"               # リセット時刻
 timezone = "Asia/Tokyo"
 # prompt = "prompts/test-coverage.md"  # エージェント固有プロンプト（省略時は [prompts].default を使用）
+
+# claude_settings は user 側の Claude settings JSON を 1 つ以上指定でき、token-burn が deep merge して
+# token-burn の Stop / StopFailure hooks を prepend した最終 JSON を `--settings <merged-path>` で渡す。
+# サポートするソース: { file = "..." } / { command = [...] } / { inline = { ... } }
+# 例: plugin の有効/無効を実行ディレクトリで切り替える wrapper を移植する場合
+# claude_settings = [
+#     { command = ["bash", "-lc", "if git -C \"$PWD\" remote get-url origin 2>/dev/null | grep -q public; then printf '%s' '{\"enabledPlugins\":{\"analytics\":true}}'; else printf '%s' '{\"enabledPlugins\":{\"analytics\":false}}'; fi"] },
+# ]
+# 例: 静的なファイルを使う場合
+# claude_settings = [{ file = "~/.config/claude/plugin-settings.json" }]
+# 例: 直接 inline で書く場合
+# claude_settings = [{ inline = { enabledPlugins = { "my-plugin@org" = true } } }]
 
 # レガシー: claude -p (Agent SDK) 経路。2026-06-15 以降は月次クレジット ($20/$100/$200) で頭打ちのため
 # token-burn の目的（プラン枠を使い切る）には合わなくなる。一時的に残置できるが推奨しない。

@@ -3,7 +3,7 @@ use colored::Colorize;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config::{Agent, AgentMode};
+use crate::config::{Agent, AgentMode, ClaudeSettingsSource};
 use crate::display;
 use crate::scanner::{ResolvedTarget, Visibility};
 
@@ -184,10 +184,12 @@ pub fn execute_plan_tmux(
         let settings_file = if matches!(agent_mode, AgentMode::ClaudeInteractive) {
             let outcome_path = marker_dir.join(format!("outcome-{}.json", idx));
             let path = settings_dir.join(format!("task-{:04}.json", idx));
-            std::fs::write(
-                &path,
-                build_claude_interactive_settings(&exe_path, &outcome_path),
+            let json = build_claude_interactive_settings(
+                &plan.agent.claude_settings,
+                &exe_path,
+                &outcome_path,
             )?;
+            std::fs::write(&path, json)?;
             Some(path)
         } else {
             None
@@ -568,44 +570,167 @@ struct TaskCtx<'a> {
     settings_file: Option<&'a Path>,
 }
 
-/// `ClaudeInteractive` で claude 起動時に `--settings` で渡す JSON。
-/// Stop / StopFailure hooks の両方で `token-burn claude-hook --outcome <path>` を呼び出し、
-/// stdin の hook JSON を outcome ファイルへ書き出す。
-fn build_claude_interactive_settings(exe_path: &Path, outcome_path: &Path) -> String {
-    let exe = exe_path
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    let outcome = outcome_path
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    format!(
-        concat!(
-            "{{\n",
-            "  \"hooks\": {{\n",
-            "    \"Stop\": [{{\n",
-            "      \"matcher\": \"*\",\n",
-            "      \"hooks\": [{{\n",
-            "        \"type\": \"command\",\n",
-            "        \"command\": \"{exe}\",\n",
-            "        \"args\": [\"claude-hook\", \"--outcome\", \"{outcome}\"]\n",
-            "      }}]\n",
-            "    }}],\n",
-            "    \"StopFailure\": [{{\n",
-            "      \"matcher\": \"*\",\n",
-            "      \"hooks\": [{{\n",
-            "        \"type\": \"command\",\n",
-            "        \"command\": \"{exe}\",\n",
-            "        \"args\": [\"claude-hook\", \"--outcome\", \"{outcome}\"]\n",
-            "      }}]\n",
-            "    }}]\n",
-            "  }}\n",
-            "}}\n",
-        ),
-        exe = exe,
-        outcome = outcome,
-    )
+/// token-burn が必ず注入する Stop / StopFailure hook 1 個分のオブジェクト。
+/// user の hooks.Stop[*] 配列の **先頭** に prepend されることで、token-burn の outcome 書き出しが
+/// 常に先に走り、その後 user hooks が走る（exit code 順序）。
+fn build_token_burn_hook_entry(exe_path: &Path, outcome_path: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": exe_path.to_string_lossy(),
+            "args": ["claude-hook", "--outcome", outcome_path.to_string_lossy()],
+        }],
+    })
+}
+
+/// `ClaudeInteractive` (および `ClaudePrint` で user 設定を渡す場合) の最終 `--settings` 用 JSON を構築する。
+///
+/// 手順:
+/// 1. `claude_settings` の各 source を解決して `Vec<serde_json::Value>` を作る
+/// 2. 定義順に deep merge して 1 つの user_settings に集約
+/// 3. token-burn の Stop / StopFailure hook を user_settings の `hooks.{Stop,StopFailure}` 配列に **prepend**
+fn build_claude_interactive_settings(
+    sources: &[ClaudeSettingsSource],
+    exe_path: &Path,
+    outcome_path: &Path,
+) -> Result<String> {
+    let mut merged = serde_json::Value::Object(serde_json::Map::new());
+    for src in sources {
+        let value = resolve_settings_source(src)
+            .with_context(|| format!("Failed to resolve claude_settings source: {src:?}"))?;
+        deep_merge(&mut merged, value);
+    }
+
+    let hook_entry = build_token_burn_hook_entry(exe_path, outcome_path);
+    prepend_hook(&mut merged, "Stop", hook_entry.clone());
+    prepend_hook(&mut merged, "StopFailure", hook_entry);
+
+    let json = serde_json::to_string_pretty(&merged)
+        .context("Failed to serialize merged claude settings")?;
+    Ok(json + "\n")
+}
+
+/// `ClaudeSettingsSource` を `serde_json::Value` に解決する。
+fn resolve_settings_source(src: &ClaudeSettingsSource) -> Result<serde_json::Value> {
+    match src {
+        ClaudeSettingsSource::File { file } => {
+            let expanded = shellexpand::tilde(file);
+            let path = std::path::PathBuf::from(expanded.as_ref());
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read settings file: {}", path.display()))?;
+            let v: serde_json::Value = serde_json::from_str(&content)
+                .with_context(|| format!("Invalid JSON in settings file: {}", path.display()))?;
+            ensure_object(&v, &format!("file:{}", path.display()))?;
+            Ok(v)
+        }
+        ClaudeSettingsSource::Command { command } => {
+            anyhow::ensure!(
+                !command.is_empty(),
+                "claude_settings command must include at least one element"
+            );
+            let output = std::process::Command::new(&command[0])
+                .args(&command[1..])
+                .output()
+                .with_context(|| {
+                    format!("Failed to execute claude_settings command: {command:?}")
+                })?;
+            anyhow::ensure!(
+                output.status.success(),
+                "claude_settings command failed (exit={:?}): {:?}\nstderr: {}",
+                output.status.code(),
+                command,
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let stdout = String::from_utf8(output.stdout)
+                .with_context(|| format!("Non-UTF8 stdout from {command:?}"))?;
+            let trimmed = stdout.trim();
+            anyhow::ensure!(
+                !trimmed.is_empty(),
+                "claude_settings command produced empty stdout: {command:?}"
+            );
+            let v: serde_json::Value = serde_json::from_str(trimmed).with_context(|| {
+                format!("Invalid JSON from claude_settings command {command:?}")
+            })?;
+            ensure_object(&v, &format!("command:{command:?}"))?;
+            Ok(v)
+        }
+        ClaudeSettingsSource::Inline { inline } => {
+            let json_str = serde_json::to_string(inline)
+                .context("Failed to convert inline TOML value to JSON")?;
+            let v: serde_json::Value = serde_json::from_str(&json_str)
+                .context("Inline value did not roundtrip to JSON")?;
+            ensure_object(&v, "inline")?;
+            Ok(v)
+        }
+    }
+}
+
+fn ensure_object(v: &serde_json::Value, label: &str) -> Result<()> {
+    anyhow::ensure!(
+        v.is_object(),
+        "claude_settings source ({label}) must be a JSON object, got: {}",
+        match v {
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Null => "null",
+            _ => "non-object",
+        }
+    );
+    Ok(())
+}
+
+/// object 同士は再帰 merge、それ以外は RHS で完全置換する（最後勝ち）。
+/// 配列は merge ではなく完全置換が rust-style で予測可能。hooks の matcher 配列は別途
+/// `prepend_hook` で扱う。
+fn deep_merge(base: &mut serde_json::Value, rhs: serde_json::Value) {
+    match (base, rhs) {
+        (serde_json::Value::Object(bo), serde_json::Value::Object(ro)) => {
+            for (k, v) in ro {
+                match bo.get_mut(&k) {
+                    Some(bv) => deep_merge(bv, v),
+                    None => {
+                        bo.insert(k, v);
+                    }
+                }
+            }
+        }
+        (slot, v) => {
+            *slot = v;
+        }
+    }
+}
+
+/// merged 設定の `hooks.<event>` 配列の **先頭** に token-burn の hook entry を prepend する。
+/// 配列が無ければ作成。`hooks` キーが無ければ作成。
+fn prepend_hook(settings: &mut serde_json::Value, event: &str, entry: serde_json::Value) {
+    let obj = match settings {
+        serde_json::Value::Object(o) => o,
+        _ => return,
+    };
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let hooks_obj = match hooks {
+        serde_json::Value::Object(o) => o,
+        _ => {
+            *hooks = serde_json::Value::Object(serde_json::Map::new());
+            hooks.as_object_mut().unwrap()
+        }
+    };
+    let arr = hooks_obj
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    match arr {
+        serde_json::Value::Array(a) => {
+            a.insert(0, entry);
+        }
+        _ => {
+            *arr = serde_json::Value::Array(vec![entry]);
+        }
+    }
 }
 
 struct WorkerCtx<'a> {
@@ -1247,6 +1372,7 @@ mod tests {
             name: "claude".to_string(),
             command: vec!["claude".to_string(), "-p".to_string()],
             mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1294,6 +1420,7 @@ mod tests {
             name: "claude".to_string(),
             command: vec!["claude".to_string(), "-p".to_string()],
             mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1341,6 +1468,7 @@ mod tests {
             name: "codex".to_string(),
             command: vec!["codex".to_string(), "exec".to_string()],
             mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1374,6 +1502,7 @@ mod tests {
                 "opus".to_string(),
             ],
             mode: AgentMode::ClaudeInteractive,
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1448,7 +1577,8 @@ mod tests {
     fn build_claude_interactive_settings_produces_valid_hooks_json() {
         let exe = std::path::Path::new("/usr/local/bin/token-burn");
         let outcome = std::path::Path::new("/tmp/token-burn/markers/outcome-3.json");
-        let json = build_claude_interactive_settings(exe, outcome);
+        let json = build_claude_interactive_settings(&[], exe, outcome)
+            .expect("no sources should succeed");
 
         let v: serde_json::Value = serde_json::from_str(&json).expect("有効な JSON であるべき");
         assert!(v.get("hooks").is_some());
@@ -1471,7 +1601,8 @@ mod tests {
         // パスに " や \ が含まれていても JSON が壊れないこと
         let exe = std::path::Path::new("/opt/with \"quote\".bin");
         let outcome = std::path::Path::new("/tmp/back\\slash.json");
-        let json = build_claude_interactive_settings(exe, outcome);
+        let json = build_claude_interactive_settings(&[], exe, outcome)
+            .expect("no sources should succeed");
         let v: serde_json::Value =
             serde_json::from_str(&json).expect("特殊文字含むパスでも JSON は valid であるべき");
         assert_eq!(
@@ -1484,6 +1615,227 @@ mod tests {
         );
     }
 
+    // -------- claude_settings: source 解決 / deep merge / prepend のテスト --------
+
+    #[test]
+    fn deep_merge_objects_recursively() {
+        let mut base = serde_json::json!({"a": 1, "b": {"x": 1, "y": 2}});
+        deep_merge(
+            &mut base,
+            serde_json::json!({"b": {"y": 99, "z": 3}, "c": 4}),
+        );
+        assert_eq!(
+            base,
+            serde_json::json!({"a": 1, "b": {"x": 1, "y": 99, "z": 3}, "c": 4})
+        );
+    }
+
+    #[test]
+    fn deep_merge_arrays_are_replaced_not_concatenated() {
+        // 配列は完全置換（hooks の matcher は別途 prepend で扱う）
+        let mut base = serde_json::json!({"list": [1, 2, 3]});
+        deep_merge(&mut base, serde_json::json!({"list": [9]}));
+        assert_eq!(base, serde_json::json!({"list": [9]}));
+    }
+
+    #[test]
+    fn deep_merge_scalar_replaces() {
+        let mut base = serde_json::json!({"k": "old"});
+        deep_merge(&mut base, serde_json::json!({"k": "new"}));
+        assert_eq!(base["k"], "new");
+    }
+
+    #[test]
+    fn prepend_hook_inserts_at_head_of_existing_array() {
+        let mut s = serde_json::json!({
+            "hooks": {
+                "Stop": [{"matcher": "*", "hooks": [{"type": "command", "command": "user"}]}]
+            }
+        });
+        let entry =
+            serde_json::json!({"matcher": "*", "hooks": [{"type": "command", "command": "tb"}]});
+        prepend_hook(&mut s, "Stop", entry);
+        let arr = s["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["hooks"][0]["command"], "tb");
+        assert_eq!(arr[1]["hooks"][0]["command"], "user");
+    }
+
+    #[test]
+    fn prepend_hook_creates_hooks_node_when_absent() {
+        let mut s = serde_json::json!({});
+        prepend_hook(
+            &mut s,
+            "StopFailure",
+            serde_json::json!({"matcher": "*", "hooks": []}),
+        );
+        let arr = s["hooks"]["StopFailure"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+    }
+
+    #[test]
+    fn resolve_settings_source_inline() {
+        let toml_val: toml::Value =
+            toml::from_str("[v]\nenabledPlugins = { plugin = true }\n").unwrap();
+        let v = toml_val.get("v").unwrap().clone();
+        let src = ClaudeSettingsSource::Inline { inline: v };
+        let resolved = resolve_settings_source(&src).expect("inline should resolve");
+        assert_eq!(resolved["enabledPlugins"]["plugin"], true);
+    }
+
+    #[test]
+    fn resolve_settings_source_file_reads_and_parses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"enabledPlugins":{"p":true},"hooks":{}}"#).unwrap();
+        let src = ClaudeSettingsSource::File {
+            file: path.to_string_lossy().to_string(),
+        };
+        let resolved = resolve_settings_source(&src).expect("file should resolve");
+        assert_eq!(resolved["enabledPlugins"]["p"], true);
+    }
+
+    #[test]
+    fn resolve_settings_source_file_rejects_invalid_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("broken.json");
+        std::fs::write(&path, "not json").unwrap();
+        let src = ClaudeSettingsSource::File {
+            file: path.to_string_lossy().to_string(),
+        };
+        let err = resolve_settings_source(&src).expect_err("invalid JSON should fail");
+        assert!(err.to_string().contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn resolve_settings_source_file_rejects_non_object() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("arr.json");
+        std::fs::write(&path, "[1,2,3]").unwrap();
+        let src = ClaudeSettingsSource::File {
+            file: path.to_string_lossy().to_string(),
+        };
+        let err = resolve_settings_source(&src).expect_err("array should be rejected");
+        assert!(err.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn resolve_settings_source_command_captures_stdout_json() {
+        let src = ClaudeSettingsSource::Command {
+            command: vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "printf '{\"enabledPlugins\":{\"x\":true}}'".to_string(),
+            ],
+        };
+        let resolved = resolve_settings_source(&src).expect("command should resolve");
+        assert_eq!(resolved["enabledPlugins"]["x"], true);
+    }
+
+    #[test]
+    fn resolve_settings_source_command_rejects_nonzero_exit() {
+        let src = ClaudeSettingsSource::Command {
+            command: vec!["bash".to_string(), "-lc".to_string(), "exit 7".to_string()],
+        };
+        let err = resolve_settings_source(&src).expect_err("nonzero exit should fail");
+        assert!(err.to_string().contains("command failed"));
+    }
+
+    #[test]
+    fn resolve_settings_source_command_rejects_empty_stdout() {
+        let src = ClaudeSettingsSource::Command {
+            command: vec!["bash".to_string(), "-lc".to_string(), "true".to_string()],
+        };
+        let err = resolve_settings_source(&src).expect_err("empty stdout should fail");
+        assert!(err.to_string().contains("empty stdout"));
+    }
+
+    #[test]
+    fn build_claude_interactive_settings_merges_user_settings_and_prepends_hook() {
+        // user の plugin 設定と既存 Stop hook が保たれ、token-burn の Stop hook が先頭に入る
+        let tmp = tempfile::TempDir::new().unwrap();
+        let user_settings = tmp.path().join("user.json");
+        std::fs::write(
+            &user_settings,
+            r#"{
+              "enabledPlugins": {"my-plugin": true},
+              "hooks": {
+                "Stop": [
+                  {"matcher": "*", "hooks": [{"type": "command", "command": "user-stop"}]}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let sources = vec![ClaudeSettingsSource::File {
+            file: user_settings.to_string_lossy().to_string(),
+        }];
+        let exe = std::path::Path::new("/usr/local/bin/token-burn");
+        let outcome = std::path::Path::new("/tmp/marker/outcome-1.json");
+        let json = build_claude_interactive_settings(&sources, exe, outcome)
+            .expect("merge should succeed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // user plugin 設定が保たれている
+        assert_eq!(v["enabledPlugins"]["my-plugin"], true);
+
+        // Stop 配列: token-burn が先頭、user が後続
+        let stop = v["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2);
+        assert_eq!(stop[0]["hooks"][0]["command"], "/usr/local/bin/token-burn");
+        assert_eq!(stop[0]["hooks"][0]["args"][0], "claude-hook");
+        assert_eq!(stop[1]["hooks"][0]["command"], "user-stop");
+
+        // StopFailure 配列: user 側には無いので token-burn のみ
+        let sf = v["hooks"]["StopFailure"].as_array().unwrap();
+        assert_eq!(sf.len(), 1);
+        assert_eq!(sf[0]["hooks"][0]["command"], "/usr/local/bin/token-burn");
+    }
+
+    #[test]
+    fn build_claude_interactive_settings_multiple_sources_merge_in_order() {
+        // 後勝ち: file の値が inline の値を override する
+        let toml_inline: toml::Value =
+            toml::from_str("[v]\nenabledPlugins = { p1 = true, p2 = true }\n").unwrap();
+        let inline_v = toml_inline.get("v").unwrap().clone();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("u.json");
+        std::fs::write(&f, r#"{"enabledPlugins": {"p2": false, "p3": true}}"#).unwrap();
+
+        let sources = vec![
+            ClaudeSettingsSource::Inline { inline: inline_v },
+            ClaudeSettingsSource::File {
+                file: f.to_string_lossy().to_string(),
+            },
+        ];
+        let exe = std::path::Path::new("/bin/tb");
+        let outcome = std::path::Path::new("/tmp/o.json");
+        let json = build_claude_interactive_settings(&sources, exe, outcome)
+            .expect("merge should succeed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // p1 は inline のみ → 残る
+        assert_eq!(v["enabledPlugins"]["p1"], true);
+        // p2 は inline で true、file で false → file が勝ち
+        assert_eq!(v["enabledPlugins"]["p2"], false);
+        // p3 は file のみ → 残る
+        assert_eq!(v["enabledPlugins"]["p3"], true);
+    }
+
+    #[test]
+    fn build_claude_interactive_settings_with_no_sources_only_has_tb_hooks() {
+        let exe = std::path::Path::new("/x");
+        let outcome = std::path::Path::new("/o.json");
+        let json = build_claude_interactive_settings(&[], exe, outcome).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // user 設定が無い場合は hooks のみのフラットな構造
+        assert!(v.as_object().unwrap().keys().all(|k| k == "hooks"));
+        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hooks"]["StopFailure"].as_array().unwrap().len(), 1);
+    }
+
     #[test]
     fn ensure_required_flags_skips_claude_interactive() {
         let mut agent = Agent {
@@ -1494,6 +1846,7 @@ mod tests {
                 "opus".to_string(),
             ],
             mode: AgentMode::ClaudeInteractive,
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1520,6 +1873,7 @@ mod tests {
             name: "claude".to_string(),
             command: vec!["claude".to_string()],
             mode: AgentMode::Auto,
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1536,6 +1890,7 @@ mod tests {
             name: "claude".to_string(),
             command: vec!["claude".to_string(), "-p".to_string()],
             mode: AgentMode::Auto,
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1733,6 +2088,7 @@ mod tests {
             name: "claude".to_string(),
             command: command.into_iter().map(String::from).collect(),
             mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1879,6 +2235,7 @@ mod tests {
             name: "test".to_string(),
             command: vec![],
             mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1908,6 +2265,7 @@ mod tests {
             name: "codex".to_string(),
             command: vec!["codex".to_string(), "exec".to_string()],
             mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "thursday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -2007,6 +2365,7 @@ mod tests {
                 "-p".to_string(),
             ],
             mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "friday".to_string(),
             reset_time: "13:00".to_string(),
             timezone: "Asia/Tokyo".to_string(),

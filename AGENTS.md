@@ -66,6 +66,45 @@ make release  # リリースビルド
 
 `mode = "claude-interactive"` 設定時は、validate 段階で `command` に `-p` / `--print` / `--output-format` / `--input-format` / `--include-partial-messages` / `--max-budget-usd` / `--no-session-persistence` / `--include-hook-events` / `--json-schema` が含まれていれば設定読み込み時にエラーになります（これらが指定されると print 経路に切り替わり Agent SDK クレジットを消費してしまうため）。
 
+また、claude 経路 (`claude-print` / `claude-interactive` / Auto with claude 実行ファイル) では `command` に `--settings` / `--settings=...` を直接書くことも禁止されます。token-burn は `--settings` を必ず 1 個だけ渡す方針（[[agents]].claude_settings で user 設定を集約）なので、wrapper 内で `--settings` を渡している場合は wrapper から外し、`claude_settings` に移行してください。
+
+## `claude_settings`: user の Claude settings を統合する仕組み
+
+`[[agents]]` に `claude_settings` を指定すると、token-burn が user の Claude settings JSON を 1 つ以上読み込み、token-burn の `Stop` / `StopFailure` hooks を **prepend** で挿入してから 1 つの merged JSON ファイルとして書き出し、`claude --settings <merged-path>` で渡します。
+
+サポートするソース:
+
+```toml
+[[agents]]
+name = "claude"
+command = ["claude", "--dangerously-skip-permissions", "--model", "opus"]
+mode = "claude-interactive"
+
+# 定義順に deep merge される。後勝ち。
+claude_settings = [
+    # (1) ファイル経路: ~ 展開対応、中身は valid な JSON object
+    { file = "~/.config/claude/plugin-settings.json" },
+
+    # (2) コマンド経路: shell コマンドを実行し stdout を JSON object として読む
+    #     動的判定（cwd 依存等）はこの経路で実現する
+    { command = ["bash", "-lc", "~/bin/claude-plugin-settings.sh"] },
+
+    # (3) inline 経路: TOML 上で直接書く JSON object
+    { inline = { enabledPlugins = { "my-plugin@org" = true } } },
+]
+```
+
+**merge 規則**:
+- object 同士は **再帰 deep merge**（同じキーがあれば後の source が勝つ）
+- 配列は完全置換（hooks の matcher 配列を除く）
+- `hooks.Stop` / `hooks.StopFailure` 配列は token-burn の hook entry が user の hook entries の **先頭** に prepend される。これにより token-burn の outcome 書き出しが先に走り、その後 user hooks が走る（user hooks の `decision: "block"` を尊重）
+
+**wrapper script からの移行**: 既存の `claude-wrapper.sh` などで `--settings "$JSON"` を渡している場合は、wrapper 内の `--settings` を **削除** し、生成ロジックを `claude_settings = [{ command = [...] }]` に移植してください。理由は token-burn が `--settings` を必ず自前で 1 個だけ渡すためです（複数指定時の claude の挙動は公式非明記）。validate でも `command` 内の `--settings` 直書きは拒否されます。
+
+**source の制約**: `file` / `command` / `inline` のソースは valid な JSON **object** を返す必要があります。array / scalar / null はエラーになります。`command` ソースの非ゼロ終了 / 空 stdout もエラーです。
+
+**mode 制限**: `claude_settings` は claude エージェント (`mode = "claude-print"` / `"claude-interactive"` / Auto with claude 実行ファイル) でのみ指定可能。`generic` モードや非 claude 実行ファイルで指定するとエラーになります。
+
 ## モード別の分類
 
 ### `claude-print` 経路
