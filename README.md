@@ -30,6 +30,8 @@
 
 Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Japanese *mottainai* (もったいない) spirit — the belief that waste is something to be avoided — **token-burn** puts those remaining tokens to work. It runs your prompts across repositories in parallel before the reset deadline — code reviews, bug hunts, refactoring, test improvements, or anything else you define. When the reset time arrives, all running processes are automatically terminated.
 
+> **Heads-up for 2026-06-15 onward**: Anthropic is moving `claude -p` / Agent SDK / GitHub Actions onto a separate monthly Agent SDK credit (Pro $20/mo, Max 5x $100/mo, Max 20x $200/mo), while interactive Claude Code (terminal/IDE) continues to draw from your normal plan quota. token-burn now defaults to **interactive mode** (`mode = "claude-interactive"`) to keep consuming the plan quota, by launching `claude` in real TTY and using `Stop` / `StopFailure` hooks for outcome classification. The legacy `claude -p` path is preserved as `mode = "claude-print"` for opt-in use. See [AGENTS.md](./AGENTS.md) for details. **No guarantee that Anthropic won't tighten the interactive path later** — adjust your usage accordingly.
+
 <p align="center">
   <img src="docs/images/screenshot.png" width="800" alt="token-burn running">
 </p>

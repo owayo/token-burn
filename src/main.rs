@@ -1,4 +1,5 @@
 mod classify;
+mod claude_hook;
 mod cleanup;
 mod config;
 mod display;
@@ -47,6 +48,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
+
+#[cfg(test)]
+use config::AgentMode;
 
 #[derive(Parser)]
 #[command(name = "token-burn")]
@@ -144,6 +148,19 @@ enum Commands {
         /// 分類対象の jsonl ファイル
         jsonl: PathBuf,
     },
+    /// Claude Code の Stop / StopFailure hook 受け口（stdin の JSON を outcome ファイルに書き出す）
+    #[command(hide = true, name = "claude-hook")]
+    ClaudeHook {
+        /// 書き出し先 outcome JSON ファイル
+        #[arg(long)]
+        outcome: PathBuf,
+    },
+    /// outcome JSON を分類して終了コード (0=success,1=failed,2=rate-limited,3=retryable) を返す
+    #[command(hide = true, name = "classify-claude-outcome")]
+    ClassifyClaudeOutcome {
+        /// 分類対象の outcome JSON ファイル
+        outcome: PathBuf,
+    },
 }
 
 fn parse_positive_limit(value: &str) -> Result<usize, String> {
@@ -194,6 +211,18 @@ async fn main() -> Result<()> {
         std::process::exit(class.exit_code());
     }
 
+    if let Commands::ClaudeHook { outcome } = &command {
+        return claude_hook::run(outcome);
+    }
+
+    if let Commands::ClassifyClaudeOutcome { outcome } = &command {
+        let class = classify::classify_outcome_json(outcome);
+        if let Some(msg) = class.message() {
+            println!("{msg}");
+        }
+        std::process::exit(class.exit_code());
+    }
+
     let config_path = cli.config.unwrap_or_else(config::default_config_path);
     let config = config::Config::load(&config_path)?;
 
@@ -231,6 +260,8 @@ async fn main() -> Result<()> {
         Commands::Init { .. } => unreachable!(),
         Commands::FormatStream { .. } => unreachable!(),
         Commands::ClassifyResult { .. } => unreachable!(),
+        Commands::ClaudeHook { .. } => unreachable!(),
+        Commands::ClassifyClaudeOutcome { .. } => unreachable!(),
     }
 
     Ok(())
@@ -571,6 +602,7 @@ mod tests {
         let agent = config::Agent {
             name: "claude".to_string(),
             command: vec!["echo".to_string()],
+            mode: AgentMode::default(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -642,6 +674,7 @@ mod tests {
         let agent = config::Agent {
             name: "claude".to_string(),
             command: vec!["echo".to_string()],
+            mode: AgentMode::default(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -685,6 +718,7 @@ mod tests {
         let agent = config::Agent {
             name: "claude".to_string(),
             command: vec!["echo".to_string()],
+            mode: AgentMode::default(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -774,6 +808,7 @@ mod tests {
             agents: vec![config::Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
@@ -819,6 +854,7 @@ mod tests {
             agents: vec![config::Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
@@ -853,6 +889,7 @@ mod tests {
             agents: vec![config::Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
@@ -898,6 +935,7 @@ mod tests {
                 agents: vec![config::Agent {
                     name: "agent".to_string(),
                     command: vec!["echo".to_string()],
+                    mode: AgentMode::default(),
                     reset_weekday: "monday".to_string(),
                     reset_time: "09:00".to_string(),
                     timezone: "UTC".to_string(),
@@ -946,6 +984,7 @@ mod tests {
             agents: vec![config::Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
@@ -991,6 +1030,7 @@ mod tests {
             agents: vec![config::Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),

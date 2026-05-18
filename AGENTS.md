@@ -10,12 +10,13 @@ token-burn/
 ├── src/
 │   ├── main.rs             # エントリポイント、clap CLI定義
 │   ├── init.rs             # config/prompt 雛形の初期化
-│   ├── config.rs           # TOML設定ファイルの読み込み・バリデーション
+│   ├── config.rs           # TOML設定ファイルの読み込み・バリデーション・AgentMode
 │   ├── scanner.rs          # ディレクトリスキャン・リポジトリ探索・gh CLI連携
 │   ├── schedule.rs         # リセット日時計算、最寄りエージェント選択
-│   ├── executor.rs         # プロセス起動・並列実行管理（tokio）
-│   ├── format_stream.rs    # claude stream-json出力のフォーマッター
-│   ├── classify.rs         # 完了 jsonl の分類（success / failed / rate-limited / retryable）
+│   ├── executor.rs         # プロセス起動・並列実行管理・mode 別タスクスクリプト生成
+│   ├── format_stream.rs    # claude stream-json出力のフォーマッター (claude-print 用)
+│   ├── classify.rs         # 完了 jsonl / outcome JSON の分類（success / failed / rate-limited / retryable）
+│   ├── claude_hook.rs      # Stop / StopFailure hook 受け口（claude-interactive 用）
 │   ├── cleanup.rs          # レポートディレクトリの自動クリーンアップ
 │   ├── state.rs            # 処理済みターゲット状態の永続化
 │   └── display.rs          # ステータス表示・プログレス出力
@@ -50,18 +51,48 @@ make release  # リリースビルド
 
 `[[agents]]` の `name` は空文字不可、`command` は1要素以上必須（先頭要素は実行ファイル名）です。
 
-実行ファイルが `claude` の場合、`--verbose`、`--output-format stream-json`、`--include-partial-messages` は自動付与されます。`--output-format` が既存でも値は `stream-json` に正規化されます。
+## エージェント `mode`（2026-06-15 Anthropic 制限への対応）
 
-`claude` エージェントのみ出力を `.jsonl` + `format-stream` パイプラインで処理します。`codex` 等の他エージェントは `.log` に直接出力します。
+`[[agents]]` には `mode` を指定できます (`auto` / `generic` / `claude-print` / `claude-interactive`、デフォルト `auto`)。
 
-`claude` エージェントでは、`format-stream` / `tee` / raw jsonl 保存のいずれかが失敗した場合、または jsonl が空の場合、そのタスクは `failed-N` として扱い、`state.json` には記録しません。ログ・分類パイプラインが壊れたタスクを成功扱いしないためです。非 `claude` エージェントでも `tee` が失敗した場合は `failed-N` として扱います。
+**背景**: 2026-06-15 以降、Anthropic は `claude -p` / Claude Agent SDK / GitHub Actions を「Agent SDK 専用月次クレジット」（Pro $20/月、Max 5x $100/月、Max 20x $200/月）に分離します。token-burn は「プラン使用枠を使い切る」のが目的なので、プラン枠を消費する **対話的 Claude Code 経路** = `mode = "claude-interactive"` をデフォルト推奨にしています。**対象外の対話モード経路は技術的にプラン枠を消費しますが、Anthropic 側のポリシーは今後変わる可能性があり、保証はありません**。
 
-`claude` エージェントのタスク完了後は `token-burn classify-result <jsonl>` により jsonl 最終 `result` イベントの `is_error` / `api_error_status` を解析して分類します。
+各モードの動作:
+
+- `claude-interactive`: `claude "prompt"` を tmux 実 TTY で起動。`--settings task-settings.json` で Stop / StopFailure hooks を注入し、hook 経由で書き出された outcome JSON を `classify-claude-outcome` が分類する。tmux pipe-pane でログ取得。
+- `claude-print`: 既存の `claude -p` 経路。`--verbose`、`--output-format stream-json`、`--include-partial-messages` を強制付与し、`format-stream` + `classify-result` で jsonl を分類。2026-06-15 以降は Agent SDK クレジット消費のため、明示 opt-in 扱い。
+- `generic`: codex 等。stdout/stderr を `tee` でログに保存し、終了コードで成否を判定。
+- `auto`: command の内容で自動判定。`-p` / `--print` / `--output-format` / `--include-partial-messages` / `--input-format` のいずれかを含む claude → `claude-print`、それ以外の claude → `claude-interactive`、claude 以外 → `generic`。
+
+`mode = "claude-interactive"` 設定時は、validate 段階で `command` に `-p` / `--print` / `--output-format` / `--input-format` / `--include-partial-messages` / `--max-budget-usd` / `--no-session-persistence` / `--include-hook-events` / `--json-schema` が含まれていれば設定読み込み時にエラーになります（これらが指定されると print 経路に切り替わり Agent SDK クレジットを消費してしまうため）。
+
+## モード別の分類
+
+### `claude-print` 経路
+
+`format-stream` / `tee` / raw jsonl 保存のいずれかが失敗した場合、または jsonl が空の場合、そのタスクは `failed-N` として扱い、`state.json` には記録しません。タスク完了後は `token-burn classify-result <jsonl>` により jsonl 最終 `result` イベントの `is_error` / `api_error_status` を解析して分類します。
 
 - 成功 (`is_error:false`) → `state.json` に記録
 - レート制限 (`resets <h><am|pm>` 等) → `failed-N` マーカー。`state.json` には記録しない
-- プロバイダ側リトライ可能エラー (`api_error_status` が 408/429/5xx) → `retry-N` マーカー。`state.json` には記録しないため次回実行で再処理される。ワーカーは継続
-- その他のプロバイダエラー → `failed-N` マーカーとエラーメッセージ（`result` フィールド）を表示し、ワーカーは停止
+- プロバイダ側リトライ可能エラー (`api_error_status` が 408/429/5xx) → `retry-N` マーカー。次回実行で再処理。ワーカーは継続
+- その他のプロバイダエラー → `failed-N` マーカーとエラーメッセージ（`result` フィールド）を表示
+
+### `claude-interactive` 経路
+
+タスクごとに `task-settings.json` を生成し、`claude --settings <path>` で Stop / StopFailure hooks を注入します。hooks は `token-burn claude-hook --outcome <path>` を呼び、stdin の hook JSON ペイロードを outcome ファイルへアトミック書き出しします。タスク完了後は `token-burn classify-claude-outcome <outcome>` で分類します。
+
+- `Stop` hook 発火 → `ResultClass::Success` → `state.json` に記録
+- `StopFailure.error == "rate_limit"` → `ResultClass::RateLimited` → `failed-N`
+- `StopFailure.error == "server_error"` → `ResultClass::Retryable` → `retry-N`、次回再処理
+- `StopFailure.error == "billing_error" / "authentication_failed" / "oauth_org_not_allowed" / "invalid_request" / "max_output_tokens"` → `ResultClass::Failed` → `failed-N`
+- `StopFailure.error == "unknown"` → `error_details` / `last_assistant_message` のテキストで判定（rate-limit シグネチャ含めば `RateLimited`、それ以外は `Failed`）
+- outcome ファイルが書き出されない (hook 不発火) → `failed-N` として「hook did not fire (claude crashed or --settings ignored)」を記録
+
+stream-json の `rate_limit_event` が使えないため、`settings.rate_limit_threshold` による 95% 自動停止は `claude-interactive` モードでは機能しません。`StopFailure(error=rate_limit)` 受信時のみ停止します。
+
+### `generic` 経路
+
+`tee` が失敗した場合は `failed-N` として扱います。終了コード 0 で `state.json` に記録、非 0 でペインの末尾出力をエラーとして `failed-N`。
 
 モニターペインの進捗は `fail:<n> retry:<n>` を併記し、完了時も `%d succeeded / %d failed / %d retry` の形で表示します。
 

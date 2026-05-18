@@ -19,11 +19,25 @@ default = "prompts/default.md"     # .md で終わる値はファイルパスと
 
 [[agents]]
 name = "claude"
-command = ["claude", "-p", "--dangerously-skip-permissions", "--model", "opus"]
+# 対話モード起動: 2026-06-15 以降の Agent SDK クレジット分離を回避し、プラン使用枠を消費する。
+# `-p` / `--print` / `--output-format` などの print 系フラグを含めると mode='claude-interactive'
+# では validate 段階で拒否される。
+command = ["claude", "--dangerously-skip-permissions", "--model", "opus"]
+mode = "claude-interactive"         # auto / generic / claude-print / claude-interactive
 reset_weekday = "monday"           # リセット曜日
 reset_time = "09:00"               # リセット時刻
 timezone = "Asia/Tokyo"
 # prompt = "prompts/test-coverage.md"  # エージェント固有プロンプト（省略時は [prompts].default を使用）
+
+# レガシー: claude -p (Agent SDK) 経路。2026-06-15 以降は月次クレジット ($20/$100/$200) で頭打ちのため
+# token-burn の目的（プラン枠を使い切る）には合わなくなる。一時的に残置できるが推奨しない。
+# [[agents]]
+# name = "claude-print"
+# command = ["claude", "-p", "--dangerously-skip-permissions", "--model", "opus"]
+# mode = "claude-print"
+# reset_weekday = "monday"
+# reset_time = "09:00"
+# timezone = "Asia/Tokyo"
 
 [[agents]]
 name = "codex"

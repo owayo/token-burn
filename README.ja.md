@@ -30,6 +30,8 @@
 
 Claude Code / Codex CLI のトークンは週次でリセットされますが、未使用分は繰り越されません。「もったいない」精神で、**token-burn** はリセット直前の残りトークンを有効活用します。コードレビュー、バグ修正、リファクタリング、テスト改善など、自由に定義したプロンプトをリポジトリ群に対して並列実行します。リセット時刻が来ると、実行中のプロセスは自動的に終了されます。
 
+> **2026年6月15日以降の注意**: Anthropic は `claude -p` / Agent SDK / GitHub Actions を「Agent SDK 専用月次クレジット」（Pro $20/月、Max 5x $100/月、Max 20x $200/月）に分離し、対話的な Claude Code（ターミナル/IDE）は引き続きプラン使用枠を消費する仕様になります。token-burn は「プラン使用枠を使い切る」のが目的のため、デフォルトを **対話モード**（`mode = "claude-interactive"`）に変更しました。`claude` を実 TTY で起動し、`Stop` / `StopFailure` hooks 経由で完了/失敗を分類します。従来の `claude -p` 経路は `mode = "claude-print"` で opt-in できますが、上記制限により目的が成立しなくなります。詳細は [AGENTS.md](./AGENTS.md) を参照。**Anthropic 側のポリシーは今後変わる可能性があり、対話モード経路の存続を保証するものではありません**。
+
 <p align="center">
   <img src="docs/images/screenshot.png" width="800" alt="token-burn 実行中">
 </p>

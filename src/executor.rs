@@ -3,7 +3,7 @@ use colored::Colorize;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config::Agent;
+use crate::config::{Agent, AgentMode};
 use crate::display;
 use crate::scanner::{ResolvedTarget, Visibility};
 
@@ -22,23 +22,21 @@ pub fn build_plan(agent: &Agent, targets: Vec<ResolvedTarget>) -> ExecutionPlan 
 }
 
 /// command の先頭要素が claude 実行ファイル（ラッパースクリプト含む）かを判定する。
-/// ファイル名（basename）が "claude" そのもの、または "claude-" / "claude_" で始まる場合に true。
+/// 共通の判定ロジックは `config::is_claude_executable` を再エクスポートする（既存テスト用）。
+#[cfg(test)]
 fn is_claude_command(command: &[String]) -> bool {
-    let Some(first) = command.first() else {
-        return false;
-    };
-    let basename = std::path::Path::new(first.as_str())
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    basename == "claude" || basename.starts_with("claude-") || basename.starts_with("claude_")
+    crate::config::is_claude_executable(command)
 }
 
 /// 既知エージェントに必要なフラグを自動付与する。
-/// `claude` の場合、`--verbose`、`--output-format stream-json`、`--include-partial-messages`
-/// はログ取得に必須であり、常に存在しなければならない。
+///
+/// - `ClaudePrint` モード: `--verbose`、`--output-format stream-json`、`--include-partial-messages` を付与
+///   （stream-json を `format-stream` でパースするのに必須）。
+/// - `ClaudeInteractive` モード: 何も付与しない。print-only フラグは config 側の validate で拒否済み。
+/// - `Generic` モード: 何も付与しない。
 fn ensure_required_flags(agent: &mut Agent) {
-    if !is_claude_command(&agent.command) {
+    let mode = agent.resolved_mode();
+    if mode != AgentMode::ClaudePrint {
         return;
     }
 
@@ -170,13 +168,30 @@ pub fn execute_plan_tmux(
     let exe_path =
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("token-burn"));
     let stop_file = tmp_dir.join("stop");
-    let is_claude = is_claude_command(&plan.agent.command);
+    let agent_mode = plan.agent.resolved_mode();
+    let settings_dir = tmp_dir.join("settings");
+    if matches!(agent_mode, AgentMode::ClaudeInteractive) {
+        std::fs::create_dir_all(&settings_dir)?;
+    }
 
     // 各タスクの実行スクリプトと pending マーカーを書き出す
     for (idx_zero, task) in plan.tasks.iter().enumerate() {
         let idx = idx_zero + 1;
         let prompt_file = tmp_dir.join(format!("prompt-{}.txt", idx));
         std::fs::write(&prompt_file, &task.prompt)?;
+
+        // interactive モードでは hooks 注入用 settings.json をタスクごとに書き出す
+        let settings_file = if matches!(agent_mode, AgentMode::ClaudeInteractive) {
+            let outcome_path = marker_dir.join(format!("outcome-{}.json", idx));
+            let path = settings_dir.join(format!("task-{:04}.json", idx));
+            std::fs::write(
+                &path,
+                build_claude_interactive_settings(&exe_path, &outcome_path),
+            )?;
+            Some(path)
+        } else {
+            None
+        };
 
         let task_script = build_task_script(&TaskCtx {
             idx,
@@ -190,7 +205,8 @@ pub fn execute_plan_tmux(
             state_file,
             stop_file: &stop_file,
             rate_limit_threshold,
-            is_claude,
+            mode: agent_mode,
+            settings_file: settings_file.as_deref(),
         });
         let task_path = task_dir.join(format!("task-{:04}.sh", idx));
         std::fs::write(&task_path, &task_script)?;
@@ -547,7 +563,49 @@ struct TaskCtx<'a> {
     state_file: &'a Path,
     stop_file: &'a Path,
     rate_limit_threshold: u8,
-    is_claude: bool,
+    mode: AgentMode,
+    /// `ClaudeInteractive` 時のみ Some。hooks 注入用に生成された settings.json のパス。
+    settings_file: Option<&'a Path>,
+}
+
+/// `ClaudeInteractive` で claude 起動時に `--settings` で渡す JSON。
+/// Stop / StopFailure hooks の両方で `token-burn claude-hook --outcome <path>` を呼び出し、
+/// stdin の hook JSON を outcome ファイルへ書き出す。
+fn build_claude_interactive_settings(exe_path: &Path, outcome_path: &Path) -> String {
+    let exe = exe_path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let outcome = outcome_path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!(
+        concat!(
+            "{{\n",
+            "  \"hooks\": {{\n",
+            "    \"Stop\": [{{\n",
+            "      \"matcher\": \"*\",\n",
+            "      \"hooks\": [{{\n",
+            "        \"type\": \"command\",\n",
+            "        \"command\": \"{exe}\",\n",
+            "        \"args\": [\"claude-hook\", \"--outcome\", \"{outcome}\"]\n",
+            "      }}]\n",
+            "    }}],\n",
+            "    \"StopFailure\": [{{\n",
+            "      \"matcher\": \"*\",\n",
+            "      \"hooks\": [{{\n",
+            "        \"type\": \"command\",\n",
+            "        \"command\": \"{exe}\",\n",
+            "        \"args\": [\"claude-hook\", \"--outcome\", \"{outcome}\"]\n",
+            "      }}]\n",
+            "    }}]\n",
+            "  }}\n",
+            "}}\n",
+        ),
+        exe = exe,
+        outcome = outcome,
+    )
 }
 
 struct WorkerCtx<'a> {
@@ -559,191 +617,377 @@ struct WorkerCtx<'a> {
 }
 
 /// キューから claim したワーカーが source して実行する、タスク単位のシェルスクリプトを生成する。
+/// 全 mode 共通のタスク固有パス・コマンドをまとめた構造体。
+struct TaskPaths {
+    log_file: String,
+    jsonl_file: String,
+    outcome_file: String,
+    done_marker: String,
+    failed_marker: String,
+    retry_marker: String,
+    error_file: String,
+    error_prefix: String,
+    stop_file_escaped: String,
+    mark_cmd: String,
+    tb_cmd: String,
+}
+
+impl TaskPaths {
+    fn from_ctx(ctx: &TaskCtx<'_>) -> Self {
+        let log_base = task_log_base(ctx.idx, &ctx.task.display_name);
+        Self {
+            log_file: shell_escape(
+                &ctx.run_dir
+                    .join(format!("{log_base}.log"))
+                    .to_string_lossy(),
+            ),
+            jsonl_file: shell_escape(
+                &ctx.run_dir
+                    .join(format!("{log_base}.jsonl"))
+                    .to_string_lossy(),
+            ),
+            outcome_file: shell_escape(
+                &ctx.marker_dir
+                    .join(format!("outcome-{}.json", ctx.idx))
+                    .to_string_lossy(),
+            ),
+            done_marker: shell_escape(
+                &ctx.marker_dir
+                    .join(format!("done-{}", ctx.idx))
+                    .to_string_lossy(),
+            ),
+            failed_marker: shell_escape(
+                &ctx.marker_dir
+                    .join(format!("failed-{}", ctx.idx))
+                    .to_string_lossy(),
+            ),
+            retry_marker: shell_escape(
+                &ctx.marker_dir
+                    .join(format!("retry-{}", ctx.idx))
+                    .to_string_lossy(),
+            ),
+            error_file: shell_escape(
+                &ctx.marker_dir
+                    .join(format!("error-{}", ctx.idx))
+                    .to_string_lossy(),
+            ),
+            error_prefix: shell_escape(&format!("[{}] ", ctx.task.display_name)),
+            stop_file_escaped: shell_escape(&ctx.stop_file.to_string_lossy()),
+            mark_cmd: format!(
+                "{} mark {} {} {}",
+                shell_escape(&ctx.exe_path.to_string_lossy()),
+                shell_escape(&ctx.agent.name),
+                shell_escape(&ctx.task.directory.to_string_lossy()),
+                shell_escape(&ctx.state_file.to_string_lossy()),
+            ),
+            tb_cmd: shell_escape(&ctx.exe_path.to_string_lossy()),
+        }
+    }
+}
+
 fn build_task_script(ctx: &TaskCtx<'_>) -> String {
-    let log_base = task_log_base(ctx.idx, &ctx.task.display_name);
-    let log_file = shell_escape(
-        &ctx.run_dir
-            .join(format!("{log_base}.log"))
-            .to_string_lossy(),
-    );
-    let jsonl_file = shell_escape(
-        &ctx.run_dir
-            .join(format!("{log_base}.jsonl"))
-            .to_string_lossy(),
-    );
-    let done_marker = shell_escape(
-        &ctx.marker_dir
-            .join(format!("done-{}", ctx.idx))
-            .to_string_lossy(),
-    );
-    let failed_marker = shell_escape(
-        &ctx.marker_dir
-            .join(format!("failed-{}", ctx.idx))
-            .to_string_lossy(),
-    );
-    let retry_marker = shell_escape(
-        &ctx.marker_dir
-            .join(format!("retry-{}", ctx.idx))
-            .to_string_lossy(),
-    );
-    let error_file = shell_escape(
-        &ctx.marker_dir
-            .join(format!("error-{}", ctx.idx))
-            .to_string_lossy(),
-    );
-    let error_prefix = shell_escape(&format!("[{}] ", ctx.task.display_name));
-    let stop_file_escaped = shell_escape(&ctx.stop_file.to_string_lossy());
-    let cmd_str = build_shell_command(&ctx.agent.command, ctx.prompt_file, &ctx.task.directory);
-    let mark_cmd = format!(
-        "{} mark {} {} {}",
-        shell_escape(&ctx.exe_path.to_string_lossy()),
-        shell_escape(&ctx.agent.name),
-        shell_escape(&ctx.task.directory.to_string_lossy()),
-        shell_escape(&ctx.state_file.to_string_lossy()),
-    );
+    let paths = TaskPaths::from_ctx(ctx);
 
     let mut script = String::new();
     // 現在処理中のタスクをシグナルハンドラから参照できるようにする
-    script += &format!("CURRENT_FAILED_MARKER={failed_marker}\n");
+    script += &format!("CURRENT_FAILED_MARKER={}\n", paths.failed_marker);
     script += &build_task_header_script(ctx.idx, ctx.total, &ctx.task.display_name);
 
-    if ctx.is_claude {
-        let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
-        script += &format!(
-            "{cmd_str} 2>&1 | {tb_cmd} format-stream --raw-output {jsonl_file} --stop-file {stop_file_escaped} --threshold {rate_limit_threshold} 2>&1 | tee {log_file}\n",
-            rate_limit_threshold = ctx.rate_limit_threshold,
-        );
-        script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
-        script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
-        script += "FORMAT_EXIT=${PIPE_STATUS[1]}\n";
-        script += "TEE_EXIT=${PIPE_STATUS[2]}\n";
-        script += "CURRENT_FAILED_MARKER=\"\"\n";
-        script += &format!(
-            concat!(
-                "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ] || [ ! -s {jsonl} ]; then\n",
-                "  printf '%slogging/classification pipeline failed (format=%s tee=%s)\\n' {prefix} \"$FORMAT_EXIT\" \"$TEE_EXIT\" > {error}\n",
-                "  touch {failed}\n",
-                "  echo '━━━ Error - logging pipeline failed ━━━'\n",
-                "  echo ''\n",
-                "  return 0\n",
-                "fi\n",
-            ),
-            prefix = error_prefix,
-            error = error_file,
-            failed = failed_marker,
-            jsonl = jsonl_file,
-        );
-    } else {
-        script += &format!("{cmd_str} 2>&1 | tee {log_file}\n");
-        script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
-        script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
-        script += "TEE_EXIT=${PIPE_STATUS[1]}\n";
-        script += "CURRENT_FAILED_MARKER=\"\"\n";
-        script += &format!(
-            concat!(
-                "if [ \"$TEE_EXIT\" -ne 0 ]; then\n",
-                "  printf '%slogging pipeline failed (tee=%s)\\n' {prefix} \"$TEE_EXIT\" > {error}\n",
-                "  touch {failed}\n",
-                "  echo '━━━ Error - logging pipeline failed ━━━'\n",
-                "  echo ''\n",
-                "  return 0\n",
-                "fi\n",
-            ),
-            prefix = error_prefix,
-            error = error_file,
-            failed = failed_marker,
-        );
+    match ctx.mode {
+        AgentMode::ClaudePrint => append_claude_print_body(&mut script, ctx, &paths),
+        AgentMode::ClaudeInteractive => append_claude_interactive_body(&mut script, ctx, &paths),
+        AgentMode::Auto | AgentMode::Generic => append_generic_body(&mut script, ctx, &paths),
     }
 
-    if ctx.is_claude {
-        let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
-        script += &format!(
-            concat!(
-                "CLASSIFIED=$({tb} classify-result {jsonl} 2>/dev/null)\n",
-                "CLASS_CODE=$?\n",
-                "case $CLASS_CODE in\n",
-                "  2)\n",
-                // 後続タスクが誤って「Cancelled」と判定されないよう、ここでフラグを必ずリセットする
-                "    CANCELLED=0\n",
-                "    touch {failed}\n",
-                "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
-                "    ;;\n",
-                "  3)\n",
-                // 後続タスクが誤って「Cancelled」と判定されないよう、ここでフラグを必ずリセットする
-                "    CANCELLED=0\n",
-                "    if [ -n \"$CLASSIFIED\" ]; then\n",
-                "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
-                "    fi\n",
-                "    touch {retry}\n",
-                "    echo \"━━━ Retryable error (will retry next run): $CLASSIFIED ━━━\"\n",
-                "    ;;\n",
-                "  1)\n",
-                "    if [ $CANCELLED -eq 1 ]; then\n",
-                "      CANCELLED=0\n",
-                "      touch {failed}\n",
-                "      echo '━━━ Cancelled ━━━'\n",
-                "    else\n",
-                "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
-                "      touch {failed}\n",
-                "      echo '━━━ Error - continuing ━━━'\n",
-                "    fi\n",
-                "    ;;\n",
-                "  *)\n",
-                "    if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
-                "      if [ $CANCELLED -eq 1 ]; then\n",
-                "        CANCELLED=0\n",
-                "        touch {failed}\n",
-                "        echo '━━━ Cancelled ━━━'\n",
-                "      else\n",
-                "        ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
-                "        printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
-                "        touch {failed}\n",
-                "        echo '━━━ Error - continuing ━━━'\n",
-                "      fi\n",
-                "    else\n",
-                "      {mark}\n",
-                "      touch {done}\n",
-                "    fi\n",
-                "    ;;\n",
-                "esac\n",
-            ),
-            prefix = error_prefix,
-            error = error_file,
-            failed = failed_marker,
-            retry = retry_marker,
-            done = done_marker,
-            jsonl = jsonl_file,
-            tb = tb_cmd,
-            mark = mark_cmd,
-        );
-    } else {
-        script += &format!(
-            concat!(
-                "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
-                "  if [ $CANCELLED -eq 1 ]; then\n",
-                "    CANCELLED=0\n",
-                "    touch {failed}\n",
-                "    echo '━━━ Cancelled ━━━'\n",
-                "  else\n",
-                "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
-                "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
-                "    touch {failed}\n",
-                "    echo '━━━ Error - continuing ━━━'\n",
-                "  fi\n",
-                "else\n",
-                "  {mark}\n",
-                "  touch {done}\n",
-                "fi\n",
-            ),
-            prefix = error_prefix,
-            error = error_file,
-            failed = failed_marker,
-            done = done_marker,
-            mark = mark_cmd,
-        );
-    }
     script += "echo ''\n";
     script
+}
+
+/// `claude -p` (stream-json) 経路。`format-stream` / `classify-result` を使用。
+fn append_claude_print_body(script: &mut String, ctx: &TaskCtx<'_>, p: &TaskPaths) {
+    let cmd_str = build_shell_command(&ctx.agent.command, ctx.prompt_file, &ctx.task.directory);
+    let TaskPaths {
+        log_file,
+        jsonl_file,
+        done_marker,
+        failed_marker,
+        retry_marker,
+        error_file,
+        error_prefix,
+        stop_file_escaped,
+        mark_cmd,
+        tb_cmd,
+        ..
+    } = p;
+    let rate_limit_threshold = ctx.rate_limit_threshold;
+
+    *script += &format!(
+        "{cmd_str} 2>&1 | {tb_cmd} format-stream --raw-output {jsonl_file} --stop-file {stop_file_escaped} --threshold {rate_limit_threshold} 2>&1 | tee {log_file}\n",
+    );
+    *script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
+    *script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
+    *script += "FORMAT_EXIT=${PIPE_STATUS[1]}\n";
+    *script += "TEE_EXIT=${PIPE_STATUS[2]}\n";
+    *script += "CURRENT_FAILED_MARKER=\"\"\n";
+    *script += &format!(
+        concat!(
+            "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ] || [ ! -s {jsonl} ]; then\n",
+            "  printf '%slogging/classification pipeline failed (format=%s tee=%s)\\n' {prefix} \"$FORMAT_EXIT\" \"$TEE_EXIT\" > {error}\n",
+            "  touch {failed}\n",
+            "  echo '━━━ Error - logging pipeline failed ━━━'\n",
+            "  echo ''\n",
+            "  return 0\n",
+            "fi\n",
+        ),
+        prefix = error_prefix,
+        error = error_file,
+        failed = failed_marker,
+        jsonl = jsonl_file,
+    );
+
+    *script += &format!(
+        concat!(
+            "CLASSIFIED=$({tb} classify-result {jsonl} 2>/dev/null)\n",
+            "CLASS_CODE=$?\n",
+            "case $CLASS_CODE in\n",
+            "  2)\n",
+            "    CANCELLED=0\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
+            "    ;;\n",
+            "  3)\n",
+            "    CANCELLED=0\n",
+            "    if [ -n \"$CLASSIFIED\" ]; then\n",
+            "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+            "    fi\n",
+            "    touch {retry}\n",
+            "    echo \"━━━ Retryable error (will retry next run): $CLASSIFIED ━━━\"\n",
+            "    ;;\n",
+            "  1)\n",
+            "    if [ $CANCELLED -eq 1 ]; then\n",
+            "      CANCELLED=0\n",
+            "      touch {failed}\n",
+            "      echo '━━━ Cancelled ━━━'\n",
+            "    else\n",
+            "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+            "      touch {failed}\n",
+            "      echo '━━━ Error - continuing ━━━'\n",
+            "    fi\n",
+            "    ;;\n",
+            "  *)\n",
+            "    if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
+            "      if [ $CANCELLED -eq 1 ]; then\n",
+            "        CANCELLED=0\n",
+            "        touch {failed}\n",
+            "        echo '━━━ Cancelled ━━━'\n",
+            "      else\n",
+            "        ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+            "        printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
+            "        touch {failed}\n",
+            "        echo '━━━ Error - continuing ━━━'\n",
+            "      fi\n",
+            "    else\n",
+            "      {mark}\n",
+            "      touch {done}\n",
+            "    fi\n",
+            "    ;;\n",
+            "esac\n",
+        ),
+        prefix = error_prefix,
+        error = error_file,
+        failed = failed_marker,
+        retry = retry_marker,
+        done = done_marker,
+        jsonl = jsonl_file,
+        tb = tb_cmd,
+        mark = mark_cmd,
+    );
+}
+
+/// claude 対話モード経路。tmux pipe-pane でログ取得、`--settings` で hooks を注入し、
+/// `Stop` / `StopFailure` hook が outcome JSON を書き出した時点で分類して終了する。
+fn append_claude_interactive_body(script: &mut String, ctx: &TaskCtx<'_>, p: &TaskPaths) {
+    let settings_path = ctx
+        .settings_file
+        .expect("ClaudeInteractive mode requires settings_file");
+    let settings_escaped = shell_escape(&settings_path.to_string_lossy());
+    let dir_escaped = shell_escape(&ctx.task.directory.to_string_lossy());
+    let prompt_escaped = shell_escape(&ctx.prompt_file.to_string_lossy());
+    // command の先頭（claude 実行ファイルパス）と、`--settings` を除いた追加 args を抽出する。
+    let exe = shell_escape(&ctx.agent.command[0]);
+    let extra_args: Vec<String> = ctx
+        .agent
+        .command
+        .iter()
+        .skip(1)
+        .map(|s| shell_escape(s))
+        .collect();
+    let extra_args_str = if extra_args.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", extra_args.join(" "))
+    };
+
+    let TaskPaths {
+        log_file,
+        outcome_file,
+        done_marker,
+        failed_marker,
+        retry_marker,
+        error_file,
+        error_prefix,
+        stop_file_escaped,
+        mark_cmd,
+        tb_cmd,
+        ..
+    } = p;
+
+    *script += &format!(
+        concat!(
+            "rm -f {outcome}\n",
+            "tmux pipe-pane -o -t \"$TMUX_PANE\" \"cat >> {log}\"\n",
+            "(\n",
+            "  while [ ! -f {outcome} ] && [ ! -f {stop_file} ]; do sleep 1; done\n",
+            "  sleep 0.5\n",
+            "  if [ ! -f {outcome} ]; then\n",
+            "    tmux send-keys -t \"$TMUX_PANE\" C-c\n",
+            "    sleep 0.3\n",
+            "  fi\n",
+            "  tmux send-keys -t \"$TMUX_PANE\" C-d\n",
+            ") &\n",
+            "WATCHER_PID=$!\n",
+            "cd {dir} && {exe} {extra}--settings {settings} \"$(cat {prompt})\"\n",
+            "CMD_EXIT=$?\n",
+            "CURRENT_FAILED_MARKER=\"\"\n",
+            "tmux pipe-pane -t \"$TMUX_PANE\"\n",
+            "wait \"$WATCHER_PID\" 2>/dev/null || true\n",
+        ),
+        outcome = outcome_file,
+        log = log_file,
+        stop_file = stop_file_escaped,
+        dir = dir_escaped,
+        exe = exe,
+        extra = extra_args_str,
+        settings = settings_escaped,
+        prompt = prompt_escaped,
+    );
+
+    *script += &format!(
+        concat!(
+            "if [ ! -f {outcome} ]; then\n",
+            "  if [ $CANCELLED -eq 1 ]; then\n",
+            "    CANCELLED=0\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Cancelled ━━━'\n",
+            "  else\n",
+            "    printf '%shook did not fire (claude crashed or --settings ignored)\\n' {prefix} > {error}\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Error - hook missing ━━━'\n",
+            "  fi\n",
+            "  echo ''\n",
+            "  return 0\n",
+            "fi\n",
+            "CLASSIFIED=$({tb} classify-claude-outcome {outcome} 2>/dev/null)\n",
+            "CLASS_CODE=$?\n",
+            "case $CLASS_CODE in\n",
+            "  2)\n",
+            "    CANCELLED=0\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
+            "    ;;\n",
+            "  3)\n",
+            "    CANCELLED=0\n",
+            "    if [ -n \"$CLASSIFIED\" ]; then\n",
+            "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+            "    fi\n",
+            "    touch {retry}\n",
+            "    echo \"━━━ Retryable error (will retry next run): $CLASSIFIED ━━━\"\n",
+            "    ;;\n",
+            "  1)\n",
+            "    if [ $CANCELLED -eq 1 ]; then\n",
+            "      CANCELLED=0\n",
+            "      touch {failed}\n",
+            "      echo '━━━ Cancelled ━━━'\n",
+            "    else\n",
+            "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+            "      touch {failed}\n",
+            "      echo '━━━ Error - continuing ━━━'\n",
+            "    fi\n",
+            "    ;;\n",
+            "  *)\n",
+            "    {mark}\n",
+            "    touch {done}\n",
+            "    ;;\n",
+            "esac\n",
+        ),
+        outcome = outcome_file,
+        prefix = error_prefix,
+        error = error_file,
+        failed = failed_marker,
+        retry = retry_marker,
+        done = done_marker,
+        mark = mark_cmd,
+        tb = tb_cmd,
+    );
+}
+
+/// 汎用エージェント（codex 等）経路。stdout/stderr を tee でログに保存し、終了コードで成否を判定。
+fn append_generic_body(script: &mut String, ctx: &TaskCtx<'_>, p: &TaskPaths) {
+    let cmd_str = build_shell_command(&ctx.agent.command, ctx.prompt_file, &ctx.task.directory);
+    let TaskPaths {
+        log_file,
+        done_marker,
+        failed_marker,
+        error_file,
+        error_prefix,
+        mark_cmd,
+        ..
+    } = p;
+
+    *script += &format!("{cmd_str} 2>&1 | tee {log_file}\n");
+    *script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
+    *script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
+    *script += "TEE_EXIT=${PIPE_STATUS[1]}\n";
+    *script += "CURRENT_FAILED_MARKER=\"\"\n";
+    *script += &format!(
+        concat!(
+            "if [ \"$TEE_EXIT\" -ne 0 ]; then\n",
+            "  printf '%slogging pipeline failed (tee=%s)\\n' {prefix} \"$TEE_EXIT\" > {error}\n",
+            "  touch {failed}\n",
+            "  echo '━━━ Error - logging pipeline failed ━━━'\n",
+            "  echo ''\n",
+            "  return 0\n",
+            "fi\n",
+        ),
+        prefix = error_prefix,
+        error = error_file,
+        failed = failed_marker,
+    );
+
+    *script += &format!(
+        concat!(
+            "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
+            "  if [ $CANCELLED -eq 1 ]; then\n",
+            "    CANCELLED=0\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Cancelled ━━━'\n",
+            "  else\n",
+            "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+            "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Error - continuing ━━━'\n",
+            "  fi\n",
+            "else\n",
+            "  {mark}\n",
+            "  touch {done}\n",
+            "fi\n",
+        ),
+        prefix = error_prefix,
+        error = error_file,
+        failed = failed_marker,
+        done = done_marker,
+        mark = mark_cmd,
+    );
 }
 
 /// 共通ワーカースクリプト: queue_dir/pending-* をアトミックに claim しつつタスクを逐次実行する。
@@ -964,7 +1208,36 @@ mod tests {
             state_file: std::path::Path::new("/tmp/state.json"),
             stop_file: std::path::Path::new("/tmp/stop"),
             rate_limit_threshold: 95,
-            is_claude,
+            mode: if is_claude {
+                AgentMode::ClaudePrint
+            } else {
+                AgentMode::Generic
+            },
+            settings_file: None,
+        }
+    }
+
+    fn task_ctx_for_interactive_test<'a>(
+        idx: usize,
+        agent: &'a Agent,
+        task: &'a ResolvedTarget,
+        tmp: &'a std::path::Path,
+        settings: &'a std::path::Path,
+    ) -> TaskCtx<'a> {
+        TaskCtx {
+            idx,
+            total: 3,
+            task,
+            agent,
+            prompt_file: std::path::Path::new("/tmp/prompt.txt"),
+            run_dir: tmp,
+            marker_dir: tmp,
+            exe_path: std::path::Path::new("/usr/local/bin/token-burn"),
+            state_file: std::path::Path::new("/tmp/state.json"),
+            stop_file: std::path::Path::new("/tmp/stop"),
+            rate_limit_threshold: 95,
+            mode: AgentMode::ClaudeInteractive,
+            settings_file: Some(settings),
         }
     }
 
@@ -973,6 +1246,7 @@ mod tests {
         let agent = Agent {
             name: "claude".to_string(),
             command: vec!["claude".to_string(), "-p".to_string()],
+            mode: AgentMode::default(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1019,6 +1293,7 @@ mod tests {
         let agent = Agent {
             name: "claude".to_string(),
             command: vec!["claude".to_string(), "-p".to_string()],
+            mode: AgentMode::default(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1065,6 +1340,7 @@ mod tests {
         let agent = Agent {
             name: "codex".to_string(),
             command: vec!["codex".to_string(), "exec".to_string()],
+            mode: AgentMode::default(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1086,6 +1362,189 @@ mod tests {
         assert!(script.contains("Error - continuing"));
         assert!(script.contains("TEE_EXIT=${PIPE_STATUS[1]}"));
         assert!(script.contains("logging pipeline failed"));
+    }
+
+    #[test]
+    fn build_task_script_for_claude_interactive_uses_outcome_and_pipe_pane() {
+        let agent = Agent {
+            name: "claude".to_string(),
+            command: vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+            ],
+            mode: AgentMode::ClaudeInteractive,
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        let task = ResolvedTarget {
+            directory: std::path::PathBuf::from("/tmp/repo"),
+            display_name: "repo".to_string(),
+            prompt: "review".to_string(),
+            visibility: Visibility::Public,
+            defer: false,
+        };
+        let tmp = std::path::PathBuf::from("/tmp");
+        let settings = std::path::PathBuf::from("/tmp/settings/task-0005.json");
+        let ctx = task_ctx_for_interactive_test(5, &agent, &task, &tmp, &settings);
+        let script = build_task_script(&ctx);
+
+        // tmux pipe-pane でログを取る
+        assert!(
+            script.contains("tmux pipe-pane -o -t \"$TMUX_PANE\""),
+            "pipe-pane でログを取得すべき: {script}"
+        );
+        // claude --settings ... "$(cat /tmp/prompt.txt)" の起動
+        assert!(
+            script.contains("--settings '/tmp/settings/task-0005.json'"),
+            "--settings 経由で task-settings.json を渡すべき: {script}"
+        );
+        assert!(
+            script.contains("'claude' '--model' 'opus'"),
+            "agent.command の追加引数が渡されるべき: {script}"
+        );
+        // outcome 監視 watcher
+        assert!(
+            script.contains("while [ ! -f '/tmp/outcome-5.json' ]"),
+            "outcome ファイルを監視すべき: {script}"
+        );
+        // outcome → classify-claude-outcome 経由で分類
+        assert!(
+            script.contains("classify-claude-outcome '/tmp/outcome-5.json'"),
+            "classify-claude-outcome を呼ぶべき: {script}"
+        );
+        // stream-json 経路の format-stream / classify-result は使わない
+        assert!(
+            !script.contains("format-stream"),
+            "interactive 経路で format-stream は使わない"
+        );
+        assert!(
+            !script.contains("classify-result"),
+            "interactive 経路で classify-result は使わない"
+        );
+        // watcher が C-d で claude セッションを閉じる
+        assert!(
+            script.contains("tmux send-keys -t \"$TMUX_PANE\" C-d"),
+            "watcher が C-d を送って claude を閉じるべき: {script}"
+        );
+        // outcome 不存在時の hook 不発火扱い
+        assert!(
+            script.contains("hook did not fire"),
+            "hook 不発火パスを持つべき: {script}"
+        );
+        assert!(
+            !script.contains("exec sleep infinity"),
+            "interactive 経路でも sleep infinity しないこと: {script}"
+        );
+        // 共通: CANCELLED / failed-N / done-N / retry-N
+        assert!(script.contains("'/tmp/failed-5'"));
+        assert!(script.contains("'/tmp/done-5'"));
+        assert!(script.contains("'/tmp/retry-5'"));
+    }
+
+    #[test]
+    fn build_claude_interactive_settings_produces_valid_hooks_json() {
+        let exe = std::path::Path::new("/usr/local/bin/token-burn");
+        let outcome = std::path::Path::new("/tmp/token-burn/markers/outcome-3.json");
+        let json = build_claude_interactive_settings(exe, outcome);
+
+        let v: serde_json::Value = serde_json::from_str(&json).expect("有効な JSON であるべき");
+        assert!(v.get("hooks").is_some());
+        let stop = &v["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(stop["type"], "command");
+        assert_eq!(stop["command"], "/usr/local/bin/token-burn");
+        assert_eq!(stop["args"][0], "claude-hook");
+        assert_eq!(stop["args"][1], "--outcome");
+        assert_eq!(stop["args"][2], "/tmp/token-burn/markers/outcome-3.json");
+        // StopFailure 側にも同じ hook が登録されている
+        let sf = &v["hooks"]["StopFailure"][0]["hooks"][0];
+        assert_eq!(sf["command"], "/usr/local/bin/token-burn");
+        // matcher は "*"（全 error 種別を補足）
+        assert_eq!(v["hooks"]["Stop"][0]["matcher"], "*");
+        assert_eq!(v["hooks"]["StopFailure"][0]["matcher"], "*");
+    }
+
+    #[test]
+    fn build_claude_interactive_settings_escapes_special_chars_in_paths() {
+        // パスに " や \ が含まれていても JSON が壊れないこと
+        let exe = std::path::Path::new("/opt/with \"quote\".bin");
+        let outcome = std::path::Path::new("/tmp/back\\slash.json");
+        let json = build_claude_interactive_settings(exe, outcome);
+        let v: serde_json::Value =
+            serde_json::from_str(&json).expect("特殊文字含むパスでも JSON は valid であるべき");
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/opt/with \"quote\".bin"
+        );
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["args"][2],
+            "/tmp/back\\slash.json"
+        );
+    }
+
+    #[test]
+    fn ensure_required_flags_skips_claude_interactive() {
+        let mut agent = Agent {
+            name: "claude".to_string(),
+            command: vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+            ],
+            mode: AgentMode::ClaudeInteractive,
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        let original_len = agent.command.len();
+        ensure_required_flags(&mut agent);
+        // interactive モードでは余計なフラグを足さない
+        assert_eq!(agent.command.len(), original_len);
+        assert!(!agent.command.iter().any(|s| s == "--verbose"));
+        assert!(!agent.command.iter().any(|s| s == "--output-format"));
+        assert!(
+            !agent
+                .command
+                .iter()
+                .any(|s| s == "--include-partial-messages")
+        );
+    }
+
+    #[test]
+    fn ensure_required_flags_auto_with_claude_no_p_treats_as_interactive() {
+        // Auto モードで -p を含まない claude → ClaudeInteractive に解決され、flag は付与されない
+        let mut agent = Agent {
+            name: "claude".to_string(),
+            command: vec!["claude".to_string()],
+            mode: AgentMode::Auto,
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        ensure_required_flags(&mut agent);
+        assert_eq!(agent.command, vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn ensure_required_flags_auto_with_claude_p_treats_as_print() {
+        // Auto モードで -p を含む claude → ClaudePrint に解決され、flag が付与される
+        let mut agent = Agent {
+            name: "claude".to_string(),
+            command: vec!["claude".to_string(), "-p".to_string()],
+            mode: AgentMode::Auto,
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        ensure_required_flags(&mut agent);
+        assert!(agent.command.contains(&"--verbose".to_string()));
+        assert!(agent.command.contains(&"--output-format".to_string()));
+        assert!(agent.command.contains(&"stream-json".to_string()));
     }
 
     #[test]
@@ -1273,6 +1732,7 @@ mod tests {
         Agent {
             name: "claude".to_string(),
             command: command.into_iter().map(String::from).collect(),
+            mode: AgentMode::default(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1418,6 +1878,7 @@ mod tests {
         let mut agent = Agent {
             name: "test".to_string(),
             command: vec![],
+            mode: AgentMode::default(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1446,6 +1907,7 @@ mod tests {
         let mut agent = Agent {
             name: "codex".to_string(),
             command: vec!["codex".to_string(), "exec".to_string()],
+            mode: AgentMode::default(),
             reset_weekday: "thursday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1544,6 +2006,7 @@ mod tests {
                 "/Users/owa/shell/claude-wrapper.sh".to_string(),
                 "-p".to_string(),
             ],
+            mode: AgentMode::default(),
             reset_weekday: "friday".to_string(),
             reset_time: "13:00".to_string(),
             timezone: "Asia/Tokyo".to_string(),

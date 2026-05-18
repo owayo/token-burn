@@ -320,7 +320,7 @@ async fn fetch_visibility_map(username: &str) -> Result<HashMap<String, Visibili
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Agent, Config, Prompts, Settings, Target};
+    use crate::config::{Agent, AgentMode, Config, Prompts, Settings, Target};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -504,6 +504,7 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
@@ -569,6 +570,7 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
@@ -641,6 +643,7 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
@@ -727,6 +730,7 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
@@ -803,6 +807,7 @@ mod tests {
                 agents: vec![Agent {
                     name: "agent".to_string(),
                     command: vec!["echo".to_string()],
+                    mode: AgentMode::default(),
                     reset_weekday: "monday".to_string(),
                     reset_time: "09:00".to_string(),
                     timezone: "UTC".to_string(),
@@ -885,6 +890,7 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
@@ -943,6 +949,7 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
@@ -1034,6 +1041,7 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
@@ -1112,6 +1120,7 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),
