@@ -204,11 +204,23 @@ fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()
         }
         "task_updated" => {
             let status = v["patch"]["status"].as_str().unwrap_or("");
+            let task_id = v["task_id"].as_str().unwrap_or("");
+            if v["patch"]["is_backgrounded"].as_bool() == Some(true) {
+                if task_id.is_empty() {
+                    writeln!(out, "\x1b[2m  \u{23f3} Task backgrounded\x1b[0m")?;
+                } else {
+                    writeln!(
+                        out,
+                        "\x1b[2m  \u{23f3} Task backgrounded ({})\x1b[0m",
+                        truncate_str(task_id, 40)
+                    )?;
+                }
+            }
             match status {
                 "completed" => {
                     writeln!(out, "\x1b[32m  \u{2705} Task completed\x1b[0m")?;
                 }
-                "failed" | "cancelled" => {
+                "failed" | "cancelled" | "killed" => {
                     writeln!(out, "\x1b[31m  \u{274c} Task {}\x1b[0m", status)?;
                 }
                 status if !status.is_empty() => {
@@ -3021,6 +3033,34 @@ mod tests {
         assert!(
             clean.contains("\u{2705} Task completed"),
             "expected task_updated completion in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_task_updated_backgrounded_shows_status() {
+        // 実データに出る background 化の通知は、後続の完了通知とは別に表示する
+        let input = r#"{"type":"system","subtype":"task_updated","task_id":"ba4f83w4h","patch":{"is_backgrounded":true}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("Task backgrounded (ba4f83w4h)"),
+            "expected task_updated background status in: {}",
+            clean
+        );
+    }
+
+    #[test]
+    fn process_task_updated_killed_is_error_colored_status() {
+        // killed は実データ上の異常終了なので failed/cancelled と同じ系統で表示する
+        let input = r#"{"type":"system","subtype":"task_updated","task_id":"abc","patch":{"status":"killed","end_time":1776959941297}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("\u{274c} Task killed"),
+            "expected task_updated killed status in: {}",
             clean
         );
     }
