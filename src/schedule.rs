@@ -3,6 +3,8 @@ use chrono::{Datelike, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 use std::time::Duration;
 
+#[cfg(test)]
+use crate::config::AgentMode;
 use crate::config::{Agent, parse_time, parse_weekday};
 
 #[derive(Debug)]
@@ -120,6 +122,8 @@ mod tests {
         Agent {
             name: name.to_string(),
             command: vec!["echo".to_string()],
+            mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: weekday.to_string(),
             reset_time: time.to_string(),
             timezone: "UTC".to_string(),
@@ -189,6 +193,8 @@ mod tests {
         let agent_tokyo = Agent {
             name: "tokyo".to_string(),
             command: vec!["echo".to_string()],
+            mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "Asia/Tokyo".to_string(),
@@ -330,6 +336,8 @@ mod tests {
         let agent = Agent {
             name: "bad-tz".to_string(),
             command: vec!["echo".to_string()],
+            mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "Invalid/Timezone".to_string(),

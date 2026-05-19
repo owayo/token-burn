@@ -2,6 +2,20 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
 
+/// `claude` interactive モードで使用してはならないフラグ。
+/// これらが指定された場合、出力が `--print` 経路になりプラン枠ではなく Agent SDK クレジット側を消費する。
+const CLAUDE_PRINT_ONLY_FLAGS: &[&str] = &[
+    "-p",
+    "--print",
+    "--output-format",
+    "--input-format",
+    "--include-partial-messages",
+    "--max-budget-usd",
+    "--no-session-persistence",
+    "--include-hook-events",
+    "--json-schema",
+];
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(skip)]
@@ -47,15 +61,109 @@ pub struct Prompts {
     pub default: String,
 }
 
+/// エージェントの起動・分類モード。
+/// 2026-06-15 以降、Anthropic は `claude -p` を Agent SDK 専用クレジットに分離し、
+/// 通常プラン枠は interactive Claude Code 経路でのみ消費可能になる。
+/// token-burn は「プラン枠を使い切る」のが目的なので `claude-interactive` 経路をデフォルトとし、
+/// 既存の `claude -p` 経路は `claude-print` として保持する（段階的移行のため）。
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentMode {
+    /// command の内容から自動判定する: `claude` 実行ファイルかつ `-p` / `--print` を含まなければ
+    /// `ClaudeInteractive`、含めば `ClaudePrint`、それ以外は `Generic` として扱う。
+    #[default]
+    Auto,
+    /// claude / codex / その他、特別な扱いをしない汎用エージェント。
+    Generic,
+    /// 既存の `claude -p` (stream-json) 経路。2026-06-15 以降は Agent SDK クレジット消費になるため明示 opt-in。
+    ClaudePrint,
+    /// `claude "prompt"` の対話モード起動経路。tmux 実 TTY + Stop/StopFailure hooks で分類。
+    ClaudeInteractive,
+}
+
+/// `claude --settings` に渡すための settings JSON ソース。
+/// 複数指定可能で、定義順に解決後 deep merge され、token-burn の Stop / StopFailure hooks を
+/// prepend した最終 JSON が 1 つだけ `--settings` で claude に渡される。
+///
+/// **TOML 例:**
+/// ```toml
+/// claude_settings = [
+///     { file = "~/.config/claude/plugin-settings.json" },
+///     { command = ["bash", "-lc", "~/bin/claude-plugin-settings.sh"] },
+///     { inline = { enabledPlugins = { "plugin@example" = true } } },
+/// ]
+/// ```
+///
+/// `file`: パス（`~` 展開対応）。中身は valid な JSON object でなければならない。
+/// `command`: shell コマンド（実行ファイル + args 配列、shell が必要なら `["bash", "-lc", "..."]`）。
+///   stdout が JSON object である必要がある。動的判定（cwd 依存等）はこの経路で実現する。
+/// `inline`: TOML 上で直接書く JSON object（TOML テーブルとして表現可能なもの）。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ClaudeSettingsSource {
+    File { file: String },
+    Command { command: Vec<String> },
+    Inline { inline: toml::Value },
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Agent {
     pub name: String,
     pub command: Vec<String>,
+    /// エージェントの起動・分類モード（省略時は Auto）。
+    #[serde(default)]
+    pub mode: AgentMode,
+    /// `claude --settings` で渡す settings JSON ソース（複数指定可、定義順に deep merge）。
+    /// claude-interactive モードで wrapper の `--settings` を廃止して token-burn 側に集約するための仕組み。
+    /// claude-print でも user settings として渡せる。generic / Auto(非claude) では空でなければエラー。
+    #[serde(default)]
+    pub claude_settings: Vec<ClaudeSettingsSource>,
     pub reset_weekday: String,
     pub reset_time: String,
     pub timezone: String,
     /// エージェント固有のプロンプト上書き（[prompts].default より優先）
     pub prompt: Option<String>,
+}
+
+impl Agent {
+    /// `Auto` モードを実コマンドから具体モードへ解決する。
+    /// claude 実行ファイルでなければ `Generic`、`-p` / `--print` / `--output-format` のいずれかを
+    /// 含めば `ClaudePrint`、それ以外は `ClaudeInteractive`。
+    pub fn resolved_mode(&self) -> AgentMode {
+        if self.mode != AgentMode::Auto {
+            return self.mode;
+        }
+        if !is_claude_executable(&self.command) {
+            return AgentMode::Generic;
+        }
+        let has_print_flag = self.command.iter().any(|s| {
+            s == "-p"
+                || s == "--print"
+                || s == "--output-format"
+                || s.starts_with("--output-format=")
+                || s == "--input-format"
+                || s.starts_with("--input-format=")
+                || s == "--include-partial-messages"
+        });
+        if has_print_flag {
+            AgentMode::ClaudePrint
+        } else {
+            AgentMode::ClaudeInteractive
+        }
+    }
+}
+
+/// command の先頭要素が claude 実行ファイル（ラッパースクリプト含む）かを判定する。
+/// ファイル名（basename）が "claude" そのもの、または "claude-" / "claude_" で始まる場合に true。
+pub fn is_claude_executable(command: &[String]) -> bool {
+    let Some(first) = command.first() else {
+        return false;
+    };
+    let basename = Path::new(first.as_str())
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    basename == "claude" || basename.starts_with("claude-") || basename.starts_with("claude_")
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,9 +263,76 @@ impl Config {
                 .timezone
                 .parse::<chrono_tz::Tz>()
                 .map_err(|_| anyhow::anyhow!("Invalid timezone: {}", agent.timezone))?;
+            validate_agent_mode(agent)?;
         }
         Ok(())
     }
+}
+
+fn validate_agent_mode(agent: &Agent) -> Result<()> {
+    let resolved = agent.resolved_mode();
+    match agent.mode {
+        AgentMode::ClaudeInteractive => {
+            if !is_claude_executable(&agent.command) {
+                anyhow::bail!(
+                    "Agent '{}': mode='claude-interactive' は claude 実行ファイルでのみ使用できます",
+                    agent.name
+                );
+            }
+            for flag in agent.command.iter() {
+                let is_print_flag = CLAUDE_PRINT_ONLY_FLAGS.iter().any(|deny| {
+                    flag == deny
+                        || (deny.starts_with("--") && flag.starts_with(&format!("{deny}=")))
+                });
+                if is_print_flag {
+                    anyhow::bail!(
+                        "Agent '{}': mode='claude-interactive' では --print 系フラグ '{}' を含められません。\n  2026-06-15 以降、これらを含むと Agent SDK クレジット経路になり token-burn の目的を達成できません。",
+                        agent.name,
+                        flag
+                    );
+                }
+            }
+        }
+        AgentMode::ClaudePrint => {
+            if !is_claude_executable(&agent.command) {
+                anyhow::bail!(
+                    "Agent '{}': mode='claude-print' は claude 実行ファイルでのみ使用できます",
+                    agent.name
+                );
+            }
+        }
+        AgentMode::Auto | AgentMode::Generic => {}
+    }
+
+    // command 内に `--settings` / `--settings=...` を直接書くことは、token-burn が `--settings` を
+    // 自前で渡す方針（claude_settings に集約）と衝突するため拒否する。
+    // claude エージェント（claude-print / claude-interactive）のみ拒否対象。generic は通過。
+    let claude_modes = matches!(
+        resolved,
+        AgentMode::ClaudeInteractive | AgentMode::ClaudePrint
+    );
+    if claude_modes {
+        let has_explicit_settings = agent
+            .command
+            .iter()
+            .any(|s| s == "--settings" || s.starts_with("--settings="));
+        if has_explicit_settings {
+            anyhow::bail!(
+                "Agent '{}': command に `--settings` を直接書けません。代わりに [[agents]].claude_settings を使用してください。\n  token-burn は --settings を必ず 1 個だけ渡す方針（user settings と token-burn hooks を deep merge）です。",
+                agent.name
+            );
+        }
+    }
+
+    // claude_settings は claude 経路でのみ使用可能。generic / 非 claude では空でなければエラー。
+    if !agent.claude_settings.is_empty() && !claude_modes {
+        anyhow::bail!(
+            "Agent '{}': claude_settings は claude エージェント (mode = 'claude-print' / 'claude-interactive' / Auto with claude 実行ファイル) でのみ指定できます",
+            agent.name
+        );
+    }
+
+    Ok(())
 }
 
 fn validate_optional_duration(field_name: &str, value: Option<&str>) -> Result<()> {
@@ -239,6 +414,296 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn agent_with_mode(name: &str, command: Vec<&str>, mode: AgentMode) -> Agent {
+        Agent {
+            name: name.to_string(),
+            command: command.into_iter().map(String::from).collect(),
+            mode,
+            claude_settings: Vec::new(),
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        }
+    }
+
+    #[test]
+    fn resolved_mode_auto_claude_with_p_is_print() {
+        let a = agent_with_mode("claude", vec!["claude", "-p"], AgentMode::Auto);
+        assert_eq!(a.resolved_mode(), AgentMode::ClaudePrint);
+    }
+
+    #[test]
+    fn resolved_mode_auto_claude_without_p_is_interactive() {
+        let a = agent_with_mode("claude", vec!["claude"], AgentMode::Auto);
+        assert_eq!(a.resolved_mode(), AgentMode::ClaudeInteractive);
+    }
+
+    #[test]
+    fn resolved_mode_auto_claude_with_output_format_is_print() {
+        let a = agent_with_mode(
+            "claude",
+            vec!["claude", "--output-format", "stream-json"],
+            AgentMode::Auto,
+        );
+        assert_eq!(a.resolved_mode(), AgentMode::ClaudePrint);
+    }
+
+    #[test]
+    fn resolved_mode_auto_codex_is_generic() {
+        let a = agent_with_mode("codex", vec!["codex", "exec"], AgentMode::Auto);
+        assert_eq!(a.resolved_mode(), AgentMode::Generic);
+    }
+
+    #[test]
+    fn resolved_mode_explicit_overrides_auto_detection() {
+        // 明示指定された mode は command 内容に関わらず尊重される
+        let a = agent_with_mode("claude", vec!["claude"], AgentMode::ClaudePrint);
+        assert_eq!(a.resolved_mode(), AgentMode::ClaudePrint);
+    }
+
+    #[test]
+    fn validate_agent_mode_rejects_claude_interactive_with_p() {
+        let mut config = base_config();
+        config.agents[0] =
+            agent_with_mode("claude", vec!["claude", "-p"], AgentMode::ClaudeInteractive);
+        let err = config
+            .validate()
+            .expect_err("claude-interactive + -p は拒否されるべき");
+        assert!(err.to_string().contains("--print 系フラグ"));
+    }
+
+    #[test]
+    fn validate_agent_mode_rejects_claude_interactive_with_output_format() {
+        let mut config = base_config();
+        config.agents[0] = agent_with_mode(
+            "claude",
+            vec!["claude", "--output-format", "stream-json"],
+            AgentMode::ClaudeInteractive,
+        );
+        let err = config
+            .validate()
+            .expect_err("claude-interactive + --output-format は拒否されるべき");
+        assert!(err.to_string().contains("--print 系フラグ"));
+    }
+
+    #[test]
+    fn validate_agent_mode_rejects_claude_interactive_with_equals_output_format() {
+        let mut config = base_config();
+        config.agents[0] = agent_with_mode(
+            "claude",
+            vec!["claude", "--output-format=stream-json"],
+            AgentMode::ClaudeInteractive,
+        );
+        let err = config
+            .validate()
+            .expect_err("equals 形式の --output-format も拒否されるべき");
+        assert!(err.to_string().contains("--print 系フラグ"));
+    }
+
+    #[test]
+    fn validate_agent_mode_rejects_claude_interactive_on_non_claude_executable() {
+        let mut config = base_config();
+        config.agents[0] = agent_with_mode("custom", vec!["codex"], AgentMode::ClaudeInteractive);
+        let err = config
+            .validate()
+            .expect_err("非 claude 実行ファイル + claude-interactive は拒否されるべき");
+        assert!(err.to_string().contains("claude 実行ファイル"));
+    }
+
+    #[test]
+    fn validate_agent_mode_allows_claude_interactive_with_clean_command() {
+        let mut config = base_config();
+        config.agents[0] = agent_with_mode(
+            "claude",
+            vec!["claude", "--model", "opus"],
+            AgentMode::ClaudeInteractive,
+        );
+        config
+            .validate()
+            .expect("--model など print-only でない flag は許可されるべき");
+    }
+
+    #[test]
+    fn validate_agent_mode_rejects_claude_print_on_non_claude_executable() {
+        let mut config = base_config();
+        config.agents[0] = agent_with_mode("foo", vec!["codex"], AgentMode::ClaudePrint);
+        let err = config
+            .validate()
+            .expect_err("非 claude + claude-print は拒否されるべき");
+        assert!(err.to_string().contains("claude 実行ファイル"));
+    }
+
+    #[test]
+    fn validate_rejects_command_with_explicit_settings_flag() {
+        // command に `--settings` を直接書くと token-burn の集約方針と衝突するため拒否
+        let mut config = base_config();
+        config.agents[0] = agent_with_mode(
+            "claude",
+            vec!["claude", "--settings", "/etc/foo.json"],
+            AgentMode::ClaudeInteractive,
+        );
+        let err = config
+            .validate()
+            .expect_err("command 内 --settings は拒否されるべき");
+        assert!(err.to_string().contains("`--settings` を直接書けません"));
+        assert!(err.to_string().contains("claude_settings"));
+    }
+
+    #[test]
+    fn validate_rejects_command_with_equals_style_settings_flag() {
+        let mut config = base_config();
+        config.agents[0] = agent_with_mode(
+            "claude",
+            vec!["claude", "--settings=/etc/foo.json"],
+            AgentMode::ClaudeInteractive,
+        );
+        let err = config
+            .validate()
+            .expect_err("equals 形式の --settings も拒否されるべき");
+        assert!(err.to_string().contains("`--settings` を直接書けません"));
+    }
+
+    #[test]
+    fn validate_rejects_command_with_settings_flag_in_claude_print() {
+        // claude-print でも同じ理由で拒否（user settings は claude_settings 経由で）
+        let mut config = base_config();
+        config.agents[0] = agent_with_mode(
+            "claude",
+            vec!["claude", "-p", "--settings", "/etc/foo.json"],
+            AgentMode::ClaudePrint,
+        );
+        let err = config
+            .validate()
+            .expect_err("claude-print でも --settings 直書きは拒否されるべき");
+        assert!(err.to_string().contains("`--settings` を直接書けません"));
+    }
+
+    #[test]
+    fn validate_allows_command_with_settings_in_generic_mode() {
+        // generic では --settings 直書きを許す（汎用エージェントは token-burn の hook 制約とは無関係）
+        let mut config = base_config();
+        config.agents[0] = agent_with_mode(
+            "codex",
+            vec!["codex", "--settings", "/etc/foo.json"],
+            AgentMode::Generic,
+        );
+        config
+            .validate()
+            .expect("generic では command 内 --settings を許可するべき");
+    }
+
+    #[test]
+    fn validate_rejects_claude_settings_in_generic_mode() {
+        let mut config = base_config();
+        let mut agent = agent_with_mode("codex", vec!["codex"], AgentMode::Generic);
+        agent.claude_settings = vec![ClaudeSettingsSource::File {
+            file: "/etc/foo.json".to_string(),
+        }];
+        config.agents[0] = agent;
+        let err = config
+            .validate()
+            .expect_err("generic で claude_settings を使うのは拒否されるべき");
+        assert!(err.to_string().contains("claude_settings は claude"));
+    }
+
+    #[test]
+    fn validate_allows_claude_settings_in_claude_interactive() {
+        let mut config = base_config();
+        let mut agent = agent_with_mode("claude", vec!["claude"], AgentMode::ClaudeInteractive);
+        agent.claude_settings = vec![ClaudeSettingsSource::File {
+            file: "/etc/foo.json".to_string(),
+        }];
+        config.agents[0] = agent;
+        config
+            .validate()
+            .expect("claude-interactive で claude_settings は許可されるべき");
+    }
+
+    #[test]
+    fn claude_settings_source_deserialize_file_variant() {
+        let toml_str = r#"claude_settings = [{ file = "~/foo.json" }]"#;
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            claude_settings: Vec<ClaudeSettingsSource>,
+        }
+        let w: Wrap = toml::from_str(toml_str).expect("file variant should deserialize");
+        assert_eq!(w.claude_settings.len(), 1);
+        match &w.claude_settings[0] {
+            ClaudeSettingsSource::File { file } => assert_eq!(file, "~/foo.json"),
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_settings_source_deserialize_command_variant() {
+        let toml_str = r#"claude_settings = [{ command = ["bash", "-lc", "echo {}"] }]"#;
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            claude_settings: Vec<ClaudeSettingsSource>,
+        }
+        let w: Wrap = toml::from_str(toml_str).expect("command variant should deserialize");
+        match &w.claude_settings[0] {
+            ClaudeSettingsSource::Command { command } => {
+                assert_eq!(command, &vec!["bash", "-lc", "echo {}"]);
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_settings_source_deserialize_inline_variant() {
+        let toml_str = r#"
+[[claude_settings]]
+inline = { enabledPlugins = { "p1" = true } }
+"#;
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            claude_settings: Vec<ClaudeSettingsSource>,
+        }
+        let w: Wrap = toml::from_str(toml_str).expect("inline variant should deserialize");
+        match &w.claude_settings[0] {
+            ClaudeSettingsSource::Inline { inline } => {
+                let t = inline.as_table().expect("inline should be a TOML table");
+                let ep = t.get("enabledPlugins").and_then(|v| v.as_table()).unwrap();
+                assert_eq!(ep.get("p1").and_then(|v| v.as_bool()), Some(true));
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_settings_source_rejects_mixed_keys() {
+        // deny_unknown_fields により、file/command/inline 以外のキーは拒否される
+        let toml_str = r#"claude_settings = [{ file = "x.json", command = ["a"] }]"#;
+        #[derive(serde::Deserialize, Debug)]
+        struct Wrap {
+            #[allow(dead_code)]
+            claude_settings: Vec<ClaudeSettingsSource>,
+        }
+        assert!(
+            toml::from_str::<Wrap>(toml_str).is_err(),
+            "file と command を同時指定するのは拒否されるべき"
+        );
+    }
+
+    #[test]
+    fn agent_mode_default_is_auto() {
+        assert_eq!(AgentMode::default(), AgentMode::Auto);
+    }
+
+    #[test]
+    fn agent_mode_deserializes_kebab_case() {
+        let a: AgentMode = toml::from_str("mode = \"claude-interactive\"\n")
+            .ok()
+            .and_then(|t: toml::Table| {
+                let v = t.get("mode")?.clone();
+                v.try_into().ok()
+            })
+            .expect("kebab-case でデシリアライズできるべき");
+        assert_eq!(a, AgentMode::ClaudeInteractive);
+    }
+
     fn base_config() -> Config {
         Config {
             config_dir: PathBuf::from("."),
@@ -256,6 +721,8 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
+                mode: AgentMode::default(),
+                claude_settings: Vec::new(),
                 reset_weekday: "monday".to_string(),
                 reset_time: "09:00".to_string(),
                 timezone: "UTC".to_string(),

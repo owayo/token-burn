@@ -30,6 +30,8 @@
 
 Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Japanese *mottainai* (もったいない) spirit — the belief that waste is something to be avoided — **token-burn** puts those remaining tokens to work. It runs your prompts across repositories in parallel before the reset deadline — code reviews, bug hunts, refactoring, test improvements, or anything else you define. When the reset time arrives, all running processes are automatically terminated.
 
+> **Heads-up for 2026-06-15 onward**: Anthropic is moving `claude -p` / Agent SDK / GitHub Actions onto a separate monthly Agent SDK credit (Pro $20/mo, Max 5x $100/mo, Max 20x $200/mo), while interactive Claude Code (terminal/IDE) continues to draw from your normal plan quota. token-burn now defaults to **interactive mode** (`mode = "claude-interactive"`) to keep consuming the plan quota, by launching `claude` in real TTY and using `Stop` / `StopFailure` hooks for outcome classification. The legacy `claude -p` path is preserved as `mode = "claude-print"` for opt-in use. See [AGENTS.md](./AGENTS.md) for details. **No guarantee that Anthropic won't tighten the interactive path later** — adjust your usage accordingly.
+
 <p align="center">
   <img src="docs/images/screenshot.png" width="800" alt="token-burn running">
 </p>
@@ -49,7 +51,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Deadline enforcement**: Kills all child processes when the reset time arrives
 - **Parallel execution**: Runs multiple prompts concurrently in tmux split panes with progress monitor
 - **Detach-safe tmux runtime**: Keeps worker scripts and queues when you detach, so background tasks continue safely until the tmux session ends
-- **Sub-agent monitoring**: Real-time start, progress, status updates, and completion notifications for Claude Code team/agent tasks
+- **Sub-agent monitoring**: Real-time start, progress, backgrounding, killed/failed status updates, and completion notifications for Claude Code team/agent tasks
 - **System notification visibility**: Shows Claude Code system notifications such as stop-hook errors, plus hook diagnostics when `hook_progress` / `hook_response` include stderr or output
 - **Richer tool details**: Shows `Read` offset/limit, `Edit` replace-all state, `Bash` timeout/background state, `Agent` background state, `Grep`/`Glob` output mode, ignore-case, glob, head/context limits, delay/reason for `ScheduleWakeup`, URL/prompt summary for `WebFetch`, query/domain filters for `WebSearch`, query/`max_results` for `ToolSearch`, monitor description/timeout for `Monitor`, stopped task ID for `TaskStop`, task ID/block/timeout for `TaskOutput`, `SendMessage` summaries, `AskUserQuestion` prompts/options, Tavily/Codex MCP sandbox/approval details, and library/query details for Context7 MCP tools
 - **Sub-agent stop visibility**: `task_notification` events with `status="stopped"` (e.g. forced via `TaskStop`) are now surfaced in the live monitor

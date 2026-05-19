@@ -30,6 +30,8 @@
 
 Claude Code / Codex CLI のトークンは週次でリセットされますが、未使用分は繰り越されません。「もったいない」精神で、**token-burn** はリセット直前の残りトークンを有効活用します。コードレビュー、バグ修正、リファクタリング、テスト改善など、自由に定義したプロンプトをリポジトリ群に対して並列実行します。リセット時刻が来ると、実行中のプロセスは自動的に終了されます。
 
+> **2026年6月15日以降の注意**: Anthropic は `claude -p` / Agent SDK / GitHub Actions を「Agent SDK 専用月次クレジット」（Pro $20/月、Max 5x $100/月、Max 20x $200/月）に分離し、対話的な Claude Code（ターミナル/IDE）は引き続きプラン使用枠を消費する仕様になります。token-burn は「プラン使用枠を使い切る」のが目的のため、デフォルトを **対話モード**（`mode = "claude-interactive"`）に変更しました。`claude` を実 TTY で起動し、`Stop` / `StopFailure` hooks 経由で完了/失敗を分類します。従来の `claude -p` 経路は `mode = "claude-print"` で opt-in できますが、上記制限により目的が成立しなくなります。詳細は [AGENTS.md](./AGENTS.md) を参照。**Anthropic 側のポリシーは今後変わる可能性があり、対話モード経路の存続を保証するものではありません**。
+
 <p align="center">
   <img src="docs/images/screenshot.png" width="800" alt="token-burn 実行中">
 </p>
@@ -49,7 +51,7 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **デッドライン制御**: リセット時刻到達時に全子プロセスを自動終了
 - **並列実行**: tmuxペイン分割とプログレスモニター付きで複数プロンプトを同時実行
 - **tmux デタッチ安全性**: デタッチ時はワーカースクリプトとキューを保持し、tmux セッション終了までバックグラウンドタスクを安全に継続
-- **サブエージェント監視**: Claude Codeのチーム/エージェントタスクの開始・進捗・状態更新・完了をリアルタイム表示
+- **サブエージェント監視**: Claude Codeのチーム/エージェントタスクの開始・進捗・バックグラウンド化・強制終了/失敗状態更新・完了をリアルタイム表示
 - **システム通知の可視化**: stop hook エラーなどの Claude Code システム通知に加え、`hook_progress` / `hook_response` に stderr や output が含まれる場合のフック診断も表示
 - **ツール詳細の強化**: Claude の stream-json に含まれる `Read` の offset/limit、`Edit` の一括置換状態、`Bash` の timeout/background 状態、`Agent` のバックグラウンド状態、`Grep`/`Glob` の output mode・ignore-case・glob・head/context 制限、`ScheduleWakeup` の待機時間/理由、`WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results`、`Monitor` の説明/タイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`SendMessage` の要約、`AskUserQuestion` の質問/選択肢、Tavily/Codex MCP の sandbox/approval 詳細、Context7 MCP ツールの library/query を表示
 - **サブエージェント停止の可視化**: `task_notification` の `status="stopped"`（`TaskStop` 等で停止された場合）もモニターに表示

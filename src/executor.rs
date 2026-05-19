@@ -3,7 +3,7 @@ use colored::Colorize;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config::Agent;
+use crate::config::{Agent, AgentMode, ClaudeSettingsSource};
 use crate::display;
 use crate::scanner::{ResolvedTarget, Visibility};
 
@@ -22,23 +22,21 @@ pub fn build_plan(agent: &Agent, targets: Vec<ResolvedTarget>) -> ExecutionPlan 
 }
 
 /// command の先頭要素が claude 実行ファイル（ラッパースクリプト含む）かを判定する。
-/// ファイル名（basename）が "claude" そのもの、または "claude-" / "claude_" で始まる場合に true。
+/// 共通の判定ロジックは `config::is_claude_executable` を再エクスポートする（既存テスト用）。
+#[cfg(test)]
 fn is_claude_command(command: &[String]) -> bool {
-    let Some(first) = command.first() else {
-        return false;
-    };
-    let basename = std::path::Path::new(first.as_str())
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    basename == "claude" || basename.starts_with("claude-") || basename.starts_with("claude_")
+    crate::config::is_claude_executable(command)
 }
 
 /// 既知エージェントに必要なフラグを自動付与する。
-/// `claude` の場合、`--verbose`、`--output-format stream-json`、`--include-partial-messages`
-/// はログ取得に必須であり、常に存在しなければならない。
+///
+/// - `ClaudePrint` モード: `--verbose`、`--output-format stream-json`、`--include-partial-messages` を付与
+///   （stream-json を `format-stream` でパースするのに必須）。
+/// - `ClaudeInteractive` モード: 何も付与しない。print-only フラグは config 側の validate で拒否済み。
+/// - `Generic` モード: 何も付与しない。
 fn ensure_required_flags(agent: &mut Agent) {
-    if !is_claude_command(&agent.command) {
+    let mode = agent.resolved_mode();
+    if mode != AgentMode::ClaudePrint {
         return;
     }
 
@@ -170,13 +168,32 @@ pub fn execute_plan_tmux(
     let exe_path =
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("token-burn"));
     let stop_file = tmp_dir.join("stop");
-    let is_claude = is_claude_command(&plan.agent.command);
+    let agent_mode = plan.agent.resolved_mode();
+    let settings_dir = tmp_dir.join("settings");
+    if matches!(agent_mode, AgentMode::ClaudeInteractive) {
+        std::fs::create_dir_all(&settings_dir)?;
+    }
 
     // 各タスクの実行スクリプトと pending マーカーを書き出す
     for (idx_zero, task) in plan.tasks.iter().enumerate() {
         let idx = idx_zero + 1;
         let prompt_file = tmp_dir.join(format!("prompt-{}.txt", idx));
         std::fs::write(&prompt_file, &task.prompt)?;
+
+        // interactive モードでは hooks 注入用 settings.json をタスクごとに書き出す
+        let settings_file = if matches!(agent_mode, AgentMode::ClaudeInteractive) {
+            let outcome_path = marker_dir.join(format!("outcome-{}.json", idx));
+            let path = settings_dir.join(format!("task-{:04}.json", idx));
+            let json = build_claude_interactive_settings(
+                &plan.agent.claude_settings,
+                &exe_path,
+                &outcome_path,
+            )?;
+            std::fs::write(&path, json)?;
+            Some(path)
+        } else {
+            None
+        };
 
         let task_script = build_task_script(&TaskCtx {
             idx,
@@ -190,7 +207,8 @@ pub fn execute_plan_tmux(
             state_file,
             stop_file: &stop_file,
             rate_limit_threshold,
-            is_claude,
+            mode: agent_mode,
+            settings_file: settings_file.as_deref(),
         });
         let task_path = task_dir.join(format!("task-{:04}.sh", idx));
         std::fs::write(&task_path, &task_script)?;
@@ -547,7 +565,172 @@ struct TaskCtx<'a> {
     state_file: &'a Path,
     stop_file: &'a Path,
     rate_limit_threshold: u8,
-    is_claude: bool,
+    mode: AgentMode,
+    /// `ClaudeInteractive` 時のみ Some。hooks 注入用に生成された settings.json のパス。
+    settings_file: Option<&'a Path>,
+}
+
+/// token-burn が必ず注入する Stop / StopFailure hook 1 個分のオブジェクト。
+/// user の hooks.Stop[*] 配列の **先頭** に prepend されることで、token-burn の outcome 書き出しが
+/// 常に先に走り、その後 user hooks が走る（exit code 順序）。
+fn build_token_burn_hook_entry(exe_path: &Path, outcome_path: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": exe_path.to_string_lossy(),
+            "args": ["claude-hook", "--outcome", outcome_path.to_string_lossy()],
+        }],
+    })
+}
+
+/// `ClaudeInteractive` (および `ClaudePrint` で user 設定を渡す場合) の最終 `--settings` 用 JSON を構築する。
+///
+/// 手順:
+/// 1. `claude_settings` の各 source を解決して `Vec<serde_json::Value>` を作る
+/// 2. 定義順に deep merge して 1 つの user_settings に集約
+/// 3. token-burn の Stop / StopFailure hook を user_settings の `hooks.{Stop,StopFailure}` 配列に **prepend**
+fn build_claude_interactive_settings(
+    sources: &[ClaudeSettingsSource],
+    exe_path: &Path,
+    outcome_path: &Path,
+) -> Result<String> {
+    let mut merged = serde_json::Value::Object(serde_json::Map::new());
+    for src in sources {
+        let value = resolve_settings_source(src)
+            .with_context(|| format!("Failed to resolve claude_settings source: {src:?}"))?;
+        deep_merge(&mut merged, value);
+    }
+
+    let hook_entry = build_token_burn_hook_entry(exe_path, outcome_path);
+    prepend_hook(&mut merged, "Stop", hook_entry.clone());
+    prepend_hook(&mut merged, "StopFailure", hook_entry);
+
+    let json = serde_json::to_string_pretty(&merged)
+        .context("Failed to serialize merged claude settings")?;
+    Ok(json + "\n")
+}
+
+/// `ClaudeSettingsSource` を `serde_json::Value` に解決する。
+fn resolve_settings_source(src: &ClaudeSettingsSource) -> Result<serde_json::Value> {
+    match src {
+        ClaudeSettingsSource::File { file } => {
+            let expanded = shellexpand::tilde(file);
+            let path = std::path::PathBuf::from(expanded.as_ref());
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read settings file: {}", path.display()))?;
+            let v: serde_json::Value = serde_json::from_str(&content)
+                .with_context(|| format!("Invalid JSON in settings file: {}", path.display()))?;
+            ensure_object(&v, &format!("file:{}", path.display()))?;
+            Ok(v)
+        }
+        ClaudeSettingsSource::Command { command } => {
+            anyhow::ensure!(
+                !command.is_empty(),
+                "claude_settings command must include at least one element"
+            );
+            let output = std::process::Command::new(&command[0])
+                .args(&command[1..])
+                .output()
+                .with_context(|| {
+                    format!("Failed to execute claude_settings command: {command:?}")
+                })?;
+            anyhow::ensure!(
+                output.status.success(),
+                "claude_settings command failed (exit={:?}): {:?}\nstderr: {}",
+                output.status.code(),
+                command,
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let stdout = String::from_utf8(output.stdout)
+                .with_context(|| format!("Non-UTF8 stdout from {command:?}"))?;
+            let trimmed = stdout.trim();
+            anyhow::ensure!(
+                !trimmed.is_empty(),
+                "claude_settings command produced empty stdout: {command:?}"
+            );
+            let v: serde_json::Value = serde_json::from_str(trimmed).with_context(|| {
+                format!("Invalid JSON from claude_settings command {command:?}")
+            })?;
+            ensure_object(&v, &format!("command:{command:?}"))?;
+            Ok(v)
+        }
+        ClaudeSettingsSource::Inline { inline } => {
+            let json_str = serde_json::to_string(inline)
+                .context("Failed to convert inline TOML value to JSON")?;
+            let v: serde_json::Value = serde_json::from_str(&json_str)
+                .context("Inline value did not roundtrip to JSON")?;
+            ensure_object(&v, "inline")?;
+            Ok(v)
+        }
+    }
+}
+
+fn ensure_object(v: &serde_json::Value, label: &str) -> Result<()> {
+    anyhow::ensure!(
+        v.is_object(),
+        "claude_settings source ({label}) must be a JSON object, got: {}",
+        match v {
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Null => "null",
+            _ => "non-object",
+        }
+    );
+    Ok(())
+}
+
+/// object 同士は再帰 merge、それ以外は RHS で完全置換する（最後勝ち）。
+/// 配列は merge ではなく完全置換が rust-style で予測可能。hooks の matcher 配列は別途
+/// `prepend_hook` で扱う。
+fn deep_merge(base: &mut serde_json::Value, rhs: serde_json::Value) {
+    match (base, rhs) {
+        (serde_json::Value::Object(bo), serde_json::Value::Object(ro)) => {
+            for (k, v) in ro {
+                match bo.get_mut(&k) {
+                    Some(bv) => deep_merge(bv, v),
+                    None => {
+                        bo.insert(k, v);
+                    }
+                }
+            }
+        }
+        (slot, v) => {
+            *slot = v;
+        }
+    }
+}
+
+/// merged 設定の `hooks.<event>` 配列の **先頭** に token-burn の hook entry を prepend する。
+/// 配列が無ければ作成。`hooks` キーが無ければ作成。
+fn prepend_hook(settings: &mut serde_json::Value, event: &str, entry: serde_json::Value) {
+    let obj = match settings {
+        serde_json::Value::Object(o) => o,
+        _ => return,
+    };
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let hooks_obj = match hooks {
+        serde_json::Value::Object(o) => o,
+        _ => {
+            *hooks = serde_json::Value::Object(serde_json::Map::new());
+            hooks.as_object_mut().unwrap()
+        }
+    };
+    let arr = hooks_obj
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    match arr {
+        serde_json::Value::Array(a) => {
+            a.insert(0, entry);
+        }
+        _ => {
+            *arr = serde_json::Value::Array(vec![entry]);
+        }
+    }
 }
 
 struct WorkerCtx<'a> {
@@ -559,191 +742,377 @@ struct WorkerCtx<'a> {
 }
 
 /// キューから claim したワーカーが source して実行する、タスク単位のシェルスクリプトを生成する。
+/// 全 mode 共通のタスク固有パス・コマンドをまとめた構造体。
+struct TaskPaths {
+    log_file: String,
+    jsonl_file: String,
+    outcome_file: String,
+    done_marker: String,
+    failed_marker: String,
+    retry_marker: String,
+    error_file: String,
+    error_prefix: String,
+    stop_file_escaped: String,
+    mark_cmd: String,
+    tb_cmd: String,
+}
+
+impl TaskPaths {
+    fn from_ctx(ctx: &TaskCtx<'_>) -> Self {
+        let log_base = task_log_base(ctx.idx, &ctx.task.display_name);
+        Self {
+            log_file: shell_escape(
+                &ctx.run_dir
+                    .join(format!("{log_base}.log"))
+                    .to_string_lossy(),
+            ),
+            jsonl_file: shell_escape(
+                &ctx.run_dir
+                    .join(format!("{log_base}.jsonl"))
+                    .to_string_lossy(),
+            ),
+            outcome_file: shell_escape(
+                &ctx.marker_dir
+                    .join(format!("outcome-{}.json", ctx.idx))
+                    .to_string_lossy(),
+            ),
+            done_marker: shell_escape(
+                &ctx.marker_dir
+                    .join(format!("done-{}", ctx.idx))
+                    .to_string_lossy(),
+            ),
+            failed_marker: shell_escape(
+                &ctx.marker_dir
+                    .join(format!("failed-{}", ctx.idx))
+                    .to_string_lossy(),
+            ),
+            retry_marker: shell_escape(
+                &ctx.marker_dir
+                    .join(format!("retry-{}", ctx.idx))
+                    .to_string_lossy(),
+            ),
+            error_file: shell_escape(
+                &ctx.marker_dir
+                    .join(format!("error-{}", ctx.idx))
+                    .to_string_lossy(),
+            ),
+            error_prefix: shell_escape(&format!("[{}] ", ctx.task.display_name)),
+            stop_file_escaped: shell_escape(&ctx.stop_file.to_string_lossy()),
+            mark_cmd: format!(
+                "{} mark {} {} {}",
+                shell_escape(&ctx.exe_path.to_string_lossy()),
+                shell_escape(&ctx.agent.name),
+                shell_escape(&ctx.task.directory.to_string_lossy()),
+                shell_escape(&ctx.state_file.to_string_lossy()),
+            ),
+            tb_cmd: shell_escape(&ctx.exe_path.to_string_lossy()),
+        }
+    }
+}
+
 fn build_task_script(ctx: &TaskCtx<'_>) -> String {
-    let log_base = task_log_base(ctx.idx, &ctx.task.display_name);
-    let log_file = shell_escape(
-        &ctx.run_dir
-            .join(format!("{log_base}.log"))
-            .to_string_lossy(),
-    );
-    let jsonl_file = shell_escape(
-        &ctx.run_dir
-            .join(format!("{log_base}.jsonl"))
-            .to_string_lossy(),
-    );
-    let done_marker = shell_escape(
-        &ctx.marker_dir
-            .join(format!("done-{}", ctx.idx))
-            .to_string_lossy(),
-    );
-    let failed_marker = shell_escape(
-        &ctx.marker_dir
-            .join(format!("failed-{}", ctx.idx))
-            .to_string_lossy(),
-    );
-    let retry_marker = shell_escape(
-        &ctx.marker_dir
-            .join(format!("retry-{}", ctx.idx))
-            .to_string_lossy(),
-    );
-    let error_file = shell_escape(
-        &ctx.marker_dir
-            .join(format!("error-{}", ctx.idx))
-            .to_string_lossy(),
-    );
-    let error_prefix = shell_escape(&format!("[{}] ", ctx.task.display_name));
-    let stop_file_escaped = shell_escape(&ctx.stop_file.to_string_lossy());
-    let cmd_str = build_shell_command(&ctx.agent.command, ctx.prompt_file, &ctx.task.directory);
-    let mark_cmd = format!(
-        "{} mark {} {} {}",
-        shell_escape(&ctx.exe_path.to_string_lossy()),
-        shell_escape(&ctx.agent.name),
-        shell_escape(&ctx.task.directory.to_string_lossy()),
-        shell_escape(&ctx.state_file.to_string_lossy()),
-    );
+    let paths = TaskPaths::from_ctx(ctx);
 
     let mut script = String::new();
     // 現在処理中のタスクをシグナルハンドラから参照できるようにする
-    script += &format!("CURRENT_FAILED_MARKER={failed_marker}\n");
+    script += &format!("CURRENT_FAILED_MARKER={}\n", paths.failed_marker);
     script += &build_task_header_script(ctx.idx, ctx.total, &ctx.task.display_name);
 
-    if ctx.is_claude {
-        let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
-        script += &format!(
-            "{cmd_str} 2>&1 | {tb_cmd} format-stream --raw-output {jsonl_file} --stop-file {stop_file_escaped} --threshold {rate_limit_threshold} 2>&1 | tee {log_file}\n",
-            rate_limit_threshold = ctx.rate_limit_threshold,
-        );
-        script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
-        script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
-        script += "FORMAT_EXIT=${PIPE_STATUS[1]}\n";
-        script += "TEE_EXIT=${PIPE_STATUS[2]}\n";
-        script += "CURRENT_FAILED_MARKER=\"\"\n";
-        script += &format!(
-            concat!(
-                "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ] || [ ! -s {jsonl} ]; then\n",
-                "  printf '%slogging/classification pipeline failed (format=%s tee=%s)\\n' {prefix} \"$FORMAT_EXIT\" \"$TEE_EXIT\" > {error}\n",
-                "  touch {failed}\n",
-                "  echo '━━━ Error - logging pipeline failed ━━━'\n",
-                "  echo ''\n",
-                "  return 0\n",
-                "fi\n",
-            ),
-            prefix = error_prefix,
-            error = error_file,
-            failed = failed_marker,
-            jsonl = jsonl_file,
-        );
-    } else {
-        script += &format!("{cmd_str} 2>&1 | tee {log_file}\n");
-        script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
-        script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
-        script += "TEE_EXIT=${PIPE_STATUS[1]}\n";
-        script += "CURRENT_FAILED_MARKER=\"\"\n";
-        script += &format!(
-            concat!(
-                "if [ \"$TEE_EXIT\" -ne 0 ]; then\n",
-                "  printf '%slogging pipeline failed (tee=%s)\\n' {prefix} \"$TEE_EXIT\" > {error}\n",
-                "  touch {failed}\n",
-                "  echo '━━━ Error - logging pipeline failed ━━━'\n",
-                "  echo ''\n",
-                "  return 0\n",
-                "fi\n",
-            ),
-            prefix = error_prefix,
-            error = error_file,
-            failed = failed_marker,
-        );
+    match ctx.mode {
+        AgentMode::ClaudePrint => append_claude_print_body(&mut script, ctx, &paths),
+        AgentMode::ClaudeInteractive => append_claude_interactive_body(&mut script, ctx, &paths),
+        AgentMode::Auto | AgentMode::Generic => append_generic_body(&mut script, ctx, &paths),
     }
 
-    if ctx.is_claude {
-        let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
-        script += &format!(
-            concat!(
-                "CLASSIFIED=$({tb} classify-result {jsonl} 2>/dev/null)\n",
-                "CLASS_CODE=$?\n",
-                "case $CLASS_CODE in\n",
-                "  2)\n",
-                // 後続タスクが誤って「Cancelled」と判定されないよう、ここでフラグを必ずリセットする
-                "    CANCELLED=0\n",
-                "    touch {failed}\n",
-                "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
-                "    ;;\n",
-                "  3)\n",
-                // 後続タスクが誤って「Cancelled」と判定されないよう、ここでフラグを必ずリセットする
-                "    CANCELLED=0\n",
-                "    if [ -n \"$CLASSIFIED\" ]; then\n",
-                "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
-                "    fi\n",
-                "    touch {retry}\n",
-                "    echo \"━━━ Retryable error (will retry next run): $CLASSIFIED ━━━\"\n",
-                "    ;;\n",
-                "  1)\n",
-                "    if [ $CANCELLED -eq 1 ]; then\n",
-                "      CANCELLED=0\n",
-                "      touch {failed}\n",
-                "      echo '━━━ Cancelled ━━━'\n",
-                "    else\n",
-                "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
-                "      touch {failed}\n",
-                "      echo '━━━ Error - continuing ━━━'\n",
-                "    fi\n",
-                "    ;;\n",
-                "  *)\n",
-                "    if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
-                "      if [ $CANCELLED -eq 1 ]; then\n",
-                "        CANCELLED=0\n",
-                "        touch {failed}\n",
-                "        echo '━━━ Cancelled ━━━'\n",
-                "      else\n",
-                "        ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
-                "        printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
-                "        touch {failed}\n",
-                "        echo '━━━ Error - continuing ━━━'\n",
-                "      fi\n",
-                "    else\n",
-                "      {mark}\n",
-                "      touch {done}\n",
-                "    fi\n",
-                "    ;;\n",
-                "esac\n",
-            ),
-            prefix = error_prefix,
-            error = error_file,
-            failed = failed_marker,
-            retry = retry_marker,
-            done = done_marker,
-            jsonl = jsonl_file,
-            tb = tb_cmd,
-            mark = mark_cmd,
-        );
-    } else {
-        script += &format!(
-            concat!(
-                "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
-                "  if [ $CANCELLED -eq 1 ]; then\n",
-                "    CANCELLED=0\n",
-                "    touch {failed}\n",
-                "    echo '━━━ Cancelled ━━━'\n",
-                "  else\n",
-                "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
-                "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
-                "    touch {failed}\n",
-                "    echo '━━━ Error - continuing ━━━'\n",
-                "  fi\n",
-                "else\n",
-                "  {mark}\n",
-                "  touch {done}\n",
-                "fi\n",
-            ),
-            prefix = error_prefix,
-            error = error_file,
-            failed = failed_marker,
-            done = done_marker,
-            mark = mark_cmd,
-        );
-    }
     script += "echo ''\n";
     script
+}
+
+/// `claude -p` (stream-json) 経路。`format-stream` / `classify-result` を使用。
+fn append_claude_print_body(script: &mut String, ctx: &TaskCtx<'_>, p: &TaskPaths) {
+    let cmd_str = build_shell_command(&ctx.agent.command, ctx.prompt_file, &ctx.task.directory);
+    let TaskPaths {
+        log_file,
+        jsonl_file,
+        done_marker,
+        failed_marker,
+        retry_marker,
+        error_file,
+        error_prefix,
+        stop_file_escaped,
+        mark_cmd,
+        tb_cmd,
+        ..
+    } = p;
+    let rate_limit_threshold = ctx.rate_limit_threshold;
+
+    *script += &format!(
+        "{cmd_str} 2>&1 | {tb_cmd} format-stream --raw-output {jsonl_file} --stop-file {stop_file_escaped} --threshold {rate_limit_threshold} 2>&1 | tee {log_file}\n",
+    );
+    *script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
+    *script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
+    *script += "FORMAT_EXIT=${PIPE_STATUS[1]}\n";
+    *script += "TEE_EXIT=${PIPE_STATUS[2]}\n";
+    *script += "CURRENT_FAILED_MARKER=\"\"\n";
+    *script += &format!(
+        concat!(
+            "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ] || [ ! -s {jsonl} ]; then\n",
+            "  printf '%slogging/classification pipeline failed (format=%s tee=%s)\\n' {prefix} \"$FORMAT_EXIT\" \"$TEE_EXIT\" > {error}\n",
+            "  touch {failed}\n",
+            "  echo '━━━ Error - logging pipeline failed ━━━'\n",
+            "  echo ''\n",
+            "  return 0\n",
+            "fi\n",
+        ),
+        prefix = error_prefix,
+        error = error_file,
+        failed = failed_marker,
+        jsonl = jsonl_file,
+    );
+
+    *script += &format!(
+        concat!(
+            "CLASSIFIED=$({tb} classify-result {jsonl} 2>/dev/null)\n",
+            "CLASS_CODE=$?\n",
+            "case $CLASS_CODE in\n",
+            "  2)\n",
+            "    CANCELLED=0\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
+            "    ;;\n",
+            "  3)\n",
+            "    CANCELLED=0\n",
+            "    if [ -n \"$CLASSIFIED\" ]; then\n",
+            "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+            "    fi\n",
+            "    touch {retry}\n",
+            "    echo \"━━━ Retryable error (will retry next run): $CLASSIFIED ━━━\"\n",
+            "    ;;\n",
+            "  1)\n",
+            "    if [ $CANCELLED -eq 1 ]; then\n",
+            "      CANCELLED=0\n",
+            "      touch {failed}\n",
+            "      echo '━━━ Cancelled ━━━'\n",
+            "    else\n",
+            "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+            "      touch {failed}\n",
+            "      echo '━━━ Error - continuing ━━━'\n",
+            "    fi\n",
+            "    ;;\n",
+            "  *)\n",
+            "    if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
+            "      if [ $CANCELLED -eq 1 ]; then\n",
+            "        CANCELLED=0\n",
+            "        touch {failed}\n",
+            "        echo '━━━ Cancelled ━━━'\n",
+            "      else\n",
+            "        ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+            "        printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
+            "        touch {failed}\n",
+            "        echo '━━━ Error - continuing ━━━'\n",
+            "      fi\n",
+            "    else\n",
+            "      {mark}\n",
+            "      touch {done}\n",
+            "    fi\n",
+            "    ;;\n",
+            "esac\n",
+        ),
+        prefix = error_prefix,
+        error = error_file,
+        failed = failed_marker,
+        retry = retry_marker,
+        done = done_marker,
+        jsonl = jsonl_file,
+        tb = tb_cmd,
+        mark = mark_cmd,
+    );
+}
+
+/// claude 対話モード経路。tmux pipe-pane でログ取得、`--settings` で hooks を注入し、
+/// `Stop` / `StopFailure` hook が outcome JSON を書き出した時点で分類して終了する。
+fn append_claude_interactive_body(script: &mut String, ctx: &TaskCtx<'_>, p: &TaskPaths) {
+    let settings_path = ctx
+        .settings_file
+        .expect("ClaudeInteractive mode requires settings_file");
+    let settings_escaped = shell_escape(&settings_path.to_string_lossy());
+    let dir_escaped = shell_escape(&ctx.task.directory.to_string_lossy());
+    let prompt_escaped = shell_escape(&ctx.prompt_file.to_string_lossy());
+    // command の先頭（claude 実行ファイルパス）と、`--settings` を除いた追加 args を抽出する。
+    let exe = shell_escape(&ctx.agent.command[0]);
+    let extra_args: Vec<String> = ctx
+        .agent
+        .command
+        .iter()
+        .skip(1)
+        .map(|s| shell_escape(s))
+        .collect();
+    let extra_args_str = if extra_args.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", extra_args.join(" "))
+    };
+
+    let TaskPaths {
+        log_file,
+        outcome_file,
+        done_marker,
+        failed_marker,
+        retry_marker,
+        error_file,
+        error_prefix,
+        stop_file_escaped,
+        mark_cmd,
+        tb_cmd,
+        ..
+    } = p;
+
+    *script += &format!(
+        concat!(
+            "rm -f {outcome}\n",
+            "tmux pipe-pane -o -t \"$TMUX_PANE\" \"cat >> {log}\"\n",
+            "(\n",
+            "  while [ ! -f {outcome} ] && [ ! -f {stop_file} ]; do sleep 1; done\n",
+            "  sleep 0.5\n",
+            "  if [ ! -f {outcome} ]; then\n",
+            "    tmux send-keys -t \"$TMUX_PANE\" C-c\n",
+            "    sleep 0.3\n",
+            "  fi\n",
+            "  tmux send-keys -t \"$TMUX_PANE\" C-d\n",
+            ") &\n",
+            "WATCHER_PID=$!\n",
+            "cd {dir} && {exe} {extra}--settings {settings} \"$(cat {prompt})\"\n",
+            "CMD_EXIT=$?\n",
+            "CURRENT_FAILED_MARKER=\"\"\n",
+            "tmux pipe-pane -t \"$TMUX_PANE\"\n",
+            "wait \"$WATCHER_PID\" 2>/dev/null || true\n",
+        ),
+        outcome = outcome_file,
+        log = log_file,
+        stop_file = stop_file_escaped,
+        dir = dir_escaped,
+        exe = exe,
+        extra = extra_args_str,
+        settings = settings_escaped,
+        prompt = prompt_escaped,
+    );
+
+    *script += &format!(
+        concat!(
+            "if [ ! -f {outcome} ]; then\n",
+            "  if [ $CANCELLED -eq 1 ]; then\n",
+            "    CANCELLED=0\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Cancelled ━━━'\n",
+            "  else\n",
+            "    printf '%shook did not fire (claude crashed or --settings ignored)\\n' {prefix} > {error}\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Error - hook missing ━━━'\n",
+            "  fi\n",
+            "  echo ''\n",
+            "  return 0\n",
+            "fi\n",
+            "CLASSIFIED=$({tb} classify-claude-outcome {outcome} 2>/dev/null)\n",
+            "CLASS_CODE=$?\n",
+            "case $CLASS_CODE in\n",
+            "  2)\n",
+            "    CANCELLED=0\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
+            "    ;;\n",
+            "  3)\n",
+            "    CANCELLED=0\n",
+            "    if [ -n \"$CLASSIFIED\" ]; then\n",
+            "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+            "    fi\n",
+            "    touch {retry}\n",
+            "    echo \"━━━ Retryable error (will retry next run): $CLASSIFIED ━━━\"\n",
+            "    ;;\n",
+            "  1)\n",
+            "    if [ $CANCELLED -eq 1 ]; then\n",
+            "      CANCELLED=0\n",
+            "      touch {failed}\n",
+            "      echo '━━━ Cancelled ━━━'\n",
+            "    else\n",
+            "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
+            "      touch {failed}\n",
+            "      echo '━━━ Error - continuing ━━━'\n",
+            "    fi\n",
+            "    ;;\n",
+            "  *)\n",
+            "    {mark}\n",
+            "    touch {done}\n",
+            "    ;;\n",
+            "esac\n",
+        ),
+        outcome = outcome_file,
+        prefix = error_prefix,
+        error = error_file,
+        failed = failed_marker,
+        retry = retry_marker,
+        done = done_marker,
+        mark = mark_cmd,
+        tb = tb_cmd,
+    );
+}
+
+/// 汎用エージェント（codex 等）経路。stdout/stderr を tee でログに保存し、終了コードで成否を判定。
+fn append_generic_body(script: &mut String, ctx: &TaskCtx<'_>, p: &TaskPaths) {
+    let cmd_str = build_shell_command(&ctx.agent.command, ctx.prompt_file, &ctx.task.directory);
+    let TaskPaths {
+        log_file,
+        done_marker,
+        failed_marker,
+        error_file,
+        error_prefix,
+        mark_cmd,
+        ..
+    } = p;
+
+    *script += &format!("{cmd_str} 2>&1 | tee {log_file}\n");
+    *script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
+    *script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
+    *script += "TEE_EXIT=${PIPE_STATUS[1]}\n";
+    *script += "CURRENT_FAILED_MARKER=\"\"\n";
+    *script += &format!(
+        concat!(
+            "if [ \"$TEE_EXIT\" -ne 0 ]; then\n",
+            "  printf '%slogging pipeline failed (tee=%s)\\n' {prefix} \"$TEE_EXIT\" > {error}\n",
+            "  touch {failed}\n",
+            "  echo '━━━ Error - logging pipeline failed ━━━'\n",
+            "  echo ''\n",
+            "  return 0\n",
+            "fi\n",
+        ),
+        prefix = error_prefix,
+        error = error_file,
+        failed = failed_marker,
+    );
+
+    *script += &format!(
+        concat!(
+            "if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
+            "  if [ $CANCELLED -eq 1 ]; then\n",
+            "    CANCELLED=0\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Cancelled ━━━'\n",
+            "  else\n",
+            "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+            "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
+            "    touch {failed}\n",
+            "    echo '━━━ Error - continuing ━━━'\n",
+            "  fi\n",
+            "else\n",
+            "  {mark}\n",
+            "  touch {done}\n",
+            "fi\n",
+        ),
+        prefix = error_prefix,
+        error = error_file,
+        failed = failed_marker,
+        done = done_marker,
+        mark = mark_cmd,
+    );
 }
 
 /// 共通ワーカースクリプト: queue_dir/pending-* をアトミックに claim しつつタスクを逐次実行する。
@@ -964,7 +1333,36 @@ mod tests {
             state_file: std::path::Path::new("/tmp/state.json"),
             stop_file: std::path::Path::new("/tmp/stop"),
             rate_limit_threshold: 95,
-            is_claude,
+            mode: if is_claude {
+                AgentMode::ClaudePrint
+            } else {
+                AgentMode::Generic
+            },
+            settings_file: None,
+        }
+    }
+
+    fn task_ctx_for_interactive_test<'a>(
+        idx: usize,
+        agent: &'a Agent,
+        task: &'a ResolvedTarget,
+        tmp: &'a std::path::Path,
+        settings: &'a std::path::Path,
+    ) -> TaskCtx<'a> {
+        TaskCtx {
+            idx,
+            total: 3,
+            task,
+            agent,
+            prompt_file: std::path::Path::new("/tmp/prompt.txt"),
+            run_dir: tmp,
+            marker_dir: tmp,
+            exe_path: std::path::Path::new("/usr/local/bin/token-burn"),
+            state_file: std::path::Path::new("/tmp/state.json"),
+            stop_file: std::path::Path::new("/tmp/stop"),
+            rate_limit_threshold: 95,
+            mode: AgentMode::ClaudeInteractive,
+            settings_file: Some(settings),
         }
     }
 
@@ -973,6 +1371,8 @@ mod tests {
         let agent = Agent {
             name: "claude".to_string(),
             command: vec!["claude".to_string(), "-p".to_string()],
+            mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1019,6 +1419,8 @@ mod tests {
         let agent = Agent {
             name: "claude".to_string(),
             command: vec!["claude".to_string(), "-p".to_string()],
+            mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1065,6 +1467,8 @@ mod tests {
         let agent = Agent {
             name: "codex".to_string(),
             command: vec!["codex".to_string(), "exec".to_string()],
+            mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1086,6 +1490,416 @@ mod tests {
         assert!(script.contains("Error - continuing"));
         assert!(script.contains("TEE_EXIT=${PIPE_STATUS[1]}"));
         assert!(script.contains("logging pipeline failed"));
+    }
+
+    #[test]
+    fn build_task_script_for_claude_interactive_uses_outcome_and_pipe_pane() {
+        let agent = Agent {
+            name: "claude".to_string(),
+            command: vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+            ],
+            mode: AgentMode::ClaudeInteractive,
+            claude_settings: Vec::new(),
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        let task = ResolvedTarget {
+            directory: std::path::PathBuf::from("/tmp/repo"),
+            display_name: "repo".to_string(),
+            prompt: "review".to_string(),
+            visibility: Visibility::Public,
+            defer: false,
+        };
+        let tmp = std::path::PathBuf::from("/tmp");
+        let settings = std::path::PathBuf::from("/tmp/settings/task-0005.json");
+        let ctx = task_ctx_for_interactive_test(5, &agent, &task, &tmp, &settings);
+        let script = build_task_script(&ctx);
+
+        // tmux pipe-pane でログを取る
+        assert!(
+            script.contains("tmux pipe-pane -o -t \"$TMUX_PANE\""),
+            "pipe-pane でログを取得すべき: {script}"
+        );
+        // claude --settings ... "$(cat /tmp/prompt.txt)" の起動
+        assert!(
+            script.contains("--settings '/tmp/settings/task-0005.json'"),
+            "--settings 経由で task-settings.json を渡すべき: {script}"
+        );
+        assert!(
+            script.contains("'claude' '--model' 'opus'"),
+            "agent.command の追加引数が渡されるべき: {script}"
+        );
+        // outcome 監視 watcher
+        assert!(
+            script.contains("while [ ! -f '/tmp/outcome-5.json' ]"),
+            "outcome ファイルを監視すべき: {script}"
+        );
+        // outcome → classify-claude-outcome 経由で分類
+        assert!(
+            script.contains("classify-claude-outcome '/tmp/outcome-5.json'"),
+            "classify-claude-outcome を呼ぶべき: {script}"
+        );
+        // stream-json 経路の format-stream / classify-result は使わない
+        assert!(
+            !script.contains("format-stream"),
+            "interactive 経路で format-stream は使わない"
+        );
+        assert!(
+            !script.contains("classify-result"),
+            "interactive 経路で classify-result は使わない"
+        );
+        // watcher が C-d で claude セッションを閉じる
+        assert!(
+            script.contains("tmux send-keys -t \"$TMUX_PANE\" C-d"),
+            "watcher が C-d を送って claude を閉じるべき: {script}"
+        );
+        // outcome 不存在時の hook 不発火扱い
+        assert!(
+            script.contains("hook did not fire"),
+            "hook 不発火パスを持つべき: {script}"
+        );
+        assert!(
+            !script.contains("exec sleep infinity"),
+            "interactive 経路でも sleep infinity しないこと: {script}"
+        );
+        // 共通: CANCELLED / failed-N / done-N / retry-N
+        assert!(script.contains("'/tmp/failed-5'"));
+        assert!(script.contains("'/tmp/done-5'"));
+        assert!(script.contains("'/tmp/retry-5'"));
+    }
+
+    #[test]
+    fn build_claude_interactive_settings_produces_valid_hooks_json() {
+        let exe = std::path::Path::new("/usr/local/bin/token-burn");
+        let outcome = std::path::Path::new("/tmp/token-burn/markers/outcome-3.json");
+        let json = build_claude_interactive_settings(&[], exe, outcome)
+            .expect("no sources should succeed");
+
+        let v: serde_json::Value = serde_json::from_str(&json).expect("有効な JSON であるべき");
+        assert!(v.get("hooks").is_some());
+        let stop = &v["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(stop["type"], "command");
+        assert_eq!(stop["command"], "/usr/local/bin/token-burn");
+        assert_eq!(stop["args"][0], "claude-hook");
+        assert_eq!(stop["args"][1], "--outcome");
+        assert_eq!(stop["args"][2], "/tmp/token-burn/markers/outcome-3.json");
+        // StopFailure 側にも同じ hook が登録されている
+        let sf = &v["hooks"]["StopFailure"][0]["hooks"][0];
+        assert_eq!(sf["command"], "/usr/local/bin/token-burn");
+        // matcher は "*"（全 error 種別を補足）
+        assert_eq!(v["hooks"]["Stop"][0]["matcher"], "*");
+        assert_eq!(v["hooks"]["StopFailure"][0]["matcher"], "*");
+    }
+
+    #[test]
+    fn build_claude_interactive_settings_escapes_special_chars_in_paths() {
+        // パスに " や \ が含まれていても JSON が壊れないこと
+        let exe = std::path::Path::new("/opt/with \"quote\".bin");
+        let outcome = std::path::Path::new("/tmp/back\\slash.json");
+        let json = build_claude_interactive_settings(&[], exe, outcome)
+            .expect("no sources should succeed");
+        let v: serde_json::Value =
+            serde_json::from_str(&json).expect("特殊文字含むパスでも JSON は valid であるべき");
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/opt/with \"quote\".bin"
+        );
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["args"][2],
+            "/tmp/back\\slash.json"
+        );
+    }
+
+    // -------- claude_settings: source 解決 / deep merge / prepend のテスト --------
+
+    #[test]
+    fn deep_merge_objects_recursively() {
+        let mut base = serde_json::json!({"a": 1, "b": {"x": 1, "y": 2}});
+        deep_merge(
+            &mut base,
+            serde_json::json!({"b": {"y": 99, "z": 3}, "c": 4}),
+        );
+        assert_eq!(
+            base,
+            serde_json::json!({"a": 1, "b": {"x": 1, "y": 99, "z": 3}, "c": 4})
+        );
+    }
+
+    #[test]
+    fn deep_merge_arrays_are_replaced_not_concatenated() {
+        // 配列は完全置換（hooks の matcher は別途 prepend で扱う）
+        let mut base = serde_json::json!({"list": [1, 2, 3]});
+        deep_merge(&mut base, serde_json::json!({"list": [9]}));
+        assert_eq!(base, serde_json::json!({"list": [9]}));
+    }
+
+    #[test]
+    fn deep_merge_scalar_replaces() {
+        let mut base = serde_json::json!({"k": "old"});
+        deep_merge(&mut base, serde_json::json!({"k": "new"}));
+        assert_eq!(base["k"], "new");
+    }
+
+    #[test]
+    fn prepend_hook_inserts_at_head_of_existing_array() {
+        let mut s = serde_json::json!({
+            "hooks": {
+                "Stop": [{"matcher": "*", "hooks": [{"type": "command", "command": "user"}]}]
+            }
+        });
+        let entry =
+            serde_json::json!({"matcher": "*", "hooks": [{"type": "command", "command": "tb"}]});
+        prepend_hook(&mut s, "Stop", entry);
+        let arr = s["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["hooks"][0]["command"], "tb");
+        assert_eq!(arr[1]["hooks"][0]["command"], "user");
+    }
+
+    #[test]
+    fn prepend_hook_creates_hooks_node_when_absent() {
+        let mut s = serde_json::json!({});
+        prepend_hook(
+            &mut s,
+            "StopFailure",
+            serde_json::json!({"matcher": "*", "hooks": []}),
+        );
+        let arr = s["hooks"]["StopFailure"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+    }
+
+    #[test]
+    fn resolve_settings_source_inline() {
+        let toml_val: toml::Value =
+            toml::from_str("[v]\nenabledPlugins = { plugin = true }\n").unwrap();
+        let v = toml_val.get("v").unwrap().clone();
+        let src = ClaudeSettingsSource::Inline { inline: v };
+        let resolved = resolve_settings_source(&src).expect("inline should resolve");
+        assert_eq!(resolved["enabledPlugins"]["plugin"], true);
+    }
+
+    #[test]
+    fn resolve_settings_source_file_reads_and_parses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"enabledPlugins":{"p":true},"hooks":{}}"#).unwrap();
+        let src = ClaudeSettingsSource::File {
+            file: path.to_string_lossy().to_string(),
+        };
+        let resolved = resolve_settings_source(&src).expect("file should resolve");
+        assert_eq!(resolved["enabledPlugins"]["p"], true);
+    }
+
+    #[test]
+    fn resolve_settings_source_file_rejects_invalid_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("broken.json");
+        std::fs::write(&path, "not json").unwrap();
+        let src = ClaudeSettingsSource::File {
+            file: path.to_string_lossy().to_string(),
+        };
+        let err = resolve_settings_source(&src).expect_err("invalid JSON should fail");
+        assert!(err.to_string().contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn resolve_settings_source_file_rejects_non_object() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("arr.json");
+        std::fs::write(&path, "[1,2,3]").unwrap();
+        let src = ClaudeSettingsSource::File {
+            file: path.to_string_lossy().to_string(),
+        };
+        let err = resolve_settings_source(&src).expect_err("array should be rejected");
+        assert!(err.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn resolve_settings_source_command_captures_stdout_json() {
+        let src = ClaudeSettingsSource::Command {
+            command: vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "printf '{\"enabledPlugins\":{\"x\":true}}'".to_string(),
+            ],
+        };
+        let resolved = resolve_settings_source(&src).expect("command should resolve");
+        assert_eq!(resolved["enabledPlugins"]["x"], true);
+    }
+
+    #[test]
+    fn resolve_settings_source_command_rejects_nonzero_exit() {
+        let src = ClaudeSettingsSource::Command {
+            command: vec!["bash".to_string(), "-lc".to_string(), "exit 7".to_string()],
+        };
+        let err = resolve_settings_source(&src).expect_err("nonzero exit should fail");
+        assert!(err.to_string().contains("command failed"));
+    }
+
+    #[test]
+    fn resolve_settings_source_command_rejects_empty_stdout() {
+        let src = ClaudeSettingsSource::Command {
+            command: vec!["bash".to_string(), "-lc".to_string(), "true".to_string()],
+        };
+        let err = resolve_settings_source(&src).expect_err("empty stdout should fail");
+        assert!(err.to_string().contains("empty stdout"));
+    }
+
+    #[test]
+    fn build_claude_interactive_settings_merges_user_settings_and_prepends_hook() {
+        // user の plugin 設定と既存 Stop hook が保たれ、token-burn の Stop hook が先頭に入る
+        let tmp = tempfile::TempDir::new().unwrap();
+        let user_settings = tmp.path().join("user.json");
+        std::fs::write(
+            &user_settings,
+            r#"{
+              "enabledPlugins": {"my-plugin": true},
+              "hooks": {
+                "Stop": [
+                  {"matcher": "*", "hooks": [{"type": "command", "command": "user-stop"}]}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let sources = vec![ClaudeSettingsSource::File {
+            file: user_settings.to_string_lossy().to_string(),
+        }];
+        let exe = std::path::Path::new("/usr/local/bin/token-burn");
+        let outcome = std::path::Path::new("/tmp/marker/outcome-1.json");
+        let json = build_claude_interactive_settings(&sources, exe, outcome)
+            .expect("merge should succeed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // user plugin 設定が保たれている
+        assert_eq!(v["enabledPlugins"]["my-plugin"], true);
+
+        // Stop 配列: token-burn が先頭、user が後続
+        let stop = v["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2);
+        assert_eq!(stop[0]["hooks"][0]["command"], "/usr/local/bin/token-burn");
+        assert_eq!(stop[0]["hooks"][0]["args"][0], "claude-hook");
+        assert_eq!(stop[1]["hooks"][0]["command"], "user-stop");
+
+        // StopFailure 配列: user 側には無いので token-burn のみ
+        let sf = v["hooks"]["StopFailure"].as_array().unwrap();
+        assert_eq!(sf.len(), 1);
+        assert_eq!(sf[0]["hooks"][0]["command"], "/usr/local/bin/token-burn");
+    }
+
+    #[test]
+    fn build_claude_interactive_settings_multiple_sources_merge_in_order() {
+        // 後勝ち: file の値が inline の値を override する
+        let toml_inline: toml::Value =
+            toml::from_str("[v]\nenabledPlugins = { p1 = true, p2 = true }\n").unwrap();
+        let inline_v = toml_inline.get("v").unwrap().clone();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("u.json");
+        std::fs::write(&f, r#"{"enabledPlugins": {"p2": false, "p3": true}}"#).unwrap();
+
+        let sources = vec![
+            ClaudeSettingsSource::Inline { inline: inline_v },
+            ClaudeSettingsSource::File {
+                file: f.to_string_lossy().to_string(),
+            },
+        ];
+        let exe = std::path::Path::new("/bin/tb");
+        let outcome = std::path::Path::new("/tmp/o.json");
+        let json = build_claude_interactive_settings(&sources, exe, outcome)
+            .expect("merge should succeed");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // p1 は inline のみ → 残る
+        assert_eq!(v["enabledPlugins"]["p1"], true);
+        // p2 は inline で true、file で false → file が勝ち
+        assert_eq!(v["enabledPlugins"]["p2"], false);
+        // p3 は file のみ → 残る
+        assert_eq!(v["enabledPlugins"]["p3"], true);
+    }
+
+    #[test]
+    fn build_claude_interactive_settings_with_no_sources_only_has_tb_hooks() {
+        let exe = std::path::Path::new("/x");
+        let outcome = std::path::Path::new("/o.json");
+        let json = build_claude_interactive_settings(&[], exe, outcome).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // user 設定が無い場合は hooks のみのフラットな構造
+        assert!(v.as_object().unwrap().keys().all(|k| k == "hooks"));
+        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hooks"]["StopFailure"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ensure_required_flags_skips_claude_interactive() {
+        let mut agent = Agent {
+            name: "claude".to_string(),
+            command: vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+            ],
+            mode: AgentMode::ClaudeInteractive,
+            claude_settings: Vec::new(),
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        let original_len = agent.command.len();
+        ensure_required_flags(&mut agent);
+        // interactive モードでは余計なフラグを足さない
+        assert_eq!(agent.command.len(), original_len);
+        assert!(!agent.command.iter().any(|s| s == "--verbose"));
+        assert!(!agent.command.iter().any(|s| s == "--output-format"));
+        assert!(
+            !agent
+                .command
+                .iter()
+                .any(|s| s == "--include-partial-messages")
+        );
+    }
+
+    #[test]
+    fn ensure_required_flags_auto_with_claude_no_p_treats_as_interactive() {
+        // Auto モードで -p を含まない claude → ClaudeInteractive に解決され、flag は付与されない
+        let mut agent = Agent {
+            name: "claude".to_string(),
+            command: vec!["claude".to_string()],
+            mode: AgentMode::Auto,
+            claude_settings: Vec::new(),
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        ensure_required_flags(&mut agent);
+        assert_eq!(agent.command, vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn ensure_required_flags_auto_with_claude_p_treats_as_print() {
+        // Auto モードで -p を含む claude → ClaudePrint に解決され、flag が付与される
+        let mut agent = Agent {
+            name: "claude".to_string(),
+            command: vec!["claude".to_string(), "-p".to_string()],
+            mode: AgentMode::Auto,
+            claude_settings: Vec::new(),
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        ensure_required_flags(&mut agent);
+        assert!(agent.command.contains(&"--verbose".to_string()));
+        assert!(agent.command.contains(&"--output-format".to_string()));
+        assert!(agent.command.contains(&"stream-json".to_string()));
     }
 
     #[test]
@@ -1273,6 +2087,8 @@ mod tests {
         Agent {
             name: "claude".to_string(),
             command: command.into_iter().map(String::from).collect(),
+            mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1418,6 +2234,8 @@ mod tests {
         let mut agent = Agent {
             name: "test".to_string(),
             command: vec![],
+            mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "monday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1446,6 +2264,8 @@ mod tests {
         let mut agent = Agent {
             name: "codex".to_string(),
             command: vec!["codex".to_string(), "exec".to_string()],
+            mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "thursday".to_string(),
             reset_time: "09:00".to_string(),
             timezone: "UTC".to_string(),
@@ -1544,6 +2364,8 @@ mod tests {
                 "/Users/owa/shell/claude-wrapper.sh".to_string(),
                 "-p".to_string(),
             ],
+            mode: AgentMode::default(),
+            claude_settings: Vec::new(),
             reset_weekday: "friday".to_string(),
             reset_time: "13:00".to_string(),
             timezone: "Asia/Tokyo".to_string(),

@@ -1,5 +1,17 @@
 use std::path::Path;
 
+/// Claude Code の hook ペイロード `error` 値（StopFailure 時のみ）。
+/// 公式ドキュメント: https://code.claude.com/docs/en/hooks
+const RATE_LIMIT_ERRORS: &[&str] = &["rate_limit"];
+const RETRYABLE_ERRORS: &[&str] = &["server_error"];
+const FAILED_ERRORS: &[&str] = &[
+    "authentication_failed",
+    "oauth_org_not_allowed",
+    "billing_error",
+    "invalid_request",
+    "max_output_tokens",
+];
+
 /// Claude stream-json の result イベントから導出されるタスク結果分類。
 #[derive(Debug, PartialEq, Eq)]
 pub enum ResultClass {
@@ -103,6 +115,67 @@ fn is_rate_limit_message(msg: &str) -> bool {
 /// リトライ可能な HTTP ステータス（5xx および 408/429）か判定する。
 fn is_retryable_status(status: u64) -> bool {
     matches!(status, 408 | 429) || (500..600).contains(&status)
+}
+
+/// `claude-hook` が書き出した outcome JSON（Stop / StopFailure hook ペイロード）を読んで分類する。
+/// ファイルが存在しない場合は Success を返す（呼び出し側で hook 不発火として別途扱う想定）。
+pub fn classify_outcome_json(path: &Path) -> ResultClass {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return ResultClass::Success;
+    };
+    classify_outcome_content(&content)
+}
+
+pub fn classify_outcome_content(content: &str) -> ResultClass {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return ResultClass::Failed("empty hook outcome".to_string());
+    }
+
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return ResultClass::Failed("invalid hook outcome JSON".to_string());
+    };
+
+    let event = v
+        .get("hook_event_name")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    let last_message = v
+        .get("last_assistant_message")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    let error_details = v
+        .get("error_details")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    let message = if !error_details.is_empty() {
+        error_details.to_string()
+    } else {
+        last_message.to_string()
+    };
+
+    match event {
+        "Stop" => ResultClass::Success,
+        "StopFailure" => {
+            let err = v.get("error").and_then(|s| s.as_str()).unwrap_or("");
+            if RATE_LIMIT_ERRORS.contains(&err) {
+                return ResultClass::RateLimited;
+            }
+            if RETRYABLE_ERRORS.contains(&err) {
+                return ResultClass::Retryable(message);
+            }
+            if FAILED_ERRORS.contains(&err) {
+                return ResultClass::Failed(message);
+            }
+            // `unknown` などはメッセージ判定で fallback
+            if is_rate_limit_message(&message) {
+                return ResultClass::RateLimited;
+            }
+            ResultClass::Failed(message)
+        }
+        // 想定外イベント
+        _ => ResultClass::Failed(format!("unexpected hook_event_name: {event}")),
+    }
 }
 
 #[cfg(test)]
@@ -304,5 +377,116 @@ mod tests {
         assert!(!is_retryable_status(400));
         assert!(!is_retryable_status(401));
         assert!(!is_retryable_status(404));
+    }
+
+    // -------- classify_outcome_* tests (interactive 経路) --------
+
+    #[test]
+    fn classify_outcome_stop_is_success() {
+        let input = r#"{"hook_event_name":"Stop","session_id":"abc"}"#;
+        assert_eq!(classify_outcome_content(input), ResultClass::Success);
+    }
+
+    #[test]
+    fn classify_outcome_stop_failure_rate_limit() {
+        let input = r#"{"hook_event_name":"StopFailure","error":"rate_limit","error_details":"limit reached"}"#;
+        assert_eq!(classify_outcome_content(input), ResultClass::RateLimited);
+    }
+
+    #[test]
+    fn classify_outcome_stop_failure_server_error_is_retryable() {
+        let input = r#"{"hook_event_name":"StopFailure","error":"server_error","error_details":"503 unavailable"}"#;
+        match classify_outcome_content(input) {
+            ResultClass::Retryable(m) => assert_eq!(m, "503 unavailable"),
+            other => panic!("expected Retryable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stop_failure_billing_is_failed() {
+        let input = r#"{"hook_event_name":"StopFailure","error":"billing_error","error_details":"plan exhausted"}"#;
+        match classify_outcome_content(input) {
+            ResultClass::Failed(m) => assert_eq!(m, "plan exhausted"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stop_failure_auth_is_failed() {
+        let input = r#"{"hook_event_name":"StopFailure","error":"authentication_failed","error_details":"token expired"}"#;
+        match classify_outcome_content(input) {
+            ResultClass::Failed(m) => assert_eq!(m, "token expired"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stop_failure_unknown_with_rate_limit_message() {
+        // unknown でメッセージが rate-limit シグネチャを含む場合は RateLimited
+        let input = r#"{"hook_event_name":"StopFailure","error":"unknown","error_details":"Claude AI usage limit reached"}"#;
+        assert_eq!(classify_outcome_content(input), ResultClass::RateLimited);
+    }
+
+    #[test]
+    fn classify_outcome_stop_failure_unknown_without_signature_is_failed() {
+        let input =
+            r#"{"hook_event_name":"StopFailure","error":"unknown","error_details":"weird stuff"}"#;
+        match classify_outcome_content(input) {
+            ResultClass::Failed(m) => assert_eq!(m, "weird stuff"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_falls_back_to_last_assistant_message() {
+        // error_details が空でも last_assistant_message を採用する
+        let input = r#"{"hook_event_name":"StopFailure","error":"server_error","last_assistant_message":"working on it"}"#;
+        match classify_outcome_content(input) {
+            ResultClass::Retryable(m) => assert_eq!(m, "working on it"),
+            other => panic!("expected Retryable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_empty_content_is_failed() {
+        // 空ファイル = hook が発火したが何も書けなかった、として Failed
+        match classify_outcome_content("") {
+            ResultClass::Failed(m) => assert!(m.contains("empty")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_invalid_json_is_failed() {
+        match classify_outcome_content("not json") {
+            ResultClass::Failed(m) => assert!(m.contains("invalid")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_unexpected_event_is_failed() {
+        let input = r#"{"hook_event_name":"PreToolUse"}"#;
+        match classify_outcome_content(input) {
+            ResultClass::Failed(m) => assert!(m.contains("unexpected")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_json_missing_file_is_success() {
+        let path = std::path::Path::new("/nonexistent/token-burn-no-outcome.json");
+        assert_eq!(classify_outcome_json(path), ResultClass::Success);
+    }
+
+    #[test]
+    fn classify_outcome_json_reads_file_content() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#,
+        )
+        .unwrap();
+        assert_eq!(classify_outcome_json(tmp.path()), ResultClass::RateLimited);
     }
 }
