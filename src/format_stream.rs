@@ -1246,6 +1246,53 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
                 return format!("to {}", truncate_inline(to, 80));
             }
         }
+        "TaskCreate" => {
+            // 実データ例: {"subject":"レビューと改善","description":"...","activeForm":"レビューと改善中"}
+            // subject はタスクの主目的を簡潔に示すため最優先で表示する
+            let subject = v["subject"].as_str().unwrap_or("");
+            let description = v["description"].as_str().unwrap_or("");
+            if !subject.is_empty() && !description.is_empty() {
+                return format!(
+                    "{} ({})",
+                    truncate_inline(subject, 60),
+                    truncate_inline(description, 60)
+                );
+            }
+            if !subject.is_empty() {
+                return truncate_inline(subject, 100);
+            }
+            if !description.is_empty() {
+                return truncate_inline(description, 100);
+            }
+        }
+        "TaskUpdate" => {
+            // 実データ例: {"taskId":"1","status":"in_progress"}
+            // taskId 単独では文脈に乏しいため status と組み合わせて表示する
+            let task_id = v["taskId"].as_str().unwrap_or("");
+            let status = v["status"].as_str().unwrap_or("");
+            let subject = v["subject"].as_str().unwrap_or("");
+            let owner = v["owner"].as_str().unwrap_or("");
+            let mut parts = Vec::new();
+            if !task_id.is_empty() {
+                parts.push(format!("task {task_id}"));
+            }
+            if !status.is_empty() {
+                parts.push(format!("status:{status}"));
+            }
+            if !owner.is_empty() {
+                parts.push(format!("owner:{owner}"));
+            }
+            if !subject.is_empty() {
+                let label = truncate_inline(subject, 60);
+                if parts.is_empty() {
+                    return label;
+                }
+                return format!("{} ({})", parts.join(" "), label);
+            }
+            if !parts.is_empty() {
+                return parts.join(" ");
+            }
+        }
         "TaskStop" => {
             if let Some(task_id) = v["task_id"].as_str()
                 && !task_id.is_empty()
@@ -2342,13 +2389,60 @@ mod tests {
     }
 
     #[test]
-    fn extract_tool_detail_generic_description_fallback() {
-        // TaskCreate のように description はあるが専用ハンドラがないツール
+    fn extract_tool_detail_task_create_shows_subject_and_description() {
+        // 実データ例: {"subject":"レビューと改善","description":"...","activeForm":"..."}
         let input = r#"{"subject":"Run tests","description":"Execute test suite","activeForm":"Running tests"}"#;
+        assert_eq!(
+            extract_tool_detail("TaskCreate", input),
+            "Run tests (Execute test suite)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_task_create_subject_only() {
+        let input = r#"{"subject":"Run tests"}"#;
+        assert_eq!(extract_tool_detail("TaskCreate", input), "Run tests");
+    }
+
+    #[test]
+    fn extract_tool_detail_task_create_description_only_fallback() {
+        // subject なしでも description があればそれを表示する
+        let input = r#"{"description":"Execute test suite"}"#;
         assert_eq!(
             extract_tool_detail("TaskCreate", input),
             "Execute test suite"
         );
+    }
+
+    #[test]
+    fn extract_tool_detail_task_update_shows_id_and_status() {
+        // 実データ例: {"taskId":"1","status":"in_progress"}
+        let input = r#"{"taskId":"1","status":"in_progress"}"#;
+        assert_eq!(
+            extract_tool_detail("TaskUpdate", input),
+            "task 1 status:in_progress"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_task_update_with_subject_and_owner() {
+        let input = r#"{"taskId":"42","status":"completed","owner":"reviewer","subject":"Review and improve"}"#;
+        assert_eq!(
+            extract_tool_detail("TaskUpdate", input),
+            "task 42 status:completed owner:reviewer (Review and improve)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_task_update_subject_only() {
+        let input = r#"{"subject":"Update doc"}"#;
+        assert_eq!(extract_tool_detail("TaskUpdate", input), "Update doc");
+    }
+
+    #[test]
+    fn extract_tool_detail_task_update_empty_returns_empty() {
+        let input = r#"{}"#;
+        assert_eq!(extract_tool_detail("TaskUpdate", input), "");
     }
 
     #[test]
@@ -3804,5 +3898,66 @@ mod tests {
         let info: serde_json::Value = serde_json::from_str(r#"{"resetsAt":null}"#).unwrap();
         let result = format_resets_at(&info);
         assert_eq!(result, "", "resetsAt が null の場合は空文字列を返すべき");
+    }
+
+    #[test]
+    fn process_stream_event_ping_is_silent() {
+        // 実データに頻出する {"type":"stream_event","event":{"type":"ping"}} は
+        // 静かに無視され、後続イベントの出力に影響しないことを確認する。
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"ping"}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        ]
+        .join("\n");
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+        assert!(
+            !clean.to_lowercase().contains("ping"),
+            "ping イベントは表示されるべきでない: {}",
+            clean
+        );
+        assert!(clean.contains("OK"), "後続テキストは表示されるべき");
+    }
+
+    #[test]
+    fn process_system_status_subtype_is_silent() {
+        // 実データに頻出する {"type":"system","subtype":"status","status":"requesting"} は
+        // 表示するとノイズになるため、サイレントに無視されること。
+        let input = r#"{"type":"system","subtype":"status","status":"requesting","uuid":"abc","session_id":"s1"}"#;
+        let output = run_process(input);
+        assert!(
+            output.is_empty(),
+            "system.subtype=status は表示されるべきでない: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn usage_summary_merge_from_none_is_noop() {
+        // None 値を渡しても既存の値が変わらないことを確認する
+        let mut usage = UsageSummary {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        usage.merge_from_value(None);
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+    }
+
+    #[test]
+    fn usage_summary_merge_overrides_with_latest() {
+        // result イベントの値が最終累計値として優先される（累積ではなく上書き）。
+        let v_first: serde_json::Value =
+            serde_json::from_str(r#"{"input_tokens":10,"output_tokens":5}"#).unwrap();
+        let v_last: serde_json::Value =
+            serde_json::from_str(r#"{"input_tokens":100,"output_tokens":50}"#).unwrap();
+        let mut usage = UsageSummary::default();
+        usage.merge_from_value(Some(&v_first));
+        usage.merge_from_value(Some(&v_last));
+        assert_eq!(usage.input_tokens, 100, "最終値で上書きされるべき");
+        assert_eq!(usage.output_tokens, 50);
     }
 }
