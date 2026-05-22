@@ -414,6 +414,15 @@ fn format_timestamp_clock(info: &serde_json::Value, key: &str) -> Option<String>
         .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
 }
 
+/// ミリ秒を短い秒表記に整形する（例: 14837ms → 14.8s）。
+fn format_millis_as_seconds(ms: u64) -> String {
+    if ms.is_multiple_of(1000) {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
 /// stop_file が指定されていれば作成する（全ワーカーの後続タスクを停止するシグナル）。
 fn touch_stop_file(stop_file: Option<&Path>) {
     if let Some(path) = stop_file {
@@ -433,20 +442,27 @@ fn handle_result(
         let secs = ms / 1000;
         let m = secs / 60;
         let s = secs % 60;
-        let api_part = if let Some(api_ms) = v["duration_api_ms"].as_u64() {
-            let api_secs = api_ms / 1000;
-            format!(" api:{}m {}s", api_secs / 60, api_secs % 60)
-        } else {
-            String::new()
-        };
+        let mut attrs = Vec::new();
         if let Some(turns) = v["num_turns"].as_u64() {
+            attrs.push(format!("{turns} turns"));
+        }
+        if let Some(api_ms) = v["duration_api_ms"].as_u64() {
+            let api_secs = api_ms / 1000;
+            attrs.push(format!("api:{}m {}s", api_secs / 60, api_secs % 60));
+        }
+        if let Some(ttft_ms) = v["ttft_ms"].as_u64() {
+            attrs.push(format!("ttft:{}", format_millis_as_seconds(ttft_ms)));
+        }
+        if attrs.is_empty() {
+            writeln!(out, "\x1b[33m\u{23f1}  {}m {}s\x1b[0m", m, s)?;
+        } else {
             writeln!(
                 out,
-                "\x1b[33m\u{23f1}  {}m {}s ({} turns{})\x1b[0m",
-                m, s, turns, api_part
+                "\x1b[33m\u{23f1}  {}m {}s ({})\x1b[0m",
+                m,
+                s,
+                attrs.join(" ")
             )?;
-        } else {
-            writeln!(out, "\x1b[33m\u{23f1}  {}m {}s\x1b[0m", m, s)?;
         }
     }
     let input = summary.usage.total_input_tokens();
@@ -502,6 +518,32 @@ fn handle_result(
         }
         writeln!(out, "\x1b[2m   web {}\x1b[0m", parts.join(" "))?;
     }
+    if let Some(usage) = v["usage"].as_object() {
+        let mut parts = Vec::new();
+        if let Some(service_tier) = usage.get("service_tier").and_then(|v| v.as_str())
+            && !service_tier.is_empty()
+        {
+            parts.push(format!("tier:{service_tier}"));
+        }
+        if let Some(speed) = usage.get("speed").and_then(|v| v.as_str())
+            && !speed.is_empty()
+        {
+            parts.push(format!("speed:{speed}"));
+        }
+        if let Some(inference_geo) = usage.get("inference_geo").and_then(|v| v.as_str())
+            && !inference_geo.is_empty()
+        {
+            parts.push(format!("geo:{inference_geo}"));
+        }
+        if let Some(iterations) = usage.get("iterations").and_then(|v| v.as_array())
+            && !iterations.is_empty()
+        {
+            parts.push(format!("iterations:{}", iterations.len()));
+        }
+        if !parts.is_empty() {
+            writeln!(out, "\x1b[2m   usage {}\x1b[0m", parts.join(" "))?;
+        }
+    }
     // モデル別使用量（modelUsage）の表示
     if let Some(model_usage) = v["modelUsage"].as_object() {
         for (model_id, usage) in model_usage {
@@ -556,6 +598,11 @@ fn handle_result(
     {
         writeln!(out, "\x1b[2m   fast_mode {}\x1b[0m", fast_mode)?;
     }
+    if let Some(origin_kind) = v["origin"]["kind"].as_str()
+        && !origin_kind.is_empty()
+    {
+        writeln!(out, "\x1b[2m   origin {}\x1b[0m", origin_kind)?;
+    }
     // 異常終了時の終了理由（completed 以外）を表示
     if let Some(reason) = v["terminal_reason"].as_str()
         && !reason.is_empty()
@@ -567,10 +614,22 @@ fn handle_result(
     if let Some(denials) = v["permission_denials"].as_array()
         && !denials.is_empty()
     {
+        let tool_names: Vec<_> = denials
+            .iter()
+            .filter_map(|denial| denial["tool_name"].as_str())
+            .filter(|name| !name.is_empty())
+            .take(3)
+            .collect();
+        let detail = if tool_names.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", tool_names.join(", "))
+        };
         writeln!(
             out,
-            "\x1b[33m   permission_denials {}\x1b[0m",
-            denials.len()
+            "\x1b[33m   permission_denials {}{}\x1b[0m",
+            denials.len(),
+            detail
         )?;
     }
     Ok(())
@@ -1031,6 +1090,11 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             {
                 attrs.push(format!("mode:{output_mode}"));
             }
+            if let Some(search_type) = v["type"].as_str()
+                && !search_type.is_empty()
+            {
+                attrs.push(format!("type:{search_type}"));
+            }
             if !glob.is_empty() {
                 attrs.push(format!("glob:{}", truncate_str(glob, 40)));
             }
@@ -1271,6 +1335,7 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             let task_id = v["taskId"].as_str().unwrap_or("");
             let status = v["status"].as_str().unwrap_or("");
             let subject = v["subject"].as_str().unwrap_or("");
+            let description = v["description"].as_str().unwrap_or("");
             let owner = v["owner"].as_str().unwrap_or("");
             let mut parts = Vec::new();
             if !task_id.is_empty() {
@@ -1284,6 +1349,13 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             }
             if !subject.is_empty() {
                 let label = truncate_inline(subject, 60);
+                if parts.is_empty() {
+                    return label;
+                }
+                return format!("{} ({})", parts.join(" "), label);
+            }
+            if !description.is_empty() {
+                let label = truncate_inline(description, 60);
                 if parts.is_empty() {
                     return label;
                 }
@@ -1397,11 +1469,15 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
         "mcp__codex__codex" => {
             let prompt = v["prompt"].as_str().unwrap_or("");
             let cwd = v["cwd"].as_str().unwrap_or("");
+            let model = v["model"].as_str().unwrap_or("");
             let sandbox = v["sandbox"].as_str().unwrap_or("");
             let approval_policy = v["approval-policy"].as_str().unwrap_or("");
             let mut attrs = Vec::new();
             if !cwd.is_empty() {
                 attrs.push(truncate_inline(cwd, 50));
+            }
+            if !model.is_empty() {
+                attrs.push(format!("model:{model}"));
             }
             if !sandbox.is_empty() {
                 attrs.push(format!("sandbox:{sandbox}"));
@@ -1745,6 +1821,15 @@ mod tests {
     }
 
     #[test]
+    fn extract_tool_detail_grep_shows_search_type() {
+        let input = r#"{"pattern":"token-burn","path":"/repo","output_mode":"files_with_matches","type":"regex"}"#;
+        assert_eq!(
+            extract_tool_detail("Grep", input),
+            "token-burn @ /repo (mode:files_with_matches, type:regex)"
+        );
+    }
+
+    #[test]
     fn extract_tool_detail_glob_pattern_only() {
         let input = r#"{"pattern":"{AGENTS.md,README.md,README.ja.md}"}"#;
         assert_eq!(
@@ -1972,16 +2057,17 @@ mod tests {
 
     #[test]
     fn extract_tool_detail_codex_shows_prompt_and_cwd() {
-        let input = r#"{"prompt":"レビューしてください\n詳細は git diff を確認してください","cwd":"/Users/owa/git/strategic-task-manager","sandbox":"read-only","approval-policy":"never"}"#;
+        let input = r#"{"prompt":"レビューしてください\n詳細は git diff を確認してください","cwd":"/workspace/strategic-task-manager","model":"gpt-5-codex","sandbox":"read-only","approval-policy":"never"}"#;
         let result = extract_tool_detail("mcp__codex__codex", input);
         assert!(
             result.starts_with("レビューしてください 詳細は git diff"),
             "got: {result}"
         );
         assert!(
-            result.contains("/Users/owa/git/strategic-task-manager"),
+            result.contains("/workspace/strategic-task-manager"),
             "got: {result}"
         );
+        assert!(result.contains("model:gpt-5-codex"), "got: {result}");
         assert!(result.contains("sandbox:read-only"), "got: {result}");
         assert!(result.contains("approval:never"), "got: {result}");
     }
@@ -2027,6 +2113,10 @@ mod tests {
         let output = run_process(input);
         let clean = strip_ansi(&output);
         assert!(clean.contains("permission_denials 2"), "got: {clean}");
+        assert!(
+            clean.contains("permission_denials 2 (Bash, Edit)"),
+            "got: {clean}"
+        );
     }
 
     #[test]
@@ -2437,6 +2527,15 @@ mod tests {
     fn extract_tool_detail_task_update_subject_only() {
         let input = r#"{"subject":"Update doc"}"#;
         assert_eq!(extract_tool_detail("TaskUpdate", input), "Update doc");
+    }
+
+    #[test]
+    fn extract_tool_detail_task_update_description_fallback() {
+        let input = r#"{"taskId":"7","status":"in_progress","description":"実データ由来の説明"}"#;
+        assert_eq!(
+            extract_tool_detail("TaskUpdate", input),
+            "task 7 status:in_progress (実データ由来の説明)"
+        );
     }
 
     #[test]
@@ -3340,6 +3439,25 @@ mod tests {
     }
 
     #[test]
+    fn process_result_with_usage_metadata() {
+        let input = r#"{"type":"result","subtype":"success","duration_ms":1000,"usage":{"input_tokens":10,"output_tokens":5,"service_tier":"standard","speed":"standard","inference_geo":"us","iterations":[{"type":"message"}]}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(
+            clean.contains("usage tier:standard speed:standard geo:us iterations:1"),
+            "got: {clean}"
+        );
+    }
+
+    #[test]
+    fn process_result_with_origin_kind() {
+        let input = r#"{"type":"result","subtype":"success","duration_ms":1000,"origin":{"kind":"task-notification"}}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("origin task-notification"), "got: {clean}");
+    }
+
+    #[test]
     fn process_result_with_fast_mode_off() {
         // fast_mode_state が "off" の場合は表示されない
         let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.5,"duration_ms":30000,"fast_mode_state":"off"}"#;
@@ -3464,6 +3582,15 @@ mod tests {
             "duration_ms も表示されるべき: {}",
             clean
         );
+    }
+
+    #[test]
+    fn process_result_with_ttft_ms() {
+        let input = r#"{"type":"result","subtype":"success","duration_ms":600000,"duration_api_ms":900000,"ttft_ms":14837,"num_turns":50}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+        assert!(clean.contains("ttft:14.8s"), "got: {clean}");
+        assert!(clean.contains("api:15m 0s"), "got: {clean}");
     }
 
     #[test]

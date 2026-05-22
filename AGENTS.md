@@ -84,17 +84,18 @@ make release  # リリースビルド
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`/`Agent`/`Task`/`TaskCreate`/`TaskUpdate`/`TaskStop`/`TaskOutput`/`TeamCreate`/`Skill`/`TodoWrite`/`Monitor`/`Grep`/`Glob`/`ScheduleWakeup`/`WebFetch`/`WebSearch`/`ToolSearch`/`SendMessage`/`AskUserQuestion`/Context7・Tavily・Codex MCP 等）の詳細表示と差分出力
 - `Read` の `file_path` と `offset` / `limit`、`Bash` の `timeout` / `run_in_background`、`Agent` の `run_in_background` を表示
 - `Edit` は `new_string` に加えて実データで確認された `new_str` 入力も差分表示に使用し、`replace_all` が true の場合は一括置換として表示する
-- `Grep` / `Glob` の検索パターン、対象パス、`output_mode`、`glob`、`head_limit`、`context`、`-A` / `-B` / `-C` / `-n` / `-i` を表示
+- `Grep` / `Glob` の検索パターン、対象パス、`output_mode`、`type`、`glob`、`head_limit`、`context`、`-A` / `-B` / `-C` / `-n` / `-i` を表示
 - `ScheduleWakeup` の待機時間と理由を表示
 - `WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results` を表示
-- `Monitor` の説明とタイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`TaskCreate` の `subject` と `description`、`TaskUpdate` の `taskId` / `status` / `owner` / `subject`、`SendMessage` の送信先/要約、`AskUserQuestion` の質問数・選択肢数、Tavily の query/max/time range/search depth、Codex MCP の prompt/cwd/sandbox/approval-policy、Context7 MCP ツールの library/query を表示
+- `Monitor` の説明とタイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`TaskCreate` の `subject` と `description`、`TaskUpdate` の `taskId` / `status` / `owner` / `subject` / `description`、`SendMessage` の送信先/要約、`AskUserQuestion` の質問数・選択肢数、Tavily の query/max/time range/search depth、Codex MCP の prompt/cwd/model/sandbox/approval-policy、Context7 MCP ツールの library/query を表示
 - サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）。`task_notification` は `completed` / `failed` に加え `stopped` も表示する
 - Claude Code のシステム通知（`notification`。例: stop hook エラー）と、出力を伴う hook 診断（`hook_progress` / `hook_response` の stderr / output）
 - トークン使用量、コスト、キャッシュ内訳、Web検索/フェッチ回数の集計表示
 - モデル別使用量（`modelUsage`）の内訳表示（キャッシュ読み取り/書き込みトークン、Web検索回数、`contextWindow` / `maxOutputTokens` を `ctx:1M` / `max_out:64K` のような単位付きで表示）
-- API応答時間（`duration_api_ms`）の表示
+- API応答時間（`duration_api_ms`）と初回トークン到達時間（`ttft_ms`）の表示
 - fast mode 状態の表示（`fast_mode_state` が `off` 以外の場合）
-- 異常終了時の `terminal_reason`（`completed` 以外の場合）と `permission_denials` の件数表示
+- 異常終了時の `terminal_reason`（`completed` 以外の場合）と `permission_denials` の件数・ツール名表示
+- result の `usage.service_tier`、`usage.speed`、空でない `usage.inference_geo`、`usage.iterations` 件数、`origin.kind` の表示
 - レート制限警告（`rate_limit_event`）の使用率表示、リクエスト拒否通知、および `allowed` 時の補足情報表示（`resetsAt` / `overageResetsAt` / overage 情報がある場合）。`allowed_warning` 時に `surpassedThreshold` が含まれている場合は通過済み警告閾値（例: `warning at 90%`）を併記する
 - レート制限使用率が `rate_limit_threshold`（デフォルト: 95%）を超えた場合、stop file を作成して後続タスクを自動停止
 - APIリトライ（`api_retry`）の試行回数とエラー情報の表示
