@@ -155,50 +155,44 @@ fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()
         "task_notification" => {
             let status = v["status"].as_str().unwrap_or("");
             let summary = v["summary"].as_str().unwrap_or("");
-            let tokens = v["usage"]["total_tokens"].as_u64().unwrap_or(0);
-            let duration_ms = v["usage"]["duration_ms"].as_u64().unwrap_or(0);
-            let dur_s = duration_ms / 1000;
-            let m = dur_s / 60;
-            let s = dur_s % 60;
+            let usage_attrs = task_notification_usage_attrs(&v["usage"]);
+            let usage_text = if usage_attrs.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", usage_attrs.join(", "))
+            };
             if status == "completed" {
                 if !summary.is_empty() {
                     writeln!(
                         out,
-                        "\x1b[32m  \u{2705} {} ({}m {}s, {} tokens)\x1b[0m",
+                        "\x1b[32m  \u{2705} {}{}\x1b[0m",
                         truncate_str(summary, 60),
-                        m,
-                        s,
-                        format_number(tokens)
+                        usage_text
                     )?;
                 } else {
                     writeln!(
                         out,
-                        "\x1b[32m  \u{2705} Task completed ({}m {}s)\x1b[0m",
-                        m, s
+                        "\x1b[32m  \u{2705} Task completed{}\x1b[0m",
+                        usage_text
                     )?;
                 }
             } else if status == "failed" {
                 writeln!(
                     out,
-                    "\x1b[31m  \u{274c} Task {} ({}m {}s)\x1b[0m",
-                    status, m, s
+                    "\x1b[31m  \u{274c} Task {}{}\x1b[0m",
+                    status, usage_text
                 )?;
             } else if status == "stopped" {
                 // TaskStop で停止された場合
                 if !summary.is_empty() {
                     writeln!(
                         out,
-                        "\x1b[33m  \u{23f9} Task stopped: {} ({}m {}s)\x1b[0m",
+                        "\x1b[33m  \u{23f9} Task stopped: {}{}\x1b[0m",
                         truncate_str(summary, 60),
-                        m,
-                        s
+                        usage_text
                     )?;
                 } else {
-                    writeln!(
-                        out,
-                        "\x1b[33m  \u{23f9} Task stopped ({}m {}s)\x1b[0m",
-                        m, s
-                    )?;
+                    writeln!(out, "\x1b[33m  \u{23f9} Task stopped{}\x1b[0m", usage_text)?;
                 }
             }
         }
@@ -253,6 +247,19 @@ fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()
         _ => {} // init, hook_started 等は無視
     }
     Ok(())
+}
+
+/// `task_notification.usage` が実データに無い場合は、未提供の値を 0 として表示しない。
+fn task_notification_usage_attrs(usage: &serde_json::Value) -> Vec<String> {
+    let mut attrs = Vec::new();
+    if let Some(duration_ms) = usage["duration_ms"].as_u64() {
+        let dur_s = duration_ms / 1000;
+        attrs.push(format!("{}m {}s", dur_s / 60, dur_s % 60));
+    }
+    if let Some(tokens) = usage["total_tokens"].as_u64() {
+        attrs.push(format!("{} tokens", format_number(tokens)));
+    }
+    attrs
 }
 
 /// フックの stderr/output がある場合だけ表示する。
@@ -1115,6 +1122,9 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             if v["-i"].as_bool() == Some(true) {
                 attrs.push("ignore-case".to_string());
             }
+            if v["multiline"].as_bool() == Some(true) {
+                attrs.push("multiline".to_string());
+            }
             let attr_text = if attrs.is_empty() {
                 String::new()
             } else {
@@ -1315,18 +1325,29 @@ fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
             // subject はタスクの主目的を簡潔に示すため最優先で表示する
             let subject = v["subject"].as_str().unwrap_or("");
             let description = v["description"].as_str().unwrap_or("");
+            let active_form = v["activeForm"].as_str().unwrap_or("");
+            let append_active = |detail: String| {
+                if active_form.is_empty() {
+                    detail
+                } else {
+                    format!("{detail} [active: {}]", truncate_inline(active_form, 40))
+                }
+            };
             if !subject.is_empty() && !description.is_empty() {
-                return format!(
+                return append_active(format!(
                     "{} ({})",
                     truncate_inline(subject, 60),
                     truncate_inline(description, 60)
-                );
+                ));
             }
             if !subject.is_empty() {
-                return truncate_inline(subject, 100);
+                return append_active(truncate_inline(subject, 100));
             }
             if !description.is_empty() {
-                return truncate_inline(description, 100);
+                return append_active(truncate_inline(description, 100));
+            }
+            if !active_form.is_empty() {
+                return truncate_inline(active_form, 100);
             }
         }
         "TaskUpdate" => {
@@ -1826,6 +1847,15 @@ mod tests {
         assert_eq!(
             extract_tool_detail("Grep", input),
             "token-burn @ /repo (mode:files_with_matches, type:regex)"
+        );
+    }
+
+    #[test]
+    fn extract_tool_detail_grep_shows_multiline() {
+        let input = r#"{"pattern":"foo[\\s\\S]+bar","path":"/repo","output_mode":"content","-n":true,"multiline":true}"#;
+        assert_eq!(
+            extract_tool_detail("Grep", input),
+            "foo[\\s\\S]+bar @ /repo (mode:content, line, multiline)"
         );
     }
 
@@ -2484,7 +2514,7 @@ mod tests {
         let input = r#"{"subject":"Run tests","description":"Execute test suite","activeForm":"Running tests"}"#;
         assert_eq!(
             extract_tool_detail("TaskCreate", input),
-            "Run tests (Execute test suite)"
+            "Run tests (Execute test suite) [active: Running tests]"
         );
     }
 
@@ -2502,6 +2532,12 @@ mod tests {
             extract_tool_detail("TaskCreate", input),
             "Execute test suite"
         );
+    }
+
+    #[test]
+    fn extract_tool_detail_task_create_active_form_only_fallback() {
+        let input = r#"{"activeForm":"Running tests"}"#;
+        assert_eq!(extract_tool_detail("TaskCreate", input), "Running tests");
     }
 
     #[test]
@@ -3153,6 +3189,31 @@ mod tests {
     }
 
     #[test]
+    fn process_task_notification_completed_without_usage_omits_zero_values() {
+        // 実データでは usage が無い完了通知が多いため、未提供値を 0 として表示しない。
+        let input = r#"{"type":"system","subtype":"task_notification","task_id":"abc","tool_use_id":"tu1","status":"completed","summary":"Fetch latest from remote"}"#;
+
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("\u{2705} Fetch latest from remote"),
+            "expected completion summary in: {}",
+            clean
+        );
+        assert!(
+            !clean.contains("0m 0s"),
+            "missing duration must not be shown as zero: {}",
+            clean
+        );
+        assert!(
+            !clean.contains("0 tokens"),
+            "missing token count must not be shown as zero: {}",
+            clean
+        );
+    }
+
+    #[test]
     fn process_task_notification_failed() {
         let input = [
             r#"{"type":"system","subtype":"task_notification","task_id":"abc","tool_use_id":"tu1","status":"failed","summary":"","usage":{"total_tokens":500,"tool_uses":1,"duration_ms":5000}}"#,
@@ -3202,6 +3263,24 @@ mod tests {
             clean
         );
         assert!(clean.contains("0m 3s"), "expected duration in: {}", clean);
+    }
+
+    #[test]
+    fn process_task_notification_stopped_without_usage_omits_zero_duration() {
+        let input = r#"{"type":"system","subtype":"task_notification","task_id":"x","tool_use_id":"t","status":"stopped","summary":"Manual stop"}"#;
+        let output = run_process(input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("Task stopped: Manual stop"),
+            "expected stop summary in: {}",
+            clean
+        );
+        assert!(
+            !clean.contains("0m 0s"),
+            "missing duration must not be shown as zero: {}",
+            clean
+        );
     }
 
     #[test]
