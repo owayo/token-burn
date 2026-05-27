@@ -32,7 +32,9 @@ pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<Vec<PathB
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
+        // path.is_dir() はシンボリックリンクを追跡するため、
+        // リンク先のディレクトリを誤って削除しないようリンクは除外する
+        if path.is_symlink() || !path.is_dir() {
             continue;
         }
 
@@ -201,5 +203,36 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = cleanup_old_reports(tmp.path(), "invalid");
         assert!(result.is_err(), "不正な max_age はエラーになるべき");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_skips_symlinks_pointing_to_dirs() {
+        // 回帰テスト: 旧実装の path.is_dir() はシンボリックリンクを追跡するため、
+        // リンク先が古いタイムスタンプ形式のディレクトリを指していると
+        // リンクが削除されたり、最悪リンク先まで削除される可能性があった。
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // 古いタイムスタンプ形式のディレクトリ（削除対象）
+        let real_dir = base.join("20200101_000000_claude");
+        fs::create_dir(&real_dir).unwrap();
+        fs::write(real_dir.join("data.txt"), "real").unwrap();
+
+        // タイムスタンプ形式のシンボリックリンク（削除対象外であるべき）
+        let link_path = base.join("20200102_120000_link");
+        symlink(&real_dir, &link_path).unwrap();
+
+        let deleted = cleanup_old_reports(base, "1d").unwrap();
+
+        // 削除されるのは実ディレクトリのみで、シンボリックリンクは保持される
+        assert_eq!(deleted.len(), 1, "削除されたのは実ディレクトリだけのはず");
+        assert!(!real_dir.exists(), "実ディレクトリは削除されるべき");
+        // シンボリックリンク自体は残るべき
+        assert!(
+            link_path.symlink_metadata().is_ok(),
+            "シンボリックリンクは削除されるべきでない"
+        );
     }
 }
