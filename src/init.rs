@@ -214,7 +214,7 @@ fn write_file(path: &Path, content: &str, force: bool) -> Result<()> {
 
 fn confirm_overwrite(path: &Path) -> Result<bool> {
     eprint!(
-        "Config file already exists at {}. Overwrite? [y/N]: ",
+        "File already exists at {}. Overwrite? [y/N]: ",
         path.display()
     );
     io::stderr().flush().context("Failed to flush stderr")?;
