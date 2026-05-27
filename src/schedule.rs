@@ -26,7 +26,10 @@ pub fn calculate_next_reset(agent: &Agent) -> Result<AgentSchedule> {
         .ok_or_else(|| anyhow::anyhow!("Invalid time: {}:{}", hour, minute))?;
 
     let days_until = days_until_weekday(now.weekday(), target_weekday);
-    let next_reset_date = now.date_naive() + chrono::Duration::days(days_until as i64);
+    // ローカルタイムゾーンの日付を基準に計算する
+    // date_naive() は UTC 日付を返すため、weekday() のローカル曜日と
+    // 日付がずれるタイムゾーン（深夜帯の Asia/Tokyo など）で 1 日ずれる
+    let next_reset_date = now.naive_local().date() + chrono::Duration::days(days_until as i64);
     let next_reset_naive = next_reset_date.and_time(target_time);
 
     // DST切り替え時の曖昧な時刻に対応するため earliest() を使用
@@ -46,7 +49,8 @@ pub fn calculate_next_reset(agent: &Agent) -> Result<AgentSchedule> {
     };
 
     let previous_reset = {
-        let prev_date = next_reset.date_naive() - chrono::Duration::days(7);
+        // ローカルタイムゾーンの日付を基準に 7 日前を計算する
+        let prev_date = next_reset.naive_local().date() - chrono::Duration::days(7);
         let prev_naive = prev_date.and_time(target_time);
         tz.from_local_datetime(&prev_naive)
             .earliest()
@@ -356,5 +360,83 @@ mod tests {
                 agent.name
             );
         }
+    }
+
+    #[test]
+    fn next_reset_weekday_matches_configured_weekday_for_all_timezones() {
+        // 回帰テスト: 旧実装では date_naive() が UTC 日付を返すため、
+        // Asia/Tokyo のような UTC+N タイムゾーンでローカル深夜帯（UTC 前日）に
+        // 実行すると next_reset の曜日が target_weekday から 1 日ずれていた。
+        // 修正後は naive_local().date() を使うので、全 7 曜日 × 主要タイムゾーンで
+        // next_reset と previous_reset の曜日が target と一致することを確認する。
+        use chrono::Datelike;
+        let weekdays_and_strs = [
+            ("monday", Weekday::Mon),
+            ("tuesday", Weekday::Tue),
+            ("wednesday", Weekday::Wed),
+            ("thursday", Weekday::Thu),
+            ("friday", Weekday::Fri),
+            ("saturday", Weekday::Sat),
+            ("sunday", Weekday::Sun),
+        ];
+        // UTC からのオフセットが正負双方を含むタイムゾーンを選ぶ
+        let timezones = [
+            "UTC",
+            "Asia/Tokyo",       // UTC+9
+            "America/New_York", // UTC-5
+            "Europe/London",
+        ];
+        for tz in timezones {
+            for (weekday_str, expected_weekday) in weekdays_and_strs {
+                let agent = Agent {
+                    name: "test".to_string(),
+                    command: vec!["echo".to_string()],
+                    reset_weekday: weekday_str.to_string(),
+                    reset_time: "09:00".to_string(),
+                    timezone: tz.to_string(),
+                    prompt: None,
+                };
+                let sched = calculate_next_reset(&agent).unwrap();
+                assert_eq!(
+                    sched.next_reset.weekday(),
+                    expected_weekday,
+                    "{} で {} のリセットが {:?} 曜日と一致しない: next_reset={}",
+                    tz,
+                    weekday_str,
+                    expected_weekday,
+                    sched.next_reset
+                );
+                assert_eq!(
+                    sched.previous_reset.weekday(),
+                    expected_weekday,
+                    "{} で {} の previous_reset が {:?} 曜日と一致しない: previous_reset={}",
+                    tz,
+                    weekday_str,
+                    expected_weekday,
+                    sched.previous_reset
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn next_reset_local_time_matches_configured_time() {
+        // ローカル時刻が設定値と一致することを確認する
+        // 旧実装の date_naive() バグでは曜日がずれるだけでなく、結果のローカル時刻も
+        // ずれるケースがあるため、ローカル時刻成分の検証も行う
+        use chrono::Timelike;
+        let agent = Agent {
+            name: "tz-test".to_string(),
+            command: vec!["echo".to_string()],
+            reset_weekday: "monday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "Asia/Tokyo".to_string(),
+            prompt: None,
+        };
+        let sched = calculate_next_reset(&agent).unwrap();
+        assert_eq!(sched.next_reset.hour(), 9, "hour mismatch");
+        assert_eq!(sched.next_reset.minute(), 0, "minute mismatch");
+        assert_eq!(sched.previous_reset.hour(), 9, "previous hour mismatch");
+        assert_eq!(sched.previous_reset.minute(), 0, "previous minute mismatch");
     }
 }
