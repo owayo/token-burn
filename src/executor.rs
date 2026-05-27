@@ -481,17 +481,18 @@ while true; do
     fi
 
     # 新規エラーを表示
-    for f in $(find "$MARKER_DIR" -name 'error-*' 2>/dev/null); do
+    # MARKER_DIR のパスに空白を含む環境でも壊れないよう while read を使用する
+    while IFS= read -r f; do
         EFILE=$(basename "$f")
         case "$DISPLAYED_ERRORS" in
             *":$EFILE:"*) ;;
             *)
-                echo ""
-                echo " ❌ $(cat "$f")"
+                ERR_TEXT=$(cat "$f")
+                printf '\n ❌ %s\n' "$ERR_TEXT"
                 DISPLAYED_ERRORS="$DISPLAYED_ERRORS$EFILE:"
                 ;;
         esac
-    done
+    done < <(find "$MARKER_DIR" -name 'error-*' 2>/dev/null)
 
     # 進捗バー
     if [ $TOTAL -gt 0 ]; then
