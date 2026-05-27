@@ -87,7 +87,17 @@ fn process(
                             let name = tool_id_map.get(id).map(|s| s.as_str()).unwrap_or("?");
                             let is_error = item["is_error"].as_bool().unwrap_or(false);
                             if is_error {
-                                writeln!(out, "\x1b[31m  \u{2717} {}\x1b[0m", name)?;
+                                // エラー内容のサマリーがある場合は併記する
+                                let summary = extract_tool_result_summary(&item["content"]);
+                                if summary.is_empty() {
+                                    writeln!(out, "\x1b[31m  \u{2717} {}\x1b[0m", name)?;
+                                } else {
+                                    writeln!(
+                                        out,
+                                        "\x1b[31m  \u{2717} {} — {}\x1b[0m",
+                                        name, summary
+                                    )?;
+                                }
                             } else {
                                 writeln!(out, "\x1b[2m  \u{2713} {}\x1b[0m", name)?;
                             }
@@ -1590,6 +1600,42 @@ fn truncate_inline(s: &str, max: usize) -> String {
     truncate_str(&normalized, max)
 }
 
+/// tool_result の `content` からサマリー（1 行・短縮済み）を抽出する。
+///
+/// 失敗時に診断が分かりやすくなるよう、`is_error: true` の tool_result から
+/// 先頭の有意な 1 行を取り出して併記する用途で使う。文字列・配列いずれの
+/// `content` 形式にも対応する。
+fn extract_tool_result_summary(content: &serde_json::Value) -> String {
+    let raw = match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => {
+            // 配列形式の場合は `text` フィールドを連結する
+            arr.iter()
+                .filter_map(|item| item["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => String::new(),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // 先頭の有意な 1 行（空行を除く）を取得
+    let first_line = trimmed
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    // <tool_use_error>...</tool_use_error> ラッパーを除去
+    let cleaned = first_line
+        .strip_prefix("<tool_use_error>")
+        .and_then(|s| s.strip_suffix("</tool_use_error>"))
+        .unwrap_or(first_line)
+        .trim();
+    truncate_str(cleaned, 120)
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
     let mut iter = s.chars();
     let mut prefix = String::new();
@@ -2380,10 +2426,15 @@ mod tests {
         let output = run_process(&input);
         let clean = strip_ansi(&output);
 
-        // エラー時は ✓ ではなく ✗ を表示する
+        // エラー時は ✓ ではなく ✗ を表示し、エラー内容のサマリーを併記する
         assert!(
             clean.contains("\u{2717} Bash"),
             "expected error mark in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("Command failed"),
+            "expected error summary in: {}",
             clean
         );
         assert!(
@@ -2391,6 +2442,58 @@ mod tests {
             "should not have checkmark on error: {}",
             clean
         );
+    }
+
+    #[test]
+    fn extract_tool_result_summary_unwraps_tool_use_error_tag() {
+        // <tool_use_error>...</tool_use_error> ラッパーは除去される
+        let v = serde_json::json!("<tool_use_error>Skill disabled</tool_use_error>");
+        assert_eq!(extract_tool_result_summary(&v), "Skill disabled");
+    }
+
+    #[test]
+    fn extract_tool_result_summary_takes_first_non_empty_line() {
+        // 複数行のエラーは先頭の有意な行のみ
+        let v = serde_json::json!("\n\nExit code 1\nFrom https://github.com/example\nMore details");
+        assert_eq!(extract_tool_result_summary(&v), "Exit code 1");
+    }
+
+    #[test]
+    fn extract_tool_result_summary_handles_array_content() {
+        // 配列形式の content にも対応
+        let v = serde_json::json!([
+            {"type": "text", "text": "Error occurred"},
+            {"type": "text", "text": "additional info"}
+        ]);
+        let result = extract_tool_result_summary(&v);
+        assert_eq!(result, "Error occurred");
+    }
+
+    #[test]
+    fn extract_tool_result_summary_truncates_long_text() {
+        // 長文は省略される
+        let long = "a".repeat(200);
+        let v = serde_json::Value::String(long);
+        let result = extract_tool_result_summary(&v);
+        assert!(result.ends_with("..."), "expected truncation: {}", result);
+        assert!(
+            result.chars().count() <= 120,
+            "result length should be <= 120: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn extract_tool_result_summary_empty_input() {
+        assert_eq!(
+            extract_tool_result_summary(&serde_json::Value::String(String::new())),
+            ""
+        );
+        assert_eq!(
+            extract_tool_result_summary(&serde_json::Value::String("   \n   ".to_string())),
+            ""
+        );
+        assert_eq!(extract_tool_result_summary(&serde_json::Value::Null), "");
     }
 
     #[test]
