@@ -86,20 +86,30 @@ fn process(
                             let id = item["tool_use_id"].as_str().unwrap_or("");
                             let name = tool_id_map.get(id).map(|s| s.as_str()).unwrap_or("?");
                             let is_error = item["is_error"].as_bool().unwrap_or(false);
+                            let metadata = tool_result_metadata(&v["tool_use_result"]);
+                            let metadata = if metadata.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [{}]", metadata)
+                            };
                             if is_error {
                                 // エラー内容のサマリーがある場合は併記する
                                 let summary = extract_tool_result_summary(&item["content"]);
                                 if summary.is_empty() {
-                                    writeln!(out, "\x1b[31m  \u{2717} {}\x1b[0m", name)?;
+                                    writeln!(
+                                        out,
+                                        "\x1b[31m  \u{2717} {}{}\x1b[0m",
+                                        name, metadata
+                                    )?;
                                 } else {
                                     writeln!(
                                         out,
-                                        "\x1b[31m  \u{2717} {} — {}\x1b[0m",
-                                        name, summary
+                                        "\x1b[31m  \u{2717} {} — {}{}\x1b[0m",
+                                        name, summary, metadata
                                     )?;
                                 }
                             } else {
-                                writeln!(out, "\x1b[2m  \u{2713} {}\x1b[0m", name)?;
+                                writeln!(out, "\x1b[2m  \u{2713} {}{}\x1b[0m", name, metadata)?;
                             }
                         }
                     }
@@ -1621,19 +1631,89 @@ fn extract_tool_result_summary(content: &serde_json::Value) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
+    // <tool_use_error> が複数行を包む実データでもタグを残さない。
+    let without_open = trimmed.strip_prefix("<tool_use_error>").unwrap_or(trimmed);
+    let trimmed = without_open
+        .strip_suffix("</tool_use_error>")
+        .unwrap_or(without_open)
+        .trim();
     // 先頭の有意な 1 行（空行を除く）を取得
     let first_line = trimmed
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("")
         .trim();
-    // <tool_use_error>...</tool_use_error> ラッパーを除去
-    let cleaned = first_line
-        .strip_prefix("<tool_use_error>")
-        .and_then(|s| s.strip_suffix("</tool_use_error>"))
-        .unwrap_or(first_line)
-        .trim();
-    truncate_str(cleaned, 120)
+    truncate_str(first_line, 120)
+}
+
+/// `tool_use_result` の補足情報から、見落とすと判断材料を失うものだけ短く表示する。
+fn tool_result_metadata(result: &serde_json::Value) -> String {
+    let Some(obj) = result.as_object() else {
+        return String::new();
+    };
+
+    let mut attrs = Vec::new();
+    if obj
+        .get("truncated")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        attrs.push("truncated".to_string());
+    }
+    if let Some(limit) = obj.get("appliedLimit").and_then(|value| value.as_u64()) {
+        attrs.push(format!("limit:{limit}"));
+    }
+    if let Some(hint) = obj
+        .get("staleReadFileStateHint")
+        .and_then(|value| value.as_str())
+        .filter(|hint| !hint.is_empty())
+    {
+        attrs.push(format!("stale-read:{}", truncate_inline(hint, 70)));
+    }
+    if obj
+        .get("assistantAutoBackgrounded")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        attrs.push("auto-backgrounded".to_string());
+    }
+    if let Some(task_id) = obj
+        .get("backgroundTaskId")
+        .and_then(|value| value.as_str())
+        .filter(|task_id| !task_id.is_empty())
+    {
+        attrs.push(format!("background:{}", truncate_inline(task_id, 40)));
+    }
+    if obj
+        .get("wasClamped")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        if let Some(delay) = obj
+            .get("clampedDelaySeconds")
+            .and_then(|value| value.as_u64())
+        {
+            attrs.push(format!("clamped:{delay}s"));
+        } else {
+            attrs.push("clamped".to_string());
+        }
+    }
+    if obj
+        .get("persistedOutputPath")
+        .and_then(|value| value.as_str())
+        .is_some_and(|path| !path.is_empty())
+    {
+        attrs.push("persisted-output".to_string());
+    }
+    if let Some(interpretation) = obj
+        .get("returnCodeInterpretation")
+        .and_then(|value| value.as_str())
+        .filter(|interpretation| !interpretation.is_empty())
+    {
+        attrs.push(format!("return:{}", truncate_inline(interpretation, 50)));
+    }
+
+    attrs.join(", ")
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -2452,6 +2532,18 @@ mod tests {
     }
 
     #[test]
+    fn extract_tool_result_summary_unwraps_multiline_tool_use_error_tag() {
+        // 実データでは tool_use_error が複数行の診断全体を包むことがある
+        let v = serde_json::json!(
+            "<tool_use_error>String to replace not found in file.\nString: old\n</tool_use_error>"
+        );
+        assert_eq!(
+            extract_tool_result_summary(&v),
+            "String to replace not found in file."
+        );
+    }
+
+    #[test]
     fn extract_tool_result_summary_takes_first_non_empty_line() {
         // 複数行のエラーは先頭の有意な行のみ
         let v = serde_json::json!("\n\nExit code 1\nFrom https://github.com/example\nMore details");
@@ -2494,6 +2586,42 @@ mod tests {
             ""
         );
         assert_eq!(extract_tool_result_summary(&serde_json::Value::Null), "");
+    }
+
+    #[test]
+    fn process_tool_result_shows_top_level_result_metadata() {
+        // 実 jsonl の top-level tool_use_result には、content だけでは分からない補足情報が入る
+        let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t_read","name":"Read","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"src/main.rs\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","tool_use_result":{"truncated":true,"appliedLimit":15,"staleReadFileStateHint":"This command modified 1 file you've previously read: src/main.rs. Call Read before editing."},"message":{"role":"user","content":[{"tool_use_id":"t_read","type":"tool_result","is_error":false,"content":"file content"}]}}"#,
+        ]
+        .join("\n");
+
+        let output = run_process(&input);
+        let clean = strip_ansi(&output);
+
+        assert!(
+            clean.contains("\u{2713} Read"),
+            "expected success mark in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("truncated"),
+            "expected truncated metadata in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("limit:15"),
+            "expected applied limit metadata in: {}",
+            clean
+        );
+        assert!(
+            clean.contains("stale-read:"),
+            "expected stale-read metadata in: {}",
+            clean
+        );
     }
 
     #[test]
