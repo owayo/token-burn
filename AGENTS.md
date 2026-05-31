@@ -65,7 +65,7 @@ make release  # リリースビルド
 
 `format-stream` は `tool_result` の `is_error:true` を検出した場合、エラー内容の先頭の有意な 1 行をサマリーとして表示します（単一行/複数行の `<tool_use_error>...</tool_use_error>` ラッパーは除去）。配列形式の `content` にも対応し、120 文字を超える場合は末尾を `...` で省略します。
 
-`tool_use_result` の top-level メタデータに `truncated`、`appliedLimit`、`staleReadFileStateHint`、`assistantAutoBackgrounded`、`backgroundTaskId`、`wasClamped` / `clampedDelaySeconds`、`persistedOutputPath`、`returnCodeInterpretation` が含まれる場合は、ツール完了行に短い補足として表示します。
+`tool_use_result` の top-level メタデータに `truncated`、`appliedLimit`、`staleReadFileStateHint`、`assistantAutoBackgrounded`、`backgroundTaskId`、`wasClamped` / `clampedDelaySeconds`、`persistedOutputPath` / `persistedOutputSize`、`returnCodeInterpretation`、`totalDurationMs` / `totalTokens` / `totalToolUseCount`、`numFiles` / `numLines`、`matches` / `total_deferred_tools`、`statusChange`、`scheduledFor`、`commandName` が含まれる場合は、ツール完了行に短い補足として表示します。
 
 モニターペインの進捗は `fail:<n> retry:<n>` を併記し、完了時も `%d succeeded / %d failed / %d retry` の形で表示します。
 
@@ -94,7 +94,7 @@ make release  # リリースビルド
 - `Monitor` の説明とタイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`TaskCreate` の `subject` / `description` / `activeForm`、`TaskUpdate` の `taskId` / `status` / `owner` / `subject` / `description`、`SendMessage` の送信先/要約、`AskUserQuestion` の質問数・選択肢数、Tavily の query/max/time range/search depth、Codex MCP の prompt/cwd/model/sandbox/approval-policy、Context7 MCP ツールの library/query を表示
 - サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）。`task_notification` は `completed` / `failed` に加え `stopped` も表示し、`usage` が無い場合は duration/token を 0 として表示しない
 - Claude Code のシステム通知（`notification`。例: stop hook エラー）と、出力を伴う hook 診断（`hook_progress` / `hook_response` の stderr / output）
-- `tool_use_result` の出力切り詰め、適用 limit、stale read ヒント、自動バックグラウンド化、clamp、永続化出力、戻りコード解釈の補足表示
+- `tool_use_result` の出力切り詰め、適用 limit、stale read ヒント、自動バックグラウンド化、clamp、永続化出力サイズ、戻りコード解釈、Agent の duration/token/tool 数、Grep/ToolSearch の結果件数、TaskUpdate の状態遷移、ScheduleWakeup の予定時刻、Skill のコマンド名の補足表示
 - トークン使用量、コスト、キャッシュ内訳、Web検索/フェッチ回数の集計表示
 - モデル別使用量（`modelUsage`）の内訳表示（キャッシュ読み取り/書き込みトークン、Web検索回数、`contextWindow` / `maxOutputTokens` を `ctx:1M` / `max_out:64K` のような単位付きで表示）
 - API応答時間（`duration_api_ms`）と初回トークン到達時間（`ttft_ms`）の表示

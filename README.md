@@ -28,7 +28,7 @@
 
 ## Overview
 
-Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Japanese *mottainai* (もったいない) spirit — the belief that waste is something to be avoided — **token-burn** puts those remaining tokens to work. It runs your prompts across repositories in parallel before the reset deadline — code reviews, bug hunts, refactoring, test improvements, or anything else you define. When the reset time arrives, all running processes are automatically terminated.
+Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Japanese *mottainai* (もったいない) spirit — the belief that waste is something to be avoided — **token-burn** puts those remaining tokens to work. It runs your prompts across repositories in parallel before the reset deadline — code reviews, bug hunts, refactoring, test improvements, or anything else you define. When the reset time arrives, token-burn stops starting new tasks and waits for the tasks already running to finish.
 
 <p align="center">
   <img src="docs/images/screenshot.png" width="800" alt="token-burn running">
@@ -46,7 +46,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Visibility-aware**: Prioritizes public repositories over private ones (matched by remote repository name)
 - **Multi-agent**: Supports Claude Code, Codex CLI, and custom agents
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
-- **Deadline enforcement**: Kills all child processes when the reset time arrives
+- **Deadline-aware stop**: Stops starting new tasks when the reset time arrives and waits for current tasks to finish
 - **Parallel execution**: Runs multiple prompts concurrently in tmux split panes with progress monitor
 - **Detach-safe tmux runtime**: Keeps worker scripts and queues when you detach, so background tasks continue safely until the tmux session ends
 - **Sub-agent monitoring**: Real-time start, progress, status updates, and completion notifications for Claude Code team/agent tasks
@@ -54,7 +54,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Richer tool details**: Shows `Read` offset/limit, `Edit` replace-all state, `Bash` timeout/background state, `Agent` background state, `Grep`/`Glob` output mode/type, ignore-case, multiline, glob, head/context limits, delay/reason for `ScheduleWakeup`, URL/prompt summary for `WebFetch`, query/domain filters for `WebSearch`, query/`max_results` for `ToolSearch`, monitor description/timeout for `Monitor`, stopped task ID for `TaskStop`, task ID/block/timeout for `TaskOutput`, `TaskCreate` subject/description/active form, `TaskUpdate` task ID/status/owner/subject/description, `SendMessage` summaries, `AskUserQuestion` prompts/options, Tavily/Codex MCP model/sandbox/approval details, and library/query details for Context7 MCP tools
 - **Sub-agent stop visibility**: `task_notification` events with `status="stopped"` (e.g. forced via `TaskStop`) are now surfaced in the live monitor; missing usage metrics are omitted instead of being shown as zero
 - **Tool error summary**: When a `tool_result` is `is_error:true`, the live monitor appends a short, single-line summary (truncated to 120 characters, with single-line or multi-line `<tool_use_error>` wrappers stripped) so the cause of a failed tool call is visible without opening the jsonl
-- **Tool result metadata**: Surfaces important top-level `tool_use_result` metadata such as truncated output, applied limits, stale-read hints, auto-backgrounding, clamped wakeups, persisted output, and return-code interpretation
+- **Tool result metadata**: Surfaces important top-level `tool_use_result` metadata such as truncated output, applied limits, stale-read hints, auto-backgrounding, clamped wakeups, persisted output size, return-code interpretation, Agent duration/token/tool counts, Grep/ToolSearch result counts, TaskUpdate status transitions, ScheduleWakeup scheduled time, and Skill command names
 - **Logging pipeline safety**: Marks a task failed if `format-stream`, `tee`, or raw jsonl capture fails instead of recording it as completed
 - **Per-model usage**: Displays token usage, cost, cache read/creation tokens, web search counts, and the model's context window / max output limits (e.g. `ctx:1M`, `max_out:64K`) per model in the result summary
 - **API timing**: Shows API response time and time to first token alongside wall-clock duration

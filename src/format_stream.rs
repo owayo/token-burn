@@ -441,6 +441,17 @@ fn format_timestamp_clock(info: &serde_json::Value, key: &str) -> Option<String>
         .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
 }
 
+/// Unix epoch ミリ秒（古い実装との互換で秒も許容）をローカル時刻の短い表記にする。
+fn format_epoch_millis_clock(timestamp: i64) -> Option<String> {
+    let seconds = if timestamp > 1_000_000_000_000 {
+        timestamp / 1000
+    } else {
+        timestamp
+    };
+    chrono::DateTime::from_timestamp(seconds, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+}
+
 /// ミリ秒を短い秒表記に整形する（例: 14837ms → 14.8s）。
 fn format_millis_as_seconds(ms: u64) -> String {
     if ms.is_multiple_of(1000) {
@@ -1646,6 +1657,19 @@ fn extract_tool_result_summary(content: &serde_json::Value) -> String {
     truncate_str(first_line, 120)
 }
 
+fn format_byte_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= MB {
+        format!("{:.1}MB", bytes_f / MB)
+    } else if bytes_f >= KB {
+        format!("{:.1}KB", bytes_f / KB)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 /// `tool_use_result` の補足情報から、見落とすと判断材料を失うものだけ短く表示する。
 fn tool_result_metadata(result: &serde_json::Value) -> String {
     let Some(obj) = result.as_object() else {
@@ -1660,8 +1684,76 @@ fn tool_result_metadata(result: &serde_json::Value) -> String {
     {
         attrs.push("truncated".to_string());
     }
+    if obj
+        .get("interrupted")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        attrs.push("interrupted".to_string());
+    }
+    if obj
+        .get("success")
+        .and_then(|value| value.as_bool())
+        .is_some_and(|success| !success)
+    {
+        attrs.push("failed".to_string());
+    }
     if let Some(limit) = obj.get("appliedLimit").and_then(|value| value.as_u64()) {
         attrs.push(format!("limit:{limit}"));
+    }
+    if let Some(files) = obj.get("numFiles").and_then(|value| value.as_u64()) {
+        attrs.push(format!("files:{files}"));
+    }
+    if let Some(lines) = obj.get("numLines").and_then(|value| value.as_u64()) {
+        attrs.push(format!("lines:{lines}"));
+    }
+    if let Some(matches) = obj.get("matches").and_then(|value| value.as_array()) {
+        attrs.push(format!("matches:{}", matches.len()));
+    }
+    if let Some(deferred) = obj
+        .get("total_deferred_tools")
+        .and_then(|value| value.as_u64())
+    {
+        attrs.push(format!("deferred:{deferred}"));
+    }
+    if let Some(command_name) = obj
+        .get("commandName")
+        .and_then(|value| value.as_str())
+        .filter(|name| !name.is_empty())
+    {
+        attrs.push(format!("command:{command_name}"));
+    }
+    if let Some(change) = obj.get("statusChange").and_then(|value| value.as_object()) {
+        let from = change
+            .get("from")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let to = change
+            .get("to")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if !from.is_empty() && !to.is_empty() {
+            attrs.push(format!("status:{from}->{to}"));
+        }
+    }
+    if let Some(ms) = obj.get("totalDurationMs").and_then(|value| value.as_u64()) {
+        attrs.push(format!("duration:{}", format_millis_as_seconds(ms)));
+    }
+    if let Some(tokens) = obj.get("totalTokens").and_then(|value| value.as_u64()) {
+        attrs.push(format!("tokens:{}", format_number(tokens)));
+    }
+    if let Some(count) = obj
+        .get("totalToolUseCount")
+        .and_then(|value| value.as_u64())
+    {
+        attrs.push(format!("tools:{count}"));
+    }
+    if obj
+        .get("userModified")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        attrs.push("user-modified".to_string());
     }
     if let Some(hint) = obj
         .get("staleReadFileStateHint")
@@ -1703,7 +1795,26 @@ fn tool_result_metadata(result: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .is_some_and(|path| !path.is_empty())
     {
-        attrs.push("persisted-output".to_string());
+        if let Some(size) = obj
+            .get("persistedOutputSize")
+            .and_then(|value| value.as_u64())
+        {
+            attrs.push(format!("persisted-output:{}", format_byte_size(size)));
+        } else {
+            attrs.push("persisted-output".to_string());
+        }
+    } else if let Some(size) = obj
+        .get("persistedOutputSize")
+        .and_then(|value| value.as_u64())
+    {
+        attrs.push(format!("output:{}", format_byte_size(size)));
+    }
+    if let Some(scheduled) = obj
+        .get("scheduledFor")
+        .and_then(|value| value.as_i64())
+        .and_then(format_epoch_millis_clock)
+    {
+        attrs.push(format!("scheduled:{scheduled}"));
     }
     if let Some(interpretation) = obj
         .get("returnCodeInterpretation")
@@ -2625,6 +2736,59 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_metadata_shows_actual_jsonl_result_counts() {
+        // 実 jsonl で確認した Grep / ToolSearch の result メタデータを完了行に出す
+        let value = serde_json::json!({
+            "numFiles": 2,
+            "numLines": 15,
+            "matches": ["TaskCreate", "TaskUpdate"],
+            "total_deferred_tools": 34,
+            "commandName": "codex"
+        });
+
+        let metadata = tool_result_metadata(&value);
+
+        assert!(metadata.contains("files:2"), "{metadata}");
+        assert!(metadata.contains("lines:15"), "{metadata}");
+        assert!(metadata.contains("matches:2"), "{metadata}");
+        assert!(metadata.contains("deferred:34"), "{metadata}");
+        assert!(metadata.contains("command:codex"), "{metadata}");
+    }
+
+    #[test]
+    fn tool_result_metadata_shows_actual_jsonl_agent_usage() {
+        // Agent tool の完了結果には duration / token / tool count が入る
+        let value = serde_json::json!({
+            "totalDurationMs": 60730,
+            "totalTokens": 90631,
+            "totalToolUseCount": 3,
+            "statusChange": {"from": "pending", "to": "completed"}
+        });
+
+        let metadata = tool_result_metadata(&value);
+
+        assert!(metadata.contains("duration:60.7s"), "{metadata}");
+        assert!(metadata.contains("tokens:90,631"), "{metadata}");
+        assert!(metadata.contains("tools:3"), "{metadata}");
+        assert!(metadata.contains("status:pending->completed"), "{metadata}");
+    }
+
+    #[test]
+    fn tool_result_metadata_shows_persisted_output_size_and_schedule() {
+        // Bash の永続化出力サイズと ScheduleWakeup の scheduledFor は実データに出る
+        let value = serde_json::json!({
+            "persistedOutputPath": "/tmp/tool-result.txt",
+            "persistedOutputSize": 41119,
+            "scheduledFor": 1779898800000_i64
+        });
+
+        let metadata = tool_result_metadata(&value);
+
+        assert!(metadata.contains("persisted-output:40.2KB"), "{metadata}");
+        assert!(metadata.contains("scheduled:"), "{metadata}");
+    }
+
+    #[test]
     fn process_result_with_full_stats() {
         // 実際の claude 実行結果と同じく num_turns と cache_creation_input_tokens を含む
         let input = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":41712,"num_turns":9,"total_cost_usd":0.5565,"usage":{"input_tokens":14,"cache_creation_input_tokens":54926,"cache_read_input_tokens":372099,"output_tokens":987}}"#;
@@ -2852,7 +3016,7 @@ mod tests {
     fn process_team_create_then_task_spawn() {
         // TeamCreate → Task の順でチームエージェントを起動する流れ
         let input = [
-            // TeamCreate
+            // チームを作成
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tc1","name":"TeamCreate","input":{}}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"team_name\":\"demo-team\",\"description\":\"Build demo project\"}"}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
@@ -2868,7 +3032,7 @@ mod tests {
         let output = run_process(&input);
         let clean = strip_ansi(&output);
 
-        // TeamCreate
+        // チーム作成ツール
         assert!(
             clean.contains("\u{1f527} TeamCreate"),
             "expected TeamCreate tool in: {}",
@@ -4073,7 +4237,7 @@ mod tests {
     fn process_rate_limit_custom_threshold() {
         let tmp = tempfile::TempDir::new().unwrap();
         let stop_file = tmp.path().join("stop");
-        // 80% >= threshold 80 → auto-stop
+        // 80% が閾値 80% 以上なので自動停止する
         let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.80}}"#;
         let output = run_process_with_opts(input, None, Some(&stop_file), 80);
         let clean = strip_ansi(&output);

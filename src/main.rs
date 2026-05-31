@@ -23,7 +23,7 @@ mod test_support {
 
     impl CwdGuard {
         pub fn switch_to(path: &Path) -> Self {
-            // current dir はプロセス全体の状態なので、変更するテストは必ず直列化する。
+            // カレントディレクトリはプロセス全体の状態なので、変更するテストは必ず直列化する。
             let lock = CWD_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());

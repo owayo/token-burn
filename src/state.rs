@@ -390,7 +390,7 @@ mod tests {
         // 回帰テスト: 修正後の書き込み手順（write_all → set_len）でも、
         // 既存ファイルが長くて新ペイロードが短い場合に末尾の古いデータが残らないこと。
         // 旧実装は set_len(0) を write_all 前に行っていたため、書き込み失敗時に
-        // state.json が空になる risk があった。新実装ではこのテストで前後どちらの
+        // state.json が空になるリスクがあった。新実装ではこのテストで前後どちらの
         // バグも回帰しないことを確認する。
         let tmp = TempDir::new().expect("temp dir should be created");
         let state_file = tmp.path().join("state.json");

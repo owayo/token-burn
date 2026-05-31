@@ -42,7 +42,7 @@ pub async fn resolve_targets(
     config: &Config,
     agent: &crate::config::Agent,
 ) -> Result<Vec<ResolvedTarget>> {
-    // 優先順位: target prompt > agent prompt > global default
+    // 優先順位: ターゲット個別プロンプト > エージェント個別プロンプト > グローバル既定値
     let effective_default = agent.prompt.as_deref().unwrap_or(&config.prompts.default);
     let default_prompt = config.resolve_prompt(effective_default)?;
     let mut targets: Vec<ResolvedTarget> = Vec::new();
