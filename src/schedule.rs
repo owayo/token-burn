@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{Datelike, NaiveTime, TimeZone, Utc, Weekday};
+use chrono::{Datelike, LocalResult, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 use std::time::Duration;
 
@@ -32,18 +32,13 @@ pub fn calculate_next_reset(agent: &Agent) -> Result<AgentSchedule> {
     let next_reset_date = now.naive_local().date() + chrono::Duration::days(days_until as i64);
     let next_reset_naive = next_reset_date.and_time(target_time);
 
-    // DST切り替え時の曖昧な時刻に対応するため earliest() を使用
-    let next_reset = tz
-        .from_local_datetime(&next_reset_naive)
-        .earliest()
-        .ok_or_else(|| anyhow::anyhow!("Invalid datetime for timezone {}", agent.timezone))?;
+    // DST 遷移（曖昧な時刻・存在しない時刻）を resolve_local_datetime で吸収する
+    let next_reset = resolve_local_datetime(&tz, next_reset_naive)?;
 
     let next_reset = if next_reset <= now {
         let next_date = next_reset_date + chrono::Duration::days(7);
         let next_naive = next_date.and_time(target_time);
-        tz.from_local_datetime(&next_naive)
-            .earliest()
-            .ok_or_else(|| anyhow::anyhow!("Invalid datetime for timezone {}", agent.timezone))?
+        resolve_local_datetime(&tz, next_naive)?
     } else {
         next_reset
     };
@@ -52,11 +47,7 @@ pub fn calculate_next_reset(agent: &Agent) -> Result<AgentSchedule> {
         // ローカルタイムゾーンの日付を基準に 7 日前を計算する
         let prev_date = next_reset.naive_local().date() - chrono::Duration::days(7);
         let prev_naive = prev_date.and_time(target_time);
-        tz.from_local_datetime(&prev_naive)
-            .earliest()
-            .ok_or_else(|| {
-                anyhow::anyhow!("Invalid datetime for previous reset in {}", agent.timezone)
-            })?
+        resolve_local_datetime(&tz, prev_naive)?
     };
 
     let duration = (next_reset - now)
@@ -69,6 +60,41 @@ pub fn calculate_next_reset(agent: &Agent) -> Result<AgentSchedule> {
         previous_reset,
         time_until_reset: duration,
     })
+}
+
+/// ローカル日時を実際の瞬間（タイムゾーン付き日時）に解決する。DST 遷移を正しく扱う。
+///
+/// - 通常の時刻: そのまま解決する。
+/// - 曖昧な時刻（秋の繰り戻しで 2 回出現する時刻）: 早い方を採用する。
+/// - 存在しない時刻（春の繰り上げでスキップされる時刻）: 遷移直後の最初の有効な
+///   瞬間にフォールバックする。`from_local_datetime().earliest()` は曖昧な時刻には
+///   対応できるが、存在しない時刻では `None` を返すため、リセット時刻がたまたま
+///   DST ギャップ（例: America/New_York の 02:30）に重なると、設定読み込みは成功
+///   するのに status / run が実行時に毎回失敗してしまう。これを防ぐ。
+fn resolve_local_datetime(tz: &Tz, naive: chrono::NaiveDateTime) -> Result<chrono::DateTime<Tz>> {
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Ok(dt),
+        LocalResult::Ambiguous(earliest, _) => Ok(earliest),
+        LocalResult::None => {
+            // 存在しない時刻（DST ギャップ）。1 分ずつ進めて遷移直後の有効な瞬間を
+            // 探す。標準的なギャップは 1 時間なので、2 時間分試行すれば必ず有効な
+            // 瞬間に到達する。
+            let mut probe = naive;
+            for _ in 0..120 {
+                probe += chrono::Duration::minutes(1);
+                match tz.from_local_datetime(&probe) {
+                    LocalResult::Single(dt) => return Ok(dt),
+                    LocalResult::Ambiguous(earliest, _) => return Ok(earliest),
+                    LocalResult::None => continue,
+                }
+            }
+            Err(anyhow::anyhow!(
+                "Could not resolve local datetime {} for timezone {}",
+                naive,
+                tz
+            ))
+        }
+    }
 }
 
 fn days_until_weekday(current: Weekday, target: Weekday) -> u32 {
@@ -118,6 +144,48 @@ mod tests {
     fn days_until_previous_weekday_wraps() {
         assert_eq!(days_until_weekday(Weekday::Wed, Weekday::Mon), 5);
         assert_eq!(days_until_weekday(Weekday::Sun, Weekday::Mon), 1);
+    }
+
+    #[test]
+    fn resolve_local_datetime_handles_spring_forward_gap() {
+        // America/New_York の 2025-03-09 02:30 は春の繰り上げ（02:00→03:00）で
+        // 存在しない時刻。遷移直後の有効な瞬間（03:00 EDT）にフォールバックすること。
+        // 以前は earliest() が None を返し、リセット計算全体がエラーになっていた。
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let naive = chrono::NaiveDate::from_ymd_opt(2025, 3, 9)
+            .unwrap()
+            .and_hms_opt(2, 30, 0)
+            .unwrap();
+        let resolved = resolve_local_datetime(&tz, naive).unwrap();
+        assert_eq!(resolved.hour(), 3);
+        assert_eq!(resolved.minute(), 0);
+    }
+
+    #[test]
+    fn resolve_local_datetime_handles_fall_back_ambiguous() {
+        // America/New_York の 2025-11-02 01:30 は秋の繰り戻し（02:00→01:00）で
+        // 2 回出現する曖昧な時刻。早い方（EDT, UTC-4）を採用すること。
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let naive = chrono::NaiveDate::from_ymd_opt(2025, 11, 2)
+            .unwrap()
+            .and_hms_opt(1, 30, 0)
+            .unwrap();
+        let resolved = resolve_local_datetime(&tz, naive).unwrap();
+        // 01:30 EDT = 05:30 UTC（早い方）。EST なら 06:30 UTC になる。
+        assert_eq!(resolved.with_timezone(&Utc).hour(), 5);
+    }
+
+    #[test]
+    fn resolve_local_datetime_handles_normal_time() {
+        // DST 遷移に関係しない通常の時刻はそのまま解決すること。
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let naive = chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let resolved = resolve_local_datetime(&tz, naive).unwrap();
+        assert_eq!(resolved.hour(), 12);
+        assert_eq!(resolved.minute(), 0);
     }
 
     fn make_agent(name: &str, weekday: &str, time: &str) -> Agent {

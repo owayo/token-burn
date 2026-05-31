@@ -104,6 +104,7 @@ make release  # リリースビルド
 - レート制限警告（`rate_limit_event`）の使用率表示、リクエスト拒否通知、および `allowed` 時の補足情報表示（`resetsAt` / `overageResetsAt` / overage 情報がある場合）。`allowed_warning` 時に `surpassedThreshold` が含まれている場合は通過済み警告閾値（例: `warning at 90%`）を併記する
 - レート制限使用率が `rate_limit_threshold`（デフォルト: 95%）を超えた場合、stop file を作成して後続タスクを自動停止
 - APIリトライ（`api_retry`）の試行回数とエラー情報の表示
+- `status`（リクエスト状態通知）と `thinking_tokens`（思考トークンの推定累積値 `estimated_tokens` / `estimated_tokens_delta`）は高頻度（1 セッションで数千件）に出力されるノイズイベントのため、明示的に無視します。思考中の進捗は `thinking_delta` のドット表示、トークン総数は `result.usage` の集計表示で代替するため、これらを表示すると重複・冗長になります
 
 なお `usage` フィールドは各 `message_start` / `message_delta` でその API 呼び出し単独の値を返し、`result` イベントに最終累計が入るため、`format-stream` は `result` の値を最終出力として優先します。
 
@@ -128,6 +129,7 @@ make release  # リリースビルド
 ## 実装上の注意点
 
 - リセット日時計算 (`schedule.rs`) は `naive_local()` をベースに行います。`DateTime::date_naive()` は UTC 日付を返すため、`weekday()` のローカル曜日と整合させるためにローカルタイムゾーンの日付を基準とします。Asia/Tokyo のような UTC+N のタイムゾーンで深夜帯（UTC 前日）に実行しても曜日がずれない設計です。
+- リセット時刻が DST（夏時間）遷移に重なる場合も `resolve_local_datetime` (`schedule.rs`) で解決します。曖昧な時刻（秋の繰り戻しで 2 回出現する時刻）は早い方を採用し、存在しない時刻（春の繰り上げでスキップされる時刻）は遷移直後の最初の有効な瞬間にフォールバックします。`from_local_datetime().earliest()` は存在しない時刻に対して `None` を返すため、`America/New_York` の `02:30` のように DST ギャップへ重なるリセット時刻だと、設定読み込みは成功するのに `status` / `run` が実行時に毎回失敗していました。これを防ぐ実装です。
 - 状態ファイル (`state.json`) の書き込みは `write_all` 完了後に `set_len(written_len)` で末尾を切り詰める順序で行います。途中で書き込みが失敗してもファイル全消失（旧実装の `set_len(0)` 先行による data loss）が起きないようにしています。
 - レポートディレクトリのクリーンアップ (`cleanup.rs`) はシンボリックリンクをスキップします。`Path::is_dir()` はリンクを追跡するため、リンク先のディレクトリを誤って削除しないよう `is_symlink()` で除外します。
 - モニタースクリプトのエラーマーカー走査は `while IFS= read -r ... < <(find ...)` 方式を使用しており、`TMPDIR` のパスに空白が含まれる環境でもワードスプリットが発生しません。エラー内容の表示は `printf '%s'` 経由で行い、ファイル内容を `echo` のダブルクォート内で再解釈しないようにしています。

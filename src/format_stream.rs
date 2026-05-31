@@ -264,6 +264,13 @@ fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()
         "hook_progress" | "hook_response" => {
             handle_hook_output(v, out)?;
         }
+        "status" | "thinking_tokens" => {
+            // 実データで高頻度に出る内部ステータス系イベントは表示しない。
+            // status:requesting はリクエスト状態の通知、thinking_tokens はセッション
+            // 累積の推定トークン数（estimated_tokens / estimated_tokens_delta）であり、
+            // いずれも表示するとノイズになる。思考中の進捗は thinking_delta のドット
+            // 表示、正確なトークン総数は result.usage の集計表示に委ねる。
+        }
         _ => {} // init, hook_started 等は無視
     }
     Ok(())
@@ -4713,6 +4720,21 @@ mod tests {
         assert!(
             output.is_empty(),
             "system.subtype=status は表示されるべきでない: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn process_system_thinking_tokens_subtype_is_silent() {
+        // 実データに高頻度（1 セッションで数千件）で出る thinking_tokens は、
+        // thinking_delta のドット進捗表示と result.usage の最終集計と重複するため、
+        // サイレントに無視されること。estimated_tokens はセッション累積の推定値で、
+        // 個別の thinking ブロックには紐付けられない。
+        let input = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":50,"estimated_tokens_delta":50,"uuid":"abc","session_id":"s1"}"#;
+        let output = run_process(input);
+        assert!(
+            output.is_empty(),
+            "system.subtype=thinking_tokens は表示されるべきでない: {}",
             output
         );
     }
