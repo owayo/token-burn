@@ -194,7 +194,7 @@ State is stored in `<config-dir>/state.json` (same directory as the active confi
 ```toml
 [[agents]]
 name = "claude"
-command = ["claude", "-p", "--dangerously-skip-permissions", "--model", "opus"]
+command = ["claude", "--dangerously-skip-permissions", "--model", "opus"]
 reset_weekday = "monday"
 reset_time = "09:00"
 timezone = "Asia/Tokyo"
@@ -212,7 +212,7 @@ timezone = "Asia/Tokyo"
 | Field | Description | Example |
 |-------|-------------|---------|
 | `name` | Agent identifier | `"claude"` |
-| `command` | Command and arguments | `["claude", "-p"]` |
+| `command` | Command and arguments | `["claude"]` |
 | `reset_weekday` | Reset day of week | `"monday"` |
 | `reset_time` | Reset time (HH:MM) | `"09:00"` |
 | `timezone` | IANA timezone | `"Asia/Tokyo"` |
@@ -222,7 +222,7 @@ timezone = "Asia/Tokyo"
 
 **Prompt priority**: `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default`
 
-**Claude auto-injected flags**: When the executable is `claude`, the following flags are enforced: `--verbose`, `--output-format stream-json`, `--include-partial-messages`, and `--disallowedTools=AskUserQuestion`. Missing flags are appended automatically, an existing `--output-format` value is normalized to `stream-json` (including `--output-format=...` form), and an existing `--disallowedTools` / `--disallowed-tools` list is normalized and extended with `AskUserQuestion` when needed. The logging flags are required for proper log capture and progress monitoring; `AskUserQuestion` is denied so unattended token-burn jobs cannot stop on an interactive question. You do not need to include them in your config.
+**Claude auto-injected flags**: When the executable is `claude`, the following flags are enforced: `-p`, `--verbose`, `--output-format stream-json`, `--include-partial-messages`, and `--disallowedTools=AskUserQuestion`. Missing flags are appended automatically, an existing `--output-format` value is normalized to `stream-json` (including `--output-format=...` form), and an existing `--disallowedTools` / `--disallowed-tools` list is normalized and extended with `AskUserQuestion` when needed. The logging flags are required for proper log capture and progress monitoring; `AskUserQuestion` is denied so unattended token-burn jobs cannot stop on an interactive question. You do not need to include them in your config.
 
 `reset_weekday` accepts: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday` (or short forms: `mon` `tue` `wed` `thu` `fri` `sat` `sun`)
 
@@ -231,13 +231,13 @@ timezone = "Asia/Tokyo"
 ```toml
 [[scan]]
 base_dirs = ["~/GitHub"]
-username = "owayo"
+username = "yourname"
 public_first = true
 exclude = ["archived-project"]
 
 [[scan]]
 base_dirs = ["~/git"]
-username = "owayo"
+username = "yourname"
 recursive = true
 public_first = false
 ```

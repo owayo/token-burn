@@ -194,7 +194,7 @@ skip_within = "7d"    # 任意
 ```toml
 [[agents]]
 name = "claude"
-command = ["claude", "-p", "--dangerously-skip-permissions", "--model", "opus"]
+command = ["claude", "--dangerously-skip-permissions", "--model", "opus"]
 reset_weekday = "monday"
 reset_time = "09:00"
 timezone = "Asia/Tokyo"
@@ -212,7 +212,7 @@ timezone = "Asia/Tokyo"
 | フィールド | 説明 | 例 |
 |-----------|------|-----|
 | `name` | エージェント識別名 | `"claude"` |
-| `command` | コマンドと引数 | `["claude", "-p"]` |
+| `command` | コマンドと引数 | `["claude"]` |
 | `reset_weekday` | リセット曜日 | `"monday"` |
 | `reset_time` | リセット時刻（HH:MM） | `"09:00"` |
 | `timezone` | IANAタイムゾーン | `"Asia/Tokyo"` |
@@ -222,7 +222,7 @@ timezone = "Asia/Tokyo"
 
 **プロンプト優先順位**: `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default`
 
-**Claude 必須フラグの自動付与**: コマンドの実行ファイルが `claude` の場合、ログ出力と進捗モニタリングに必要な `--verbose`、`--output-format stream-json`、`--include-partial-messages` と、対話回答待ちを防ぐ `--disallowedTools=AskUserQuestion` が必ず有効化されます。未指定フラグは自動追加され、既存の `--output-format` 値（`--output-format=...` 形式を含む）は `stream-json` に正規化されます。既存の `--disallowedTools` / `--disallowed-tools` がある場合は、必要に応じて equals 形式へ正規化して `AskUserQuestion` を追記します。設定ファイルへの記述は不要です。
+**Claude 必須フラグの自動付与**: コマンドの実行ファイルが `claude` の場合、ログ出力と進捗モニタリングに必要な `-p`、`--verbose`、`--output-format stream-json`、`--include-partial-messages` と、対話回答待ちを防ぐ `--disallowedTools=AskUserQuestion` が必ず有効化されます。未指定フラグは自動追加され、既存の `--output-format` 値（`--output-format=...` 形式を含む）は `stream-json` に正規化されます。既存の `--disallowedTools` / `--disallowed-tools` がある場合は、必要に応じて equals 形式へ正規化して `AskUserQuestion` を追記します。設定ファイルへの記述は不要です。
 
 `reset_weekday` に指定可能な値: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday`（短縮形: `mon` `tue` `wed` `thu` `fri` `sat` `sun`）
 
@@ -231,13 +231,13 @@ timezone = "Asia/Tokyo"
 ```toml
 [[scan]]
 base_dirs = ["~/GitHub"]
-username = "owayo"
+username = "yourname"
 public_first = true
 exclude = ["archived-project"]
 
 [[scan]]
 base_dirs = ["~/git"]
-username = "owayo"
+username = "yourname"
 recursive = true
 public_first = false
 ```

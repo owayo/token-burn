@@ -19,9 +19,9 @@ default = "prompts/default.md"     # .md で終わる値はファイルパスと
 
 [[agents]]
 name = "claude"
-command = ["claude", "-p", "--dangerously-skip-permissions", "--model", "opus"]
-# token-burn が --verbose / --output-format stream-json / --include-partial-messages /
-# --disallowedTools=AskUserQuestion を自動付与します
+command = ["claude", "--dangerously-skip-permissions", "--model", "opus"]
+# token-burn が -p / --verbose / --output-format stream-json /
+# --include-partial-messages / --disallowedTools=AskUserQuestion を自動付与します
 reset_weekday = "monday"           # リセット曜日
 reset_time = "09:00"               # リセット時刻
 timezone = "Asia/Tokyo"
@@ -40,13 +40,13 @@ timezone = "Asia/Tokyo"
 [[scan]]
 base_dirs = ["~/GitHub"]           # スキャン対象のベースディレクトリ
 recursive = false                  # true: ネストされたサブディレクトリも再帰的に探索
-username = "owayo"                 # このユーザーのリポジトリのみ対象（remote URLで判定）
+username = "yourname"              # このユーザーのリポジトリのみ対象（remote URLで判定）
 public_first = true                # 公開リポジトリを優先的に処理
 exclude = []                       # 除外するディレクトリ名
 
 # [[scan]]
 # base_dirs = ["~/git"]
-# username = "owayo"
+# username = "yourname"
 # public_first = false
 
 # ---- 個別ターゲット（任意、スキャン結果とマージ） ----

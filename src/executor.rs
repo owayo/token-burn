@@ -37,14 +37,16 @@ fn is_claude_command(command: &[String]) -> bool {
 }
 
 /// 既知エージェントに必要なフラグを自動付与する。
-/// `claude` の場合、`--verbose`、`--output-format stream-json`、`--include-partial-messages`
-/// はログ取得に必須であり、常に存在しなければならない。また、token-burn は無人実行のため、
+/// `claude` の場合、`-p`、`--verbose`、`--output-format stream-json`、
+/// `--include-partial-messages` はログ取得に必須であり、常に存在しなければならない。
+/// また、token-burn は無人実行のため、
 /// ユーザー回答待ちで停止する `AskUserQuestion` を禁止する。
 fn ensure_required_flags(agent: &mut Agent) {
     if !is_claude_command(&agent.command) {
         return;
     }
 
+    let needs_print = !agent.command.iter().any(|s| s == "-p" || s == "--print");
     let needs_verbose = !agent.command.iter().any(|s| s == "--verbose");
     let needs_partial = !agent
         .command
@@ -81,6 +83,9 @@ fn ensure_required_flags(agent: &mut Agent) {
         idx += 1;
     }
 
+    if needs_print {
+        agent.command.push("-p".to_string());
+    }
     if needs_verbose {
         agent.command.push("--verbose".to_string());
     }
@@ -1373,8 +1378,9 @@ mod tests {
 
     #[test]
     fn ensure_required_flags_adds_missing_claude_flags() {
-        let mut agent = make_agent(vec!["claude", "-p"]);
+        let mut agent = make_agent(vec!["claude"]);
         ensure_required_flags(&mut agent);
+        assert!(agent.command.contains(&"-p".to_string()));
         assert!(agent.command.contains(&"--verbose".to_string()));
         assert!(agent.command.contains(&"--output-format".to_string()));
         assert!(agent.command.contains(&"stream-json".to_string()));
@@ -1404,6 +1410,24 @@ mod tests {
         let original_len = agent.command.len();
         ensure_required_flags(&mut agent);
         assert_eq!(agent.command.len(), original_len);
+    }
+
+    #[test]
+    fn ensure_required_flags_accepts_long_print_flag_without_duplicate() {
+        let mut agent = make_agent(vec![
+            "claude",
+            "--print",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--disallowedTools=AskUserQuestion",
+        ]);
+        let original_len = agent.command.len();
+        ensure_required_flags(&mut agent);
+
+        assert_eq!(agent.command.len(), original_len);
+        assert!(!agent.command.iter().any(|s| s == "-p"));
     }
 
     #[test]
@@ -1698,7 +1722,7 @@ mod tests {
     #[test]
     fn is_claude_command_detects_wrapper_script() {
         assert!(is_claude_command(&[
-            "/Users/owa/shell/claude-wrapper.sh".to_string()
+            "/opt/tools/claude-wrapper.sh".to_string()
         ]));
         assert!(is_claude_command(&[
             "./claude-wrapper.sh".to_string(),
@@ -1719,16 +1743,14 @@ mod tests {
     fn ensure_required_flags_works_with_wrapper() {
         let mut agent = Agent {
             name: "claude".to_string(),
-            command: vec![
-                "/Users/owa/shell/claude-wrapper.sh".to_string(),
-                "-p".to_string(),
-            ],
+            command: vec!["/opt/tools/claude-wrapper.sh".to_string()],
             reset_weekday: "friday".to_string(),
             reset_time: "13:00".to_string(),
             timezone: "Asia/Tokyo".to_string(),
             prompt: None,
         };
         ensure_required_flags(&mut agent);
+        assert!(agent.command.contains(&"-p".to_string()));
         assert!(agent.command.contains(&"--verbose".to_string()));
         assert!(agent.command.contains(&"--output-format".to_string()));
         assert!(agent.command.contains(&"stream-json".to_string()));
