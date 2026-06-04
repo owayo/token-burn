@@ -7,6 +7,8 @@ use crate::config::Agent;
 use crate::display;
 use crate::scanner::{ResolvedTarget, Visibility};
 
+const CLAUDE_BLOCKED_INTERACTIVE_TOOL: &str = "AskUserQuestion";
+
 pub struct ExecutionPlan {
     pub agent: Agent,
     pub tasks: Vec<ResolvedTarget>,
@@ -36,7 +38,8 @@ fn is_claude_command(command: &[String]) -> bool {
 
 /// 既知エージェントに必要なフラグを自動付与する。
 /// `claude` の場合、`--verbose`、`--output-format stream-json`、`--include-partial-messages`
-/// はログ取得に必須であり、常に存在しなければならない。
+/// はログ取得に必須であり、常に存在しなければならない。また、token-burn は無人実行のため、
+/// ユーザー回答待ちで停止する `AskUserQuestion` を禁止する。
 fn ensure_required_flags(agent: &mut Agent) {
     if !is_claude_command(&agent.command) {
         return;
@@ -87,6 +90,62 @@ fn ensure_required_flags(agent: &mut Agent) {
     }
     if needs_partial {
         agent.command.push("--include-partial-messages".to_string());
+    }
+    ensure_disallowed_tool(&mut agent.command, CLAUDE_BLOCKED_INTERACTIVE_TOOL);
+}
+
+fn ensure_disallowed_tool(command: &mut Vec<String>, tool: &str) {
+    let mut idx = 0usize;
+    while idx < command.len() {
+        if let Some((flag, tools)) = command[idx].split_once('=')
+            && is_disallowed_tools_flag(flag)
+        {
+            let flag = flag.to_string();
+            if !tool_list_contains(tools, tool) {
+                command[idx] = format!("{flag}={}", append_tool(tools, tool));
+            }
+            return;
+        }
+
+        if is_disallowed_tools_flag(&command[idx]) {
+            let flag = command[idx].clone();
+            let value_start = idx + 1;
+            let mut value_end = value_start;
+            while value_end < command.len() && !command[value_end].starts_with('-') {
+                value_end += 1;
+            }
+
+            let mut tools = command[value_start..value_end].join(",");
+            if !tool_list_contains(&tools, tool) {
+                tools = append_tool(&tools, tool);
+            }
+            command[idx] = format!("{flag}={tools}");
+            command.drain(value_start..value_end);
+            return;
+        }
+
+        idx += 1;
+    }
+
+    command.push(format!("--disallowedTools={tool}"));
+}
+
+fn is_disallowed_tools_flag(flag: &str) -> bool {
+    flag == "--disallowedTools" || flag == "--disallowed-tools"
+}
+
+fn tool_list_contains(tools: &str, tool: &str) -> bool {
+    tools
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .any(|part| part == tool)
+}
+
+fn append_tool(tools: &str, tool: &str) -> String {
+    let tools = tools.trim_end();
+    if tools.is_empty() {
+        tool.to_string()
+    } else {
+        format!("{tools},{tool}")
     }
 }
 
@@ -1324,6 +1383,11 @@ mod tests {
                 .command
                 .contains(&"--include-partial-messages".to_string())
         );
+        assert!(
+            agent
+                .command
+                .contains(&"--disallowedTools=AskUserQuestion".to_string())
+        );
     }
 
     #[test]
@@ -1335,6 +1399,7 @@ mod tests {
             "--output-format",
             "stream-json",
             "--include-partial-messages",
+            "--disallowedTools=AskUserQuestion",
         ]);
         let original_len = agent.command.len();
         ensure_required_flags(&mut agent);
@@ -1359,13 +1424,18 @@ mod tests {
         let mut agent = make_agent(vec!["claude", "-p", "--output-format=stream-json"]);
         let original_len = agent.command.len();
         ensure_required_flags(&mut agent);
-        assert_eq!(agent.command.len(), original_len + 2);
+        assert_eq!(agent.command.len(), original_len + 3);
         assert!(
             agent
                 .command
                 .contains(&"--output-format=stream-json".to_string())
         );
         assert!(!agent.command.iter().any(|s| s == "--output-format"));
+        assert!(
+            agent
+                .command
+                .contains(&"--disallowedTools=AskUserQuestion".to_string())
+        );
     }
 
     #[test]
@@ -1378,6 +1448,78 @@ mod tests {
             .position(|s| s == "--output-format")
             .expect("output-format flag should exist");
         assert_eq!(agent.command.get(idx + 1), Some(&"stream-json".to_string()));
+    }
+
+    #[test]
+    fn ensure_required_flags_appends_ask_user_question_to_existing_disallowed_tools() {
+        let mut agent = make_agent(vec![
+            "claude",
+            "-p",
+            "--disallowedTools",
+            "Bash,Edit",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+        ]);
+        ensure_required_flags(&mut agent);
+
+        assert!(
+            agent
+                .command
+                .contains(&"--disallowedTools=Bash,Edit,AskUserQuestion".to_string())
+        );
+        assert!(!agent.command.iter().any(|s| s == "--disallowedTools"));
+    }
+
+    #[test]
+    fn ensure_required_flags_accepts_kebab_disallowed_tools_flag_without_duplicate() {
+        let mut agent = make_agent(vec![
+            "claude",
+            "-p",
+            "--disallowed-tools",
+            "Bash",
+            "AskUserQuestion",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+        ]);
+        ensure_required_flags(&mut agent);
+
+        assert!(
+            agent
+                .command
+                .contains(&"--disallowed-tools=Bash,AskUserQuestion".to_string())
+        );
+        assert_eq!(
+            agent
+                .command
+                .iter()
+                .filter(|arg| arg.contains("AskUserQuestion"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ensure_required_flags_appends_to_equals_style_disallowed_tools() {
+        let mut agent = make_agent(vec![
+            "claude",
+            "-p",
+            "--disallowedTools=Bash",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+        ]);
+        ensure_required_flags(&mut agent);
+
+        assert!(
+            agent
+                .command
+                .contains(&"--disallowedTools=Bash,AskUserQuestion".to_string())
+        );
     }
 
     #[test]
@@ -1395,6 +1537,11 @@ mod tests {
         assert_eq!(plan.tasks[0].display_name, "repo");
         // claude エージェントにはフラグが自動付与される
         assert!(plan.agent.command.contains(&"--verbose".to_string()));
+        assert!(
+            plan.agent
+                .command
+                .contains(&"--disallowedTools=AskUserQuestion".to_string())
+        );
     }
 
     #[test]
@@ -1589,6 +1736,11 @@ mod tests {
             agent
                 .command
                 .contains(&"--include-partial-messages".to_string())
+        );
+        assert!(
+            agent
+                .command
+                .contains(&"--disallowedTools=AskUserQuestion".to_string())
         );
     }
 

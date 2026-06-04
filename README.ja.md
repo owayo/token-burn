@@ -49,9 +49,10 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **デッドライン制御**: リセット時刻到達時に新規タスクの開始を止め、実行中タスクの完了を待機
 - **並列実行**: tmuxペイン分割とプログレスモニター付きで複数プロンプトを同時実行
 - **tmux デタッチ安全性**: デタッチ時はワーカースクリプトとキューを保持し、tmux セッション終了までバックグラウンドタスクを安全に継続
+- **Claude の無人実行**: Claude Code の `AskUserQuestion` ツールを自動禁止し、token-burn ジョブが対話回答待ちで停止しないようにする
 - **サブエージェント監視**: Claude Codeのチーム/エージェントタスクの開始・進捗・状態更新・完了をリアルタイム表示
 - **システム通知の可視化**: stop hook エラーなどの Claude Code システム通知に加え、`hook_progress` / `hook_response` に stderr や output が含まれる場合のフック診断も表示
-- **ツール詳細の強化**: Claude の stream-json に含まれる `Read` の offset/limit、`Edit` の一括置換状態、`Bash` の timeout/background 状態、`Agent` のバックグラウンド状態、`Grep`/`Glob` の output mode・type・ignore-case・multiline・glob・head/context 制限、`ScheduleWakeup` の待機時間/理由、`WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results`、`Monitor` の説明/タイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`TaskCreate` の `subject` / `description` / `activeForm`、`TaskUpdate` の `taskId` / `status` / `owner` / `subject` / `description`、`SendMessage` の要約、`AskUserQuestion` の質問/選択肢、Tavily/Codex MCP の model/sandbox/approval 詳細、Context7 MCP ツールの library/query を表示
+- **ツール詳細の強化**: Claude の stream-json に含まれる `Read` の offset/limit、`Edit` の一括置換状態、`Bash` の timeout/background 状態、`Agent` のバックグラウンド状態、`Grep`/`Glob` の output mode・type・ignore-case・multiline・glob・head/context 制限、`ScheduleWakeup` の待機時間/理由、`WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results`、`Monitor` の説明/タイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`TaskCreate` の `subject` / `description` / `activeForm`、`TaskUpdate` の `taskId` / `status` / `owner` / `subject` / `description`、`SendMessage` の要約、既存ログなどに含まれる `AskUserQuestion` の質問/選択肢、Tavily/Codex MCP の model/sandbox/approval 詳細、Context7 MCP ツールの library/query を表示
 - **サブエージェント停止の可視化**: `task_notification` の `status="stopped"`（`TaskStop` 等で停止された場合）もモニターに表示。`usage` が無い通知では duration/token を 0 として表示しない
 - **ツールエラー要約**: `tool_result` の `is_error:true` を検出すると、エラー内容の先頭の有意な 1 行を 120 文字までに省略してモニターに併記（単一行/複数行の `<tool_use_error>` ラッパーは除去）。jsonl を開かずに失敗の原因が分かる
 - **ツール結果メタデータ**: top-level `tool_use_result` に含まれる出力切り詰め、適用 limit、stale read ヒント、自動バックグラウンド化、待機時間の clamp、永続化出力サイズ、戻りコード解釈、Agent の duration/token/tool 数、Grep/ToolSearch の結果件数、git commit 操作（sha/kind）、TaskUpdate の状態遷移、ScheduleWakeup の予定時刻、Skill のコマンド名などの重要情報を表示
@@ -221,7 +222,7 @@ timezone = "Asia/Tokyo"
 
 **プロンプト優先順位**: `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default`
 
-**Claude 必須フラグの自動付与**: コマンドの実行ファイルが `claude` の場合、ログ出力と進捗モニタリングに必要な `--verbose`、`--output-format stream-json`、`--include-partial-messages` が必ず有効化されます。未指定フラグは自動追加され、既存の `--output-format` 値（`--output-format=...` 形式を含む）は `stream-json` に正規化されます。設定ファイルへの記述は不要です。
+**Claude 必須フラグの自動付与**: コマンドの実行ファイルが `claude` の場合、ログ出力と進捗モニタリングに必要な `--verbose`、`--output-format stream-json`、`--include-partial-messages` と、対話回答待ちを防ぐ `--disallowedTools=AskUserQuestion` が必ず有効化されます。未指定フラグは自動追加され、既存の `--output-format` 値（`--output-format=...` 形式を含む）は `stream-json` に正規化されます。既存の `--disallowedTools` / `--disallowed-tools` がある場合は、必要に応じて equals 形式へ正規化して `AskUserQuestion` を追記します。設定ファイルへの記述は不要です。
 
 `reset_weekday` に指定可能な値: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday`（短縮形: `mon` `tue` `wed` `thu` `fri` `sat` `sun`）
 
