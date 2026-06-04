@@ -14,7 +14,21 @@ token-burn/
 │   ├── scanner.rs          # ディレクトリスキャン・リポジトリ探索・gh CLI連携
 │   ├── schedule.rs         # リセット日時計算、最寄りエージェント選択
 │   ├── executor.rs         # プロセス起動・並列実行管理（tokio）
-│   ├── format_stream.rs    # claude stream-json出力のフォーマッター
+│   ├── format_stream/      # claude stream-json出力のフォーマッター（モジュール分割）
+│   │   ├── mod.rs          # pub run / process（JSON行のトップレベル dispatch）
+│   │   ├── state.rs        # StreamState / StreamSummary / UsageSummary
+│   │   ├── blocks.rs       # ContentBlockState・ブロック確定（finalize_block 等）
+│   │   ├── stream.rs       # handle_stream_event（content_block_* ハンドラ）
+│   │   ├── system.rs       # handle_system_event（task通知 / hook / api_retry）
+│   │   ├── result.rs       # handle_result（コスト・トークン・モデル別使用量等の各行生成）
+│   │   ├── rate_limit.rs   # handle_rate_limit_event（reset時刻 / stop_file）
+│   │   ├── diff.rs         # format_tool_diff / format_diff_lines
+│   │   ├── util.rs         # truncate_str / format_number / first_string 等の小ヘルパー
+│   │   ├── tools/          # ツール詳細・結果メタデータ表示
+│   │   │   ├── mod.rs
+│   │   │   ├── detail.rs   # tool_specific_detail / extract_tool_detail / detail_* 系
+│   │   │   └── metadata.rs # tool_result_metadata
+│   │   └── tests/          # 機能別に分割した #[cfg(test)] テスト群
 │   ├── classify.rs         # 完了 jsonl の分類（success / failed / rate-limited / retryable）
 │   ├── cleanup.rs          # レポートディレクトリの自動クリーンアップ
 │   ├── state.rs            # 処理済みターゲット状態の永続化
@@ -65,7 +79,7 @@ make release  # リリースビルド
 
 `format-stream` は `tool_result` の `is_error:true` を検出した場合、エラー内容の先頭の有意な 1 行をサマリーとして表示します（単一行/複数行の `<tool_use_error>...</tool_use_error>` ラッパーは除去）。配列形式の `content` にも対応し、120 文字を超える場合は末尾を `...` で省略します。
 
-`tool_use_result` の top-level メタデータに `truncated`、`appliedLimit`、`staleReadFileStateHint`、`assistantAutoBackgrounded`、`backgroundTaskId`、`wasClamped` / `clampedDelaySeconds`、`persistedOutputPath` / `persistedOutputSize`、`returnCodeInterpretation`、`totalDurationMs` / `totalTokens` / `totalToolUseCount`、`numFiles` / `numLines`、`matches` / `total_deferred_tools`、`statusChange`、`scheduledFor`、`commandName` が含まれる場合は、ツール完了行に短い補足として表示します。
+`tool_use_result` の top-level メタデータに `truncated`、`appliedLimit`、`staleReadFileStateHint`、`assistantAutoBackgrounded`、`backgroundTaskId`、`wasClamped` / `clampedDelaySeconds`、`persistedOutputPath` / `persistedOutputSize`、`returnCodeInterpretation`、`totalDurationMs` / `totalTokens` / `totalToolUseCount`、`numFiles` / `numLines`、`matches`（ToolSearch）/ `numMatches`（Grep の count モード）/ `total_deferred_tools`、`gitOperation`（git commit の sha / kind。`commit:<sha> <kind>` 形式）、`statusChange`、`scheduledFor`、`commandName` が含まれる場合は、ツール完了行に短い補足として表示します。`matches` 配列は ToolSearch 専用で Grep の結果には存在しないため、Grep の count モードでは `numMatches` 整数から件数を表示します。
 
 モニターペインの進捗は `fail:<n> retry:<n>` を併記し、完了時も `%d succeeded / %d failed / %d retry` の形で表示します。
 
@@ -75,6 +89,7 @@ make release  # リリースビルド
 
 - 各タスクは `queue_dir/pending-<idx>` と `tasks/task-<idx>.sh` として事前に書き出される
 - ワーカーは `pending-<idx>` を `mv` でアトミックに `claimed-<idx>` にリネームして claim し、対応する `task-<idx>.sh` を `source` で実行する
+- 各タスクを `source` する前にワーカーループ先頭で `CANCELLED` フラグを 0 にリセットする。直前タスクの実行中に SIGINT/SIGTERM を受けて `CANCELLED=1` が立ったまま成功・早期 return しても、後続タスクの通常エラーを誤って `Cancelled` 判定しエラー記録を欠落させるのを防ぐ
 - タスクがエラー終了してもワーカーは `exec sleep infinity` せず、即座に次の `pending-*` を取りに行く
 - ワーカーは claim できる pending が尽きるまで処理を続け、尽きて初めて `worker-done-<w>` を作成して終了する
 - ユーザーが tmux をデタッチした場合、tmux セッションが生存していれば `/tmp/token-burn` は削除しない。ワーカーのキュー・タスクスクリプト・プロンプトファイルを保持し、バックグラウンド実行を継続できるようにする
@@ -91,7 +106,7 @@ make release  # リリースビルド
 - `Grep` / `Glob` の検索パターン、対象パス、`output_mode`、`type`、`glob`、`head_limit`、`context`、`-A` / `-B` / `-C` / `-n` / `-i`、`multiline` を表示
 - `ScheduleWakeup` の待機時間と理由を表示
 - `WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results` を表示
-- `Monitor` の説明とタイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`TaskCreate` の `subject` / `description` / `activeForm`、`TaskUpdate` の `taskId` / `status` / `owner` / `subject` / `description`、`SendMessage` の送信先/要約、`AskUserQuestion` の質問数・選択肢数、Tavily の query/max/time range/search depth、Codex MCP の prompt/cwd/model/sandbox/approval-policy、Context7 MCP ツールの library/query を表示
+- `Monitor` の説明とタイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`TaskCreate` の `subject` / `description` / `activeForm`、`TaskUpdate` の `taskId` / `status` / `owner` / `subject` / `description`、`SendMessage` の送信先/要約、`AskUserQuestion` の質問数・選択肢数、Tavily search の query/max/time range/search depth と Tavily extract の先頭 URL/件数(+N more)/extract_depth、Codex MCP の prompt/cwd/model/sandbox/approval-policy、Context7 MCP ツールの library/query を表示
 - サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）。`task_notification` は `completed` / `failed` に加え `stopped` も表示し、`usage` が無い場合は duration/token を 0 として表示しない
 - Claude Code のシステム通知（`notification`。例: stop hook エラー）と、出力を伴う hook 診断（`hook_progress` / `hook_response` の stderr / output）
 - `tool_use_result` の出力切り詰め、適用 limit、stale read ヒント、自動バックグラウンド化、clamp、永続化出力サイズ、戻りコード解釈、Agent の duration/token/tool 数、Grep/ToolSearch の結果件数、TaskUpdate の状態遷移、ScheduleWakeup の予定時刻、Skill のコマンド名の補足表示

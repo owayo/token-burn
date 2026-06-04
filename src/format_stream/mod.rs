@@ -1,0 +1,159 @@
+use anyhow::Result;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, BufRead, Write};
+use std::path::Path;
+
+mod blocks;
+mod diff;
+mod rate_limit;
+mod result;
+mod state;
+mod stream;
+mod system;
+mod tools;
+mod util;
+
+use blocks::{ContentBlockState, finalize_open_blocks};
+use rate_limit::handle_rate_limit_event;
+use result::handle_result;
+use state::{StreamState, StreamSummary};
+use stream::handle_stream_event;
+use system::handle_system_event;
+use tools::metadata::tool_result_metadata;
+use util::extract_tool_result_summary;
+
+/// `claude -p` の stream-json 出力を読みやすいテキストに変換する。
+/// JSON以外の行はそのまま出力（任意のエージェントで動作）。
+pub fn run(raw_output: Option<&Path>, stop_file: Option<&Path>, threshold: u8) -> Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let out = stdout.lock();
+    process(stdin.lock(), out, raw_output, stop_file, threshold)
+}
+
+fn process(
+    reader: impl BufRead,
+    mut out: impl Write,
+    raw_output: Option<&Path>,
+    stop_file: Option<&Path>,
+    threshold: u8,
+) -> Result<()> {
+    let mut tool_id_map: HashMap<String, String> = HashMap::new();
+    let mut blocks: HashMap<usize, ContentBlockState> = HashMap::new();
+    let mut summary = StreamSummary::default();
+    let mut raw_writer = match raw_output {
+        Some(path) => Some(io::BufWriter::new(File::create(path)?)),
+        None => None,
+    };
+
+    for line in reader.lines() {
+        let line = line?;
+        if let Some(writer) = raw_writer.as_mut() {
+            writeln!(writer, "{}", line)?;
+        }
+        if line.is_empty() {
+            continue;
+        }
+
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                // JSON以外 — そのまま出力（例: codex のプレーンテキスト出力）
+                writeln!(out, "{}", line)?;
+                out.flush()?;
+                continue;
+            }
+        };
+
+        let msg_type = v["type"].as_str().unwrap_or("");
+
+        match msg_type {
+            "system" => {
+                summary.update_from_system(&v);
+                handle_system_event(&v, &mut out)?;
+            }
+            "stream_event" => {
+                handle_stream_event(
+                    &v["event"],
+                    &mut out,
+                    &mut StreamState {
+                        blocks: &mut blocks,
+                        tool_id_map: &mut tool_id_map,
+                        summary: &mut summary,
+                    },
+                )?;
+            }
+            "assistant" => {
+                // assistant メッセージから tool_use ID を抽出（サブエージェントのツール結果に必要）
+                if let Some(content) = v["message"]["content"].as_array() {
+                    for item in content {
+                        if matches!(item["type"].as_str(), Some("tool_use" | "server_tool_use"))
+                            && let (Some(id), Some(name)) =
+                                (item["id"].as_str(), item["name"].as_str())
+                        {
+                            tool_id_map.insert(id.to_string(), name.to_string());
+                        }
+                    }
+                }
+            }
+            "user" => {
+                // ツール結果 — 完了したツール名を表示
+                if let Some(content) = v["message"]["content"].as_array() {
+                    for item in content {
+                        if item["type"].as_str() == Some("tool_result") {
+                            let id = item["tool_use_id"].as_str().unwrap_or("");
+                            let name = tool_id_map.get(id).map(|s| s.as_str()).unwrap_or("?");
+                            let is_error = item["is_error"].as_bool().unwrap_or(false);
+                            let metadata = tool_result_metadata(&v["tool_use_result"]);
+                            let metadata = if metadata.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [{}]", metadata)
+                            };
+                            if is_error {
+                                // エラー内容のサマリーがある場合は併記する
+                                let summary = extract_tool_result_summary(&item["content"]);
+                                if summary.is_empty() {
+                                    writeln!(
+                                        out,
+                                        "\x1b[31m  \u{2717} {}{}\x1b[0m",
+                                        name, metadata
+                                    )?;
+                                } else {
+                                    writeln!(
+                                        out,
+                                        "\x1b[31m  \u{2717} {} — {}{}\x1b[0m",
+                                        name, summary, metadata
+                                    )?;
+                                }
+                            } else {
+                                writeln!(out, "\x1b[2m  \u{2713} {}{}\x1b[0m", name, metadata)?;
+                            }
+                        }
+                    }
+                }
+            }
+            "result" => {
+                summary.update_from_result(v.as_object());
+                finalize_open_blocks(&mut out, &mut blocks)?;
+                handle_result(&v, &summary, &mut out)?;
+            }
+            "rate_limit_event" => {
+                handle_rate_limit_event(&v, &mut out, stop_file, threshold)?;
+            }
+            _ => {} // message_stop 等
+        }
+    }
+
+    finalize_open_blocks(&mut out, &mut blocks)?;
+    out.flush()?;
+    if let Some(writer) = raw_writer.as_mut() {
+        writer.flush()?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

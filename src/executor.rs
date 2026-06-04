@@ -779,6 +779,10 @@ fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "    echo '━━━ Stopped ━━━'\n",
             "    break\n",
             "  fi\n",
+            // 各タスク開始前に必ずリセットする。直前タスクの実行中に SIGINT/SIGTERM を
+            // 受けて CANCELLED=1 が立ったまま成功・早期 return した場合でも、後続タスクの
+            // 通常エラーを誤って「Cancelled」と判定しエラー記録を欠落させるのを防ぐ。
+            "  CANCELLED=0\n",
             "  CLAIMED=\"\"\n",
             "  for pending in \"$QUEUE_DIR\"/pending-*; do\n",
             "    [ -e \"$pending\" ] || continue\n",
@@ -1109,6 +1113,33 @@ mod tests {
         assert!(script.contains("worker-done-0"));
         // 停止シグナル対応
         assert!(script.contains("trap handle_cancel INT TERM"));
+    }
+
+    #[test]
+    fn build_worker_script_resets_cancelled_before_each_task() {
+        // 各タスクを source する前に CANCELLED=0 をリセットすることで、直前タスクの
+        // 実行中に SIGINT/SIGTERM を受けて立った Cancelled フラグが後続タスクへ漏れ、
+        // 通常のエラーを誤って「Cancelled」と判定するのを防ぐ。
+        let tmp = std::path::PathBuf::from("/tmp/burn");
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &tmp.join("queue"),
+            task_dir: &tmp.join("tasks"),
+            marker_dir: &tmp.join("markers"),
+            stop_file: &tmp.join("stop"),
+        });
+
+        // while ループ本体（task を source する前）で CANCELLED をリセットすること
+        let loop_start = script.find("while true; do").expect("worker loop missing");
+        let source_idx = script
+            .find("source \"$TASK_SCRIPT\"")
+            .expect("source missing");
+        let loop_body = &script[loop_start..source_idx];
+        assert!(
+            loop_body.contains("CANCELLED=0"),
+            "worker loop must reset CANCELLED before sourcing each task:\n{}",
+            loop_body
+        );
     }
 
     #[test]

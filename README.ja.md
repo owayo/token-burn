@@ -54,7 +54,7 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **ツール詳細の強化**: Claude の stream-json に含まれる `Read` の offset/limit、`Edit` の一括置換状態、`Bash` の timeout/background 状態、`Agent` のバックグラウンド状態、`Grep`/`Glob` の output mode・type・ignore-case・multiline・glob・head/context 制限、`ScheduleWakeup` の待機時間/理由、`WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results`、`Monitor` の説明/タイムアウト、`TaskStop` の task id、`TaskOutput` の task id / `block` / `timeout`、`TaskCreate` の `subject` / `description` / `activeForm`、`TaskUpdate` の `taskId` / `status` / `owner` / `subject` / `description`、`SendMessage` の要約、`AskUserQuestion` の質問/選択肢、Tavily/Codex MCP の model/sandbox/approval 詳細、Context7 MCP ツールの library/query を表示
 - **サブエージェント停止の可視化**: `task_notification` の `status="stopped"`（`TaskStop` 等で停止された場合）もモニターに表示。`usage` が無い通知では duration/token を 0 として表示しない
 - **ツールエラー要約**: `tool_result` の `is_error:true` を検出すると、エラー内容の先頭の有意な 1 行を 120 文字までに省略してモニターに併記（単一行/複数行の `<tool_use_error>` ラッパーは除去）。jsonl を開かずに失敗の原因が分かる
-- **ツール結果メタデータ**: top-level `tool_use_result` に含まれる出力切り詰め、適用 limit、stale read ヒント、自動バックグラウンド化、待機時間の clamp、永続化出力サイズ、戻りコード解釈、Agent の duration/token/tool 数、Grep/ToolSearch の結果件数、TaskUpdate の状態遷移、ScheduleWakeup の予定時刻、Skill のコマンド名などの重要情報を表示
+- **ツール結果メタデータ**: top-level `tool_use_result` に含まれる出力切り詰め、適用 limit、stale read ヒント、自動バックグラウンド化、待機時間の clamp、永続化出力サイズ、戻りコード解釈、Agent の duration/token/tool 数、Grep/ToolSearch の結果件数、git commit 操作（sha/kind）、TaskUpdate の状態遷移、ScheduleWakeup の予定時刻、Skill のコマンド名などの重要情報を表示
 - **ログパイプラインの安全性**: `format-stream`、`tee`、raw jsonl 保存に失敗したタスクを完了扱いにせず失敗として記録
 - **モデル別使用量**: 結果サマリーにモデルごと（Opus、Haiku等）のトークン使用量・コスト・キャッシュ読み取り/書き込み・Web検索回数、そして各モデルのコンテキスト上限/最大出力上限（例: `ctx:1M` / `max_out:64K`）を表示
 - **API応答時間**: 実行時間に加えてAPI応答時間と初回トークン到達時間を表示
