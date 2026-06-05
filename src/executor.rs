@@ -145,19 +145,32 @@ fn ensure_codex_unattended_flags(command: &mut Vec<String>) {
 
 /// ユーザーが codex の承認方針を明示済みかを判定する。
 /// 明示済みなら token-burn は `approval_policy` を上書きしない。
+///
+/// clap の short option は値結合形式（`-aVALUE` / `-a=VALUE`）も受理するため、
+/// スペース区切り・結合・`=` 形式のすべてを検出する。`--` 以降は位置引数
+/// （prompt 等）なのでオプションとして解釈しない。
 fn has_codex_approval_override(command: &[String]) -> bool {
     let mut idx = 0usize;
     while idx < command.len() {
         let arg = &command[idx];
 
+        // `--` 以降は位置引数。オプション走査を打ち切る。
+        if arg == "--" {
+            break;
+        }
+
+        // 承認フラグ: --ask-for-approval / -a（単体・結合・= 形式）、
+        // および承認とサンドボックスを一括無効化する bypass フラグ。
         if arg == "--dangerously-bypass-approvals-and-sandbox"
             || arg == "-a"
             || arg == "--ask-for-approval"
             || arg.starts_with("--ask-for-approval=")
+            || arg.strip_prefix("-a").is_some_and(|rest| !rest.is_empty())
         {
             return true;
         }
 
+        // -c / --config のスペース区切り形式（値は次要素）
         if arg == "-c" || arg == "--config" {
             if command
                 .get(idx + 1)
@@ -169,10 +182,19 @@ fn has_codex_approval_override(command: &[String]) -> bool {
             continue;
         }
 
+        // --config=key=value 形式
         if let Some(value) = arg.strip_prefix("--config=")
             && is_approval_policy_override(value)
         {
             return true;
+        }
+
+        // -c 値結合形式（-cKEY=VALUE / -c=KEY=VALUE）
+        if let Some(rest) = arg.strip_prefix("-c").filter(|rest| !rest.is_empty()) {
+            let value = rest.strip_prefix('=').unwrap_or(rest);
+            if is_approval_policy_override(value) {
+                return true;
+            }
         }
 
         idx += 1;
@@ -1988,6 +2010,80 @@ mod tests {
         ];
         ensure_codex_unattended_flags(&mut command);
         assert!(command.contains(&"approval_policy=never".to_string()));
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_respects_attached_short_approval() {
+        // -a=never / -anever（clap の short option 値結合形式）も尊重する
+        for arg in ["-a=never", "-anever"] {
+            let mut command = vec!["codex".to_string(), arg.to_string(), "exec".to_string()];
+            let original = command.clone();
+            ensure_codex_unattended_flags(&mut command);
+            assert_eq!(command, original, "should respect {arg}");
+        }
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_respects_attached_config_approval() {
+        // -capproval_policy=... / -c=approval_policy=...（-c 値結合形式）も尊重する
+        for arg in [
+            "-capproval_policy=on-request",
+            "-c=approval_policy=on-request",
+        ] {
+            let mut command = vec!["codex".to_string(), "exec".to_string(), arg.to_string()];
+            let original = command.clone();
+            ensure_codex_unattended_flags(&mut command);
+            assert_eq!(command, original, "should respect {arg}");
+        }
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_respects_spaced_config_approval() {
+        // --config approval_policy=...（スペース区切りの long config）も尊重する
+        let mut command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "--config".to_string(),
+            "approval_policy=never".to_string(),
+        ];
+        let original = command.clone();
+        ensure_codex_unattended_flags(&mut command);
+        assert_eq!(command, original);
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_attached_unrelated_config_still_adds() {
+        // -cmodel=... のような無関係な結合 config では尊重判定にならず付与される
+        let mut command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "-cmodel=gpt-5.5".to_string(),
+        ];
+        ensure_codex_unattended_flags(&mut command);
+        assert!(command.contains(&"approval_policy=never".to_string()));
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_stops_at_double_dash() {
+        // `--` 以降は位置引数。承認フラグとして誤検出せず付与する
+        let mut command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "--".to_string(),
+            "-a".to_string(),
+        ];
+        ensure_codex_unattended_flags(&mut command);
+        assert_eq!(
+            &command[..3],
+            &[
+                "codex".to_string(),
+                "-c".to_string(),
+                "approval_policy=never".to_string(),
+            ]
+        );
+        // `--` 以降はそのまま保持される
+        assert!(command.contains(&"--".to_string()));
+        assert!(command.contains(&"-a".to_string()));
     }
 
     #[test]
