@@ -8,6 +8,10 @@ use crate::display;
 use crate::scanner::{ResolvedTarget, Visibility};
 
 const CLAUDE_BLOCKED_INTERACTIVE_TOOL: &str = "AskUserQuestion";
+/// codex を無人実行する際、コマンド承認待ちで停止しないための config override。
+/// `codex exec` には `--ask-for-approval` フラグが無い（0.136.0）ため、サブコマンドの
+/// オプション表面に依存しない top-level の `-c approval_policy=never` を使う。
+const CODEX_APPROVAL_OVERRIDE: &str = "approval_policy=never";
 
 pub struct ExecutionPlan {
     pub agent: Agent,
@@ -23,29 +27,48 @@ pub fn build_plan(agent: &Agent, targets: Vec<ResolvedTarget>) -> ExecutionPlan 
     }
 }
 
+/// command の先頭要素（実行ファイル）の basename（拡張子なし）を返す。
+/// 空 command やパス解決不能な場合は空文字列を返す。
+fn command_basename(command: &[String]) -> &str {
+    let Some(first) = command.first() else {
+        return "";
+    };
+    std::path::Path::new(first.as_str())
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+}
+
 /// command の先頭要素が claude 実行ファイル（ラッパースクリプト含む）かを判定する。
 /// ファイル名（basename）が "claude" そのもの、または "claude-" / "claude_" で始まる場合に true。
 fn is_claude_command(command: &[String]) -> bool {
-    let Some(first) = command.first() else {
-        return false;
-    };
-    let basename = std::path::Path::new(first.as_str())
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let basename = command_basename(command);
     basename == "claude" || basename.starts_with("claude-") || basename.starts_with("claude_")
 }
 
+/// command の先頭要素が codex 実行ファイル（ラッパースクリプト含む）かを判定する。
+/// ファイル名（basename）が "codex" そのもの、または "codex-" / "codex_" で始まる場合に true。
+fn is_codex_command(command: &[String]) -> bool {
+    let basename = command_basename(command);
+    basename == "codex" || basename.starts_with("codex-") || basename.starts_with("codex_")
+}
+
 /// 既知エージェントに必要なフラグを自動付与する。
+/// 実行ファイルが `claude` か `codex` かを判定し、それぞれの無人実行に必要な
+/// フラグを付与する。いずれにも該当しない未知のエージェントには何もしない。
+fn ensure_required_flags(agent: &mut Agent) {
+    if is_claude_command(&agent.command) {
+        ensure_claude_required_flags(agent);
+    } else if is_codex_command(&agent.command) {
+        ensure_codex_unattended_flags(&mut agent.command);
+    }
+}
+
 /// `claude` の場合、`-p`、`--verbose`、`--output-format stream-json`、
 /// `--include-partial-messages` はログ取得に必須であり、常に存在しなければならない。
 /// また、token-burn は無人実行のため、
 /// ユーザー回答待ちで停止する `AskUserQuestion` を禁止する。
-fn ensure_required_flags(agent: &mut Agent) {
-    if !is_claude_command(&agent.command) {
-        return;
-    }
-
+fn ensure_claude_required_flags(agent: &mut Agent) {
     let needs_print = !agent.command.iter().any(|s| s == "-p" || s == "--print");
     let needs_verbose = !agent.command.iter().any(|s| s == "--verbose");
     let needs_partial = !agent
@@ -97,6 +120,71 @@ fn ensure_required_flags(agent: &mut Agent) {
         agent.command.push("--include-partial-messages".to_string());
     }
     ensure_disallowed_tool(&mut agent.command, CLAUDE_BLOCKED_INTERACTIVE_TOOL);
+}
+
+/// codex は無人バッチ実行のため、コマンド承認待ちで停止しないよう
+/// `-c approval_policy=never` を付与する。
+///
+/// `codex exec` には `--ask-for-approval` フラグが存在しない（0.136.0 で確認）ため、
+/// サブコマンドのオプション表面に依存しない top-level の config override を
+/// 実行ファイル直後に挿入する（`codex -c approval_policy=never exec ...`）。
+/// `--sandbox` とは独立した軸なので、サンドボックス指定の有無に関わらず付与する。
+///
+/// ユーザーが承認方針を明示済みの場合（`-a` / `--ask-for-approval` /
+/// `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）は
+/// その意図を尊重し、何も付与しない。
+fn ensure_codex_unattended_flags(command: &mut Vec<String>) {
+    if has_codex_approval_override(command) {
+        return;
+    }
+    // 実行ファイル（command[0]）の直後に top-level config override を挿入する。
+    let insert_at = command.len().min(1);
+    command.insert(insert_at, CODEX_APPROVAL_OVERRIDE.to_string());
+    command.insert(insert_at, "-c".to_string());
+}
+
+/// ユーザーが codex の承認方針を明示済みかを判定する。
+/// 明示済みなら token-burn は `approval_policy` を上書きしない。
+fn has_codex_approval_override(command: &[String]) -> bool {
+    let mut idx = 0usize;
+    while idx < command.len() {
+        let arg = &command[idx];
+
+        if arg == "--dangerously-bypass-approvals-and-sandbox"
+            || arg == "-a"
+            || arg == "--ask-for-approval"
+            || arg.starts_with("--ask-for-approval=")
+        {
+            return true;
+        }
+
+        if arg == "-c" || arg == "--config" {
+            if command
+                .get(idx + 1)
+                .is_some_and(|value| is_approval_policy_override(value))
+            {
+                return true;
+            }
+            idx += 2;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--config=")
+            && is_approval_policy_override(value)
+        {
+            return true;
+        }
+
+        idx += 1;
+    }
+    false
+}
+
+/// `key=value` 形式の config override が `approval_policy` キーかを判定する。
+fn is_approval_policy_override(value: &str) -> bool {
+    value
+        .split_once('=')
+        .is_some_and(|(key, _)| key == "approval_policy")
 }
 
 fn ensure_disallowed_tool(command: &mut Vec<String>, tool: &str) {
@@ -1645,7 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_required_flags_ignores_non_claude_agent() {
+    fn ensure_required_flags_adds_codex_approval_policy() {
         let mut agent = Agent {
             name: "codex".to_string(),
             command: vec!["codex".to_string(), "exec".to_string()],
@@ -1654,9 +1742,33 @@ mod tests {
             timezone: "UTC".to_string(),
             prompt: None,
         };
-        let original_len = agent.command.len();
         ensure_required_flags(&mut agent);
-        assert_eq!(agent.command.len(), original_len);
+        // 実行ファイル直後に top-level config override が挿入される
+        assert_eq!(
+            agent.command,
+            vec![
+                "codex".to_string(),
+                "-c".to_string(),
+                "approval_policy=never".to_string(),
+                "exec".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ensure_required_flags_ignores_unknown_agent() {
+        // claude でも codex でもないエージェントは一切変更しない
+        let mut agent = Agent {
+            name: "aider".to_string(),
+            command: vec!["aider".to_string(), "--yes".to_string()],
+            reset_weekday: "thursday".to_string(),
+            reset_time: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            prompt: None,
+        };
+        let original = agent.command.clone();
+        ensure_required_flags(&mut agent);
+        assert_eq!(agent.command, original);
     }
 
     #[test]
@@ -1737,6 +1849,145 @@ mod tests {
         assert!(!is_claude_command(&["codex".to_string()]));
         assert!(!is_claude_command(&["my-claude-fork".to_string()]));
         assert!(!is_claude_command(&[]));
+    }
+
+    #[test]
+    fn is_codex_command_detects_bare_and_wrapper() {
+        assert!(is_codex_command(&["codex".to_string()]));
+        assert!(is_codex_command(&["codex".to_string(), "exec".to_string()]));
+        assert!(is_codex_command(&[
+            "/opt/tools/codex-wrapper.sh".to_string()
+        ]));
+        assert!(is_codex_command(&["codex_custom".to_string()]));
+    }
+
+    #[test]
+    fn is_codex_command_rejects_non_codex() {
+        assert!(!is_codex_command(&["claude".to_string()]));
+        assert!(!is_codex_command(&["my-codex-fork".to_string()]));
+        assert!(!is_codex_command(&[]));
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_inserts_after_executable() {
+        // ユーザーの実際の構成に近いコマンド
+        let mut command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+            "-c".to_string(),
+            "model='gpt-5.5'".to_string(),
+        ];
+        ensure_codex_unattended_flags(&mut command);
+        // 実行ファイル直後に -c approval_policy=never が入る
+        assert_eq!(
+            &command[..3],
+            &[
+                "codex".to_string(),
+                "-c".to_string(),
+                "approval_policy=never".to_string(),
+            ]
+        );
+        // 既存の引数は保持される
+        assert!(command.contains(&"--sandbox".to_string()));
+        assert!(command.contains(&"model='gpt-5.5'".to_string()));
+        // 二重付与しない
+        assert_eq!(
+            command
+                .iter()
+                .filter(|s| *s == "approval_policy=never")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_respects_short_approval_flag() {
+        let mut command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "-a".to_string(),
+            "on-request".to_string(),
+        ];
+        let original = command.clone();
+        ensure_codex_unattended_flags(&mut command);
+        assert_eq!(command, original);
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_respects_long_approval_flag() {
+        let mut command = vec![
+            "codex".to_string(),
+            "--ask-for-approval".to_string(),
+            "never".to_string(),
+            "exec".to_string(),
+        ];
+        let original = command.clone();
+        ensure_codex_unattended_flags(&mut command);
+        assert_eq!(command, original);
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_respects_equals_approval_flag() {
+        let mut command = vec![
+            "codex".to_string(),
+            "--ask-for-approval=never".to_string(),
+            "exec".to_string(),
+        ];
+        let original = command.clone();
+        ensure_codex_unattended_flags(&mut command);
+        assert_eq!(command, original);
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_respects_existing_approval_policy() {
+        let mut command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "-c".to_string(),
+            "approval_policy=on-request".to_string(),
+        ];
+        let original = command.clone();
+        ensure_codex_unattended_flags(&mut command);
+        assert_eq!(command, original);
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_respects_config_equals_approval_policy() {
+        let mut command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "--config=approval_policy=untrusted".to_string(),
+        ];
+        let original = command.clone();
+        ensure_codex_unattended_flags(&mut command);
+        assert_eq!(command, original);
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_respects_bypass_flag() {
+        let mut command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
+        ];
+        let original = command.clone();
+        ensure_codex_unattended_flags(&mut command);
+        assert_eq!(command, original);
+    }
+
+    #[test]
+    fn ensure_codex_unattended_flags_ignores_unrelated_config() {
+        // -c model=... のような無関係な config override は尊重判定にならず付与される
+        let mut command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "-c".to_string(),
+            "model='gpt-5.5'".to_string(),
+        ];
+        ensure_codex_unattended_flags(&mut command);
+        assert!(command.contains(&"approval_policy=never".to_string()));
     }
 
     #[test]
