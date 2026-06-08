@@ -73,6 +73,13 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
         // Grep の count モードは matches 配列ではなく numMatches 整数で件数を返す
         attrs.push(format!("matches:{matches}"));
     }
+    if let Some(mode) = obj
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .filter(|mode| !mode.is_empty())
+    {
+        attrs.push(format!("mode:{mode}"));
+    }
     if let Some(deferred) = obj
         .get("total_deferred_tools")
         .and_then(|value| value.as_u64())
@@ -101,6 +108,8 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     }
     if let Some(ms) = obj.get("totalDurationMs").and_then(|value| value.as_u64()) {
         attrs.push(format!("duration:{}", format_millis_as_seconds(ms)));
+    } else if let Some(ms) = obj.get("durationMs").and_then(|value| value.as_u64()) {
+        attrs.push(format!("duration:{}", format_millis_as_seconds(ms)));
     }
     if let Some(tokens) = obj.get("totalTokens").and_then(|value| value.as_u64()) {
         attrs.push(format!("tokens:{}", format_number(tokens)));
@@ -110,6 +119,56 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
         .and_then(|value| value.as_u64())
     {
         attrs.push(format!("tools:{count}"));
+    }
+    if let Some(tasks) = obj.get("tasks").and_then(|value| value.as_array()) {
+        attrs.push(format!("tasks:{}", tasks.len()));
+    }
+    if let Some(task) = obj.get("task").and_then(|value| value.as_object()) {
+        let id = task
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let subject = task
+            .get("subject")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if !id.is_empty() && !subject.is_empty() {
+            attrs.push(format!("task:{id} {}", truncate_inline(subject, 40)));
+        } else if !id.is_empty() {
+            attrs.push(format!("task:{id}"));
+        }
+    }
+    if let Some(status) = obj
+        .get("retrieval_status")
+        .and_then(|value| value.as_str())
+        .filter(|status| !status.is_empty())
+    {
+        attrs.push(format!("retrieval:{status}"));
+    }
+    if obj
+        .get("outputFile")
+        .and_then(|value| value.as_str())
+        .is_some_and(|path| !path.is_empty())
+    {
+        if obj
+            .get("canReadOutputFile")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            attrs.push("output-file:readable".to_string());
+        } else {
+            attrs.push("output-file".to_string());
+        }
+    }
+    if let Some(timeout) = obj.get("timeoutMs").and_then(|value| value.as_u64()) {
+        attrs.push(format!("timeout:{}", format_millis_as_seconds(timeout)));
+    }
+    if obj
+        .get("persistent")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        attrs.push("persistent".to_string());
     }
     if obj
         .get("userModified")

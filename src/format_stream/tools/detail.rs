@@ -48,6 +48,7 @@ fn tool_specific_detail(tool_name: &str, v: &serde_json::Value) -> DetailResult 
         "Monitor" => DetailResult::Handled(detail_monitor(v)),
         "SendMessage" => detail_send_message(v),
         "TaskCreate" => detail_task_create(v),
+        "TaskList" => DetailResult::Handled(detail_task_list(v)),
         "TaskUpdate" => detail_task_update(v),
         "TaskStop" => detail_task_stop(v),
         "TaskOutput" => detail_task_output(v),
@@ -109,6 +110,9 @@ fn detail_bash(v: &serde_json::Value) -> String {
     if v["run_in_background"].as_bool() == Some(true) {
         attrs.push("background".to_string());
     }
+    if v["dangerouslyDisableSandbox"].as_bool() == Some(true) {
+        attrs.push("sandbox:disabled".to_string());
+    }
     let attr_text = if attrs.is_empty() {
         String::new()
     } else {
@@ -151,6 +155,9 @@ fn detail_grep_or_glob(v: &serde_json::Value) -> DetailResult {
     if let Some(context) = v["context"].as_u64() {
         attrs.push(format!("ctx:{context}"));
     }
+    if let Some(offset) = v["offset"].as_u64() {
+        attrs.push(format!("offset:{offset}"));
+    }
     for key in ["-A", "-B", "-C"] {
         if let Some(value) = v[key].as_u64() {
             attrs.push(format!("{}:{value}", key.trim_start_matches('-')));
@@ -161,6 +168,9 @@ fn detail_grep_or_glob(v: &serde_json::Value) -> DetailResult {
     }
     if v["-i"].as_bool() == Some(true) {
         attrs.push("ignore-case".to_string());
+    }
+    if v["-o"].as_bool() == Some(true) {
+        attrs.push("only-matching".to_string());
     }
     if v["multiline"].as_bool() == Some(true) {
         attrs.push("multiline".to_string());
@@ -347,23 +357,31 @@ fn detail_tool_search(v: &serde_json::Value) -> DetailResult {
 fn detail_monitor(v: &serde_json::Value) -> String {
     let desc = v["description"].as_str().unwrap_or("");
     let cmd = v["command"].as_str().unwrap_or("");
-    let timeout_ms = v["timeout_ms"].as_u64();
+    let condition = v["condition"].as_str().unwrap_or("");
+    let timeout_seconds = v["timeout_seconds"]
+        .as_u64()
+        .or_else(|| v["timeout_ms"].as_u64().map(|ms| ms / 1000));
     let persistent = v["persistent"].as_bool().unwrap_or(false);
 
     let mut detail = if !desc.is_empty() {
         truncate_str(desc, 80)
     } else if !cmd.is_empty() {
         truncate_str(cmd, 80)
+    } else if !condition.is_empty() {
+        truncate_inline(condition, 80)
     } else {
         String::new()
     };
 
     let mut attrs = Vec::new();
-    if let Some(ms) = timeout_ms {
-        attrs.push(format!("timeout={}s", ms / 1000));
+    if let Some(seconds) = timeout_seconds {
+        attrs.push(format!("timeout={seconds}s"));
     }
     if persistent {
         attrs.push("persistent".to_string());
+    }
+    if !condition.is_empty() && (!desc.is_empty() || !cmd.is_empty()) {
+        attrs.push(format!("condition:{}", truncate_inline(condition, 40)));
     }
     if !detail.is_empty() && !attrs.is_empty() {
         detail = format!("{} ({})", detail, attrs.join(", "));
@@ -432,6 +450,11 @@ fn detail_task_create(v: &serde_json::Value) -> DetailResult {
     DetailResult::Fallback
 }
 
+/// TaskList: 入力が空の実データでも、ツールの意図が分かるよう固定ラベルを表示する。
+fn detail_task_list(_v: &serde_json::Value) -> String {
+    "tasks".to_string()
+}
+
 /// TaskUpdate: taskId / status / owner と subject/description を組み合わせて表示。
 /// すべて空なら汎用フォールバックへ。
 fn detail_task_update(v: &serde_json::Value) -> DetailResult {
@@ -474,10 +497,49 @@ fn detail_task_update(v: &serde_json::Value) -> DetailResult {
 
 /// TaskStop: 停止対象の task id を表示。空なら汎用フォールバックへ。
 fn detail_task_stop(v: &serde_json::Value) -> DetailResult {
+    let mut task_ids = Vec::new();
     if let Some(task_id) = v["task_id"].as_str()
         && !task_id.is_empty()
     {
-        return DetailResult::Handled(format!("task {}", truncate_str(task_id, 80)));
+        task_ids.push(task_id);
+    }
+    if let Some(ids) = v["task_ids"].as_array() {
+        for id in ids {
+            if let Some(id) = id.as_str()
+                && !id.is_empty()
+            {
+                task_ids.push(id);
+            }
+        }
+    }
+    let reason = v["reason"].as_str().unwrap_or("");
+
+    let detail = if task_ids.is_empty() {
+        String::new()
+    } else if task_ids.len() == 1 {
+        format!("task {}", truncate_str(task_ids[0], 80))
+    } else {
+        let shown = task_ids
+            .iter()
+            .take(3)
+            .map(|id| truncate_str(id, 24))
+            .collect::<Vec<_>>();
+        let suffix = if task_ids.len() > 3 {
+            format!(" +{} more", task_ids.len() - 3)
+        } else {
+            String::new()
+        };
+        format!("tasks {}{}", shown.join(","), suffix)
+    };
+
+    if !detail.is_empty() && !reason.is_empty() {
+        return DetailResult::Handled(format!("{} ({})", detail, truncate_inline(reason, 60)));
+    }
+    if !detail.is_empty() {
+        return DetailResult::Handled(detail);
+    }
+    if !reason.is_empty() {
+        return DetailResult::Handled(truncate_inline(reason, 100));
     }
     DetailResult::Fallback
 }

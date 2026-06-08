@@ -193,6 +193,7 @@ fn tool_result_metadata_shows_grep_count_matches() {
     let metadata = tool_result_metadata(&value);
 
     assert!(metadata.contains("matches:483"), "{metadata}");
+    assert!(metadata.contains("mode:count"), "{metadata}");
     assert!(metadata.contains("files:1"), "{metadata}");
 }
 
@@ -222,6 +223,31 @@ fn tool_result_metadata_shows_actual_jsonl_agent_usage() {
     assert!(metadata.contains("tokens:90,631"), "{metadata}");
     assert!(metadata.contains("tools:3"), "{metadata}");
     assert!(metadata.contains("status:pending->completed"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_shows_actual_jsonl_task_and_monitor_fields() {
+    // 実 jsonl で確認した TaskList / TaskCreate / TaskOutput / Monitor 系の結果補足。
+    let value = serde_json::json!({
+        "durationMs": 176,
+        "tasks": [{"id": "1"}, {"id": "2"}],
+        "task": {"id": "3", "subject": "レビューと改善"},
+        "retrieval_status": "success",
+        "outputFile": "/tmp/agent-output.log",
+        "canReadOutputFile": true,
+        "timeoutMs": 240000,
+        "persistent": true
+    });
+
+    let metadata = tool_result_metadata(&value);
+
+    assert!(metadata.contains("duration:0.2s"), "{metadata}");
+    assert!(metadata.contains("tasks:2"), "{metadata}");
+    assert!(metadata.contains("task:3 レビューと改善"), "{metadata}");
+    assert!(metadata.contains("retrieval:success"), "{metadata}");
+    assert!(metadata.contains("output-file:readable"), "{metadata}");
+    assert!(metadata.contains("timeout:240s"), "{metadata}");
+    assert!(metadata.contains("persistent"), "{metadata}");
 }
 
 #[test]

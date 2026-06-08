@@ -73,6 +73,16 @@ fn extract_tool_detail_bash_shows_runtime_attrs() {
 }
 
 #[test]
+fn extract_tool_detail_bash_shows_disabled_sandbox() {
+    // 実 jsonl の Bash 入力では、サンドボックス無効化が明示されることがある。
+    let input = r#"{"command":"make install","dangerouslyDisableSandbox":true}"#;
+    assert_eq!(
+        extract_tool_detail("Bash", input),
+        "make install [sandbox:disabled]"
+    );
+}
+
+#[test]
 fn extract_tool_detail_bash_with_description() {
     let input = r#"{"command":"pnpm install","description":"Install deps"}"#;
     assert_eq!(
@@ -96,6 +106,15 @@ fn extract_tool_detail_grep_shows_filters_and_limits() {
     assert_eq!(
         extract_tool_detail("Grep", input),
         "console\\.error @ /repo/src (mode:content, glob:*.ts, head:20, ctx:2, line)"
+    );
+}
+
+#[test]
+fn extract_tool_detail_grep_shows_offset_and_only_matching() {
+    let input = r#"{"pattern":"TODO","path":"/repo","offset":10,"-o":true}"#;
+    assert_eq!(
+        extract_tool_detail("Grep", input),
+        "TODO @ /repo (offset:10, only-matching)"
     );
 }
 
@@ -285,6 +304,15 @@ fn extract_tool_detail_monitor_prefers_description() {
 }
 
 #[test]
+fn extract_tool_detail_monitor_shows_seconds_and_condition() {
+    let input = r#"{"description":"Wait for review","condition":"tokens used","timeout_seconds":120,"persistent":true}"#;
+    assert_eq!(
+        extract_tool_detail("Monitor", input),
+        "Wait for review (timeout=120s, persistent, condition:tokens used)"
+    );
+}
+
+#[test]
 fn extract_tool_detail_monitor_falls_back_to_command() {
     let input = r#"{"command":"until test -s /tmp/output; do sleep 5; done","timeout_ms":300000,"persistent":true}"#;
     assert_eq!(
@@ -294,9 +322,32 @@ fn extract_tool_detail_monitor_falls_back_to_command() {
 }
 
 #[test]
+fn extract_tool_detail_monitor_uses_condition_without_description_or_command() {
+    let input = r#"{"condition":"test -s /tmp/output","timeout_seconds":30}"#;
+    assert_eq!(
+        extract_tool_detail("Monitor", input),
+        "test -s /tmp/output (timeout=30s)"
+    );
+}
+
+#[test]
 fn extract_tool_detail_task_stop_shows_task_id() {
     let input = r#"{"task_id":"b0mfly525"}"#;
     assert_eq!(extract_tool_detail("TaskStop", input), "task b0mfly525");
+}
+
+#[test]
+fn extract_tool_detail_task_stop_shows_task_ids_and_reason() {
+    let input = r#"{"task_ids":["t1","t2","t3","t4"],"reason":"rate limit reached"}"#;
+    assert_eq!(
+        extract_tool_detail("TaskStop", input),
+        "tasks t1,t2,t3 +1 more (rate limit reached)"
+    );
+}
+
+#[test]
+fn extract_tool_detail_task_list_shows_fixed_label() {
+    assert_eq!(extract_tool_detail("TaskList", r#"{}"#), "tasks");
 }
 
 #[test]
