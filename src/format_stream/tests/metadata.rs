@@ -454,3 +454,89 @@ fn tool_result_metadata_preserves_attr_order() {
     });
     assert_eq!(tool_result_metadata(&value), "truncated, limit:10, files:3");
 }
+
+#[test]
+fn tool_result_metadata_webfetch_http_status_and_bytes() {
+    // 実 jsonl の WebFetch 結果: HTTP ステータスコード + codeText と応答サイズを表示する
+    let value = serde_json::json!({
+        "bytes": 123088,
+        "code": 200,
+        "codeText": "OK",
+        "durationMs": 5122
+    });
+
+    let metadata = tool_result_metadata(&value);
+
+    assert!(metadata.contains("http:200 OK"), "{metadata}");
+    assert!(metadata.contains("bytes:120.2KB"), "{metadata}");
+    assert!(metadata.contains("duration:5.1s"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_webfetch_http_without_code_text() {
+    // codeText が無い場合は HTTP ステータスコードのみ表示する
+    let value = serde_json::json!({"code": 404});
+    let metadata = tool_result_metadata(&value);
+    assert!(metadata.contains("http:404"), "{metadata}");
+    assert!(!metadata.contains("http:404 "), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_websearch_results_and_duration() {
+    // 実 jsonl の WebSearch 結果: 検索結果件数と所要時間（秒の float）を表示する
+    let value = serde_json::json!({
+        "query": "example query",
+        "results": [{"title": "a"}, {"title": "b"}, {"title": "c"}],
+        "durationSeconds": 6.919656833999994,
+        "searchCount": 1
+    });
+
+    let metadata = tool_result_metadata(&value);
+
+    assert!(metadata.contains("results:3"), "{metadata}");
+    assert!(metadata.contains("duration:6.9s"), "{metadata}");
+    // searchCount が 1 の通常ケースはノイズを避けるため表示しない
+    assert!(!metadata.contains("searches:"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_websearch_multiple_searches_shown() {
+    // searchCount が 2 以上の場合のみ検索回数を表示する
+    let value = serde_json::json!({
+        "results": [],
+        "searchCount": 3
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(metadata.contains("searches:3"), "{metadata}");
+    assert!(metadata.contains("results:0"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_read_partial_shows_line_ratio() {
+    // Read の file.numLines < totalLines（部分読み取り）は "lines:N/M" で切り詰めを示す
+    let value = serde_json::json!({
+        "type": "text",
+        "file": {"filePath": "/src/big.rs", "numLines": 50, "startLine": 1, "totalLines": 2000}
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(metadata.contains("lines:50/2000"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_read_full_omits_line_ratio() {
+    // 全行読み取り（numLines == totalLines）は比率表示しない（ノイズ回避）
+    let value = serde_json::json!({
+        "type": "text",
+        "file": {"filePath": "/src/small.rs", "numLines": 23, "startLine": 1, "totalLines": 23}
+    });
+    assert_eq!(tool_result_metadata(&value), "");
+}
+
+#[test]
+fn tool_result_metadata_read_missing_total_lines_omits_ratio() {
+    // totalLines が欠けている場合は比率を出さない（部分読み取りの判定不能）
+    let value = serde_json::json!({
+        "file": {"numLines": 10}
+    });
+    assert_eq!(tool_result_metadata(&value), "");
+}

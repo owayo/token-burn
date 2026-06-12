@@ -66,12 +66,59 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     if let Some(lines) = obj.get("numLines").and_then(|value| value.as_u64()) {
         attrs.push(format!("lines:{lines}"));
     }
+    // Read は読み取り結果を file オブジェクトに格納する。部分読み取り（limit 指定や
+    // ファイル途中までの読み取り）では numLines < totalLines となり、切り詰めの判断材料になる。
+    if let Some(file) = obj.get("file").and_then(|value| value.as_object())
+        && let Some(num_lines) = file.get("numLines").and_then(|value| value.as_u64())
+        && let Some(total_lines) = file.get("totalLines").and_then(|value| value.as_u64())
+        && total_lines > num_lines
+    {
+        attrs.push(format!("lines:{num_lines}/{total_lines}"));
+    }
     if let Some(matches) = obj.get("matches").and_then(|value| value.as_array()) {
         // ToolSearch は matches 配列で結果を返す
         attrs.push(format!("matches:{}", matches.len()));
     } else if let Some(matches) = obj.get("numMatches").and_then(|value| value.as_u64()) {
         // Grep の count モードは matches 配列ではなく numMatches 整数で件数を返す
         attrs.push(format!("matches:{matches}"));
+    }
+    // --- Web ツール（WebSearch / WebFetch）の結果メタデータ ---
+    // WebSearch: 検索結果件数 / 検索回数（複数時のみ）/ 所要時間（秒の float）
+    if let Some(results) = obj.get("results").and_then(|value| value.as_array()) {
+        attrs.push(format!("results:{}", results.len()));
+    }
+    if let Some(searches) = obj
+        .get("searchCount")
+        .and_then(|value| value.as_u64())
+        .filter(|count| *count > 1)
+    {
+        attrs.push(format!("searches:{searches}"));
+    }
+    if let Some(seconds) = obj
+        .get("durationSeconds")
+        .and_then(|value| value.as_f64())
+        .filter(|seconds| *seconds > 0.0)
+    {
+        // 既存の ms ベース duration 表示と表記を揃えるためミリ秒へ換算する
+        attrs.push(format!(
+            "duration:{}",
+            format_millis_as_seconds((seconds * 1000.0) as u64)
+        ));
+    }
+    // WebFetch: HTTP ステータスコード（+ codeText）と応答サイズ
+    if let Some(code) = obj.get("code").and_then(|value| value.as_u64()) {
+        if let Some(code_text) = obj
+            .get("codeText")
+            .and_then(|value| value.as_str())
+            .filter(|text| !text.is_empty())
+        {
+            attrs.push(format!("http:{code} {code_text}"));
+        } else {
+            attrs.push(format!("http:{code}"));
+        }
+    }
+    if let Some(bytes) = obj.get("bytes").and_then(|value| value.as_u64()) {
+        attrs.push(format!("bytes:{}", format_byte_size(bytes)));
     }
     if let Some(mode) = obj
         .get("mode")
