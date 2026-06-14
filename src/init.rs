@@ -15,6 +15,26 @@ rate_limit_threshold = 95          # レート制限使用率がこの閾値(%)�
 default = "prompts/default.md"     # .md で終わる値はファイルパスとして読み込み
 # default = "prompts/default.ja.md"
 
+# ---- ai-usage 連携（任意） ----
+# `ai-usage --json` と連携して、リセットまでの時間を実データから自動取得します。
+# 有効化すると、各エージェントの reset_weekday/reset_time は fallback 用になります。
+# [ai_usage]
+# enabled = true
+# command = ["ai-usage", "--json"]   # 連携コマンド（デフォルト: ["ai-usage", "--json"]）
+# window = "weekly"                  # deadline 算出枠: weekly | five_hour | nearest
+# fallback = "fixed"                 # 解決失敗時: fixed(曜日計算に戻す) | skip | error
+# state_window = "weekly"            # 処理済みカットオフの枠: weekly | selected
+#
+# [[ai_usage.profiles]]
+# name = "work"                                            # token-burn 内部の参照名
+# profile = "Work"                                         # ai-usage --json の profile と照合
+# env = { CLAUDE_CONFIG_DIR = "~/.config/claude-work" }    # このアカウントでの起動環境
+#
+# [[ai_usage.profiles]]
+# name = "home"
+# profile = "Home"
+# env = { CLAUDE_CONFIG_DIR = "~/.config/claude-home" }
+
 # ---- エージェント定義 ----
 
 [[agents]]
@@ -26,6 +46,10 @@ reset_weekday = "monday"           # リセット曜日
 reset_time = "09:00"               # リセット時刻
 timezone = "Asia/Tokyo"
 # prompt = "prompts/test-coverage.md"  # エージェント固有プロンプト（省略時は [prompts].default を使用）
+# ai-usage 連携する場合は provider と参照 profile を指定します:
+# provider = "claude"                # ai-usage の (profile, provider) 照合に使用
+# [agents.ai_usage]
+# profiles = ["work", "home"]        # この agent を work/home の 2 アカウントに展開
 
 [[agents]]
 name = "codex"

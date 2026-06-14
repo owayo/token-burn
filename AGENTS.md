@@ -12,7 +12,8 @@ token-burn/
 │   ├── init.rs             # config/prompt 雛形の初期化
 │   ├── config.rs           # TOML設定ファイルの読み込み・バリデーション
 │   ├── scanner.rs          # ディレクトリスキャン・リポジトリ探索・gh CLI連携
-│   ├── schedule.rs         # リセット日時計算、最寄りエージェント選択
+│   ├── schedule.rs         # 固定リセット計算（曜日ベース）・AgentSchedule/ScheduleSource
+│   ├── usage.rs            # ai-usage --json 連携・ScheduleResolver（スケジュール解決・最寄り選択）
 │   ├── executor.rs         # プロセス起動・並列実行管理（tokio）
 │   ├── format_stream/      # claude stream-json出力のフォーマッター（モジュール分割）
 │   │   ├── mod.rs          # pub run / process（JSON行のトップレベル dispatch）
@@ -58,15 +59,30 @@ make release  # リリースビルド
 主要セクション:
 - `[settings]` - 並列実行数、スキップ期間、レポート設定、ターゲット上限
 - `[prompts]` - デフォルトプロンプト
-- `[[agents]]` - エージェント定義（command, リセットスケジュール, prompt）
+- `[ai_usage]` - ai-usage --json 連携設定（任意。enabled / window / fallback / state_window / `[[ai_usage.profiles]]`）
+- `[[agents]]` - エージェント定義（command, provider, env, リセットスケジュール, prompt, ai_usage 連携）
 - `[[scan]]` - ディレクトリ自動スキャン設定
 - `[[targets]]` - 個別ターゲット（任意）
 
-`[[agents]]` の `name` は空文字不可、`command` は1要素以上必須（先頭要素は実行ファイル名）です。
+`[[agents]]` の `name` は空文字不可、`command` は1要素以上必須（先頭要素は実行ファイル名）です。`reset_weekday` / `reset_time` / `timezone` は ai-usage 連携かつ fallback が `fixed` 以外のときは省略可、それ以外（ai-usage 非連携、または fallback=fixed）では必須です。`env`（環境変数マップ）のキーは `[A-Za-z_][A-Za-z0-9_]*` に制限され、値は読み込み時に `~` 展開されます。
 
 実行ファイルが `claude` の場合、`-p`、`--verbose`、`--output-format stream-json`、`--include-partial-messages`、`--disallowedTools=AskUserQuestion` は自動付与されます。`--output-format` が既存でも値は `stream-json` に正規化されます。既存の `--disallowedTools` / `--disallowed-tools` がある場合は、必要に応じて equals 形式へ正規化して `AskUserQuestion` を追記します。
 
 実行ファイルが `codex` の場合、無人実行で承認待ちにより停止しないよう `-c approval_policy=never` を実行ファイル直後に自動付与します（`codex -c approval_policy=never exec ...`）。`codex exec` には `--ask-for-approval` フラグが無い（0.136.0）ため、サブコマンドのオプション表面に依存しない top-level の config override として挿入します。`--sandbox`（サンドボックス）とは独立した軸のため、サンドボックス指定の有無に関わらず付与します。ユーザーが承認方針を明示済みの場合（`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）は上書きしません。
+
+### ai-usage 連携
+
+`[ai_usage]` を設定すると、各エージェントのリセット時刻を `ai-usage --json` の実データ（`weekly.resets_at` 等）から自動取得します。`[ai_usage]` が無い、または `enabled = false` の場合は従来どおり `reset_weekday` / `reset_time` / `timezone` による曜日ベースの固定計算のみで動作します（後方互換）。
+
+- `[ai_usage]`: `enabled`（連携の有効化）、`command`（デフォルト `["ai-usage", "--json"]`）、`window`（deadline 算出枠。`weekly` | `five_hour` | `nearest`、デフォルト `weekly`）、`fallback`（解決失敗時の方針。`fixed` | `skip` | `error`、デフォルト `fixed`）、`state_window`（処理済みカットオフの枠。`weekly` | `selected`、デフォルト `weekly`）。
+- `[[ai_usage.profiles]]`: `name`（内部参照名）、`profile`（`ai-usage --json` の `profile` と大文字小文字を区別して照合）、`env`（そのアカウントで起動する際に付与する環境変数。例: `CLAUDE_CONFIG_DIR`）。
+- `[[agents]]` 側: `provider`（`claude` | `codex` | `antigravity`。ai-usage の `(profile, provider)` 照合に使うため連携時は必須）、`[agents.ai_usage]` の `profiles`（参照する profile 名のリスト）、任意の `window` / `fallback` 上書き。
+
+実行時は agent × profile を `RuntimeAgent` に展開します。例えば agent `claude` が profiles `["work", "home"]` を参照する場合、`claude-work` / `claude-home` の 2 エージェントに展開され、それぞれ profile の `env`（agent の `env` を上書きマージ）を付与して起動します。**profile を 1 つだけ参照する agent は展開名が agent 名のまま**になります（例: agent `codex` が profiles `["home"]` のみ参照 → `codex`）。サフィックス `<agent>-<profile>` が付くのは 2 つ以上参照したときだけで、これにより各アカウントを個別の agent として定義（`claude` / `claude-home` のように起動コマンドが異なるラッパーを使う構成）しても展開名が冗長にならず、`state.json` のキー互換も保たれます。展開名は `state.json` のキーにも使われるため、アカウントごとに処理済み状態が分離されます。`ai-usage --json` は 1 プロセスにつき 1 回だけ実行され（`ScheduleResolver`）、全エージェントで使い回します。
+
+解決に失敗した場合（ai-usage コマンドが無い/失敗、該当 `(profile, provider)` が無い、`ok:false`、該当枠が `null`）は `fallback` に従います: `fixed` は曜日ベースの固定計算に戻り（`status` / `run` の source 表示は `fixed fallback: <理由>`）、`skip` はそのエージェントを選択候補から除外し、`error` は即エラーで停止します。`window = "nearest"` で `five_hour` が選ばれても、`state_window = "weekly"` のときは処理済みカットオフは weekly（`resets_at - 7d`）を基準にします（weekly が無い場合のみ選択枠の period に落ちます）。
+
+リセット時刻は `DateTime<FixedOffset>` で保持します。ai-usage の `resets_at`（RFC3339、オフセット付き）と固定計算（タイムゾーンのオフセット）を同じ型で統一し、ローカル時刻成分を保つためです。`status` と `run` は各エージェントのスケジュールの導出元（`ai-usage (weekly)` / `fixed` / `fixed fallback: <理由>`）を表示し、ai-usage が静かに固定計算へ戻ることはありません。
 
 `claude` エージェントのみ出力を `.jsonl` + `format-stream` パイプラインで処理します。`codex` 等の他エージェントは `.log` に直接出力します。
 

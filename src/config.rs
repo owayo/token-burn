@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
@@ -14,6 +15,9 @@ pub struct Config {
     pub scan: Vec<Scan>,
     #[serde(default)]
     pub targets: Vec<Target>,
+    /// ai-usage --json 連携設定（省略時は連携無効）。
+    #[serde(default)]
+    pub ai_usage: Option<AiUsageConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,15 +51,144 @@ pub struct Prompts {
     pub default: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct Agent {
     pub name: String,
+    /// provider 明示（"claude" | "codex" | "antigravity"）。
+    /// ai-usage 連携時は (profile, provider) 照合に使うため必須。
+    pub provider: Option<String>,
     pub command: Vec<String>,
-    pub reset_weekday: String,
-    pub reset_time: String,
-    pub timezone: String,
+    /// 起動時に付与する環境変数。profile 展開時は profile.env で上書きマージされる。
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// fallback=fixed 用のリセット曜日。ai-usage 連携かつ fallback!=fixed なら省略可。
+    pub reset_weekday: Option<String>,
+    pub reset_time: Option<String>,
+    pub timezone: Option<String>,
     /// エージェント固有のプロンプト上書き（[prompts].default より優先）
     pub prompt: Option<String>,
+    /// ai-usage 連携設定（参照する profile、window/fallback 上書き）。
+    pub ai_usage: Option<AgentAiUsage>,
+}
+
+/// ai-usage --json 連携のグローバル設定（`[ai_usage]`）。
+#[derive(Debug, Deserialize, Clone)]
+pub struct AiUsageConfig {
+    /// 連携を有効化する。false なら従来の曜日計算のみで動作する。
+    #[serde(default)]
+    pub enabled: bool,
+    /// ai-usage を起動するコマンド（デフォルト: ["ai-usage", "--json"]）。
+    #[serde(default = "default_ai_usage_command")]
+    pub command: Vec<String>,
+    /// deadline 算出に使う枠（weekly | five_hour | nearest）。
+    #[serde(default)]
+    pub window: UsageWindowPolicy,
+    /// ai-usage 解決失敗時のフォールバック方針（fixed | skip | error）。
+    #[serde(default)]
+    pub fallback: UsageFallback,
+    /// 処理済みカットオフに使う枠（weekly | selected）。
+    #[serde(default)]
+    pub state_window: StateWindowPolicy,
+    /// プロファイル定義（`[[ai_usage.profiles]]`）。
+    #[serde(default)]
+    pub profiles: Vec<AiUsageProfile>,
+}
+
+fn default_ai_usage_command() -> Vec<String> {
+    vec!["ai-usage".to_string(), "--json".to_string()]
+}
+
+/// ai-usage の Chrome プロファイルと、そのアカウントで起動する環境のマッピング。
+#[derive(Debug, Deserialize, Clone)]
+pub struct AiUsageProfile {
+    /// token-burn 内部で参照する名前。agent から参照し、展開名 `<agent>-<name>` にも使う。
+    pub name: String,
+    /// ai-usage --json の `profile` フィールドと照合する値（大文字小文字は区別）。
+    pub profile: String,
+    /// このプロファイルで起動する際に付与する環境変数（agent.env を上書きマージ）。
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// agent 側の ai-usage 連携設定（`[agents.ai_usage]`）。
+#[derive(Debug, Deserialize, Clone)]
+pub struct AgentAiUsage {
+    /// 参照する `[[ai_usage.profiles]]` の name 一覧。空なら fixed 計算にフォールバック。
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    /// この agent の window 上書き（省略時はグローバル設定）。
+    pub window: Option<UsageWindowPolicy>,
+    /// この agent の fallback 上書き（省略時はグローバル設定）。
+    pub fallback: Option<UsageFallback>,
+}
+
+/// deadline 算出に使う ai-usage の枠。
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageWindowPolicy {
+    /// 週次リセットを使う（token-burn の主目的に合致、デフォルト）。
+    #[default]
+    Weekly,
+    /// 5 時間枠リセットを使う。
+    FiveHour,
+    /// weekly / five_hour のうち近い方を使う。
+    Nearest,
+}
+
+/// ai-usage 解決に失敗したときの方針。
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageFallback {
+    /// reset_weekday/reset_time/timezone による固定計算に戻す（デフォルト、後方互換）。
+    #[default]
+    Fixed,
+    /// その RuntimeAgent を候補から除外する。
+    Skip,
+    /// 即エラーにする。
+    Error,
+}
+
+/// 処理済みカットオフ（state_cutoff）に使う枠。
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StateWindowPolicy {
+    /// 常に週次（resets_at - 7d）を基準にする（デフォルト）。
+    #[default]
+    Weekly,
+    /// deadline に採用した枠の period を基準にする。
+    Selected,
+}
+
+/// agent × profile を実行時に展開した実体。スケジュール解決・実行の単位。
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeAgent {
+    /// 展開名（例: "claude" または "claude-owa"）。state.json キー・レポート名に使う。
+    pub name: String,
+    /// provider（"claude" | "codex" | "antigravity"）。
+    pub provider: Option<String>,
+    pub command: Vec<String>,
+    /// `~` 展開済みの環境変数。
+    pub env: BTreeMap<String, String>,
+    pub prompt: Option<String>,
+    /// fixed フォールバック用のリセット定義。
+    pub reset_weekday: Option<String>,
+    pub reset_time: Option<String>,
+    pub timezone: Option<String>,
+    /// ai-usage 連携情報（None なら常に fixed 計算）。
+    pub ai_usage: Option<RuntimeAiUsage>,
+    /// 適用する fallback 方針。
+    pub fallback: UsageFallback,
+    /// 適用する window 方針。
+    pub window: UsageWindowPolicy,
+}
+
+/// RuntimeAgent に紐づく ai-usage 照合情報。
+#[derive(Debug, Clone)]
+pub struct RuntimeAiUsage {
+    /// ai-usage --json の `profile` と照合する値。
+    pub profile: String,
+    /// ai-usage --json の `provider` と照合する値。
+    pub provider: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +269,36 @@ impl Config {
         }
         validate_optional_duration("skip_within", self.settings.skip_within.as_deref())?;
         validate_optional_duration("cleanup_after", self.settings.cleanup_after.as_deref())?;
+
+        if let Some(global) = &self.ai_usage {
+            if global.command.is_empty() {
+                anyhow::bail!("ai_usage.command must include at least one element");
+            }
+            if global.command[0].trim().is_empty() {
+                anyhow::bail!("ai_usage.command executable must not be empty");
+            }
+            let mut seen = std::collections::HashSet::new();
+            for p in &global.profiles {
+                if p.name.trim().is_empty() {
+                    anyhow::bail!("ai_usage profile name must not be empty");
+                }
+                if !seen.insert(p.name.as_str()) {
+                    anyhow::bail!("Duplicate ai_usage profile name: {}", p.name);
+                }
+                if p.profile.trim().is_empty() {
+                    anyhow::bail!(
+                        "ai_usage profile '{}' must set a non-empty profile match",
+                        p.name
+                    );
+                }
+                for k in p.env.keys() {
+                    if !is_valid_env_key(k) {
+                        anyhow::bail!("ai_usage profile '{}' has invalid env key: {}", p.name, k);
+                    }
+                }
+            }
+        }
+
         for agent in &self.agents {
             if agent.name.trim().is_empty() {
                 anyhow::bail!("Agent name must not be empty");
@@ -149,15 +312,215 @@ impl Config {
             if agent.command[0].trim().is_empty() {
                 anyhow::bail!("Agent '{}' executable must not be empty", agent.name);
             }
-            parse_weekday(&agent.reset_weekday)?;
-            parse_time(&agent.reset_time)?;
-            agent
-                .timezone
-                .parse::<chrono_tz::Tz>()
-                .map_err(|_| anyhow::anyhow!("Invalid timezone: {}", agent.timezone))?;
+            for k in agent.env.keys() {
+                if !is_valid_env_key(k) {
+                    anyhow::bail!("Agent '{}' has invalid env key: {}", agent.name, k);
+                }
+            }
+
+            let uses_ai_usage = self.agent_uses_ai_usage(agent);
+            if uses_ai_usage
+                && agent
+                    .provider
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+            {
+                anyhow::bail!(
+                    "Agent '{}' uses ai_usage and must set a non-empty provider",
+                    agent.name
+                );
+            }
+
+            // ai-usage 非連携、または fallback=fixed のときは曜日計算が必要。
+            let reset_required =
+                !uses_ai_usage || self.effective_fallback(agent) == UsageFallback::Fixed;
+            if reset_required {
+                let wd = agent.reset_weekday.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Agent '{}' requires reset_weekday (no ai-usage or fallback=fixed)",
+                        agent.name
+                    )
+                })?;
+                let tm = agent.reset_time.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Agent '{}' requires reset_time (no ai-usage or fallback=fixed)",
+                        agent.name
+                    )
+                })?;
+                let tz = agent.timezone.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Agent '{}' requires timezone (no ai-usage or fallback=fixed)",
+                        agent.name
+                    )
+                })?;
+                parse_weekday(wd)?;
+                parse_time(tm)?;
+                tz.parse::<chrono_tz::Tz>()
+                    .map_err(|_| anyhow::anyhow!("Invalid timezone: {}", tz))?;
+            } else {
+                if let Some(wd) = agent.reset_weekday.as_deref() {
+                    parse_weekday(wd)?;
+                }
+                if let Some(tm) = agent.reset_time.as_deref() {
+                    parse_time(tm)?;
+                }
+                if let Some(tz) = agent.timezone.as_deref() {
+                    tz.parse::<chrono_tz::Tz>()
+                        .map_err(|_| anyhow::anyhow!("Invalid timezone: {}", tz))?;
+                }
+            }
         }
+
+        // agent × profile の展開が成立するか（未知 profile 参照・env key 不正等を検出）。
+        self.expand_runtime_agents()?;
         Ok(())
     }
+
+    /// agent が ai-usage 連携を使うか。
+    /// グローバル `[ai_usage] enabled = true` かつ agent が参照 profile を 1 件以上持つ場合のみ。
+    /// enabled=false のときは profile 展開せず従来の単一 agent として扱う。
+    fn agent_uses_ai_usage(&self, agent: &Agent) -> bool {
+        self.ai_usage.as_ref().is_some_and(|g| g.enabled)
+            && agent
+                .ai_usage
+                .as_ref()
+                .is_some_and(|u| !u.profiles.is_empty())
+    }
+
+    /// agent に適用される fallback 方針（agent 上書き → グローバル → デフォルト）。
+    fn effective_fallback(&self, agent: &Agent) -> UsageFallback {
+        agent
+            .ai_usage
+            .as_ref()
+            .and_then(|u| u.fallback)
+            .or_else(|| self.ai_usage.as_ref().map(|g| g.fallback))
+            .unwrap_or_default()
+    }
+
+    /// agent に適用される window 方針（agent 上書き → グローバル → デフォルト）。
+    fn effective_window(&self, agent: &Agent) -> UsageWindowPolicy {
+        agent
+            .ai_usage
+            .as_ref()
+            .and_then(|u| u.window)
+            .or_else(|| self.ai_usage.as_ref().map(|g| g.window))
+            .unwrap_or_default()
+    }
+
+    /// agent × profile を RuntimeAgent に展開する。
+    /// ai_usage.profiles が空/未設定の agent は単一の RuntimeAgent（fixed 計算）になる。
+    pub fn expand_runtime_agents(&self) -> Result<Vec<RuntimeAgent>> {
+        let global = self.ai_usage.as_ref();
+        let mut out = Vec::new();
+        for agent in &self.agents {
+            let window = self.effective_window(agent);
+            let fallback = self.effective_fallback(agent);
+
+            if !self.agent_uses_ai_usage(agent) {
+                out.push(RuntimeAgent {
+                    name: agent.name.clone(),
+                    provider: agent.provider.clone(),
+                    command: agent.command.clone(),
+                    env: expand_env(&agent.env)?,
+                    prompt: agent.prompt.clone(),
+                    reset_weekday: agent.reset_weekday.clone(),
+                    reset_time: agent.reset_time.clone(),
+                    timezone: agent.timezone.clone(),
+                    ai_usage: None,
+                    fallback,
+                    window,
+                });
+                continue;
+            }
+
+            let provider = agent
+                .provider
+                .clone()
+                .filter(|p| !p.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Agent '{}' uses ai_usage and must set a provider",
+                        agent.name
+                    )
+                })?;
+            let profile_names = agent
+                .ai_usage
+                .as_ref()
+                .map(|u| u.profiles.as_slice())
+                .unwrap_or(&[]);
+            // profile を 1 つだけ参照する agent は展開名を agent 名のまま保つ。
+            // 「claude-home」が「claude-home-home」になる冗長化を避け、state.json の
+            // キー互換（既存の agent 名のまま）も維持する。複数参照時のみサフィックスを付ける。
+            let multi_profile = profile_names.len() > 1;
+
+            for pname in profile_names {
+                let profile = global
+                    .and_then(|g| g.profiles.iter().find(|p| &p.name == pname))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Agent '{}' references unknown ai_usage profile '{}'",
+                            agent.name,
+                            pname
+                        )
+                    })?;
+                // env マージ: agent.env をベースに profile.env で上書き。
+                let mut env = agent.env.clone();
+                for (k, v) in &profile.env {
+                    env.insert(k.clone(), v.clone());
+                }
+                let name = if multi_profile {
+                    format!("{}-{}", agent.name, profile.name)
+                } else {
+                    agent.name.clone()
+                };
+                out.push(RuntimeAgent {
+                    name,
+                    provider: Some(provider.clone()),
+                    command: agent.command.clone(),
+                    env: expand_env(&env)?,
+                    prompt: agent.prompt.clone(),
+                    reset_weekday: agent.reset_weekday.clone(),
+                    reset_time: agent.reset_time.clone(),
+                    timezone: agent.timezone.clone(),
+                    ai_usage: Some(RuntimeAiUsage {
+                        profile: profile.profile.clone(),
+                        provider: provider.clone(),
+                    }),
+                    fallback,
+                    window,
+                });
+            }
+        }
+        if out.is_empty() {
+            anyhow::bail!("No runtime agents after expansion");
+        }
+        Ok(out)
+    }
+}
+
+/// 環境変数マップの値を `~` 展開し、key を検証する。
+/// 値は必ずしもパスとは限らないため、相対パスを config 相対へ解決することはしない。
+fn expand_env(env: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for (k, v) in env {
+        if !is_valid_env_key(k) {
+            anyhow::bail!("Invalid environment variable name: {k}");
+        }
+        out.insert(k.clone(), shellexpand::tilde(v).to_string());
+    }
+    Ok(out)
+}
+
+/// 環境変数名が `[A-Za-z_][A-Za-z0-9_]*` かを判定する。
+fn is_valid_env_key(k: &str) -> bool {
+    let mut chars = k.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn validate_optional_duration(field_name: &str, value: Option<&str>) -> Result<()> {
@@ -256,10 +619,10 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
-                prompt: None,
+                reset_weekday: Some("monday".to_string()),
+                reset_time: Some("09:00".to_string()),
+                timezone: Some("UTC".to_string()),
+                ..Default::default()
             }],
             scan: vec![],
             targets: vec![Target {
@@ -267,6 +630,7 @@ mod tests {
                 prompt: None,
                 defer: false,
             }],
+            ai_usage: None,
         }
     }
 
@@ -431,7 +795,7 @@ mod tests {
     #[test]
     fn validate_rejects_invalid_timezone() {
         let mut config = base_config();
-        config.agents[0].timezone = "Invalid/Zone".to_string();
+        config.agents[0].timezone = Some("Invalid/Zone".to_string());
         let err = config
             .validate()
             .expect_err("無効なタイムゾーンは拒否されるべき");
@@ -629,7 +993,7 @@ mod tests {
     #[test]
     fn validate_rejects_invalid_reset_weekday() {
         let mut config = base_config();
-        config.agents[0].reset_weekday = "notaday".to_string();
+        config.agents[0].reset_weekday = Some("notaday".to_string());
         let err = config.validate().expect_err("無効な曜日は拒否されるべき");
         assert!(err.to_string().contains("Invalid weekday"));
     }
@@ -637,7 +1001,7 @@ mod tests {
     #[test]
     fn validate_rejects_invalid_reset_time() {
         let mut config = base_config();
-        config.agents[0].reset_time = "25:00".to_string();
+        config.agents[0].reset_time = Some("25:00".to_string());
         let err = config.validate().expect_err("無効な時刻は拒否されるべき");
         assert!(err.to_string().contains("Invalid time"));
     }
@@ -679,5 +1043,182 @@ mod tests {
         let value = txt_path.to_string_lossy().to_string();
         let result = config.resolve_prompt(&value).unwrap();
         assert_eq!(result, value);
+    }
+
+    fn ai_usage_global(enabled: bool, profiles: Vec<(&str, &str)>) -> AiUsageConfig {
+        AiUsageConfig {
+            enabled,
+            command: default_ai_usage_command(),
+            window: UsageWindowPolicy::Weekly,
+            fallback: UsageFallback::Fixed,
+            state_window: StateWindowPolicy::Weekly,
+            profiles: profiles
+                .into_iter()
+                .map(|(name, profile)| AiUsageProfile {
+                    name: name.to_string(),
+                    profile: profile.to_string(),
+                    env: BTreeMap::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn agent_ai_usage(profiles: Vec<&str>, fallback: Option<UsageFallback>) -> AgentAiUsage {
+        AgentAiUsage {
+            profiles: profiles.into_iter().map(String::from).collect(),
+            window: None,
+            fallback,
+        }
+    }
+
+    #[test]
+    fn expand_runtime_agents_without_ai_usage_returns_one_per_agent() {
+        let config = base_config();
+        let agents = config.expand_runtime_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "agent");
+        assert!(agents[0].ai_usage.is_none());
+    }
+
+    #[test]
+    fn expand_runtime_agents_expands_profiles() {
+        let mut config = base_config();
+        config.agents[0].provider = Some("claude".to_string());
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["work", "home"], None));
+        config.ai_usage = Some(ai_usage_global(
+            true,
+            vec![("work", "Work"), ("home", "Home")],
+        ));
+
+        let agents = config.expand_runtime_agents().unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].name, "agent-work");
+        assert_eq!(agents[1].name, "agent-home");
+        assert_eq!(agents[0].ai_usage.as_ref().unwrap().profile, "Work");
+        assert_eq!(agents[0].provider.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn expand_merges_profile_env_over_agent_env() {
+        let mut config = base_config();
+        let mut agent_env = BTreeMap::new();
+        agent_env.insert("BASE".to_string(), "1".to_string());
+        agent_env.insert("OVERRIDE".to_string(), "agent".to_string());
+        config.agents[0].env = agent_env;
+        config.agents[0].provider = Some("claude".to_string());
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["work"], None));
+
+        let mut prof_env = BTreeMap::new();
+        prof_env.insert("OVERRIDE".to_string(), "profile".to_string());
+        prof_env.insert("PROF".to_string(), "2".to_string());
+        let mut global = ai_usage_global(true, vec![("work", "Work")]);
+        global.profiles[0].env = prof_env;
+        config.ai_usage = Some(global);
+
+        let agents = config.expand_runtime_agents().unwrap();
+        // agent.env をベースに profile.env が上書きマージされる
+        assert_eq!(agents[0].env.get("BASE").map(String::as_str), Some("1"));
+        assert_eq!(
+            agents[0].env.get("OVERRIDE").map(String::as_str),
+            Some("profile")
+        );
+        assert_eq!(agents[0].env.get("PROF").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn validate_ai_usage_skip_allows_missing_reset_fields() {
+        let mut config = base_config();
+        config.agents[0].reset_weekday = None;
+        config.agents[0].reset_time = None;
+        config.agents[0].timezone = None;
+        config.agents[0].provider = Some("claude".to_string());
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["work"], Some(UsageFallback::Skip)));
+        config.ai_usage = Some(ai_usage_global(true, vec![("work", "Work")]));
+        config
+            .validate()
+            .expect("fallback=skip では reset_* 省略可");
+    }
+
+    #[test]
+    fn validate_ai_usage_fixed_requires_reset_fields() {
+        let mut config = base_config();
+        config.agents[0].reset_weekday = None;
+        config.agents[0].provider = Some("claude".to_string());
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["work"], Some(UsageFallback::Fixed)));
+        config.ai_usage = Some(ai_usage_global(true, vec![("work", "Work")]));
+        let err = config
+            .validate()
+            .expect_err("fallback=fixed では reset_weekday 必須");
+        assert!(err.to_string().contains("reset_weekday"));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_profile_reference() {
+        let mut config = base_config();
+        config.agents[0].provider = Some("claude".to_string());
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["nonexistent"], None));
+        config.ai_usage = Some(ai_usage_global(true, vec![("work", "Work")]));
+        let err = config.validate().expect_err("未知の profile 参照はエラー");
+        assert!(err.to_string().contains("unknown ai_usage profile"));
+    }
+
+    #[test]
+    fn validate_rejects_ai_usage_without_provider() {
+        let mut config = base_config();
+        config.agents[0].provider = None;
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["work"], None));
+        config.ai_usage = Some(ai_usage_global(true, vec![("work", "Work")]));
+        let err = config
+            .validate()
+            .expect_err("provider 無しの ai_usage 連携はエラー");
+        assert!(err.to_string().contains("provider"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_env_key() {
+        let mut config = base_config();
+        let mut env = BTreeMap::new();
+        env.insert("1BAD".to_string(), "x".to_string());
+        config.agents[0].env = env;
+        let err = config
+            .validate()
+            .expect_err("数字始まりの env key はエラー");
+        assert!(err.to_string().contains("invalid env key"));
+    }
+
+    #[test]
+    fn expand_disabled_ai_usage_does_not_expand_profiles() {
+        let mut config = base_config();
+        config.agents[0].provider = Some("claude".to_string());
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["work"], None));
+        config.ai_usage = Some(ai_usage_global(false, vec![("work", "Work")]));
+        // enabled=false なので profile 展開せず単一 agent（reset_* は base_config が保持）
+        let agents = config.expand_runtime_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "agent");
+        assert!(agents[0].ai_usage.is_none());
+    }
+
+    #[test]
+    fn is_valid_env_key_rules() {
+        assert!(is_valid_env_key("CLAUDE_CONFIG_DIR"));
+        assert!(is_valid_env_key("_X"));
+        assert!(!is_valid_env_key("1A"));
+        assert!(!is_valid_env_key("A-B"));
+        assert!(!is_valid_env_key(""));
+    }
+
+    #[test]
+    fn expand_single_profile_keeps_agent_name() {
+        // profile を 1 つだけ参照する agent は展開名が agent 名のまま（サフィックス無し）。
+        let mut config = base_config();
+        config.agents[0].name = "claude-home".to_string();
+        config.agents[0].provider = Some("claude".to_string());
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["home"], None));
+        config.ai_usage = Some(ai_usage_global(true, vec![("home", "Home")]));
+        let agents = config.expand_runtime_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "claude-home");
+        assert_eq!(agents[0].ai_usage.as_ref().unwrap().profile, "Home");
     }
 }

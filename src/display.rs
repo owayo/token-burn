@@ -1,28 +1,39 @@
 use colored::Colorize;
 use std::time::Duration;
 
-use crate::config::Config;
+use crate::config::RuntimeAgent;
 use crate::scanner::{ResolvedTarget, Visibility};
-use crate::schedule::calculate_next_reset;
+use crate::usage::ScheduleResolver;
 
-pub fn print_status(config: &Config) -> anyhow::Result<()> {
+pub fn print_status(agents: &[RuntimeAgent], resolver: &ScheduleResolver) -> anyhow::Result<()> {
     println!("{}", "=== Agent Status ===".bold());
     println!();
-    for agent in &config.agents {
-        let schedule = calculate_next_reset(agent)?;
-        println!("  {} {}", "Agent:".bold(), schedule.agent_name.cyan());
-        println!(
-            "    Next reset: {}",
-            schedule
-                .next_reset
-                .format("%Y-%m-%d %H:%M %Z")
-                .to_string()
-                .yellow()
-        );
-        println!(
-            "    Remaining:  {}",
-            format_duration(schedule.time_until_reset).red()
-        );
+    if let Some(err) = resolver.failure() {
+        println!("  {} {}", "ai-usage error:".red().bold(), err.dimmed());
+        println!();
+    }
+    for agent in agents {
+        println!("  {} {}", "Agent:".bold(), agent.name.cyan());
+        match resolver.schedule_for(agent)? {
+            Some(schedule) => {
+                println!(
+                    "    Next reset: {}",
+                    schedule
+                        .next_reset
+                        .format("%Y-%m-%d %H:%M %Z")
+                        .to_string()
+                        .yellow()
+                );
+                println!(
+                    "    Remaining:  {}",
+                    format_duration(schedule.time_until_reset).red()
+                );
+                println!("    Source:     {}", schedule.source.label().dimmed());
+            }
+            None => {
+                println!("    {}", "skipped (ai-usage fallback=skip)".dimmed());
+            }
+        }
         println!();
     }
     Ok(())

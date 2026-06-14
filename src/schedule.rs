@@ -1,64 +1,133 @@
 use anyhow::Result;
-use chrono::{Datelike, LocalResult, NaiveTime, TimeZone, Utc, Weekday};
+use chrono::{DateTime, Datelike, FixedOffset, LocalResult, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 use std::time::Duration;
 
-use crate::config::{Agent, parse_time, parse_weekday};
+use crate::config::{RuntimeAgent, parse_time, parse_weekday};
 
-#[derive(Debug)]
+/// あるエージェントの次回リセットと、それに付随する情報。
+#[derive(Debug, Clone)]
 pub struct AgentSchedule {
     pub agent_name: String,
-    pub next_reset: chrono::DateTime<Tz>,
-    pub previous_reset: chrono::DateTime<Tz>,
+    /// 次回リセット時刻（ローカルオフセット付き）。
+    pub next_reset: DateTime<FixedOffset>,
+    /// 処理済み判定のカットオフ（この時刻以降に処理済みのターゲットはスキップ）。
+    pub state_cutoff: DateTime<FixedOffset>,
     pub time_until_reset: Duration,
+    /// このスケジュールの導出元。
+    pub source: ScheduleSource,
 }
 
-pub fn calculate_next_reset(agent: &Agent) -> Result<AgentSchedule> {
-    let tz: Tz = agent
-        .timezone
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid timezone: {}", agent.timezone))?;
-    let now = Utc::now().with_timezone(&tz);
+/// スケジュールの導出元。`status` / `run` で表示し、ai-usage が静かに fixed へ戻るのを防ぐ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleSource {
+    /// ai-usage --json 由来（採用した枠）。
+    AiUsage(UsageWindow),
+    /// 曜日ベースの固定計算。
+    Fixed,
+    /// ai-usage 解決に失敗し、固定計算へフォールバックした（理由付き）。
+    FixedFallback(String),
+}
 
-    let target_weekday = parse_weekday(&agent.reset_weekday)?;
-    let (hour, minute) = parse_time(&agent.reset_time)?;
+impl ScheduleSource {
+    /// 表示用の短いラベル。
+    pub fn label(&self) -> String {
+        match self {
+            ScheduleSource::AiUsage(w) => format!("ai-usage ({})", w.label()),
+            ScheduleSource::Fixed => "fixed".to_string(),
+            ScheduleSource::FixedFallback(reason) => format!("fixed fallback: {reason}"),
+        }
+    }
+}
+
+/// ai-usage で解決された実際のリセット枠。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageWindow {
+    Weekly,
+    FiveHour,
+}
+
+impl UsageWindow {
+    /// 1 周期の長さ（state_cutoff 導出に使う）。
+    pub fn period(self) -> chrono::Duration {
+        match self {
+            UsageWindow::Weekly => chrono::Duration::days(7),
+            UsageWindow::FiveHour => chrono::Duration::hours(5),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UsageWindow::Weekly => "weekly",
+            UsageWindow::FiveHour => "five_hour",
+        }
+    }
+}
+
+/// 曜日 + 時刻 + タイムゾーンから次回リセットを固定計算する。
+/// `reset_weekday` / `reset_time` / `timezone` が揃っている必要がある。
+///
+/// リセット日時計算は `naive_local()` をベースに行う。`DateTime::date_naive()` は
+/// UTC 日付を返すため、`weekday()` のローカル曜日と整合させるためにローカルタイム
+/// ゾーンの日付を基準とする。DST 遷移は `resolve_local_datetime` で吸収する。
+pub fn calculate_fixed_reset(agent: &RuntimeAgent) -> Result<AgentSchedule> {
+    let tz_str = agent.timezone.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("Agent '{}' has no timezone for fixed schedule", agent.name)
+    })?;
+    let tz: Tz = tz_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid timezone: {}", tz_str))?;
+    let wd_str = agent.reset_weekday.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Agent '{}' has no reset_weekday for fixed schedule",
+            agent.name
+        )
+    })?;
+    let tm_str = agent.reset_time.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Agent '{}' has no reset_time for fixed schedule",
+            agent.name
+        )
+    })?;
+
+    let now_utc = Utc::now();
+    let now = now_utc.with_timezone(&tz);
+
+    let target_weekday = parse_weekday(wd_str)?;
+    let (hour, minute) = parse_time(tm_str)?;
     let target_time = NaiveTime::from_hms_opt(hour, minute, 0)
         .ok_or_else(|| anyhow::anyhow!("Invalid time: {}:{}", hour, minute))?;
 
     let days_until = days_until_weekday(now.weekday(), target_weekday);
-    // ローカルタイムゾーンの日付を基準に計算する
-    // date_naive() は UTC 日付を返すため、weekday() のローカル曜日と
-    // 日付がずれるタイムゾーン（深夜帯の Asia/Tokyo など）で 1 日ずれる
     let next_reset_date = now.naive_local().date() + chrono::Duration::days(days_until as i64);
     let next_reset_naive = next_reset_date.and_time(target_time);
+    let next_reset_tz = resolve_local_datetime(&tz, next_reset_naive)?;
 
-    // DST 遷移（曖昧な時刻・存在しない時刻）を resolve_local_datetime で吸収する
-    let next_reset = resolve_local_datetime(&tz, next_reset_naive)?;
-
-    let next_reset = if next_reset <= now {
+    let next_reset_tz = if next_reset_tz <= now {
         let next_date = next_reset_date + chrono::Duration::days(7);
-        let next_naive = next_date.and_time(target_time);
-        resolve_local_datetime(&tz, next_naive)?
+        resolve_local_datetime(&tz, next_date.and_time(target_time))?
     } else {
-        next_reset
+        next_reset_tz
     };
 
-    let previous_reset = {
-        // ローカルタイムゾーンの日付を基準に 7 日前を計算する
-        let prev_date = next_reset.naive_local().date() - chrono::Duration::days(7);
-        let prev_naive = prev_date.and_time(target_time);
-        resolve_local_datetime(&tz, prev_naive)?
+    // 前回リセット = 次回の 7 日前。
+    let prev_reset_tz = {
+        let prev_date = next_reset_tz.naive_local().date() - chrono::Duration::days(7);
+        resolve_local_datetime(&tz, prev_date.and_time(target_time))?
     };
 
-    let duration = (next_reset - now)
+    let next_reset = next_reset_tz.fixed_offset();
+    let state_cutoff = prev_reset_tz.fixed_offset();
+    let time_until_reset = (next_reset.with_timezone(&Utc) - now_utc)
         .to_std()
         .unwrap_or(Duration::from_secs(0));
 
     Ok(AgentSchedule {
         agent_name: agent.name.clone(),
         next_reset,
-        previous_reset,
-        time_until_reset: duration,
+        state_cutoff,
+        time_until_reset,
+        source: ScheduleSource::Fixed,
     })
 }
 
@@ -71,14 +140,12 @@ pub fn calculate_next_reset(agent: &Agent) -> Result<AgentSchedule> {
 ///   対応できるが、存在しない時刻では `None` を返すため、リセット時刻がたまたま
 ///   DST ギャップ（例: America/New_York の 02:30）に重なると、設定読み込みは成功
 ///   するのに status / run が実行時に毎回失敗してしまう。これを防ぐ。
-fn resolve_local_datetime(tz: &Tz, naive: chrono::NaiveDateTime) -> Result<chrono::DateTime<Tz>> {
+fn resolve_local_datetime(tz: &Tz, naive: chrono::NaiveDateTime) -> Result<DateTime<Tz>> {
     match tz.from_local_datetime(&naive) {
         LocalResult::Single(dt) => Ok(dt),
         LocalResult::Ambiguous(earliest, _) => Ok(earliest),
         LocalResult::None => {
-            // 存在しない時刻（DST ギャップ）。1 分ずつ進めて遷移直後の有効な瞬間を
-            // 探す。標準的なギャップは 1 時間なので、2 時間分試行すれば必ず有効な
-            // 瞬間に到達する。
+            // 存在しない時刻（DST ギャップ）。1 分ずつ進めて遷移直後の有効な瞬間を探す。
             let mut probe = naive;
             for _ in 0..120 {
                 probe += chrono::Duration::minutes(1);
@@ -107,26 +174,21 @@ fn days_until_weekday(current: Weekday, target: Weekday) -> u32 {
     }
 }
 
-pub fn select_nearest_agent(agents: &[Agent]) -> Result<(usize, AgentSchedule)> {
-    anyhow::ensure!(!agents.is_empty(), "No agents configured");
-    let mut nearest_idx = 0;
-    let mut nearest_schedule = calculate_next_reset(&agents[0])?;
-
-    for (i, agent) in agents.iter().enumerate().skip(1) {
-        let schedule = calculate_next_reset(agent)?;
-        if schedule.time_until_reset < nearest_schedule.time_until_reset {
-            nearest_idx = i;
-            nearest_schedule = schedule;
-        }
-    }
-
-    Ok((nearest_idx, nearest_schedule))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{Timelike, Utc, Weekday};
+
+    fn make_runtime_agent(name: &str, weekday: &str, time: &str, tz: &str) -> RuntimeAgent {
+        RuntimeAgent {
+            name: name.to_string(),
+            command: vec!["echo".to_string()],
+            reset_weekday: Some(weekday.to_string()),
+            reset_time: Some(time.to_string()),
+            timezone: Some(tz.to_string()),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn days_until_same_weekday_is_zero() {
@@ -150,7 +212,6 @@ mod tests {
     fn resolve_local_datetime_handles_spring_forward_gap() {
         // America/New_York の 2025-03-09 02:30 は春の繰り上げ（02:00→03:00）で
         // 存在しない時刻。遷移直後の有効な瞬間（03:00 EDT）にフォールバックすること。
-        // 以前は earliest() が None を返し、リセット計算全体がエラーになっていた。
         let tz: Tz = "America/New_York".parse().unwrap();
         let naive = chrono::NaiveDate::from_ymd_opt(2025, 3, 9)
             .unwrap()
@@ -163,21 +224,19 @@ mod tests {
 
     #[test]
     fn resolve_local_datetime_handles_fall_back_ambiguous() {
-        // America/New_York の 2025-11-02 01:30 は秋の繰り戻し（02:00→01:00）で
-        // 2 回出現する曖昧な時刻。早い方（EDT, UTC-4）を採用すること。
+        // America/New_York の 2025-11-02 01:30 は秋の繰り戻しで 2 回出現する曖昧な時刻。
+        // 早い方（EDT, UTC-4）を採用すること。
         let tz: Tz = "America/New_York".parse().unwrap();
         let naive = chrono::NaiveDate::from_ymd_opt(2025, 11, 2)
             .unwrap()
             .and_hms_opt(1, 30, 0)
             .unwrap();
         let resolved = resolve_local_datetime(&tz, naive).unwrap();
-        // 01:30 EDT = 05:30 UTC（早い方）。EST なら 06:30 UTC になる。
         assert_eq!(resolved.with_timezone(&Utc).hour(), 5);
     }
 
     #[test]
     fn resolve_local_datetime_handles_normal_time() {
-        // DST 遷移に関係しない通常の時刻はそのまま解決すること。
         let tz: Tz = "America/New_York".parse().unwrap();
         let naive = chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
             .unwrap()
@@ -188,116 +247,60 @@ mod tests {
         assert_eq!(resolved.minute(), 0);
     }
 
-    fn make_agent(name: &str, weekday: &str, time: &str) -> Agent {
-        Agent {
-            name: name.to_string(),
-            command: vec!["echo".to_string()],
-            reset_weekday: weekday.to_string(),
-            reset_time: time.to_string(),
-            timezone: "UTC".to_string(),
-            prompt: None,
-        }
-    }
-
     #[test]
-    fn calculate_next_reset_returns_future_time() {
-        let agent = make_agent("test", "monday", "09:00");
-        let sched = calculate_next_reset(&agent).unwrap();
+    fn calculate_fixed_reset_returns_future_time() {
+        let agent = make_runtime_agent("test", "monday", "09:00", "UTC");
+        let sched = calculate_fixed_reset(&agent).unwrap();
         assert!(sched.time_until_reset.as_secs() > 0);
-        assert!(sched.next_reset > sched.previous_reset);
+        assert!(sched.next_reset > sched.state_cutoff);
+        assert_eq!(sched.source, ScheduleSource::Fixed);
     }
 
     #[test]
-    fn previous_reset_is_seven_days_before_next() {
-        let agent = make_agent("test", "wednesday", "14:00");
-        let sched = calculate_next_reset(&agent).unwrap();
-        let diff = sched.next_reset - sched.previous_reset;
+    fn state_cutoff_is_seven_days_before_next() {
+        let agent = make_runtime_agent("test", "wednesday", "14:00", "UTC");
+        let sched = calculate_fixed_reset(&agent).unwrap();
+        let diff = sched.next_reset - sched.state_cutoff;
         assert_eq!(diff.num_days(), 7);
     }
 
     #[test]
-    fn select_nearest_agent_picks_valid_agent() {
-        let agents = vec![
-            make_agent("a", "monday", "09:00"),
-            make_agent("b", "thursday", "09:00"),
-        ];
-        let (idx, sched) = select_nearest_agent(&agents).unwrap();
-        assert!(idx < agents.len());
-        assert_eq!(sched.agent_name, agents[idx].name);
-        assert!(sched.time_until_reset.as_secs() > 0);
-    }
-
-    #[test]
-    fn select_nearest_agent_single_agent() {
-        let agents = vec![make_agent("only", "wednesday", "12:00")];
-        let (idx, sched) = select_nearest_agent(&agents).unwrap();
-        assert_eq!(idx, 0);
-        assert_eq!(sched.agent_name, "only");
-    }
-
-    #[test]
-    fn calculate_next_reset_includes_agent_name() {
-        let agent = make_agent("test-agent", "friday", "18:00");
-        let sched = calculate_next_reset(&agent).unwrap();
+    fn calculate_fixed_reset_includes_agent_name() {
+        let agent = make_runtime_agent("test-agent", "friday", "18:00", "UTC");
+        let sched = calculate_fixed_reset(&agent).unwrap();
         assert_eq!(sched.agent_name, "test-agent");
     }
 
     #[test]
-    fn select_nearest_agent_all_same_schedule() {
-        // 全エージェントが同じスケジュールの場合、いずれかのエージェントが返る
-        let agents = vec![
-            make_agent("first", "monday", "09:00"),
-            make_agent("second", "monday", "09:00"),
-        ];
-        let (idx, sched) = select_nearest_agent(&agents).unwrap();
-        // 同一スケジュールなので < 比較により最初のエージェントが保持される
-        assert!(idx < agents.len());
-        assert_eq!(sched.agent_name, agents[idx].name);
-    }
+    fn calculate_fixed_reset_different_timezones() {
+        let agent_tokyo = make_runtime_agent("tokyo", "monday", "09:00", "Asia/Tokyo");
+        let agent_utc = make_runtime_agent("utc", "monday", "09:00", "UTC");
 
-    #[test]
-    fn calculate_next_reset_different_timezones() {
-        // 異なるタイムゾーンでも正しく計算される
-        let agent_tokyo = Agent {
-            name: "tokyo".to_string(),
-            command: vec!["echo".to_string()],
-            reset_weekday: "monday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "Asia/Tokyo".to_string(),
-            prompt: None,
-        };
-        let agent_utc = make_agent("utc", "monday", "09:00");
+        let sched_tokyo = calculate_fixed_reset(&agent_tokyo).unwrap();
+        let sched_utc = calculate_fixed_reset(&agent_utc).unwrap();
 
-        let sched_tokyo = calculate_next_reset(&agent_tokyo).unwrap();
-        let sched_utc = calculate_next_reset(&agent_utc).unwrap();
-
-        // 東京の方がUTCより早くリセットされる（UTC+9）
-        // 両方とも未来であること
         assert!(sched_tokyo.time_until_reset.as_secs() > 0);
         assert!(sched_utc.time_until_reset.as_secs() > 0);
     }
 
     #[test]
-    fn calculate_next_reset_midnight() {
-        // 深夜0時のリセットが正しく計算される
-        let agent = make_agent("midnight", "friday", "00:00");
-        let sched = calculate_next_reset(&agent).unwrap();
+    fn calculate_fixed_reset_midnight() {
+        let agent = make_runtime_agent("midnight", "friday", "00:00", "UTC");
+        let sched = calculate_fixed_reset(&agent).unwrap();
         assert!(sched.time_until_reset.as_secs() > 0);
         assert_eq!(sched.next_reset.time().hour(), 0);
         assert_eq!(sched.next_reset.time().minute(), 0);
     }
 
     #[test]
-    fn calculate_next_reset_end_of_day() {
-        // 23:59のリセットが正しく計算される
-        let agent = make_agent("late", "sunday", "23:59");
-        let sched = calculate_next_reset(&agent).unwrap();
+    fn calculate_fixed_reset_end_of_day() {
+        let agent = make_runtime_agent("late", "sunday", "23:59", "UTC");
+        let sched = calculate_fixed_reset(&agent).unwrap();
         assert!(sched.time_until_reset.as_secs() > 0);
     }
 
     #[test]
     fn days_until_weekday_all_combinations() {
-        // 全曜日の組み合わせで 0〜6 の範囲に収まることを確認
         let weekdays = [
             Weekday::Mon,
             Weekday::Tue,
@@ -316,18 +319,8 @@ mod tests {
     }
 
     #[test]
-    fn select_nearest_agent_空スライスはエラー() {
-        let agents: Vec<Agent> = vec![];
-        let result = select_nearest_agent(&agents);
-        assert!(result.is_err(), "空スライスはエラーを返すべき");
-    }
-
-    #[test]
-    fn calculate_next_reset_現在時刻と同一曜日同一時刻は7日後() {
-        // 現在時刻（UTC）の曜日と1分前の時刻をリセット設定に指定する
-        // days_until_weekday が 0 を返し、かつリセット時刻 < 現在時刻となるため
-        // next_reset <= now の条件に該当し、7日後にシフトされることを検証する
-        use chrono_tz::Tz;
+    fn calculate_fixed_reset_same_weekday_same_time_is_seven_days_later() {
+        // 現在時刻の 1 分前をリセット時刻に設定（同一曜日 + 過去時刻 → 7 日後にシフト）。
         let tz: Tz = "UTC".parse().unwrap();
         let now = Utc::now().with_timezone(&tz);
 
@@ -341,90 +334,55 @@ mod tests {
             Weekday::Sun => "sunday",
         };
 
-        // 現在時刻の1分前をリセット時刻に設定（同一曜日 + 過去時刻 → 7日後にシフト）
         let past_minute = now - chrono::Duration::minutes(1);
         let reset_time = format!("{:02}:{:02}", past_minute.hour(), past_minute.minute());
 
-        let agent = make_agent("same-day", weekday_str, &reset_time);
-        let sched = calculate_next_reset(&agent).unwrap();
+        let agent = make_runtime_agent("same-day", weekday_str, &reset_time, "UTC");
+        let sched = calculate_fixed_reset(&agent).unwrap();
 
-        // next_reset は必ず現在より未来であること
-        assert!(
-            sched.next_reset > now,
-            "next_reset は現在時刻より未来でなければならない"
-        );
-
-        // 同一曜日・過去時刻のため7日後にシフトされるので、残り時間は6日超（余裕を持って5日以上）
+        assert!(sched.next_reset.with_timezone(&Utc) > now.with_timezone(&Utc));
         let days_until = sched.time_until_reset.as_secs() / 86400;
         assert!(
             days_until >= 5,
-            "同一曜日の過去時刻を指定した場合、next_reset は7日後になるべきだが {} 日後だった",
+            "7日後になるべきだが {} 日後だった",
             days_until
         );
 
-        // next_reset と previous_reset の差は常に7日
-        let diff = sched.next_reset - sched.previous_reset;
+        let diff = sched.next_reset - sched.state_cutoff;
         assert_eq!(diff.num_days(), 7);
     }
 
     #[test]
-    fn select_nearest_agent_picks_closest_reset() {
-        // 異なるタイムゾーンのエージェントを用意し、最も近いリセットが選ばれることを確認
-        let now = Utc::now();
-        let today_weekday = now.weekday();
-
-        // 今日の曜日の次の曜日（1日後）と、その次（2日後）を設定
-        let next_day = today_weekday.succ();
-        let day_after = next_day.succ();
-        let weekday_to_str = |w: Weekday| -> &'static str {
-            match w {
-                Weekday::Mon => "monday",
-                Weekday::Tue => "tuesday",
-                Weekday::Wed => "wednesday",
-                Weekday::Thu => "thursday",
-                Weekday::Fri => "friday",
-                Weekday::Sat => "saturday",
-                Weekday::Sun => "sunday",
-            }
-        };
-
-        let agents = vec![
-            make_agent("far", weekday_to_str(day_after), "09:00"),
-            make_agent("near", weekday_to_str(next_day), "09:00"),
-        ];
-        let (idx, sched) = select_nearest_agent(&agents).unwrap();
-        assert_eq!(idx, 1, "最も近いリセットのエージェントが選ばれるべき");
-        assert_eq!(sched.agent_name, "near");
+    fn calculate_fixed_reset_invalid_timezone_returns_error() {
+        let agent = make_runtime_agent("bad-tz", "monday", "09:00", "Invalid/Timezone");
+        assert!(calculate_fixed_reset(&agent).is_err());
     }
 
     #[test]
-    fn calculate_next_reset_invalid_timezone_returns_error() {
-        let agent = Agent {
-            name: "bad-tz".to_string(),
+    fn calculate_fixed_reset_missing_fields_returns_error() {
+        // ai-usage 連携で reset_* が無い RuntimeAgent は fixed 計算でエラーになる。
+        let agent = RuntimeAgent {
+            name: "no-reset".to_string(),
             command: vec!["echo".to_string()],
-            reset_weekday: "monday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "Invalid/Timezone".to_string(),
-            prompt: None,
+            ..Default::default()
         };
-        let result = calculate_next_reset(&agent);
-        assert!(result.is_err(), "無効なタイムゾーンはエラーになるべき");
+        let err = calculate_fixed_reset(&agent).expect_err("reset_* が無ければエラー");
+        assert!(err.to_string().contains("timezone"));
     }
 
     #[test]
-    fn calculate_next_reset_previous_is_always_past() {
-        // すべてのテストエージェントで previous_reset が現在時刻より過去であることを確認
+    fn calculate_fixed_reset_previous_is_always_past() {
         let agents = vec![
-            make_agent("a", "monday", "00:00"),
-            make_agent("b", "wednesday", "12:00"),
-            make_agent("c", "friday", "23:59"),
+            make_runtime_agent("a", "monday", "00:00", "UTC"),
+            make_runtime_agent("b", "wednesday", "12:00", "UTC"),
+            make_runtime_agent("c", "friday", "23:59", "UTC"),
         ];
         let now = Utc::now();
         for agent in &agents {
-            let sched = calculate_next_reset(agent).unwrap();
+            let sched = calculate_fixed_reset(agent).unwrap();
             assert!(
-                sched.previous_reset.with_timezone(&Utc) <= now,
-                "{} の previous_reset が未来になっている",
+                sched.state_cutoff.with_timezone(&Utc) <= now,
+                "{} の state_cutoff が未来になっている",
                 agent.name
             );
         }
@@ -432,12 +390,8 @@ mod tests {
 
     #[test]
     fn next_reset_weekday_matches_configured_weekday_for_all_timezones() {
-        // 回帰テスト: 旧実装では date_naive() が UTC 日付を返すため、
-        // Asia/Tokyo のような UTC+N タイムゾーンでローカル深夜帯（UTC 前日）に
-        // 実行すると next_reset の曜日が target_weekday から 1 日ずれていた。
-        // 修正後は naive_local().date() を使うので、全 7 曜日 × 主要タイムゾーンで
-        // next_reset と previous_reset の曜日が target と一致することを確認する。
-        use chrono::Datelike;
+        // 回帰テスト: naive_local().date() を使うので、全 7 曜日 × 主要タイムゾーンで
+        // next_reset / state_cutoff の曜日が target と一致する。
         let weekdays_and_strs = [
             ("monday", Weekday::Mon),
             ("tuesday", Weekday::Tue),
@@ -447,41 +401,27 @@ mod tests {
             ("saturday", Weekday::Sat),
             ("sunday", Weekday::Sun),
         ];
-        // UTC からのオフセットが正負双方を含むタイムゾーンを選ぶ
-        let timezones = [
-            "UTC",
-            "Asia/Tokyo",       // UTC+9
-            "America/New_York", // UTC-5
-            "Europe/London",
-        ];
+        let timezones = ["UTC", "Asia/Tokyo", "America/New_York", "Europe/London"];
         for tz in timezones {
             for (weekday_str, expected_weekday) in weekdays_and_strs {
-                let agent = Agent {
-                    name: "test".to_string(),
-                    command: vec!["echo".to_string()],
-                    reset_weekday: weekday_str.to_string(),
-                    reset_time: "09:00".to_string(),
-                    timezone: tz.to_string(),
-                    prompt: None,
-                };
-                let sched = calculate_next_reset(&agent).unwrap();
+                let agent = make_runtime_agent("test", weekday_str, "09:00", tz);
+                let sched = calculate_fixed_reset(&agent).unwrap();
                 assert_eq!(
                     sched.next_reset.weekday(),
                     expected_weekday,
-                    "{} で {} のリセットが {:?} 曜日と一致しない: next_reset={}",
+                    "{} で {} のリセットが {:?} と一致しない: next_reset={}",
                     tz,
                     weekday_str,
                     expected_weekday,
                     sched.next_reset
                 );
                 assert_eq!(
-                    sched.previous_reset.weekday(),
+                    sched.state_cutoff.weekday(),
                     expected_weekday,
-                    "{} で {} の previous_reset が {:?} 曜日と一致しない: previous_reset={}",
+                    "{} で {} の state_cutoff が {:?} と一致しない",
                     tz,
                     weekday_str,
-                    expected_weekday,
-                    sched.previous_reset
+                    expected_weekday
                 );
             }
         }
@@ -489,22 +429,12 @@ mod tests {
 
     #[test]
     fn next_reset_local_time_matches_configured_time() {
-        // ローカル時刻が設定値と一致することを確認する
-        // 旧実装の date_naive() バグでは曜日がずれるだけでなく、結果のローカル時刻も
-        // ずれるケースがあるため、ローカル時刻成分の検証も行う
-        use chrono::Timelike;
-        let agent = Agent {
-            name: "tz-test".to_string(),
-            command: vec!["echo".to_string()],
-            reset_weekday: "monday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "Asia/Tokyo".to_string(),
-            prompt: None,
-        };
-        let sched = calculate_next_reset(&agent).unwrap();
+        // FixedOffset 保持なのでローカル時刻成分が設定値と一致する。
+        let agent = make_runtime_agent("tz-test", "monday", "09:00", "Asia/Tokyo");
+        let sched = calculate_fixed_reset(&agent).unwrap();
         assert_eq!(sched.next_reset.hour(), 9, "hour mismatch");
         assert_eq!(sched.next_reset.minute(), 0, "minute mismatch");
-        assert_eq!(sched.previous_reset.hour(), 9, "previous hour mismatch");
-        assert_eq!(sched.previous_reset.minute(), 0, "previous minute mismatch");
+        assert_eq!(sched.state_cutoff.hour(), 9, "previous hour mismatch");
+        assert_eq!(sched.state_cutoff.minute(), 0, "previous minute mismatch");
     }
 }

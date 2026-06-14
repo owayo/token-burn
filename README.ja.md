@@ -46,6 +46,8 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **可視性対応**: 公開リポジトリを優先的に処理（remote のリポジトリ名で照合）
 - **マルチエージェント**: Claude Code、Codex CLI、カスタムエージェントに対応
 - **スマートスケジューリング**: リセット期限が最も近いエージェントを自動選択
+- **ai-usage 連携**: 外部ツール `ai-usage --json` から各エージェントの reset 時刻を実データ（`weekly.resets_at`）で取得し、曜日固定計算に頼らずスケジュールを自動更新（解決失敗時は曜日計算へフォールバック可能）
+- **アカウント別展開**: 1 エージェントを複数プロファイル（例: `work` / `home`）へ展開し、それぞれ専用の env（`CLAUDE_CONFIG_DIR` 等）で起動。`state.json` のキーも `<agent>-<profile>` で分離されアカウントごとに処理済み状態を管理
 - **デッドライン制御**: リセット時刻到達時に新規タスクの開始を止め、実行中タスクの完了を待機
 - **並列実行**: tmuxペイン分割とプログレスモニター付きで複数プロンプトを同時実行
 - **tmux デタッチ安全性**: デタッチ時はワーカースクリプトとキューを保持し、tmux セッション終了までバックグラウンドタスクを安全に継続
@@ -212,7 +214,9 @@ timezone = "Asia/Tokyo"
 | フィールド | 説明 | 例 |
 |-----------|------|-----|
 | `name` | エージェント識別名 | `"claude"` |
+| `provider` | プロバイダ識別子。`ai-usage` の `(profile, provider)` 照合に使用（ai-usage 連携時は必須） | `"claude"` |
 | `command` | コマンドと引数 | `["claude"]` |
+| `env` | 起動時に付与する環境変数（任意）。プロファイル側の `env` で上書きマージされる | `{ FOO = "bar" }` |
 | `reset_weekday` | リセット曜日 | `"monday"` |
 | `reset_time` | リセット時刻（HH:MM） | `"09:00"` |
 | `timezone` | IANAタイムゾーン | `"Asia/Tokyo"` |
@@ -220,11 +224,90 @@ timezone = "Asia/Tokyo"
 
 `name` は空文字不可です。`command` は1要素以上を指定し、先頭要素には空でない実行ファイル名を指定してください。`prompt` を指定するとグローバルの `[prompts].default` の代わりに使われます。ターゲット固有の `prompt` が最優先です。
 
+`reset_weekday` / `reset_time` / `timezone` は通常は必須ですが、ai-usage 連携（[ai-usage 連携](#ai-usage-連携任意)を参照）を有効化しており、かつ `fallback` が `fixed` 以外の場合のみ `reset_weekday` を省略できます。省略時は ai-usage が解決できなかったときの曜日計算フォールバックが利用できなくなる点に注意してください。`env` のキーは `[A-Za-z_][A-Za-z0-9_]*` に制限され、値は `~`（ホームディレクトリ）が展開されます。
+
 **プロンプト優先順位**: `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default`
 
 **Claude 必須フラグの自動付与**: コマンドの実行ファイルが `claude` の場合、ログ出力と進捗モニタリングに必要な `-p`、`--verbose`、`--output-format stream-json`、`--include-partial-messages` と、対話回答待ちを防ぐ `--disallowedTools=AskUserQuestion` が必ず有効化されます。未指定フラグは自動追加され、既存の `--output-format` 値（`--output-format=...` 形式を含む）は `stream-json` に正規化されます。既存の `--disallowedTools` / `--disallowed-tools` がある場合は、必要に応じて equals 形式へ正規化して `AskUserQuestion` を追記します。設定ファイルへの記述は不要です。
 
 `reset_weekday` に指定可能な値: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday`（短縮形: `mon` `tue` `wed` `thu` `fri` `sat` `sun`）
+
+### ai-usage 連携（任意）
+
+外部ツール `ai-usage --json` と連携すると、各エージェントの reset 時刻を実データ（`weekly.resets_at`）から自動取得できます。従来は `reset_weekday` / `reset_time` / `timezone` から固定計算していましたが、ai-usage 連携を有効化すると実際の利用状況に基づいた reset 時刻が使われます（固定計算は解決失敗時のフォールバックとして引き続き機能します）。
+
+連携が無い、または `enabled = false` の場合は従来どおり曜日計算のみで動作します。
+
+```toml
+[ai_usage]                 # 任意。無い or enabled=false なら従来の曜日計算のみ
+enabled = true
+command = ["ai-usage", "--json"]   # デフォルト
+window = "weekly"          # weekly | five_hour | nearest（deadline 算出枠、デフォルト weekly）
+fallback = "fixed"         # fixed | skip | error（解決失敗時、デフォルト fixed）
+state_window = "weekly"    # weekly | selected（処理済みカットオフ枠、デフォルト weekly）
+
+[[ai_usage.profiles]]
+name = "work"              # 内部参照名（展開名 <agent>-<name> に使う）
+profile = "Work"           # ai-usage --json の "profile" と照合（大文字小文字を区別）
+env = { CLAUDE_CONFIG_DIR = "~/.config/claude-work" }  # そのアカウントでの起動時 env（~ 展開される）
+
+[[ai_usage.profiles]]
+name = "home"
+profile = "Home"
+env = { CLAUDE_CONFIG_DIR = "~/.config/claude-home" }
+
+[[agents]]
+name = "claude"
+provider = "claude"        # ai-usage の (profile, provider) 照合に使用。ai_usage 連携時は必須
+command = ["claude"]
+# env = { ... }            # 任意。profile.env で上書きマージされる
+reset_weekday = "monday"   # ai_usage 連携かつ fallback != fixed のときは省略可。それ以外は必須
+reset_time = "09:00"
+timezone = "Asia/Tokyo"
+[agents.ai_usage]
+profiles = ["work", "home"]    # 参照する profile 名。複数指定でアカウント別に展開
+# window = "weekly"            # 任意: グローバル設定の上書き
+# fallback = "fixed"           # 任意: グローバル設定の上書き
+```
+
+#### `[ai_usage]`（グローバル設定）
+
+| フィールド | 説明 | デフォルト |
+|-----------|------|-----------|
+| `enabled` | ai-usage 連携を有効化する。無い or `false` なら従来の曜日計算のみ | `false` |
+| `command` | 実行する ai-usage コマンドと引数 | `["ai-usage", "--json"]` |
+| `window` | deadline 算出に使う枠。`weekly` / `five_hour` / `nearest` | `"weekly"` |
+| `fallback` | 解決失敗時の挙動。`fixed`（曜日計算へフォールバック）/ `skip`（候補から除外）/ `error`（停止） | `"fixed"` |
+| `state_window` | 処理済みカットオフの算出枠。`weekly` / `selected` | `"weekly"` |
+
+#### `[[ai_usage.profiles]]`（プロファイル定義）
+
+| フィールド | 説明 | 例 |
+|-----------|------|-----|
+| `name` | 内部参照名。エージェントの展開名 `<agent>-<name>` に使われる | `"work"` |
+| `profile` | `ai-usage --json` の `"profile"` と照合する名前（大文字小文字を区別） | `"Work"` |
+| `env` | そのアカウントでの起動時 env（任意）。キーは `[A-Za-z_][A-Za-z0-9_]*`、値は `~` 展開される | `{ CLAUDE_CONFIG_DIR = "~/.config/claude-work" }` |
+
+#### `[agents.ai_usage]`（エージェント側の連携設定）
+
+| フィールド | 説明 | 例 |
+|-----------|------|-----|
+| `profiles` | 参照する profile 名のリスト。複数指定でアカウント別に展開 | `["work", "home"]` |
+| `window` | グローバル `window` の上書き（任意） | `"weekly"` |
+| `fallback` | グローバル `fallback` の上書き（任意） | `"fixed"` |
+
+#### 挙動
+
+- 実行時に agent × profile を展開します。例: `claude` + `["work", "home"]` → `claude-work` / `claude-home` の 2 エージェント。各々プロファイルの `env` を付与して起動します。**profile を 1 つだけ参照する場合は展開名が agent 名のまま**（例: `codex` が `["home"]` のみ → `codex`）で、サフィックス `<agent>-<profile>` が付くのは 2 つ以上参照したときだけです。起動コマンドが異なる各アカウントを別 agent として定義しても展開名が冗長にならず、`state.json` キーも安定します。
+- 展開名は `state.json` のキーにも使われ、アカウントごとに処理済み状態が分離されます。
+- `ai-usage --json` は 1 プロセスにつき 1 回だけ実行されます。
+- reset 時刻は ai-usage が選択した枠（`weekly` 等）の `resets_at` から取得します。
+- 解決に失敗した場合（ai-usage コマンドが無い／失敗、該当する `(profile, provider)` が無い、`ok:false`、該当枠が `null`）は `fallback` に従います。
+  - `fixed`: 曜日計算に戻ります（source 表示は `fixed fallback: <理由>`）。
+  - `skip`: そのエージェントを候補から除外します。
+  - `error`: 停止します。
+- `status` / `run` は各エージェントのスケジュールの **source**（`ai-usage (weekly)` / `fixed` / `fixed fallback`）を表示します（静かにフォールバックしません）。
+- `env` のキーは `[A-Za-z_][A-Za-z0-9_]*` に制限されます。値は `~`（ホームディレクトリ）が展開されます。
 
 ### 自動スキャン（複数定義可）
 

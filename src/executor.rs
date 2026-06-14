@@ -3,7 +3,7 @@ use colored::Colorize;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config::Agent;
+use crate::config::RuntimeAgent;
 use crate::display;
 use crate::scanner::{ResolvedTarget, Visibility};
 
@@ -14,11 +14,11 @@ const CLAUDE_BLOCKED_INTERACTIVE_TOOL: &str = "AskUserQuestion";
 const CODEX_APPROVAL_OVERRIDE: &str = "approval_policy=never";
 
 pub struct ExecutionPlan {
-    pub agent: Agent,
+    pub agent: RuntimeAgent,
     pub tasks: Vec<ResolvedTarget>,
 }
 
-pub fn build_plan(agent: &Agent, targets: Vec<ResolvedTarget>) -> ExecutionPlan {
+pub fn build_plan(agent: &RuntimeAgent, targets: Vec<ResolvedTarget>) -> ExecutionPlan {
     let mut agent = agent.clone();
     ensure_required_flags(&mut agent);
     ExecutionPlan {
@@ -53,13 +53,30 @@ fn is_codex_command(command: &[String]) -> bool {
     basename == "codex" || basename.starts_with("codex-") || basename.starts_with("codex_")
 }
 
+/// RuntimeAgent が claude provider かを判定する。
+/// provider が明示されていればそれを優先し、無ければ実行ファイル名から推論する。
+fn agent_is_claude(agent: &RuntimeAgent) -> bool {
+    match agent.provider.as_deref() {
+        Some(p) => p.eq_ignore_ascii_case("claude"),
+        None => is_claude_command(&agent.command),
+    }
+}
+
+/// RuntimeAgent が codex provider かを判定する。
+fn agent_is_codex(agent: &RuntimeAgent) -> bool {
+    match agent.provider.as_deref() {
+        Some(p) => p.eq_ignore_ascii_case("codex"),
+        None => is_codex_command(&agent.command),
+    }
+}
+
 /// 既知エージェントに必要なフラグを自動付与する。
-/// 実行ファイルが `claude` か `codex` かを判定し、それぞれの無人実行に必要な
-/// フラグを付与する。いずれにも該当しない未知のエージェントには何もしない。
-fn ensure_required_flags(agent: &mut Agent) {
-    if is_claude_command(&agent.command) {
+/// provider（または実行ファイル名）が `claude` か `codex` かを判定し、それぞれの
+/// 無人実行に必要なフラグを付与する。いずれにも該当しない場合は何もしない。
+fn ensure_required_flags(agent: &mut RuntimeAgent) {
+    if agent_is_claude(agent) {
         ensure_claude_required_flags(agent);
-    } else if is_codex_command(&agent.command) {
+    } else if agent_is_codex(agent) {
         ensure_codex_unattended_flags(&mut agent.command);
     }
 }
@@ -68,7 +85,7 @@ fn ensure_required_flags(agent: &mut Agent) {
 /// `--include-partial-messages` はログ取得に必須であり、常に存在しなければならない。
 /// また、token-burn は無人実行のため、
 /// ユーザー回答待ちで停止する `AskUserQuestion` を禁止する。
-fn ensure_claude_required_flags(agent: &mut Agent) {
+fn ensure_claude_required_flags(agent: &mut RuntimeAgent) {
     let needs_print = !agent.command.iter().any(|s| s == "-p" || s == "--print");
     let needs_verbose = !agent.command.iter().any(|s| s == "--verbose");
     let needs_partial = !agent
@@ -344,7 +361,7 @@ pub fn execute_plan_tmux(
     let exe_path =
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("token-burn"));
     let stop_file = tmp_dir.join("stop");
-    let is_claude = is_claude_command(&plan.agent.command);
+    let is_claude = agent_is_claude(&plan.agent);
 
     // 各タスクの実行スクリプトと pending マーカーを書き出す
     for (idx_zero, task) in plan.tasks.iter().enumerate() {
@@ -714,7 +731,7 @@ struct TaskCtx<'a> {
     idx: usize,
     total: usize,
     task: &'a ResolvedTarget,
-    agent: &'a Agent,
+    agent: &'a RuntimeAgent,
     prompt_file: &'a Path,
     run_dir: &'a Path,
     marker_dir: &'a Path,
@@ -768,7 +785,12 @@ fn build_task_script(ctx: &TaskCtx<'_>) -> String {
     );
     let error_prefix = shell_escape(&format!("[{}] ", ctx.task.display_name));
     let stop_file_escaped = shell_escape(&ctx.stop_file.to_string_lossy());
-    let cmd_str = build_shell_command(&ctx.agent.command, ctx.prompt_file, &ctx.task.directory);
+    let cmd_str = build_shell_command(
+        &ctx.agent.command,
+        &ctx.agent.env,
+        ctx.prompt_file,
+        &ctx.task.directory,
+    );
     let mark_cmd = format!(
         "{} mark {} {} {}",
         shell_escape(&ctx.exe_path.to_string_lossy()),
@@ -1004,16 +1026,33 @@ fn build_task_header_script(idx: usize, total: usize, display_name: &str) -> Str
 
 fn build_shell_command(
     cmd_parts: &[String],
+    env: &std::collections::BTreeMap<String, String>,
     prompt_file: &std::path::Path,
     directory: &std::path::Path,
 ) -> String {
     let mut parts: Vec<String> = vec![format!("cd {}", shell_escape(&directory.to_string_lossy()))];
-    let cmd: Vec<String> = cmd_parts.iter().map(|s| shell_escape(s)).collect();
+    // 環境変数を `KEY='val' cmd ...` の形で前置する。key は設定読み込み時に
+    // [A-Za-z_][A-Za-z0-9_]* へ制限済みなのでエスケープ不要、値のみ shell_escape する。
+    let env_prefix = env
+        .iter()
+        .map(|(k, v)| format!("{k}={}", shell_escape(v)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cmd_joined = cmd_parts
+        .iter()
+        .map(|s| shell_escape(s))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let run = if env_prefix.is_empty() {
+        cmd_joined
+    } else {
+        format!("{env_prefix} {cmd_joined}")
+    };
     // プロンプトをコマンド置換 $(cat file) で引数として渡す
     // stdin パイプは claude -p で確実に動作しないため
     parts.push(format!(
         "{} \"$(cat {})\"",
-        cmd.join(" "),
+        run,
         shell_escape(&prompt_file.to_string_lossy())
     ));
     parts.join(" && ")
@@ -1126,7 +1165,7 @@ mod tests {
 
     fn task_ctx_for_test<'a>(
         idx: usize,
-        agent: &'a Agent,
+        agent: &'a RuntimeAgent,
         task: &'a ResolvedTarget,
         tmp: &'a std::path::Path,
         is_claude: bool,
@@ -1149,13 +1188,10 @@ mod tests {
 
     #[test]
     fn build_task_script_for_claude_uses_classify_result_and_no_sleep_infinity() {
-        let agent = Agent {
+        let agent = RuntimeAgent {
             name: "claude".to_string(),
             command: vec!["claude".to_string(), "-p".to_string()],
-            reset_weekday: "monday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "UTC".to_string(),
-            prompt: None,
+            ..Default::default()
         };
         let task = ResolvedTarget {
             directory: std::path::PathBuf::from("/tmp/repo"),
@@ -1195,13 +1231,10 @@ mod tests {
         // SIGINT で CANCELLED=1 になった後、レート制限 (CLASS_CODE=2) や
         // リトライ可能エラー (CLASS_CODE=3) で終了したタスクは CANCELLED を
         // リセットしないと、後続タスクで誤って Cancelled と判定されてしまう。
-        let agent = Agent {
+        let agent = RuntimeAgent {
             name: "claude".to_string(),
             command: vec!["claude".to_string(), "-p".to_string()],
-            reset_weekday: "monday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "UTC".to_string(),
-            prompt: None,
+            ..Default::default()
         };
         let task = ResolvedTarget {
             directory: std::path::PathBuf::from("/tmp/repo"),
@@ -1241,13 +1274,10 @@ mod tests {
 
     #[test]
     fn build_task_script_for_non_claude_skips_classify() {
-        let agent = Agent {
+        let agent = RuntimeAgent {
             name: "codex".to_string(),
             command: vec!["codex".to_string(), "exec".to_string()],
-            reset_weekday: "monday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "UTC".to_string(),
-            prompt: None,
+            ..Default::default()
         };
         let task = ResolvedTarget {
             directory: std::path::PathBuf::from("/tmp/repo"),
@@ -1467,22 +1497,48 @@ mod tests {
     #[test]
     fn build_shell_command_escapes_paths() {
         let cmd = vec!["claude".to_string(), "-p".to_string()];
+        let env = std::collections::BTreeMap::new();
         let prompt = std::path::Path::new("/tmp/prompt.txt");
         let dir = std::path::Path::new("/home/user/my project");
-        let result = build_shell_command(&cmd, prompt, dir);
+        let result = build_shell_command(&cmd, &env, prompt, dir);
         assert!(result.contains("cd '/home/user/my project'"));
         assert!(result.contains("'claude' '-p'"));
         assert!(result.contains("$(cat '/tmp/prompt.txt')"));
     }
 
-    fn make_agent(command: Vec<&str>) -> Agent {
-        Agent {
+    #[test]
+    fn build_shell_command_prepends_env_vars() {
+        let cmd = vec!["claude".to_string(), "-p".to_string()];
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/home/user/.config/work".to_string(),
+        );
+        let prompt = std::path::Path::new("/tmp/prompt.txt");
+        let dir = std::path::Path::new("/repo");
+        let result = build_shell_command(&cmd, &env, prompt, dir);
+        // env は cmd の直前に KEY='val' 形式で前置される
+        assert!(
+            result.contains("CLAUDE_CONFIG_DIR='/home/user/.config/work' 'claude' '-p'"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn build_shell_command_without_env_has_no_prefix() {
+        let cmd = vec!["codex".to_string()];
+        let env = std::collections::BTreeMap::new();
+        let prompt = std::path::Path::new("/tmp/p.txt");
+        let dir = std::path::Path::new("/repo");
+        let result = build_shell_command(&cmd, &env, prompt, dir);
+        assert!(result.contains("&& 'codex' \"$(cat"));
+    }
+
+    fn make_agent(command: Vec<&str>) -> RuntimeAgent {
+        RuntimeAgent {
             name: "claude".to_string(),
             command: command.into_iter().map(String::from).collect(),
-            reset_weekday: "monday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "UTC".to_string(),
-            prompt: None,
+            ..Default::default()
         }
     }
 
@@ -1728,13 +1784,10 @@ mod tests {
     #[test]
     fn ensure_required_flags_empty_command_returns_early() {
         // command が空の場合（executable が空文字列にならない）
-        let mut agent = Agent {
+        let mut agent = RuntimeAgent {
             name: "test".to_string(),
             command: vec![],
-            reset_weekday: "monday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "UTC".to_string(),
-            prompt: None,
+            ..Default::default()
         };
         let original_len = agent.command.len();
         ensure_required_flags(&mut agent);
@@ -1756,13 +1809,10 @@ mod tests {
 
     #[test]
     fn ensure_required_flags_adds_codex_approval_policy() {
-        let mut agent = Agent {
+        let mut agent = RuntimeAgent {
             name: "codex".to_string(),
             command: vec!["codex".to_string(), "exec".to_string()],
-            reset_weekday: "thursday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "UTC".to_string(),
-            prompt: None,
+            ..Default::default()
         };
         ensure_required_flags(&mut agent);
         // 実行ファイル直後に top-level config override が挿入される
@@ -1780,13 +1830,10 @@ mod tests {
     #[test]
     fn ensure_required_flags_ignores_unknown_agent() {
         // claude でも codex でもないエージェントは一切変更しない
-        let mut agent = Agent {
+        let mut agent = RuntimeAgent {
             name: "aider".to_string(),
             command: vec!["aider".to_string(), "--yes".to_string()],
-            reset_weekday: "thursday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "UTC".to_string(),
-            prompt: None,
+            ..Default::default()
         };
         let original = agent.command.clone();
         ensure_required_flags(&mut agent);
@@ -2088,13 +2135,10 @@ mod tests {
 
     #[test]
     fn ensure_required_flags_works_with_wrapper() {
-        let mut agent = Agent {
+        let mut agent = RuntimeAgent {
             name: "claude".to_string(),
             command: vec!["/opt/tools/claude-wrapper.sh".to_string()],
-            reset_weekday: "friday".to_string(),
-            reset_time: "13:00".to_string(),
-            timezone: "Asia/Tokyo".to_string(),
-            prompt: None,
+            ..Default::default()
         };
         ensure_required_flags(&mut agent);
         assert!(agent.command.contains(&"-p".to_string()));
@@ -2136,6 +2180,7 @@ mod tests {
     fn build_shell_command_includes_cd_and_prompt() {
         let cmd = build_shell_command(
             &["claude".to_string(), "-p".to_string()],
+            &std::collections::BTreeMap::new(),
             std::path::Path::new("/tmp/prompt.txt"),
             std::path::Path::new("/home/user/repo"),
         );

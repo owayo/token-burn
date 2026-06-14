@@ -45,6 +45,8 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Duplicate-safe scan merge**: If multiple scan sources find the same directory, it is processed only once
 - **Visibility-aware**: Prioritizes public repositories over private ones (matched by remote repository name)
 - **Multi-agent**: Supports Claude Code, Codex CLI, and custom agents
+- **ai-usage integration**: Derives reset times from real usage data via `ai-usage --json` (with the configured fixed-schedule calculation kept as a fallback)
+- **Multi-account expansion**: Expands a single agent across multiple accounts (e.g. `claude` → `claude-work` / `claude-home`), each launched with its own environment and tracked separately in `state.json`
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
 - **Deadline-aware stop**: Stops starting new tasks when the reset time arrives and waits for current tasks to finish
 - **Parallel execution**: Runs multiple prompts concurrently in tmux split panes with progress monitor
@@ -213,6 +215,8 @@ timezone = "Asia/Tokyo"
 |-------|-------------|---------|
 | `name` | Agent identifier | `"claude"` |
 | `command` | Command and arguments | `["claude"]` |
+| `provider` | Provider name used to match `(profile, provider)` against `ai-usage --json` output. Required when ai-usage integration is enabled for the agent | `"claude"` |
+| `env` | Environment variables applied when launching the agent (optional). Keys must match `[A-Za-z_][A-Za-z0-9_]*`; values are `~`-expanded. Merged with (and overridden by) a profile's `env` | `{ CLAUDE_CONFIG_DIR = "~/.config/claude-home" }` |
 | `reset_weekday` | Reset day of week | `"monday"` |
 | `reset_time` | Reset time (HH:MM) | `"09:00"` |
 | `timezone` | IANA timezone | `"Asia/Tokyo"` |
@@ -220,11 +224,89 @@ timezone = "Asia/Tokyo"
 
 `name` must not be empty. `command` must contain at least one element, and the first element must be a non-empty executable name. `prompt` overrides the global `[prompts].default` for this agent; target-level `prompt` takes highest priority.
 
+`reset_weekday`, `reset_time`, and `timezone` are normally required. They may be omitted only when ai-usage integration is enabled for the agent **and** the effective `fallback` is not `fixed`, since in that case the fixed-schedule calculation is never used. Otherwise they are still required as the fallback schedule. See [ai-usage integration (optional)](#ai-usage-integration-optional).
+
 **Prompt priority**: `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default`
 
 **Claude auto-injected flags**: When the executable is `claude`, the following flags are enforced: `-p`, `--verbose`, `--output-format stream-json`, `--include-partial-messages`, and `--disallowedTools=AskUserQuestion`. Missing flags are appended automatically, an existing `--output-format` value is normalized to `stream-json` (including `--output-format=...` form), and an existing `--disallowedTools` / `--disallowed-tools` list is normalized and extended with `AskUserQuestion` when needed. The logging flags are required for proper log capture and progress monitoring; `AskUserQuestion` is denied so unattended token-burn jobs cannot stop on an interactive question. You do not need to include them in your config.
 
 `reset_weekday` accepts: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday` (or short forms: `mon` `tue` `wed` `thu` `fri` `sat` `sun`)
+
+### ai-usage integration (optional)
+
+By default, each agent's reset deadline is computed from its fixed `reset_weekday` / `reset_time` / `timezone`. The optional `[ai_usage]` integration instead derives reset times from real usage data reported by an external `ai-usage --json` tool (from the selected window's `resets_at`). The fixed-schedule calculation is kept as a fallback, so token-burn never silently loses a deadline when live data is unavailable.
+
+The integration also lets you expand a single agent across multiple accounts (profiles). For example, a `claude` agent referencing `["work", "home"]` expands into two agents, `claude-work` and `claude-home`, each launched with its own environment and tracked under its own key in `state.json`. A profile referenced alone keeps the agent's own name (e.g. a `codex` agent referencing only `["home"]` stays `codex`); the `<agent>-<profile>` suffix is added only when two or more profiles are referenced. This lets you define each account as a separate agent — handy when accounts launch via different wrapper commands — without redundant names, and keeps `state.json` keys stable.
+
+```toml
+[ai_usage]                # optional. If omitted or enabled = false, only the fixed weekday calculation is used
+enabled = true
+command = ["ai-usage", "--json"]   # default
+window = "weekly"         # weekly | five_hour | nearest — window used to compute the deadline (default: weekly)
+fallback = "fixed"        # fixed | skip | error — what to do when resolution fails (default: fixed)
+state_window = "weekly"   # weekly | selected — window used for the processed-target cutoff (default: weekly)
+
+[[ai_usage.profiles]]
+name = "work"             # internal reference name (used in the expanded name <agent>-<name>)
+profile = "Work"          # matched against the "profile" field of ai-usage --json output (case-sensitive)
+env = { CLAUDE_CONFIG_DIR = "~/.config/claude-work" }  # env applied when launching this account (~-expanded)
+
+[[ai_usage.profiles]]
+name = "home"
+profile = "Home"
+env = { CLAUDE_CONFIG_DIR = "~/.config/claude-home" }
+
+[[agents]]
+name = "claude"
+provider = "claude"       # used to match (profile, provider) against ai-usage output. Required when ai-usage is enabled
+command = ["claude"]
+# env = { ... }           # optional base env; overridden by a profile's env on key collisions
+reset_weekday = "monday"  # optional when ai-usage is enabled and fallback != fixed; required otherwise (used as fallback)
+reset_time = "09:00"
+timezone = "Asia/Tokyo"
+[agents.ai_usage]
+profiles = ["work", "home"]   # profile names to reference; multiple names expand into per-account agents
+# window = "weekly"           # optional: override the global [ai_usage].window for this agent
+# fallback = "fixed"          # optional: override the global [ai_usage].fallback for this agent
+```
+
+#### `[ai_usage]` (global)
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `enabled` | Enable the integration. When omitted or `false`, only the fixed weekday calculation is used | `false` |
+| `command` | Command and arguments used to query usage data (must emit JSON) | `["ai-usage", "--json"]` |
+| `window` | Window whose `resets_at` is used to compute the deadline: `weekly`, `five_hour`, or `nearest` | `weekly` |
+| `fallback` | Behavior when resolution fails: `fixed`, `skip`, or `error` | `fixed` |
+| `state_window` | Window used for the processed-target cutoff: `weekly` or `selected` | `weekly` |
+
+#### `[[ai_usage.profiles]]`
+
+| Field | Description |
+|-------|-------------|
+| `name` | Internal reference name. Used in the expanded agent name `<agent>-<name>` and referenced from `[agents.ai_usage].profiles` |
+| `profile` | Value matched against the `profile` field of `ai-usage --json` output (case-sensitive) |
+| `env` | Environment variables applied when launching this account. Keys must match `[A-Za-z_][A-Za-z0-9_]*`; values are `~`-expanded. Merged into (and override) the agent's `env` |
+
+#### `[agents.ai_usage]` (per agent)
+
+| Field | Description |
+|-------|-------------|
+| `profiles` | Profile names (from `[[ai_usage.profiles]].name`) this agent uses. Multiple names expand the agent into one instance per account |
+| `window` | Optional override of the global `[ai_usage].window` for this agent |
+| `fallback` | Optional override of the global `[ai_usage].fallback` for this agent |
+
+#### Behavior
+
+- At run time, each agent is expanded across its referenced profiles. For example, `claude` with `["work", "home"]` becomes two agents, `claude-work` and `claude-home`, each launched with its profile's `env`.
+- Expanded names are also used as `state.json` keys, so processed-target state is tracked separately per account.
+- `ai-usage --json` is invoked only once per process.
+- The reset time is taken from the `resets_at` value of the selected window (e.g. `weekly`) for the matching `(profile, provider)` pair.
+- When resolution fails — the command is missing or fails, no matching `(profile, provider)` is found, the response reports `ok: false`, or the selected window is null — the configured `fallback` applies:
+  - `fixed`: fall back to the fixed weekday calculation (the schedule source is shown as `fixed fallback: <reason>`).
+  - `skip`: drop the affected agent from the candidate list.
+  - `error`: stop with an error.
+- `status` and `run` display each agent's schedule **source** (`ai-usage (weekly)`, `fixed`, or `fixed fallback`) so token-burn never falls back silently.
 
 ### Auto-scan (multiple sources)
 

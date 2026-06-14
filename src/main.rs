@@ -8,6 +8,7 @@ mod init;
 mod scanner;
 mod schedule;
 mod state;
+mod usage;
 
 #[cfg(test)]
 mod test_support {
@@ -209,7 +210,9 @@ async fn main() -> Result<()> {
 
     match command {
         Commands::Status => {
-            display::print_status(&config)?;
+            let runtime_agents = config.expand_runtime_agents()?;
+            let resolver = usage::ScheduleResolver::load(&config).await;
+            display::print_status(&runtime_agents, &resolver)?;
         }
         Commands::Run { paths } => {
             run(RunOptions {
@@ -258,24 +261,33 @@ async fn run(opts: RunOptions) -> Result<()> {
         public_only,
         force_paths,
     } = opts;
+    let runtime_agents = config.expand_runtime_agents()?;
+    let resolver = usage::ScheduleResolver::load(&config).await;
     let (agent_idx, sched) = if let Some(name) = &agent_name {
-        let idx = config
-            .agents
+        let idx = runtime_agents
             .iter()
             .position(|a| a.name == *name)
             .ok_or_else(|| anyhow::anyhow!("Agent not found: {}", name))?;
-        let s = schedule::calculate_next_reset(&config.agents[idx])?;
+        let s = resolver
+            .schedule_for(&runtime_agents[idx])?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Selected agent '{}' is skipped (ai-usage fallback=skip)",
+                    name
+                )
+            })?;
         (idx, s)
     } else {
-        schedule::select_nearest_agent(&config.agents)?
+        resolver.select_nearest(&runtime_agents)?
     };
 
-    let agent = &config.agents[agent_idx];
+    let agent = &runtime_agents[agent_idx];
     println!(
-        "{} {} (reset in {})",
+        "{} {} (reset in {}, source: {})",
         "Selected agent:".bold(),
-        agent.name.cyan(),
-        display::format_duration(sched.time_until_reset).red()
+        sched.agent_name.cyan(),
+        display::format_duration(sched.time_until_reset).red(),
+        sched.source.label().dimmed(),
     );
     println!();
 
@@ -424,7 +436,7 @@ fn resolve_report_dir(settings: &config::Settings) -> PathBuf {
 
 fn resolve_force_paths(
     config: &config::Config,
-    agent: &config::Agent,
+    agent: &config::RuntimeAgent,
     paths: &[PathBuf],
 ) -> Result<Vec<scanner::ResolvedTarget>> {
     let effective_default = agent.prompt.as_deref().unwrap_or(&config.prompts.default);
@@ -488,7 +500,7 @@ fn resolve_force_paths(
 fn filter_by_state(
     targets: Vec<scanner::ResolvedTarget>,
     run_state: &state::State,
-    agent: &config::Agent,
+    agent: &config::RuntimeAgent,
     config: &config::Config,
     sched: &schedule::AgentSchedule,
 ) -> (Vec<scanner::ResolvedTarget>, usize) {
@@ -506,12 +518,12 @@ fn filter_by_state(
                     e
                 );
                 // 前回リセット時刻にフォールバック
-                sched.previous_reset.with_timezone(&Utc)
+                sched.state_cutoff.with_timezone(&Utc)
             }
         }
     } else {
         // デフォルト: 前回リセット以降に処理済みのディレクトリをスキップ
-        sched.previous_reset.with_timezone(&Utc)
+        sched.state_cutoff.with_timezone(&Utc)
     };
 
     let mut kept = Vec::new();
@@ -571,10 +583,10 @@ mod tests {
         let agent = config::Agent {
             name: "claude".to_string(),
             command: vec!["echo".to_string()],
-            reset_weekday: "monday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "UTC".to_string(),
-            prompt: None,
+            reset_weekday: Some("monday".to_string()),
+            reset_time: Some("09:00".to_string()),
+            timezone: Some("UTC".to_string()),
+            ..Default::default()
         };
         let conf = config::Config {
             config_dir: std::path::PathBuf::from("."),
@@ -592,8 +604,11 @@ mod tests {
             agents: vec![agent.clone()],
             scan: vec![],
             targets: vec![],
+            ai_usage: None,
         };
-        let sched = schedule::calculate_next_reset(&agent).unwrap();
+        let runtime = conf.expand_runtime_agents().expect("expand");
+        let runtime_agent = &runtime[0];
+        let sched = schedule::calculate_fixed_reset(runtime_agent).unwrap();
 
         // 2つのターゲットを用意: 1つは処理済み、1つは未処理
         let targets = vec![
@@ -620,7 +635,7 @@ mod tests {
             .or_default()
             .insert("/tmp/processed-repo".to_string(), Utc::now());
 
-        let (kept, skipped) = filter_by_state(targets, &run_state, &agent, &conf, &sched);
+        let (kept, skipped) = filter_by_state(targets, &run_state, runtime_agent, &conf, &sched);
         assert_eq!(skipped, 1);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].display_name, "new-repo");
@@ -642,10 +657,10 @@ mod tests {
         let agent = config::Agent {
             name: "claude".to_string(),
             command: vec!["echo".to_string()],
-            reset_weekday: "monday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "UTC".to_string(),
-            prompt: None,
+            reset_weekday: Some("monday".to_string()),
+            reset_time: Some("09:00".to_string()),
+            timezone: Some("UTC".to_string()),
+            ..Default::default()
         };
         let conf = config::Config {
             config_dir: std::path::PathBuf::from("."),
@@ -663,11 +678,14 @@ mod tests {
             agents: vec![agent.clone()],
             scan: vec![],
             targets: vec![],
+            ai_usage: None,
         };
-        let sched = schedule::calculate_next_reset(&agent).unwrap();
+        let runtime = conf.expand_runtime_agents().expect("expand");
+        let runtime_agent = &runtime[0];
+        let sched = schedule::calculate_fixed_reset(runtime_agent).unwrap();
         let empty_state = state::State::default();
 
-        let (kept, skipped) = filter_by_state(targets, &empty_state, &agent, &conf, &sched);
+        let (kept, skipped) = filter_by_state(targets, &empty_state, runtime_agent, &conf, &sched);
         assert_eq!(skipped, 0);
         assert_eq!(kept.len(), original_len);
     }
@@ -685,10 +703,10 @@ mod tests {
         let agent = config::Agent {
             name: "claude".to_string(),
             command: vec!["echo".to_string()],
-            reset_weekday: "monday".to_string(),
-            reset_time: "09:00".to_string(),
-            timezone: "UTC".to_string(),
-            prompt: None,
+            reset_weekday: Some("monday".to_string()),
+            reset_time: Some("09:00".to_string()),
+            timezone: Some("UTC".to_string()),
+            ..Default::default()
         };
         // skip_within を 1 時間に設定
         let conf = config::Config {
@@ -707,8 +725,11 @@ mod tests {
             agents: vec![agent.clone()],
             scan: vec![],
             targets: vec![],
+            ai_usage: None,
         };
-        let sched = schedule::calculate_next_reset(&agent).unwrap();
+        let runtime = conf.expand_runtime_agents().expect("expand");
+        let runtime_agent = &runtime[0];
+        let sched = schedule::calculate_fixed_reset(runtime_agent).unwrap();
 
         let targets = vec![
             scanner::ResolvedTarget {
@@ -747,7 +768,7 @@ mod tests {
                 Utc::now() - chrono::Duration::hours(2),
             );
 
-        let (kept, skipped) = filter_by_state(targets, &run_state, &agent, &conf, &sched);
+        let (kept, skipped) = filter_by_state(targets, &run_state, runtime_agent, &conf, &sched);
         assert_eq!(
             skipped, 1,
             "1時間以内に処理済みのターゲットはスキップされるべき"
@@ -774,18 +795,21 @@ mod tests {
             agents: vec![config::Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
-                prompt: None,
+                reset_weekday: Some("monday".to_string()),
+                reset_time: Some("09:00".to_string()),
+                timezone: Some("UTC".to_string()),
+                ..Default::default()
             }],
             scan: vec![],
             targets: vec![],
+            ai_usage: None,
         };
+        let runtime = config.expand_runtime_agents().expect("expand");
+        let runtime_agent = &runtime[0];
 
         let result = resolve_force_paths(
             &config,
-            &config.agents[0],
+            runtime_agent,
             &[PathBuf::from("/nonexistent/path/that/does/not/exist")],
         );
         assert!(result.is_err(), "存在しないパスはエラーになるべき");
@@ -819,16 +843,19 @@ mod tests {
             agents: vec![config::Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
-                prompt: None,
+                reset_weekday: Some("monday".to_string()),
+                reset_time: Some("09:00".to_string()),
+                timezone: Some("UTC".to_string()),
+                ..Default::default()
             }],
             scan: vec![],
             targets: vec![],
+            ai_usage: None,
         };
+        let runtime = config.expand_runtime_agents().expect("expand");
+        let runtime_agent = &runtime[0];
 
-        let result = resolve_force_paths(&config, &config.agents[0], &[file_path]);
+        let result = resolve_force_paths(&config, runtime_agent, &[file_path]);
         assert!(result.is_err(), "ファイルパスはエラーになるべき");
         assert!(result.unwrap_err().to_string().contains("Not a directory"));
 
@@ -853,16 +880,19 @@ mod tests {
             agents: vec![config::Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
-                prompt: None,
+                reset_weekday: Some("monday".to_string()),
+                reset_time: Some("09:00".to_string()),
+                timezone: Some("UTC".to_string()),
+                ..Default::default()
             }],
             scan: vec![],
             targets: vec![],
+            ai_usage: None,
         };
+        let runtime = config.expand_runtime_agents().expect("expand");
+        let runtime_agent = &runtime[0];
 
-        let result = resolve_force_paths(&config, &config.agents[0], &[]);
+        let result = resolve_force_paths(&config, runtime_agent, &[]);
         assert!(result.is_err(), "空のパスリストはエラーになるべき");
         assert!(result.unwrap_err().to_string().contains("No valid paths"));
     }
@@ -898,18 +928,21 @@ mod tests {
                 agents: vec![config::Agent {
                     name: "agent".to_string(),
                     command: vec!["echo".to_string()],
-                    reset_weekday: "monday".to_string(),
-                    reset_time: "09:00".to_string(),
-                    timezone: "UTC".to_string(),
-                    prompt: None,
+                    reset_weekday: Some("monday".to_string()),
+                    reset_time: Some("09:00".to_string()),
+                    timezone: Some("UTC".to_string()),
+                    ..Default::default()
                 }],
                 scan: vec![],
                 targets: vec![],
+                ai_usage: None,
             };
+            let runtime = config.expand_runtime_agents().expect("expand");
+            let runtime_agent = &runtime[0];
 
             let resolved = resolve_force_paths(
                 &config,
-                &config.agents[0],
+                runtime_agent,
                 &[PathBuf::from("repo"), PathBuf::from("./repo")],
             );
             (expected_repo_dir, resolved)
@@ -946,10 +979,10 @@ mod tests {
             agents: vec![config::Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
-                prompt: None,
+                reset_weekday: Some("monday".to_string()),
+                reset_time: Some("09:00".to_string()),
+                timezone: Some("UTC".to_string()),
+                ..Default::default()
             }],
             scan: vec![],
             targets: vec![config::Target {
@@ -957,11 +990,13 @@ mod tests {
                 prompt: Some("custom target prompt".to_string()),
                 defer: false,
             }],
+            ai_usage: None,
         };
+        let runtime = config.expand_runtime_agents().expect("expand");
+        let runtime_agent = &runtime[0];
 
-        let resolved =
-            resolve_force_paths(&config, &config.agents[0], std::slice::from_ref(&repo_dir))
-                .expect("should resolve");
+        let resolved = resolve_force_paths(&config, runtime_agent, std::slice::from_ref(&repo_dir))
+            .expect("should resolve");
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].prompt, "custom target prompt");
@@ -991,18 +1026,20 @@ mod tests {
             agents: vec![config::Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
-                prompt: None,
+                reset_weekday: Some("monday".to_string()),
+                reset_time: Some("09:00".to_string()),
+                timezone: Some("UTC".to_string()),
+                ..Default::default()
             }],
             scan: vec![],
             targets: vec![],
+            ai_usage: None,
         };
+        let runtime = config.expand_runtime_agents().expect("expand");
+        let runtime_agent = &runtime[0];
 
-        let resolved =
-            resolve_force_paths(&config, &config.agents[0], std::slice::from_ref(&repo_dir))
-                .expect("should resolve");
+        let resolved = resolve_force_paths(&config, runtime_agent, std::slice::from_ref(&repo_dir))
+            .expect("should resolve");
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].prompt, "default prompt");

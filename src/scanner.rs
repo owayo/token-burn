@@ -40,7 +40,7 @@ struct GhRepo {
 
 pub async fn resolve_targets(
     config: &Config,
-    agent: &crate::config::Agent,
+    agent: &crate::config::RuntimeAgent,
 ) -> Result<Vec<ResolvedTarget>> {
     // 優先順位: ターゲット個別プロンプト > エージェント個別プロンプト > グローバル既定値
     let effective_default = agent.prompt.as_deref().unwrap_or(&config.prompts.default);
@@ -504,10 +504,8 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
                 prompt: None,
+                ..Default::default()
             }],
             scan: vec![],
             targets: vec![
@@ -522,9 +520,13 @@ mod tests {
                     defer: false,
                 },
             ],
+            ai_usage: None,
         };
 
-        let resolved = resolve_targets(&config, &config.agents[0])
+        let runtime = config
+            .expand_runtime_agents()
+            .expect("expand runtime agents");
+        let resolved = resolve_targets(&config, &runtime[0])
             .await
             .expect("one valid directory target should remain");
         assert_eq!(resolved.len(), 1);
@@ -569,10 +571,8 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
                 prompt: Some("agent prompt".to_string()),
+                ..Default::default()
             }],
             scan: vec![],
             targets: vec![
@@ -592,9 +592,13 @@ mod tests {
                     defer: false,
                 },
             ],
+            ai_usage: None,
         };
 
-        let resolved = resolve_targets(&config, &config.agents[0])
+        let runtime = config
+            .expand_runtime_agents()
+            .expect("expand runtime agents");
+        let resolved = resolve_targets(&config, &runtime[0])
             .await
             .expect("three targets should resolve");
 
@@ -641,10 +645,8 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
                 prompt: None,
+                ..Default::default()
             }],
             scan: vec![],
             // bbb を2回追加し、2回目でプロンプトを上書きする
@@ -665,9 +667,13 @@ mod tests {
                     defer: false,
                 },
             ],
+            ai_usage: None,
         };
 
-        let resolved = resolve_targets(&config, &config.agents[0])
+        let runtime = config
+            .expand_runtime_agents()
+            .expect("expand runtime agents");
+        let resolved = resolve_targets(&config, &runtime[0])
             .await
             .expect("targets should resolve");
 
@@ -727,10 +733,8 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
                 prompt: None,
+                ..Default::default()
             }],
             scan: vec![
                 Scan {
@@ -749,9 +753,13 @@ mod tests {
                 },
             ],
             targets: vec![],
+            ai_usage: None,
         };
 
-        let resolved = resolve_targets(&config, &config.agents[0])
+        let runtime = config
+            .expand_runtime_agents()
+            .expect("expand runtime agents");
+        let resolved = resolve_targets(&config, &runtime[0])
             .await
             .expect("targets should resolve");
 
@@ -803,10 +811,8 @@ mod tests {
                 agents: vec![Agent {
                     name: "agent".to_string(),
                     command: vec!["echo".to_string()],
-                    reset_weekday: "monday".to_string(),
-                    reset_time: "09:00".to_string(),
-                    timezone: "UTC".to_string(),
                     prompt: None,
+                    ..Default::default()
                 }],
                 scan: vec![Scan {
                     base_dirs: vec![".".to_string()],
@@ -820,9 +826,13 @@ mod tests {
                     prompt: Some("target prompt".to_string()),
                     defer: false,
                 }],
+                ai_usage: None,
             };
 
-            let resolved = resolve_targets(&config, &config.agents[0]).await;
+            let runtime = config
+                .expand_runtime_agents()
+                .expect("expand runtime agents");
+            let resolved = resolve_targets(&config, &runtime[0]).await;
             (expected_repo_dir, resolved)
         };
         let resolved = resolved.expect("same directory should be deduplicated");
@@ -885,16 +895,18 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
                 prompt: None,
+                ..Default::default()
             }],
             scan: vec![scan],
             targets: vec![],
+            ai_usage: None,
         };
 
-        let resolved = resolve_targets(&config, &config.agents[0]).await;
+        let runtime = config
+            .expand_runtime_agents()
+            .expect("expand runtime agents");
+        let resolved = resolve_targets(&config, &runtime[0]).await;
         let resolved = resolved.expect("resolve should succeed");
 
         // シンボリックリンクはスキップされ、実ディレクトリのみ検出される
@@ -943,10 +955,8 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
                 prompt: None,
+                ..Default::default()
             }],
             scan: vec![],
             // a (defer), b, c (defer), d の順で定義 → 結果は b, d, a, c
@@ -972,9 +982,13 @@ mod tests {
                     defer: false,
                 },
             ],
+            ai_usage: None,
         };
 
-        let resolved = resolve_targets(&config, &config.agents[0])
+        let runtime = config
+            .expand_runtime_agents()
+            .expect("expand runtime agents");
+        let resolved = resolve_targets(&config, &runtime[0])
             .await
             .expect("targets should resolve");
 
@@ -1034,10 +1048,8 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
                 prompt: None,
+                ..Default::default()
             }],
             scan: vec![Scan {
                 base_dirs: vec![temp_dir.to_string_lossy().to_string()],
@@ -1051,9 +1063,13 @@ mod tests {
                 prompt: None,
                 defer: true,
             }],
+            ai_usage: None,
         };
 
-        let resolved = resolve_targets(&config, &config.agents[0])
+        let runtime = config
+            .expand_runtime_agents()
+            .expect("expand runtime agents");
+        let resolved = resolve_targets(&config, &runtime[0])
             .await
             .expect("targets should resolve");
 
@@ -1112,10 +1128,8 @@ mod tests {
             agents: vec![Agent {
                 name: "agent".to_string(),
                 command: vec!["echo".to_string()],
-                reset_weekday: "monday".to_string(),
-                reset_time: "09:00".to_string(),
-                timezone: "UTC".to_string(),
                 prompt: None,
+                ..Default::default()
             }],
             scan: vec![Scan {
                 base_dirs: vec![temp_dir.to_string_lossy().to_string()],
@@ -1130,9 +1144,13 @@ mod tests {
                 prompt: Some("override".to_string()),
                 defer: true,
             }],
+            ai_usage: None,
         };
 
-        let resolved = resolve_targets(&config, &config.agents[0])
+        let runtime = config
+            .expand_runtime_agents()
+            .expect("expand runtime agents");
+        let resolved = resolve_targets(&config, &runtime[0])
             .await
             .expect("targets should resolve");
 
