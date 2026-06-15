@@ -25,6 +25,10 @@ pub struct UsageGateConfig {
     pub provider: String,
     /// ai-usage を起動するコマンド（例: ["ai-usage", "--json"]）。
     pub command: Vec<String>,
+    /// 選択 agent の env（CLAUDE_CONFIG_DIR 等）。usage-gate / monitor statusline /
+    /// 起動時キャッシュ初期化を、その agent の実行文脈で動かすために使う。
+    /// これにより起動シェルの環境継承で別アカウントの使用率を見るズレを防ぐ。
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 pub fn build_plan(
@@ -40,6 +44,7 @@ pub fn build_plan(
             profile: rt.profile.clone(),
             provider: rt.provider.clone(),
             command,
+            env: agent.env.clone(),
         }),
         _ => None,
     };
@@ -415,7 +420,10 @@ pub fn execute_plan_tmux(
     // ai-usage 連携時、各タスク完了後に使用率をチェックする usage-gate コマンドを組み立てる。
     let cache_file = tmp_dir.join("ai-usage-cache.json");
     let usage_gate_cmd = plan.usage_gate.as_ref().map(|g| {
-        let mut parts = vec![
+        // usage-gate プロセス自体に選択 agent の env を前置きする。`--` 以降に KEY=val を
+        // 入れると hidden CLI が実行ファイルと誤認するため、サブコマンドより前に置く。
+        let mut parts = env_prefix_parts(&g.env);
+        parts.extend([
             shell_escape(&exe_path.to_string_lossy()),
             "usage-gate".to_string(),
             "--profile".to_string(),
@@ -429,22 +437,22 @@ pub fn execute_plan_tmux(
             "--cache-file".to_string(),
             shell_escape(&cache_file.to_string_lossy()),
             "--".to_string(),
-        ];
+        ]);
         parts.extend(g.command.iter().map(|s| shell_escape(s)));
         parts.join(" ")
     });
 
     // monitor ペインに表示する ai-usage statusline コマンド（--input でキャッシュから高速描画）。
-    let usage_statusline_cmd = plan
-        .usage_gate
-        .as_ref()
-        .and_then(|g| build_statusline_cmd(&g.command, &cache_file));
+    let usage_statusline_cmd = plan.usage_gate.as_ref().and_then(|g| {
+        build_statusline_cmd(&g.command, &cache_file, &g.env, &g.profile, &g.provider)
+    });
     // 起動時に ai-usage キャッシュを初期化し、monitor 起動直後から statusline を表示できるようにする
     // （以後は usage-gate が各タスク完了時に 20 秒 TTL で更新する）。
     if let Some(g) = plan.usage_gate.as_ref()
         && let Some(exe) = g.command.first()
         && let Ok(output) = std::process::Command::new(exe)
             .args(&g.command[1..])
+            .envs(&g.env)
             .output()
         && output.status.success()
     {
@@ -1157,11 +1165,7 @@ fn build_shell_command(
     let mut parts: Vec<String> = vec![format!("cd {}", shell_escape(&directory.to_string_lossy()))];
     // 環境変数を `KEY='val' cmd ...` の形で前置する。key は設定読み込み時に
     // [A-Za-z_][A-Za-z0-9_]* へ制限済みなのでエスケープ不要、値のみ shell_escape する。
-    let env_prefix = env
-        .iter()
-        .map(|(k, v)| format!("{k}={}", shell_escape(v)))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let env_prefix = env_prefix_parts(env).join(" ");
     let cmd_joined = cmd_parts
         .iter()
         .map(|s| shell_escape(s))
@@ -1186,12 +1190,29 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// env マップを `KEY='val'` 形式のシェル前置きトークン列にする。key は設定読み込み時に
+/// [A-Za-z_][A-Za-z0-9_]* へ制限済みなのでクオート不要、値のみ shell_escape する。選択
+/// agent の実行文脈（CLAUDE_CONFIG_DIR 等）を usage-gate / statusline へ伝播するのに使う。
+fn env_prefix_parts(env: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    env.iter()
+        .map(|(k, v)| format!("{k}={}", shell_escape(v)))
+        .collect()
+}
+
 /// ai-usage の `--json` 取得コマンドから monitor 表示用の statusline コマンドを組み立てる。
 /// 出力モードの `--json` を `--statusline --logos --input <cache>` に差し替え、
 /// `env FOO=1 ai-usage --json` のようなラッパー前置きを保持する。`--json` が無ければ末尾に追加する。
-/// usage-gate / 起動時キャッシュ初期化と同じく command 全体を使うため、先頭要素だけを使う実装で
-/// ラッパー構成が静かに壊れる問題を避ける。空コマンドのときは None。
-fn build_statusline_cmd(command: &[String], cache_file: &std::path::Path) -> Option<String> {
+/// さらに実行中 agent の profile/provider を `--active-profile`/`--active-provider` で渡し、選択
+/// agent の env を前置きして monitor が実行中アカウント行を強調するようにする。ai-usage の active
+/// 既定（CLAUDE_CONFIG_DIR/.claude.json の email）は email を持たないアカウントで解決できない
+/// ため、email 非依存の profile 指定を使う。空コマンドのときは None。
+fn build_statusline_cmd(
+    command: &[String],
+    cache_file: &std::path::Path,
+    env: &std::collections::BTreeMap<String, String>,
+    profile: &str,
+    provider: &str,
+) -> Option<String> {
     if command.is_empty() {
         return None;
     }
@@ -1210,13 +1231,15 @@ fn build_statusline_cmd(command: &[String], cache_file: &std::path::Path) -> Opt
     if !replaced {
         parts.extend(statusline_args.iter().map(|s| s.to_string()));
     }
-    Some(
-        parts
-            .iter()
-            .map(|s| shell_escape(s))
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+    // 実行中アカウント行を強調する active 指定（email 非依存の profile/provider）。
+    parts.push("--active-profile".to_string());
+    parts.push(profile.to_string());
+    parts.push("--active-provider".to_string());
+    parts.push(provider.to_string());
+    // 選択 agent の env を前置きし、statusline の実行文脈を揃える。
+    let mut all = env_prefix_parts(env);
+    all.extend(parts.iter().map(|s| shell_escape(s)));
+    Some(all.join(" "))
 }
 
 fn sanitize_filename(s: &str) -> String {
@@ -1689,11 +1712,14 @@ mod tests {
         let cmd = build_statusline_cmd(
             &["ai-usage".to_string(), "--json".to_string()],
             std::path::Path::new("/tmp/cache.json"),
+            &std::collections::BTreeMap::new(),
+            "Work",
+            "claude",
         )
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "'ai-usage' '--statusline' '--logos' '--input' '/tmp/cache.json'"
+            "'ai-usage' '--statusline' '--logos' '--input' '/tmp/cache.json' '--active-profile' 'Work' '--active-provider' 'claude'"
         );
     }
 
@@ -1709,11 +1735,14 @@ mod tests {
                 "--json".to_string(),
             ],
             std::path::Path::new("/tmp/c.json"),
+            &std::collections::BTreeMap::new(),
+            "Home",
+            "codex",
         )
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "'env' 'FOO=1' 'ai-usage' '--statusline' '--logos' '--input' '/tmp/c.json'"
+            "'env' 'FOO=1' 'ai-usage' '--statusline' '--logos' '--input' '/tmp/c.json' '--active-profile' 'Home' '--active-provider' 'codex'"
         );
     }
 
@@ -1722,17 +1751,52 @@ mod tests {
         let cmd = build_statusline_cmd(
             &["ai-usage".to_string()],
             std::path::Path::new("/tmp/c.json"),
+            &std::collections::BTreeMap::new(),
+            "Work",
+            "claude",
         )
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "'ai-usage' '--statusline' '--logos' '--input' '/tmp/c.json'"
+            "'ai-usage' '--statusline' '--logos' '--input' '/tmp/c.json' '--active-profile' 'Work' '--active-provider' 'claude'"
         );
     }
 
     #[test]
     fn build_statusline_cmd_none_for_empty_command() {
-        assert!(build_statusline_cmd(&[], std::path::Path::new("/tmp/c.json")).is_none());
+        assert!(
+            build_statusline_cmd(
+                &[],
+                std::path::Path::new("/tmp/c.json"),
+                &std::collections::BTreeMap::new(),
+                "Work",
+                "claude",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn build_statusline_cmd_prepends_agent_env() {
+        // 選択 agent の env（CLAUDE_CONFIG_DIR 等）が `KEY='val'` 形式で前置きされ、
+        // monitor の statusline が実行中アカウントの実行文脈で動くこと。
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/home/u/.claude".to_string(),
+        );
+        let cmd = build_statusline_cmd(
+            &["ai-usage".to_string(), "--json".to_string()],
+            std::path::Path::new("/tmp/c.json"),
+            &env,
+            "Work",
+            "claude",
+        )
+        .expect("non-empty command");
+        assert_eq!(
+            cmd,
+            "CLAUDE_CONFIG_DIR='/home/u/.claude' 'ai-usage' '--statusline' '--logos' '--input' '/tmp/c.json' '--active-profile' 'Work' '--active-provider' 'claude'"
+        );
     }
 
     #[test]
