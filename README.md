@@ -47,6 +47,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Multi-agent**: Supports Claude Code, Codex CLI, and custom agents
 - **ai-usage integration**: Derives reset times from real usage data via `ai-usage --json` (with the configured fixed-schedule calculation kept as a fallback)
 - **Usage-rate gate**: When ai-usage integration is enabled, re-checks each agent's real utilization (`weekly` / `five_hour`) after every task and stops starting new tasks once `rate_limit_threshold` is reached — extending threshold-based auto-stop to `codex`, not just Claude Code's in-task `rate_limit_event`
+- **Monitor usage panel**: When ai-usage integration is enabled, the tmux monitor pane shows `ai-usage --statusline --logos` (each account's 5h / weekly utilization bars) refreshed every 10 seconds, rendered from a cached `--input` snapshot alongside the per-second progress bar
 - **Multi-account expansion**: Expands a single agent across multiple accounts (e.g. `claude` → `claude-work` / `claude-home`), each launched with its own environment and tracked separately in `state.json`
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
 - **Deadline-aware stop**: Stops starting new tasks when the reset time arrives and waits for current tasks to finish

@@ -434,6 +434,28 @@ pub fn execute_plan_tmux(
         parts.join(" ")
     });
 
+    // monitor ペインに表示する ai-usage statusline コマンド（--input でキャッシュから高速描画）。
+    let usage_statusline_cmd = plan.usage_gate.as_ref().and_then(|g| {
+        g.command.first().map(|exe| {
+            format!(
+                "{} --statusline --logos --input {}",
+                shell_escape(exe),
+                shell_escape(&cache_file.to_string_lossy())
+            )
+        })
+    });
+    // 起動時に ai-usage キャッシュを初期化し、monitor 起動直後から statusline を表示できるようにする
+    // （以後は usage-gate が各タスク完了時に 20 秒 TTL で更新する）。
+    if let Some(g) = plan.usage_gate.as_ref()
+        && let Some(exe) = g.command.first()
+        && let Ok(output) = std::process::Command::new(exe)
+            .args(&g.command[1..])
+            .output()
+        && output.status.success()
+    {
+        let _ = std::fs::write(&cache_file, &output.stdout);
+    }
+
     let mut script_paths = Vec::new();
     for w in 0..worker_count {
         let script_path = tmp_dir.join(format!("worker-{}.sh", w));
@@ -466,6 +488,7 @@ pub fn execute_plan_tmux(
         worker_count,
         &stop_file,
         &run_dir,
+        usage_statusline_cmd.as_deref(),
     );
     std::fs::write(&monitor_path, &monitor_script)?;
     std::process::Command::new("chmod")
@@ -613,6 +636,7 @@ fn generate_monitor_script(
     worker_count: usize,
     stop_file: &std::path::Path,
     report_dir: &std::path::Path,
+    ai_usage_statusline_cmd: Option<&str>,
 ) -> String {
     let agent_escaped = shell_escape(agent_name);
     let command_escaped = shell_escape(command_str);
@@ -621,6 +645,11 @@ fn generate_monitor_script(
     let session_escaped = shell_escape(session);
     let stop_file_escaped = shell_escape(&stop_file.to_string_lossy());
     let report_dir_escaped = shell_escape(&report_dir.to_string_lossy());
+    // ai-usage 連携時のみ statusline コマンド（shell_escape 済みを再度 escape し、
+    // monitor 側の eval で 1 段戻して実行する）。未設定は空文字列で monitor が無効判定する。
+    let ai_usage_cmd_escaped = ai_usage_statusline_cmd
+        .map(shell_escape)
+        .unwrap_or_else(|| "''".to_string());
 
     format!(
         r#"#!/bin/bash
@@ -634,43 +663,73 @@ SESSION={session}
 WORKER_COUNT={worker_count}
 STOP_FILE={stop_file}
 REPORT_DIR={report_dir}
+AI_USAGE_CMD={ai_usage_cmd}
 STOPPED=0
-DISPLAYED_ERRORS=":"
+USAGE_DISPLAY=""
+LAST_USAGE=0
+LAST_ERR_COUNT=-1
+STATUS_MSG=""
+
+restore_cursor() {{ tput cnorm 2>/dev/null; }}
+
+fetch_usage() {{
+    [ -z "$AI_USAGE_CMD" ] && return
+    local new
+    new=$(eval "$AI_USAGE_CMD" 2>/dev/null)
+    [ -n "$new" ] && USAGE_DISPLAY="$new"
+}}
+
+render() {{
+    printf '\033[H\033[J'
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo " 🔥 token-burn 🔥"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo " Agent:   $AGENT"
+    echo " Command: $COMMAND"
+    echo " Reset:   $RESET"
+    echo " Tasks:   $TOTAL"
+    echo " Workers: $WORKER_COUNT"
+    echo " Logs:    $REPORT_DIR"
+    if [ -n "$USAGE_DISPLAY" ]; then
+        echo ""
+        echo " AI Usage:"
+        printf '%s\n' "$USAGE_DISPLAY"
+    fi
+    echo ""
+    while IFS= read -r f; do
+        printf ' ❌ %s\n' "$(cat "$f")"
+    done < <(find "$MARKER_DIR" -name 'error-*' 2>/dev/null)
+    [ -n "$STATUS_MSG" ] && echo "$STATUS_MSG"
+    echo ""
+}}
 
 handle_signal() {{
     if [ $STOPPED -eq 0 ]; then
         STOPPED=1
         touch "$STOP_FILE"
-        echo ""
-        echo " ⏳ Waiting for current tasks to finish..."
-        echo "    Press Ctrl-C again to force kill."
+        STATUS_MSG=" ⏳ Waiting for current tasks to finish... (Ctrl-C again to force kill)"
+        render
     else
+        restore_cursor
         echo ""
         echo " 📁 Logs: $REPORT_DIR"
-        echo ""
         echo " Force killing session..."
         tmux kill-session -t "$SESSION" 2>/dev/null
         exit
     fi
 }}
 trap handle_signal INT TERM
+trap restore_cursor EXIT
 
 printf '\033]2;token-burn\033\\'
 printf '\033[?7l'
+tput civis 2>/dev/null
 
 END=$(($(date +%s) + DEADLINE))
 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " 🔥 token-burn 🔥"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo " Agent:   $AGENT"
-echo " Command: $COMMAND"
-echo " Reset:   $RESET"
-echo " Tasks:   $TOTAL"
-echo " Workers: $WORKER_COUNT"
-echo " Logs:    $REPORT_DIR"
-echo ""
+fetch_usage
+render
 
 while true; do
     NOW=$(date +%s)
@@ -679,23 +738,38 @@ while true; do
     FAILED=$(find "$MARKER_DIR" -name 'failed-*' 2>/dev/null | wc -l | tr -d ' ')
     RETRY=$(find "$MARKER_DIR" -name 'retry-*' 2>/dev/null | wc -l | tr -d ' ')
     PROCESSED=$((DONE + FAILED + RETRY))
+    ERR_COUNT=$(find "$MARKER_DIR" -name 'error-*' 2>/dev/null | wc -l | tr -d ' ')
+
+    NEED_RENDER=0
+    # ai-usage statusline は 10 秒ごとに再取得・再描画する
+    if [ -n "$AI_USAGE_CMD" ] && [ $((NOW - LAST_USAGE)) -ge 10 ]; then
+        fetch_usage
+        LAST_USAGE=$NOW
+        NEED_RENDER=1
+    fi
+    # 新規エラー検出時も全体を再描画する
+    if [ "$ERR_COUNT" != "$LAST_ERR_COUNT" ]; then
+        LAST_ERR_COUNT=$ERR_COUNT
+        NEED_RENDER=1
+    fi
 
     # デッドライン到達確認
     if [ $REMAINING -le 0 ] && [ $STOPPED -eq 0 ]; then
         STOPPED=1
         touch "$STOP_FILE"
-        echo ""
-        echo " ⚠ DEADLINE REACHED"
-        echo " ⏳ Waiting for current tasks to finish..."
-        echo "    Press Ctrl-C to force kill."
+        STATUS_MSG=" ⚠ DEADLINE REACHED — waiting for current tasks (Ctrl-C to force kill)"
+        NEED_RENDER=1
     fi
+
+    if [ $NEED_RENDER -eq 1 ]; then render; fi
 
     # 失敗・リトライを含め、全タスクが処理済みか確認
     if [ "$PROCESSED" -ge "$TOTAL" ]; then
+        render
         if [ "$FAILED" -gt 0 ] || [ "$RETRY" -gt 0 ]; then
-            printf "\r\033[2K ⚠  Completed: %d succeeded / %d failed / %d retry\n" "$DONE" "$FAILED" "$RETRY"
+            printf " ⚠  Completed: %d succeeded / %d failed / %d retry\n" "$DONE" "$FAILED" "$RETRY"
         else
-            printf "\r\033[2K ✅ All %d/%d tasks completed!\n" "$DONE" "$TOTAL"
+            printf " ✅ All %d/%d tasks completed!\n" "$DONE" "$TOTAL"
         fi
         echo ""
         echo " 📁 Logs: $REPORT_DIR"
@@ -708,7 +782,8 @@ while true; do
     if [ $STOPPED -eq 1 ]; then
         WORKERS_DONE=$(find "$MARKER_DIR" -name 'worker-done-*' 2>/dev/null | wc -l | tr -d ' ')
         if [ "$WORKERS_DONE" -ge "$WORKER_COUNT" ]; then
-            printf "\r\033[2K ⏹ Stopped: %d/%d processed (fail:%d retry:%d)\n" "$PROCESSED" "$TOTAL" "$FAILED" "$RETRY"
+            render
+            printf " ⏹ Stopped: %d/%d processed (fail:%d retry:%d)\n" "$PROCESSED" "$TOTAL" "$FAILED" "$RETRY"
             echo ""
             echo " 📁 Logs: $REPORT_DIR"
             echo ""
@@ -717,21 +792,7 @@ while true; do
         fi
     fi
 
-    # 新規エラーを表示
-    # MARKER_DIR のパスに空白を含む環境でも壊れないよう while read を使用する
-    while IFS= read -r f; do
-        EFILE=$(basename "$f")
-        case "$DISPLAYED_ERRORS" in
-            *":$EFILE:"*) ;;
-            *)
-                ERR_TEXT=$(cat "$f")
-                printf '\n ❌ %s\n' "$ERR_TEXT"
-                DISPLAYED_ERRORS="$DISPLAYED_ERRORS$EFILE:"
-                ;;
-        esac
-    done < <(find "$MARKER_DIR" -name 'error-*' 2>/dev/null)
-
-    # 進捗バー
+    # 進捗バー（画面最下部、毎秒 \r 上書き）
     if [ $TOTAL -gt 0 ]; then
         PCT=$((PROCESSED * 100 / TOTAL))
         BAR_W=20
@@ -770,6 +831,7 @@ done
         worker_count = worker_count,
         stop_file = stop_file_escaped,
         report_dir = report_dir_escaped,
+        ai_usage_cmd = ai_usage_cmd_escaped,
     )
 }
 
@@ -1469,16 +1531,79 @@ mod tests {
             1,
             std::path::Path::new("/tmp/stop file"),
             std::path::Path::new("/tmp/report dir"),
+            None,
         );
 
         assert!(script.contains("AGENT='ag\"$(touch /tmp/pwn)\"'"));
-        assert!(script.contains("DISPLAYED_ERRORS=\":\""));
-        assert!(script.contains("*\":$EFILE:\"*"));
         assert!(script.contains("FAILED=$(find \"$MARKER_DIR\" -name 'failed-*'"));
         assert!(script.contains("RETRY=$(find \"$MARKER_DIR\" -name 'retry-*'"));
         assert!(script.contains("PROCESSED=$((DONE + FAILED + RETRY))"));
         assert!(script.contains("Completed: %d succeeded / %d failed / %d retry"));
         assert!(script.contains("fail:%d retry:%d"));
+        // 全体再描画方式: render 関数とマーカー由来のエラー表示を持つ
+        assert!(script.contains("render() {"));
+        assert!(script.contains(r" ❌ %s\n"));
+        // ai-usage 連携なしのときは AI_USAGE_CMD は空文字列
+        assert!(script.contains("AI_USAGE_CMD=''"));
+    }
+
+    #[test]
+    fn generate_monitor_script_includes_statusline_when_enabled() {
+        let script = generate_monitor_script(
+            "claude",
+            "claude",
+            "2026/02/24 09:00",
+            1,
+            60,
+            std::path::Path::new("/tmp/markers"),
+            "token-burn",
+            1,
+            std::path::Path::new("/tmp/stop"),
+            std::path::Path::new("/tmp/report"),
+            Some("'ai-usage' --statusline --logos --input '/tmp/cache.json'"),
+        );
+        // statusline コマンドが AI_USAGE_CMD に埋め込まれ、10秒ごとに再取得・再描画する
+        assert!(script.contains("AI_USAGE_CMD="));
+        assert!(script.contains("--statusline"));
+        assert!(script.contains("fetch_usage"));
+        assert!(script.contains("$((NOW - LAST_USAGE)) -ge 10"));
+        assert!(script.contains("AI Usage:"));
+    }
+
+    #[test]
+    fn generate_monitor_script_is_valid_bash() {
+        // statusline あり/なしの両方で、生成されるスクリプトが bash 構文として妥当なこと。
+        for cmd in [
+            None,
+            Some("'ai-usage' --statusline --logos --input '/tmp/c.json'"),
+        ] {
+            let script = generate_monitor_script(
+                "claude",
+                "claude --model opus",
+                "2026/02/24 09:00",
+                3,
+                3600,
+                std::path::Path::new("/tmp/markers"),
+                "token-burn",
+                2,
+                std::path::Path::new("/tmp/stop"),
+                std::path::Path::new("/tmp/report"),
+                cmd,
+            );
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("monitor.sh");
+            std::fs::write(&path, &script).unwrap();
+            let status = std::process::Command::new("bash")
+                .arg("-n")
+                .arg(&path)
+                .status()
+                .expect("bash should be available");
+            assert!(
+                status.success(),
+                "monitor script must be valid bash (statusline={})",
+                cmd.is_some()
+            );
+        }
     }
 
     #[test]

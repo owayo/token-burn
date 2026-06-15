@@ -66,6 +66,7 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **結果メタデータ**: `usage.service_tier`、`usage.speed`、空でない推論リージョン、iteration 数、result origin 種別を表示
 - **レート制限通知**: 使用率の警告、リクエスト拒否、`allowed` 時のリセット時刻/overageリセット補足情報、および `allowed_warning` でサーバー側が通過した警告閾値（例: `warning at 90%`）を表示し、ローカル閾値超過時に後続タスクを自動停止
 - **ai-usage 使用率ゲート**: ai-usage 連携時、各タスク完了後に該当 agent の実使用率（weekly / five_hour の最大）を確認し、`rate_limit_threshold` 以上なら後続タスクを停止。stream-json のリアルタイム監視が無い codex でも実使用率で確実に停止でき、取得失敗時は fail-closed で安全側に倒す
+- **モニター使用量パネル**: ai-usage 連携時、tmux モニターペインに `ai-usage --statusline --logos`（各アカウントの 5h / 週次使用率バー）を 10 秒ごとに表示（`--input` でキャッシュから高速描画、進捗バーは毎秒更新）
 - **APIリトライ表示**: 一時的な障害時のリトライ試行回数とエラー情報を表示
 - **ログ衝突回避**: タスクごとのログに連番を付け、同名リポジトリでも上書きしない
 - **プロンプトファイル**: `.md` ファイルまたはインライン文字列でプロンプトを指定可能
