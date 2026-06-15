@@ -46,6 +46,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Visibility-aware**: Prioritizes public repositories over private ones (matched by remote repository name)
 - **Multi-agent**: Supports Claude Code, Codex CLI, and custom agents
 - **ai-usage integration**: Derives reset times from real usage data via `ai-usage --json` (with the configured fixed-schedule calculation kept as a fallback)
+- **Usage-rate gate**: When ai-usage integration is enabled, re-checks each agent's real utilization (`weekly` / `five_hour`) after every task and stops starting new tasks once `rate_limit_threshold` is reached — extending threshold-based auto-stop to `codex`, not just Claude Code's in-task `rate_limit_event`
 - **Multi-account expansion**: Expands a single agent across multiple accounts (e.g. `claude` → `claude-work` / `claude-home`), each launched with its own environment and tracked separately in `state.json`
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
 - **Deadline-aware stop**: Stops starting new tasks when the reset time arrives and waits for current tasks to finish
@@ -189,6 +190,8 @@ skip_within = "7d"    # optional
 
 `skip_within` and `cleanup_after` accept duration strings using `d` (days), `h` (hours), `m` (minutes), and `s` (seconds). Invalid values are rejected when the config file is loaded. If `skip_within` is omitted, directories processed since the previous reset are skipped. Excessively large values are also rejected. Use `--fresh` to ignore saved state entirely.
 
+`rate_limit_threshold` is enforced on two paths. During a task, Claude Code's stream-json `rate_limit_event` is monitored in real time and execution stops once the threshold is exceeded. In addition, when [ai-usage integration](#ai-usage-integration-optional) is enabled, after each task completes the agent's real utilization is re-checked against this threshold using the higher of the matching `(profile, provider)` pair's `weekly` and `five_hour` `used_percent` values; this applies to both `claude` and `codex` agents (the latter previously had no real-time monitoring).
+
 State is stored in `<config-dir>/state.json` (same directory as the active config file) and updated atomically to avoid lost updates during parallel runs. With the default config path, this is `~/.config/token-burn/state.json`.
 
 ### Agents
@@ -307,6 +310,9 @@ profiles = ["work", "home"]   # profile names to reference; multiple names expan
   - `skip`: drop the affected agent from the candidate list.
   - `error`: stop with an error.
 - `status` and `run` display each agent's schedule **source** (`ai-usage (weekly)`, `fixed`, or `fixed fallback`) so token-burn never falls back silently.
+- **Post-task usage gate**: After each task completes, token-burn re-queries `ai-usage --json` and compares the matching `(profile, provider)` pair's `weekly` and `five_hour` `used_percent` against `rate_limit_threshold`. If either window meets or exceeds the threshold, a stop file is created so no further tasks start. This applies to both `claude` and `codex` agents, giving `codex` (which has no in-task `rate_limit_event` stream) a real-utilization stop signal.
+- The `ai-usage --json` output is cached with a short TTL (20 seconds) so parallel workers do not each spawn a redundant query. The stop-file creation is idempotent and safe to call concurrently from multiple workers.
+- The usage gate is **fail-closed**: if the query fails (utilization cannot be confirmed), tasks are stopped to stay on the safe side. When no matching entry is found or `used_percent` is missing, execution continues instead, to avoid over-stopping on incomplete data.
 
 ### Auto-scan (multiple sources)
 

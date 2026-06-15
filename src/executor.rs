@@ -16,14 +16,37 @@ const CODEX_APPROVAL_OVERRIDE: &str = "approval_policy=never";
 pub struct ExecutionPlan {
     pub agent: RuntimeAgent,
     pub tasks: Vec<ResolvedTarget>,
+    pub usage_gate: Option<UsageGateConfig>,
 }
 
-pub fn build_plan(agent: &RuntimeAgent, targets: Vec<ResolvedTarget>) -> ExecutionPlan {
+/// ai-usage 使用率ゲートの設定（各タスク完了後にワーカーが実行）。
+pub struct UsageGateConfig {
+    pub profile: String,
+    pub provider: String,
+    /// ai-usage を起動するコマンド（例: ["ai-usage", "--json"]）。
+    pub command: Vec<String>,
+}
+
+pub fn build_plan(
+    agent: &RuntimeAgent,
+    targets: Vec<ResolvedTarget>,
+    ai_usage_command: Option<Vec<String>>,
+) -> ExecutionPlan {
     let mut agent = agent.clone();
     ensure_required_flags(&mut agent);
+    // ai-usage 連携 agent かつグローバルで ai-usage が有効なときだけゲートを設定する。
+    let usage_gate = match (agent.ai_usage.as_ref(), ai_usage_command) {
+        (Some(rt), Some(command)) => Some(UsageGateConfig {
+            profile: rt.profile.clone(),
+            provider: rt.provider.clone(),
+            command,
+        }),
+        _ => None,
+    };
     ExecutionPlan {
         agent,
         tasks: targets,
+        usage_gate,
     }
 }
 
@@ -389,6 +412,28 @@ pub fn execute_plan_tmux(
         std::fs::write(queue_dir.join(format!("pending-{:04}", idx)), "")?;
     }
 
+    // ai-usage 連携時、各タスク完了後に使用率をチェックする usage-gate コマンドを組み立てる。
+    let cache_file = tmp_dir.join("ai-usage-cache.json");
+    let usage_gate_cmd = plan.usage_gate.as_ref().map(|g| {
+        let mut parts = vec![
+            shell_escape(&exe_path.to_string_lossy()),
+            "usage-gate".to_string(),
+            "--profile".to_string(),
+            shell_escape(&g.profile),
+            "--provider".to_string(),
+            shell_escape(&g.provider),
+            "--threshold".to_string(),
+            rate_limit_threshold.to_string(),
+            "--stop-file".to_string(),
+            shell_escape(&stop_file.to_string_lossy()),
+            "--cache-file".to_string(),
+            shell_escape(&cache_file.to_string_lossy()),
+            "--".to_string(),
+        ];
+        parts.extend(g.command.iter().map(|s| shell_escape(s)));
+        parts.join(" ")
+    });
+
     let mut script_paths = Vec::new();
     for w in 0..worker_count {
         let script_path = tmp_dir.join(format!("worker-{}.sh", w));
@@ -398,6 +443,7 @@ pub fn execute_plan_tmux(
             task_dir: &task_dir,
             marker_dir: &marker_dir,
             stop_file: &stop_file,
+            usage_gate_cmd: usage_gate_cmd.as_deref(),
         });
         std::fs::write(&script_path, &worker_script)?;
         std::process::Command::new("chmod")
@@ -748,6 +794,8 @@ struct WorkerCtx<'a> {
     task_dir: &'a Path,
     marker_dir: &'a Path,
     stop_file: &'a Path,
+    /// 各タスク完了後に実行する usage-gate コマンド（ai-usage 連携時のみ）。
+    usage_gate_cmd: Option<&'a str>,
 }
 
 /// キューから claim したワーカーが source して実行する、タスク単位のシェルスクリプトを生成する。
@@ -954,6 +1002,12 @@ fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             .join(format!("worker-done-{}", ctx.worker_id))
             .to_string_lossy(),
     );
+    // ai-usage 連携時は各タスク完了後（次の pending を claim する前）に usage-gate を実行する。
+    // 未設定なら空文字列で、ワーカースクリプトに行は追加されない。
+    let gate_line = match ctx.usage_gate_cmd {
+        Some(cmd) => format!("  {cmd}\n"),
+        None => String::new(),
+    };
 
     format!(
         concat!(
@@ -999,6 +1053,7 @@ fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "  fi\n",
             "  # shellcheck disable=SC1090\n",
             "  source \"$TASK_SCRIPT\"\n",
+            "{gate_line}",
             "done\n",
             "\n",
             "printf '\\033]2;Worker {w} done\\033\\\\'\n",
@@ -1011,6 +1066,7 @@ fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
         stop_file = stop_file,
         w = w,
         worker_done = worker_done,
+        gate_line = gate_line,
     )
 }
 
@@ -1306,6 +1362,7 @@ mod tests {
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
             stop_file: &tmp.join("stop"),
+            usage_gate_cmd: None,
         });
 
         assert!(script.contains("#!/bin/bash"));
@@ -1320,6 +1377,42 @@ mod tests {
     }
 
     #[test]
+    fn build_worker_script_runs_usage_gate_after_source() {
+        let tmp = std::path::PathBuf::from("/tmp/burn");
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &tmp.join("queue"),
+            task_dir: &tmp.join("tasks"),
+            marker_dir: &tmp.join("markers"),
+            stop_file: &tmp.join("stop"),
+            usage_gate_cmd: Some("tb usage-gate --profile P --provider claude"),
+        });
+        let source_idx = script
+            .find("source \"$TASK_SCRIPT\"")
+            .expect("source missing");
+        let gate_idx = script
+            .find("usage-gate --profile P")
+            .expect("usage-gate line missing");
+        let done_idx = script.find("\ndone\n").expect("loop end missing");
+        // gate はタスク source の後、ループ末尾(done)の前に実行される
+        assert!(source_idx < gate_idx && gate_idx < done_idx);
+    }
+
+    #[test]
+    fn build_worker_script_omits_usage_gate_when_unset() {
+        let tmp = std::path::PathBuf::from("/tmp/burn");
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &tmp.join("queue"),
+            task_dir: &tmp.join("tasks"),
+            marker_dir: &tmp.join("markers"),
+            stop_file: &tmp.join("stop"),
+            usage_gate_cmd: None,
+        });
+        assert!(!script.contains("usage-gate"));
+    }
+
+    #[test]
     fn build_worker_script_resets_cancelled_before_each_task() {
         // 各タスクを source する前に CANCELLED=0 をリセットすることで、直前タスクの
         // 実行中に SIGINT/SIGTERM を受けて立った Cancelled フラグが後続タスクへ漏れ、
@@ -1331,6 +1424,7 @@ mod tests {
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
             stop_file: &tmp.join("stop"),
+            usage_gate_cmd: None,
         });
 
         // while ループ本体（task を source する前）で CANCELLED をリセットすること
@@ -1354,6 +1448,7 @@ mod tests {
             task_dir: std::path::Path::new("/tmp/my tasks"),
             marker_dir: std::path::Path::new("/tmp/my markers"),
             stop_file: std::path::Path::new("/tmp/my stop"),
+            usage_gate_cmd: None,
         });
         assert!(script.contains("QUEUE_DIR='/tmp/my queue'"));
         assert!(script.contains("TASK_DIR='/tmp/my tasks'"));
@@ -1722,7 +1817,7 @@ mod tests {
             visibility: Visibility::Public,
             defer: false,
         }];
-        let plan = build_plan(&agent, targets);
+        let plan = build_plan(&agent, targets, None);
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].display_name, "repo");
         // claude エージェントにはフラグが自動付与される

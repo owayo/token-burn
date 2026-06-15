@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, Utc};
 use serde::Deserialize;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::config::{
@@ -35,6 +38,8 @@ struct AiUsageAccount {
 struct UsageWindowData {
     resets_at: Option<String>,
     resets_in_seconds: Option<i64>,
+    /// 使用率（%）。usage-gate の閾値判定に使う。
+    used_percent: Option<f64>,
 }
 
 /// ai-usage --json の取得結果スナップショット。
@@ -269,6 +274,115 @@ async fn run_ai_usage(command: &[String]) -> Result<AiUsageSnapshot> {
     })
 }
 
+/// 使用率ゲート: `(profile, provider)` の weekly / five_hour 使用率のうち、いずれかが
+/// `threshold`（%）以上なら `stop_file` を作成し、後続タスクの実行を止める。
+///
+/// - ai-usage の取得に失敗したときは fail-closed（使用率を確認できない以上、安全側で停止）。
+/// - 該当エントリが無い / 使用率欠損のときは過剰停止を避けて続行する。
+/// - `stop_file` の作成は `create_new` で冪等（並列 worker から同時に呼ばれても安全）。
+/// - `cache_file` に短 TTL で ai-usage 出力をキャッシュし、並列実行時の重複取得を抑える。
+pub async fn run_usage_gate(
+    profile: &str,
+    provider: &str,
+    threshold: u8,
+    stop_file: &Path,
+    cache_file: &Path,
+    command: &[String],
+) -> Result<()> {
+    // 既に停止シグナルがあれば何もしない。
+    if stop_file.exists() {
+        return Ok(());
+    }
+
+    let snapshot = match load_usage_cached(command, cache_file).await {
+        Ok(s) => s,
+        Err(e) => {
+            if write_stop_file(stop_file, &format!("usage-gate failed: {e}")) {
+                println!(
+                    "\x1b[31m  \u{26d4} usage-gate: ai-usage を確認できないため停止 ({e})\x1b[0m"
+                );
+            }
+            return Ok(());
+        }
+    };
+
+    let Some(acc) = snapshot.find(profile, provider) else {
+        eprintln!("usage-gate: ({profile}, {provider}) のエントリが無いため続行します");
+        return Ok(());
+    };
+
+    // weekly / five_hour のうち最大の使用率で判定する（安全側）。
+    let max_used = [acc.weekly.as_ref(), acc.five_hour.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w.used_percent)
+        .fold(None::<f64>, |max, p| Some(max.map_or(p, |m| m.max(p))));
+
+    if let Some(used) = max_used
+        && used >= threshold as f64
+        && write_stop_file(
+            stop_file,
+            &format!("usage {used:.0}% >= threshold {threshold}%"),
+        )
+    {
+        println!(
+            "\x1b[31m  \u{26d4} usage-gate: {profile}/{provider} 使用率 {used:.0}% >= {threshold}% のため後続を停止\x1b[0m"
+        );
+    }
+    Ok(())
+}
+
+/// 短 TTL のキャッシュを介して ai-usage --json を取得する。
+async fn load_usage_cached(command: &[String], cache_file: &Path) -> Result<AiUsageSnapshot> {
+    const TTL_SECS: u64 = 20;
+    if let Ok(meta) = std::fs::metadata(cache_file)
+        && let Ok(modified) = meta.modified()
+        && modified
+            .elapsed()
+            .map(|e| e.as_secs() < TTL_SECS)
+            .unwrap_or(false)
+        && let Ok(content) = std::fs::read(cache_file)
+        && let Ok(parsed) = serde_json::from_slice::<AiUsageOutput>(&content)
+    {
+        return Ok(AiUsageSnapshot {
+            accounts: parsed.accounts,
+        });
+    }
+
+    anyhow::ensure!(!command.is_empty(), "ai_usage.command is empty");
+    let output = tokio::process::Command::new(&command[0])
+        .args(&command[1..])
+        .output()
+        .await
+        .with_context(|| format!("failed to run ai-usage command: {}", command.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ai-usage exited with {}: {}", output.status, stderr.trim());
+    }
+    let parsed: AiUsageOutput =
+        serde_json::from_slice(&output.stdout).context("failed to parse ai-usage --json output")?;
+    // 取得成功時のみ raw JSON をキャッシュへ書き込む。
+    let _ = std::fs::write(cache_file, &output.stdout);
+    Ok(AiUsageSnapshot {
+        accounts: parsed.accounts,
+    })
+}
+
+/// stop_file を冪等に作成する。新規作成できたら true、既存なら false。
+fn write_stop_file(stop_file: &Path, reason: &str) -> bool {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(stop_file)
+    {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{reason}");
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +391,7 @@ mod tests {
         UsageWindowData {
             resets_at: resets_at.map(String::from),
             resets_in_seconds: resets_in,
+            used_percent: None,
         }
     }
 
@@ -520,5 +635,96 @@ mod tests {
             UsageFallback::Skip,
         )];
         assert!(r.select_nearest(&agents).is_err());
+    }
+
+    #[tokio::test]
+    async fn usage_gate_stops_when_over_threshold() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let cache = tmp.path().join("cache.json");
+        // cache が新鮮なので ai-usage コマンド（ダミー）は実行されない。
+        std::fs::write(
+            &cache,
+            r#"{"accounts":[{"profile":"Work","provider":"claude","ok":true,"weekly":{"used_percent":95.0}}]}"#,
+        )
+        .unwrap();
+        run_usage_gate("Work", "claude", 90, &stop, &cache, &["false".to_string()])
+            .await
+            .unwrap();
+        assert!(stop.exists(), "閾値超過で stop_file が作られるべき");
+    }
+
+    #[tokio::test]
+    async fn usage_gate_continues_when_under_threshold() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let cache = tmp.path().join("cache.json");
+        std::fs::write(
+            &cache,
+            r#"{"accounts":[{"profile":"Work","provider":"claude","ok":true,"weekly":{"used_percent":50.0},"five_hour":{"used_percent":10.0}}]}"#,
+        )
+        .unwrap();
+        run_usage_gate("Work", "claude", 90, &stop, &cache, &["false".to_string()])
+            .await
+            .unwrap();
+        assert!(!stop.exists(), "閾値未満では stop_file は作られない");
+    }
+
+    #[tokio::test]
+    async fn usage_gate_uses_max_of_weekly_and_five_hour() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let cache = tmp.path().join("cache.json");
+        // weekly は低いが five_hour が閾値超過 → 停止する。
+        std::fs::write(
+            &cache,
+            r#"{"accounts":[{"profile":"Work","provider":"codex","ok":true,"weekly":{"used_percent":20.0},"five_hour":{"used_percent":92.0}}]}"#,
+        )
+        .unwrap();
+        run_usage_gate("Work", "codex", 90, &stop, &cache, &["false".to_string()])
+            .await
+            .unwrap();
+        assert!(stop.exists(), "five_hour が閾値超過なら停止すべき");
+    }
+
+    #[tokio::test]
+    async fn usage_gate_fail_closed_on_fetch_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let cache = tmp.path().join("missing-cache.json"); // 存在しない → fetch する
+        // command が失敗する（false は exit 1）→ fail-closed で停止。
+        run_usage_gate("Work", "claude", 90, &stop, &cache, &["false".to_string()])
+            .await
+            .unwrap();
+        assert!(stop.exists(), "取得失敗時は fail-closed で停止すべき");
+    }
+
+    #[tokio::test]
+    async fn usage_gate_continues_when_entry_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let cache = tmp.path().join("cache.json");
+        std::fs::write(
+            &cache,
+            r#"{"accounts":[{"profile":"Other","provider":"claude","ok":true,"weekly":{"used_percent":99.0}}]}"#,
+        )
+        .unwrap();
+        run_usage_gate("Work", "claude", 90, &stop, &cache, &["false".to_string()])
+            .await
+            .unwrap();
+        assert!(!stop.exists(), "該当エントリ無しは続行（過剰停止しない）");
+    }
+
+    #[tokio::test]
+    async fn usage_gate_noop_when_stop_file_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        std::fs::write(&stop, "pre-existing").unwrap();
+        let cache = tmp.path().join("missing-cache.json");
+        // stop_file が既存なら ai-usage を呼ばず即 return（fail-closed もしない）。
+        run_usage_gate("Work", "claude", 90, &stop, &cache, &["false".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&stop).unwrap(), "pre-existing");
     }
 }

@@ -145,6 +145,28 @@ enum Commands {
         /// 分類対象の jsonl ファイル
         jsonl: PathBuf,
     },
+    /// ai-usage の使用率をチェックし閾値超過なら stop file を作成する（ワーカースクリプト専用）
+    #[command(hide = true, name = "usage-gate")]
+    UsageGate {
+        /// ai-usage --json の profile と照合する値
+        #[arg(long)]
+        profile: String,
+        /// ai-usage --json の provider と照合する値
+        #[arg(long)]
+        provider: String,
+        /// 使用率の停止閾値（%）
+        #[arg(long)]
+        threshold: u8,
+        /// 閾値超過時に作成する stop file のパス
+        #[arg(long)]
+        stop_file: PathBuf,
+        /// ai-usage 出力の短 TTL キャッシュファイルのパス
+        #[arg(long)]
+        cache_file: PathBuf,
+        /// ai-usage コマンド（`--` 以降）
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
 }
 
 fn parse_positive_limit(value: &str) -> Result<usize, String> {
@@ -195,6 +217,22 @@ async fn main() -> Result<()> {
         std::process::exit(class.exit_code());
     }
 
+    if let Commands::UsageGate {
+        profile,
+        provider,
+        threshold,
+        stop_file,
+        cache_file,
+        command,
+    } = &command
+    {
+        usage::run_usage_gate(
+            profile, provider, *threshold, stop_file, cache_file, command,
+        )
+        .await?;
+        return Ok(());
+    }
+
     let config_path = cli.config.unwrap_or_else(config::default_config_path);
     let config = config::Config::load(&config_path)?;
 
@@ -234,6 +272,7 @@ async fn main() -> Result<()> {
         Commands::Init { .. } => unreachable!(),
         Commands::FormatStream { .. } => unreachable!(),
         Commands::ClassifyResult { .. } => unreachable!(),
+        Commands::UsageGate { .. } => unreachable!(),
     }
 
     Ok(())
@@ -377,7 +416,12 @@ async fn run(opts: RunOptions) -> Result<()> {
         return Ok(());
     }
 
-    let plan = executor::build_plan(agent, targets);
+    let ai_usage_command = config
+        .ai_usage
+        .as_ref()
+        .filter(|g| g.enabled)
+        .map(|g| g.command.clone());
+    let plan = executor::build_plan(agent, targets, ai_usage_command);
     executor::print_plan(&plan);
 
     if dry_run {

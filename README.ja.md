@@ -65,6 +65,7 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **terminal_reason / permission_denials**: 異常終了時の `terminal_reason`（`completed` 以外）と権限拒否されたツール呼び出しの件数/ツール名を結果サマリーに表示
 - **結果メタデータ**: `usage.service_tier`、`usage.speed`、空でない推論リージョン、iteration 数、result origin 種別を表示
 - **レート制限通知**: 使用率の警告、リクエスト拒否、`allowed` 時のリセット時刻/overageリセット補足情報、および `allowed_warning` でサーバー側が通過した警告閾値（例: `warning at 90%`）を表示し、ローカル閾値超過時に後続タスクを自動停止
+- **ai-usage 使用率ゲート**: ai-usage 連携時、各タスク完了後に該当 agent の実使用率（weekly / five_hour の最大）を確認し、`rate_limit_threshold` 以上なら後続タスクを停止。stream-json のリアルタイム監視が無い codex でも実使用率で確実に停止でき、取得失敗時は fail-closed で安全側に倒す
 - **APIリトライ表示**: 一時的な障害時のリトライ試行回数とエラー情報を表示
 - **ログ衝突回避**: タスクごとのログに連番を付け、同名リポジトリでも上書きしない
 - **プロンプトファイル**: `.md` ファイルまたはインライン文字列でプロンプトを指定可能
@@ -185,7 +186,7 @@ skip_within = "7d"    # 任意
 | `cleanup_after` | この期間より古いレポートディレクトリを自動削除 | `"7d"`（デフォルト） |
 | `report_dir` | 実行ログの保存先ディレクトリ | `~/Documents/token-burn`（デフォルト） |
 | `limit` | 1回の実行で処理する最大ターゲット数（`>= 1`） | `10`（デフォルト） |
-| `rate_limit_threshold` | レート制限使用率がこの閾値（%）を超えたら自動停止（`1-100`） | `95`（デフォルト） |
+| `rate_limit_threshold` | レート制限使用率がこの閾値（%）以上で自動停止（`1-100`）。Claude の stream-json リアルタイム監視に加え、ai-usage 連携時は各タスク完了後にも該当 agent の実使用率（weekly / five_hour の最大）でチェックされる | `95`（デフォルト） |
 
 `skip_within` と `cleanup_after` には、`d`（日）、`h`（時間）、`m`（分）、`s`（秒）を使った期間文字列を指定します。不正な値は設定ファイルの読み込み時点でエラーになります。`skip_within` を省略した場合は前回リセット以降に処理済みのターゲットをスキップします。過大な値もエラーになります。`--fresh` を指定すると保存済み状態を無視して全ターゲットを処理します。
 
@@ -301,6 +302,10 @@ profiles = ["work", "home"]    # 参照する profile 名。複数指定でア�
 - 実行時に agent × profile を展開します。例: `claude` + `["work", "home"]` → `claude-work` / `claude-home` の 2 エージェント。各々プロファイルの `env` を付与して起動します。**profile を 1 つだけ参照する場合は展開名が agent 名のまま**（例: `codex` が `["home"]` のみ → `codex`）で、サフィックス `<agent>-<profile>` が付くのは 2 つ以上参照したときだけです。起動コマンドが異なる各アカウントを別 agent として定義しても展開名が冗長にならず、`state.json` キーも安定します。
 - 展開名は `state.json` のキーにも使われ、アカウントごとに処理済み状態が分離されます。
 - `ai-usage --json` は 1 プロセスにつき 1 回だけ実行されます。
+- **使用率ゲート（完了後チェック）**: ai-usage 連携が有効な場合、各タスク完了後に該当 agent の `(profile, provider)` の weekly / five_hour の `used_percent` を ai-usage から取得し、いずれかが `rate_limit_threshold` 以上なら stop file を作成して後続タスクの開始を停止します。Claude の stream-json `rate_limit_event` によるリアルタイム監視（タスク実行中の停止）に加えてこの完了後チェックが効くため、**従来リアルタイム監視が無かった codex でも実使用率で確実に停止できます**（claude / codex 両方に適用）。
+  - 完了後チェック用の ai-usage 出力は短い TTL（20 秒）でキャッシュされ、並列ワーカーからの重複取得を抑えます。
+  - 取得失敗時は fail-closed（使用率を確認できないため安全側で停止）。該当エントリが無い、または `used_percent` が欠損している場合は過剰停止を避けて続行します。
+  - stop file の作成は冪等で、並列ワーカーから同時に呼ばれても安全です。
 - reset 時刻は ai-usage が選択した枠（`weekly` 等）の `resets_at` から取得します。
 - 解決に失敗した場合（ai-usage コマンドが無い／失敗、該当する `(profile, provider)` が無い、`ok:false`、該当枠が `null`）は `fallback` に従います。
   - `fixed`: 曜日計算に戻ります（source 表示は `fixed fallback: <理由>`）。
