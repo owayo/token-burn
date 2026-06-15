@@ -377,6 +377,18 @@ fn process_result_with_ttft_ms() {
 }
 
 #[test]
+fn process_result_with_stream_latency_fields() {
+    // 実 jsonl で確認した ttft_stream_ms（純粋なストリーム遅延）と
+    // time_to_request_ms（リクエスト送信までの ms）を表示する。
+    let input = r#"{"type":"result","subtype":"success","duration_ms":600000,"ttft_ms":19189,"ttft_stream_ms":3043,"time_to_request_ms":182,"num_turns":50}"#;
+    let output = run_process(input);
+    let clean = strip_ansi(&output);
+    assert!(clean.contains("ttft:19.2s"), "got: {clean}");
+    assert!(clean.contains("stream:3.0s"), "got: {clean}");
+    assert!(clean.contains("req:182ms"), "got: {clean}");
+}
+
+#[test]
 fn process_result_without_duration_api_ms() {
     // duration_api_ms がない場合は api: が表示されない
     let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.5,"duration_ms":120000,"num_turns":10}"#;

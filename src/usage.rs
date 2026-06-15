@@ -37,7 +37,6 @@ struct AiUsageAccount {
 #[derive(Debug, Deserialize, Clone)]
 struct UsageWindowData {
     resets_at: Option<String>,
-    resets_in_seconds: Option<i64>,
     /// 使用率（%）。usage-gate の閾値判定に使う。
     used_percent: Option<f64>,
 }
@@ -239,7 +238,11 @@ impl ScheduleResolver {
     }
 }
 
-/// weekly / five_hour のうち、より近い方を選ぶ（resets_in_seconds 基準）。
+/// weekly / five_hour のうち、resets_at が最も近い方を選ぶ。
+/// deadline 算出に使う resets_at と同じ基準で選択し、選択枠と締切の不整合を防ぐ
+/// （resets_in_seconds は resets_at と独立に欠損し得るため選択基準には使わない）。
+/// resets_at がパースできない枠は候補から除外する（採用すると build_from_account が
+/// 丸ごと None を返し、スケジュール解決全体が失敗してしまうため）。
 fn nearest_window(acc: &AiUsageAccount) -> Option<(UsageWindow, &UsageWindowData)> {
     [
         acc.weekly.as_ref().map(|w| (UsageWindow::Weekly, w)),
@@ -247,8 +250,9 @@ fn nearest_window(acc: &AiUsageAccount) -> Option<(UsageWindow, &UsageWindowData
     ]
     .into_iter()
     .flatten()
-    .filter(|(_, w)| w.resets_at.is_some())
-    .min_by_key(|(_, w)| w.resets_in_seconds.unwrap_or(i64::MAX))
+    .filter_map(|(win, w)| parse_resets_at(w).map(|r| (win, w, r)))
+    .min_by_key(|(_, _, r)| r.with_timezone(&Utc))
+    .map(|(win, w, _)| (win, w))
 }
 
 fn parse_resets_at(data: &UsageWindowData) -> Option<DateTime<FixedOffset>> {
@@ -387,10 +391,9 @@ fn write_stop_file(stop_file: &Path, reason: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn window_data(resets_at: Option<&str>, resets_in: Option<i64>) -> UsageWindowData {
+    fn window_data(resets_at: Option<&str>) -> UsageWindowData {
         UsageWindowData {
             resets_at: resets_at.map(String::from),
-            resets_in_seconds: resets_in,
             used_percent: None,
         }
     }
@@ -445,28 +448,46 @@ mod tests {
 
     #[test]
     fn parse_resets_at_parses_rfc3339() {
-        let d = window_data(Some("2099-01-02T03:04:05+00:00"), None);
+        let d = window_data(Some("2099-01-02T03:04:05+00:00"));
         let parsed = parse_resets_at(&d).expect("RFC3339 should parse");
         assert_eq!(parsed.to_utc().to_rfc3339(), "2099-01-02T03:04:05+00:00");
     }
 
     #[test]
     fn parse_resets_at_none_for_missing() {
-        assert!(parse_resets_at(&window_data(None, None)).is_none());
-        assert!(parse_resets_at(&window_data(Some("not-a-date"), None)).is_none());
+        assert!(parse_resets_at(&window_data(None)).is_none());
+        assert!(parse_resets_at(&window_data(Some("not-a-date"))).is_none());
     }
 
     #[test]
-    fn nearest_window_picks_smaller_resets_in_seconds() {
+    fn nearest_window_picks_nearer_resets_at() {
+        // deadline 算出に使う resets_at 基準で、最も近い枠を選ぶ。
         let acc = account(
             "P",
             "claude",
             true,
-            Some(window_data(Some("2099-01-10T00:00:00+00:00"), Some(1000))),
-            Some(window_data(Some("2099-01-05T00:00:00+00:00"), Some(50))),
+            Some(window_data(Some("2099-01-10T00:00:00+00:00"))),
+            Some(window_data(Some("2099-01-05T00:00:00+00:00"))),
             None,
         );
         let (w, _) = nearest_window(&acc).expect("should pick one");
+        // five_hour(1/05) が weekly(1/10) より近い。
+        assert_eq!(w, UsageWindow::FiveHour);
+    }
+
+    #[test]
+    fn nearest_window_ignores_unparseable_resets_at() {
+        // resets_at がパース不能な枠は候補から除外する。
+        // （採用すると build_from_account が None を返してスケジュール解決全体が失敗するため）
+        let acc = account(
+            "P",
+            "claude",
+            true,
+            Some(window_data(Some("not-a-date"))),
+            Some(window_data(Some("2099-01-10T00:00:00+00:00"))),
+            None,
+        );
+        let (w, _) = nearest_window(&acc).expect("should pick the parseable window");
         assert_eq!(w, UsageWindow::FiveHour);
     }
 
@@ -477,7 +498,7 @@ mod tests {
                 "Work",
                 "claude",
                 true,
-                Some(window_data(Some("2099-01-01T00:00:00+00:00"), Some(999))),
+                Some(window_data(Some("2099-01-01T00:00:00+00:00"))),
                 None,
                 None,
             )],
@@ -588,10 +609,7 @@ mod tests {
                     "FAR",
                     "claude",
                     true,
-                    Some(window_data(
-                        Some("2099-12-31T00:00:00+00:00"),
-                        Some(999_999),
-                    )),
+                    Some(window_data(Some("2099-12-31T00:00:00+00:00"))),
                     None,
                     None,
                 ),
@@ -599,7 +617,7 @@ mod tests {
                     "NEAR",
                     "claude",
                     true,
-                    Some(window_data(Some("2099-01-01T00:00:00+00:00"), Some(100))),
+                    Some(window_data(Some("2099-01-01T00:00:00+00:00"))),
                     None,
                     None,
                 ),

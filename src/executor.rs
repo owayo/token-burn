@@ -435,15 +435,10 @@ pub fn execute_plan_tmux(
     });
 
     // monitor ペインに表示する ai-usage statusline コマンド（--input でキャッシュから高速描画）。
-    let usage_statusline_cmd = plan.usage_gate.as_ref().and_then(|g| {
-        g.command.first().map(|exe| {
-            format!(
-                "{} --statusline --logos --input {}",
-                shell_escape(exe),
-                shell_escape(&cache_file.to_string_lossy())
-            )
-        })
-    });
+    let usage_statusline_cmd = plan
+        .usage_gate
+        .as_ref()
+        .and_then(|g| build_statusline_cmd(&g.command, &cache_file));
     // 起動時に ai-usage キャッシュを初期化し、monitor 起動直後から statusline を表示できるようにする
     // （以後は usage-gate が各タスク完了時に 20 秒 TTL で更新する）。
     if let Some(g) = plan.usage_gate.as_ref()
@@ -670,7 +665,7 @@ LAST_USAGE=0
 LAST_ERR_COUNT=-1
 STATUS_MSG=""
 
-restore_cursor() {{ tput cnorm 2>/dev/null; }}
+restore_terminal() {{ tput cnorm 2>/dev/null; printf '\033[?7h'; }}
 
 fetch_usage() {{
     [ -z "$AI_USAGE_CMD" ] && return
@@ -711,7 +706,7 @@ handle_signal() {{
         STATUS_MSG=" ⏳ Waiting for current tasks to finish... (Ctrl-C again to force kill)"
         render
     else
-        restore_cursor
+        restore_terminal
         echo ""
         echo " 📁 Logs: $REPORT_DIR"
         echo " Force killing session..."
@@ -720,7 +715,7 @@ handle_signal() {{
     fi
 }}
 trap handle_signal INT TERM
-trap restore_cursor EXIT
+trap restore_terminal EXIT
 
 printf '\033]2;token-burn\033\\'
 printf '\033[?7l'
@@ -775,6 +770,7 @@ while true; do
         echo " 📁 Logs: $REPORT_DIR"
         echo ""
         echo " Press Ctrl-C to close session."
+        restore_terminal
         exec sleep infinity
     fi
 
@@ -799,8 +795,10 @@ while true; do
         FILLED=$((PCT * BAR_W / 100))
         EMPTY=$((BAR_W - FILLED))
         BAR=""
-        for i in $(seq 1 $FILLED 2>/dev/null); do BAR="${{BAR}}█"; done
-        for i in $(seq 1 $EMPTY 2>/dev/null); do BAR="${{BAR}}░"; done
+        # BSD seq(macOS) は `seq 1 0` が降順で "1 0" を出すため、算術ループで描画する
+        # （seq 依存だと FILLED/EMPTY が 0 の 0%/100% でバーが2文字ずれる）
+        i=0; while [ $i -lt $FILLED ]; do BAR="${{BAR}}█"; i=$((i+1)); done
+        i=0; while [ $i -lt $EMPTY ]; do BAR="${{BAR}}░"; i=$((i+1)); done
     else
         BAR="░░░░░░░░░░░░░░░░░░░░"
         PCT=0
@@ -1007,9 +1005,13 @@ fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "        touch {failed}\n",
                 "        echo '━━━ Error - continuing ━━━'\n",
                 "      fi\n",
-                "    else\n",
-                "      {mark}\n",
+                "    elif {mark}; then\n",
                 "      touch {done}\n",
+                "    else\n",
+                // state 書き込み失敗を成功扱いしない（次回再処理されるよう done を作らない）
+                "      printf '%sstate update failed\\n' {prefix} > {error}\n",
+                "      touch {failed}\n",
+                "      echo '━━━ Error - state update failed ━━━'\n",
                 "    fi\n",
                 "    ;;\n",
                 "esac\n",
@@ -1037,9 +1039,13 @@ fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "    touch {failed}\n",
                 "    echo '━━━ Error - continuing ━━━'\n",
                 "  fi\n",
-                "else\n",
-                "  {mark}\n",
+                "elif {mark}; then\n",
                 "  touch {done}\n",
+                "else\n",
+                // state 書き込み失敗を成功扱いしない（次回再処理されるよう done を作らない）
+                "  printf '%sstate update failed\\n' {prefix} > {error}\n",
+                "  touch {failed}\n",
+                "  echo '━━━ Error - state update failed ━━━'\n",
                 "fi\n",
             ),
             prefix = error_prefix,
@@ -1178,6 +1184,39 @@ fn build_shell_command(
 
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// ai-usage の `--json` 取得コマンドから monitor 表示用の statusline コマンドを組み立てる。
+/// 出力モードの `--json` を `--statusline --logos --input <cache>` に差し替え、
+/// `env FOO=1 ai-usage --json` のようなラッパー前置きを保持する。`--json` が無ければ末尾に追加する。
+/// usage-gate / 起動時キャッシュ初期化と同じく command 全体を使うため、先頭要素だけを使う実装で
+/// ラッパー構成が静かに壊れる問題を避ける。空コマンドのときは None。
+fn build_statusline_cmd(command: &[String], cache_file: &std::path::Path) -> Option<String> {
+    if command.is_empty() {
+        return None;
+    }
+    let cache = cache_file.to_string_lossy();
+    let statusline_args = ["--statusline", "--logos", "--input", cache.as_ref()];
+    let mut parts: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for arg in command {
+        if arg == "--json" && !replaced {
+            parts.extend(statusline_args.iter().map(|s| s.to_string()));
+            replaced = true;
+        } else {
+            parts.push(arg.clone());
+        }
+    }
+    if !replaced {
+        parts.extend(statusline_args.iter().map(|s| s.to_string()));
+    }
+    Some(
+        parts
+            .iter()
+            .map(|s| shell_escape(s))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 fn sanitize_filename(s: &str) -> String {
@@ -1342,6 +1381,11 @@ mod tests {
         assert!(script.contains("/failed-7"));
         assert!(script.contains("/retry-7"));
         assert!(script.contains("/done-7"));
+        // state 書き込み(mark)失敗時は done を作らず failed 扱いにする（成功扱いを防ぐ）
+        assert!(script.contains("state update failed"));
+        assert!(script.contains("━━━ Error - state update failed ━━━"));
+        // 成功パスは mark の終了コードで分岐する（elif <mark>; then touch done）
+        assert!(script.contains("elif "));
     }
 
     #[test]
@@ -1545,6 +1589,15 @@ mod tests {
         assert!(script.contains(r" ❌ %s\n"));
         // ai-usage 連携なしのときは AI_USAGE_CMD は空文字列
         assert!(script.contains("AI_USAGE_CMD=''"));
+        // 進捗バーは BSD seq(macOS) の "seq 1 0 → 1 0" 問題を避けるため算術ループで描画する
+        assert!(script.contains("while [ $i -lt $FILLED ]"));
+        assert!(script.contains("while [ $i -lt $EMPTY ]"));
+        assert!(!script.contains("seq 1 $FILLED"));
+        // 完了/停止後も端末状態（カーソル/autowrap）を復元する。EXIT trap は exec で発火しないため
+        // exec sleep infinity の直前でも復元する。
+        assert!(script.contains("restore_terminal() {"));
+        assert!(script.contains("trap restore_terminal EXIT"));
+        assert!(script.contains("restore_terminal\n        exec sleep infinity"));
     }
 
     #[test]
@@ -1604,6 +1657,82 @@ mod tests {
                 cmd.is_some()
             );
         }
+    }
+
+    #[test]
+    fn progress_bar_loop_produces_exact_width_at_boundaries() {
+        // 進捗バーの算術ループが FILLED/EMPTY=0（0%/100%）でも正しい幅になること。
+        // BSD seq は `seq 1 0` が "1 0" を出すため、旧実装では 0%/100% で2文字ずれていた。
+        let script = r#"
+            for case in "0 20" "20 0" "10 10"; do
+                set -- $case
+                FILLED=$1; EMPTY=$2
+                BAR=""
+                i=0; while [ $i -lt $FILLED ]; do BAR="${BAR}X"; i=$((i+1)); done
+                i=0; while [ $i -lt $EMPTY ]; do BAR="${BAR}Y"; i=$((i+1)); done
+                echo "${#BAR}"
+            done
+        "#;
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("bash should be available");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let widths: Vec<&str> = stdout.lines().collect();
+        // 0%、100%、50% いずれもバー幅はちょうど 20。
+        assert_eq!(widths, vec!["20", "20", "20"]);
+    }
+
+    #[test]
+    fn build_statusline_cmd_replaces_json_in_default_command() {
+        let cmd = build_statusline_cmd(
+            &["ai-usage".to_string(), "--json".to_string()],
+            std::path::Path::new("/tmp/cache.json"),
+        )
+        .expect("non-empty command");
+        assert_eq!(
+            cmd,
+            "'ai-usage' '--statusline' '--logos' '--input' '/tmp/cache.json'"
+        );
+    }
+
+    #[test]
+    fn build_statusline_cmd_preserves_wrapper_prefix() {
+        // `env FOO=1 ai-usage --json` のようなラッパー構成でも先頭要素を捨てず保持する
+        // （以前は command.first() のみ使い env が実行ファイル扱いされて壊れていた）。
+        let cmd = build_statusline_cmd(
+            &[
+                "env".to_string(),
+                "FOO=1".to_string(),
+                "ai-usage".to_string(),
+                "--json".to_string(),
+            ],
+            std::path::Path::new("/tmp/c.json"),
+        )
+        .expect("non-empty command");
+        assert_eq!(
+            cmd,
+            "'env' 'FOO=1' 'ai-usage' '--statusline' '--logos' '--input' '/tmp/c.json'"
+        );
+    }
+
+    #[test]
+    fn build_statusline_cmd_appends_when_no_json_flag() {
+        let cmd = build_statusline_cmd(
+            &["ai-usage".to_string()],
+            std::path::Path::new("/tmp/c.json"),
+        )
+        .expect("non-empty command");
+        assert_eq!(
+            cmd,
+            "'ai-usage' '--statusline' '--logos' '--input' '/tmp/c.json'"
+        );
+    }
+
+    #[test]
+    fn build_statusline_cmd_none_for_empty_command() {
+        assert!(build_statusline_cmd(&[], std::path::Path::new("/tmp/c.json")).is_none());
     }
 
     #[test]

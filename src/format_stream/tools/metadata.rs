@@ -153,6 +153,22 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
             attrs.push(format!("status:{from}->{to}"));
         }
     }
+    // Agent: 起動したサブエージェント種別（どのエージェントが実行したかの文脈）。
+    if let Some(agent_type) = obj
+        .get("agentType")
+        .and_then(|value| value.as_str())
+        .filter(|agent_type| !agent_type.is_empty())
+    {
+        attrs.push(format!("agent:{agent_type}"));
+    }
+    // Skill / Agent が解決したモデル名（モデルによりトークン消費が変わるため判断材料になる）。
+    if let Some(model) = obj
+        .get("resolvedModel")
+        .and_then(|value| value.as_str())
+        .filter(|model| !model.is_empty())
+    {
+        attrs.push(format!("model:{}", truncate_inline(model, 30)));
+    }
     if let Some(ms) = obj.get("totalDurationMs").and_then(|value| value.as_u64()) {
         attrs.push(format!("duration:{}", format_millis_as_seconds(ms)));
     } else if let Some(ms) = obj.get("durationMs").and_then(|value| value.as_u64()) {
@@ -166,6 +182,21 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
         .and_then(|value| value.as_u64())
     {
         attrs.push(format!("tools:{count}"));
+    }
+    // Agent/Task の toolStats からサブエージェントの編集行数を表示する。
+    // 他のメタデータには無い固有情報のため、加除いずれかが非ゼロのときだけ出す。
+    if let Some(stats) = obj.get("toolStats").and_then(|value| value.as_object()) {
+        let added = stats
+            .get("linesAdded")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let removed = stats
+            .get("linesRemoved")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        if added > 0 || removed > 0 {
+            attrs.push(format!("edits:+{added}/-{removed}"));
+        }
     }
     if let Some(tasks) = obj.get("tasks").and_then(|value| value.as_array()) {
         attrs.push(format!("tasks:{}", tasks.len()));

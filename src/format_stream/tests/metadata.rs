@@ -226,6 +226,39 @@ fn tool_result_metadata_shows_actual_jsonl_agent_usage() {
 }
 
 #[test]
+fn tool_result_metadata_shows_agent_type_and_tool_stats() {
+    // 実 jsonl で確認した Agent 結果の agentType / resolvedModel / toolStats(編集行数)。
+    let value = serde_json::json!({
+        "agentType": "general-purpose",
+        "resolvedModel": "claude-opus-4-8",
+        "totalToolUseCount": 9,
+        "toolStats": {
+            "readCount": 6, "searchCount": 0, "bashCount": 2, "editFileCount": 1,
+            "linesAdded": 120, "linesRemoved": 45, "otherToolCount": 0
+        }
+    });
+
+    let metadata = tool_result_metadata(&value);
+
+    assert!(metadata.contains("agent:general-purpose"), "{metadata}");
+    assert!(metadata.contains("model:claude-opus-4-8"), "{metadata}");
+    assert!(metadata.contains("tools:9"), "{metadata}");
+    assert!(metadata.contains("edits:+120/-45"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_omits_edits_when_no_lines_changed() {
+    // 読み取り専用サブエージェント（linesAdded/Removed=0）では edits: を出さない。
+    let value = serde_json::json!({
+        "agentType": "general-purpose",
+        "toolStats": {"readCount": 6, "bashCount": 3, "linesAdded": 0, "linesRemoved": 0}
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(metadata.contains("agent:general-purpose"), "{metadata}");
+    assert!(!metadata.contains("edits:"), "{metadata}");
+}
+
+#[test]
 fn tool_result_metadata_shows_actual_jsonl_task_and_monitor_fields() {
     // 実 jsonl で確認した TaskList / TaskCreate / TaskOutput / Monitor 系の結果補足。
     let value = serde_json::json!({

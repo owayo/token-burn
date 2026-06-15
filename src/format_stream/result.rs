@@ -50,6 +50,15 @@ fn write_duration(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
         if let Some(ttft_ms) = v["ttft_ms"].as_u64() {
             attrs.push(format!("ttft:{}", format_millis_as_seconds(ttft_ms)));
         }
+        // ttft_stream_ms: 初回ストリームトークン到達時間。キュー/リトライ待ちを含む ttft_ms より
+        // 小さい純粋なストリーム遅延で、両者の差が待ち時間の目安になる。
+        if let Some(stream_ms) = v["ttft_stream_ms"].as_u64() {
+            attrs.push(format!("stream:{}", format_millis_as_seconds(stream_ms)));
+        }
+        // time_to_request_ms: リクエスト送信までの所要時間。通常は数十〜数百 ms のためミリ秒で表示。
+        if let Some(req_ms) = v["time_to_request_ms"].as_u64() {
+            attrs.push(format!("req:{req_ms}ms"));
+        }
         if attrs.is_empty() {
             writeln!(out, "\x1b[33m\u{23f1}  {}m {}s\x1b[0m", m, s)?;
         } else {
