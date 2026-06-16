@@ -1217,7 +1217,14 @@ fn build_statusline_cmd(
         return None;
     }
     let cache = cache_file.to_string_lossy();
-    let statusline_args = ["--statusline", "--logos", "--input", cache.as_ref()];
+    // monitor ペインは横幅が狭いため、ゲージ幅を半分にする --compact を常に付ける。
+    let statusline_args = [
+        "--statusline",
+        "--logos",
+        "--compact",
+        "--input",
+        cache.as_ref(),
+    ];
     let mut parts: Vec<String> = Vec::new();
     let mut replaced = false;
     for arg in command {
@@ -1719,7 +1726,7 @@ mod tests {
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "'ai-usage' '--statusline' '--logos' '--input' '/tmp/cache.json' '--active-profile' 'Work' '--active-provider' 'claude'"
+            "'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/cache.json' '--active-profile' 'Work' '--active-provider' 'claude'"
         );
     }
 
@@ -1742,7 +1749,7 @@ mod tests {
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "'env' 'FOO=1' 'ai-usage' '--statusline' '--logos' '--input' '/tmp/c.json' '--active-profile' 'Home' '--active-provider' 'codex'"
+            "'env' 'FOO=1' 'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile' 'Home' '--active-provider' 'codex'"
         );
     }
 
@@ -1758,7 +1765,7 @@ mod tests {
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "'ai-usage' '--statusline' '--logos' '--input' '/tmp/c.json' '--active-profile' 'Work' '--active-provider' 'claude'"
+            "'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile' 'Work' '--active-provider' 'claude'"
         );
     }
 
@@ -1795,7 +1802,7 @@ mod tests {
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "CLAUDE_CONFIG_DIR='/home/u/.claude' 'ai-usage' '--statusline' '--logos' '--input' '/tmp/c.json' '--active-profile' 'Work' '--active-provider' 'claude'"
+            "CLAUDE_CONFIG_DIR='/home/u/.claude' 'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile' 'Work' '--active-provider' 'claude'"
         );
     }
 
