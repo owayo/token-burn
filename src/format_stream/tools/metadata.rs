@@ -68,12 +68,20 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     }
     // Read は読み取り結果を file オブジェクトに格納する。部分読み取り（limit 指定や
     // ファイル途中までの読み取り）では numLines < totalLines となり、切り詰めの判断材料になる。
-    if let Some(file) = obj.get("file").and_then(|value| value.as_object())
-        && let Some(num_lines) = file.get("numLines").and_then(|value| value.as_u64())
-        && let Some(total_lines) = file.get("totalLines").and_then(|value| value.as_u64())
-        && total_lines > num_lines
-    {
-        attrs.push(format!("lines:{num_lines}/{total_lines}"));
+    if let Some(file) = obj.get("file").and_then(|value| value.as_object()) {
+        if let Some(num_lines) = file.get("numLines").and_then(|value| value.as_u64())
+            && let Some(total_lines) = file.get("totalLines").and_then(|value| value.as_u64())
+            && total_lines > num_lines
+        {
+            attrs.push(format!("lines:{num_lines}/{total_lines}"));
+        }
+        if file
+            .get("truncatedByTokenCap")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            attrs.push("truncated:token-cap".to_string());
+        }
     }
     if let Some(matches) = obj.get("matches").and_then(|value| value.as_array()) {
         // ToolSearch は matches 配列で結果を返す

@@ -48,6 +48,7 @@ fn tool_specific_detail(tool_name: &str, v: &serde_json::Value) -> DetailResult 
         "Monitor" => DetailResult::Handled(detail_monitor(v)),
         "SendMessage" => detail_send_message(v),
         "TaskCreate" => detail_task_create(v),
+        "TaskGet" => detail_task_get(v),
         "TaskList" => DetailResult::Handled(detail_task_list(v)),
         "TaskUpdate" => detail_task_update(v),
         "TaskStop" => detail_task_stop(v),
@@ -453,6 +454,15 @@ fn detail_task_create(v: &serde_json::Value) -> DetailResult {
 /// TaskList: 入力が空の実データでも、ツールの意図が分かるよう固定ラベルを表示する。
 fn detail_task_list(_v: &serde_json::Value) -> String {
     "tasks".to_string()
+}
+
+/// TaskGet: 取得対象の task id を表示。空なら汎用フォールバックへ。
+fn detail_task_get(v: &serde_json::Value) -> DetailResult {
+    let task_id = first_string(v, &["taskId", "task_id", "id"]);
+    if !task_id.is_empty() {
+        return DetailResult::Handled(format!("task {}", truncate_inline(task_id, 80)));
+    }
+    DetailResult::Fallback
 }
 
 /// TaskUpdate: taskId / status / owner と subject/description を組み合わせて表示。

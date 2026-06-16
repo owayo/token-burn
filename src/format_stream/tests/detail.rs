@@ -531,6 +531,13 @@ fn extract_tool_detail_task_create_active_form_only_fallback() {
 }
 
 #[test]
+fn extract_tool_detail_task_get_shows_task_id() {
+    // 実データ例: {"taskId":"3"}
+    let input = r#"{"taskId":"3"}"#;
+    assert_eq!(extract_tool_detail("TaskGet", input), "task 3");
+}
+
+#[test]
 fn extract_tool_detail_task_update_shows_id_and_status() {
     // 実データ例: {"taskId":"1","status":"in_progress"}
     let input = r#"{"taskId":"1","status":"in_progress"}"#;

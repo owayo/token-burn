@@ -556,6 +556,23 @@ fn tool_result_metadata_read_partial_shows_line_ratio() {
 }
 
 #[test]
+fn tool_result_metadata_read_token_cap_truncation_is_shown() {
+    // 実データの Read 結果では token cap による切り詰めが file 配下に入る。
+    let value = serde_json::json!({
+        "type": "text",
+        "file": {
+            "filePath": "/src/huge.rs",
+            "numLines": 1200,
+            "startLine": 1,
+            "totalLines": 1200,
+            "truncatedByTokenCap": true
+        }
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(metadata.contains("truncated:token-cap"), "{metadata}");
+}
+
+#[test]
 fn tool_result_metadata_read_full_omits_line_ratio() {
     // 全行読み取り（numLines == totalLines）は比率表示しない（ノイズ回避）
     let value = serde_json::json!({
