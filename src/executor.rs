@@ -1190,13 +1190,42 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// env マップを `KEY='val'` 形式のシェル前置きトークン列にする。key は設定読み込み時に
-/// [A-Za-z_][A-Za-z0-9_]* へ制限済みなのでクオート不要、値のみ shell_escape する。選択
-/// agent の実行文脈（CLAUDE_CONFIG_DIR 等）を usage-gate / statusline へ伝播するのに使う。
+/// env マップをシェル前置きトークン列にする。key は設定読み込み時に
+/// [A-Za-z_][A-Za-z0-9_]* へ制限済みなのでクオート不要、値のみ shell_escape する。
+///
+/// 値が空文字のキーは `env -u KEY` で子プロセスから完全に除去する。bash の
+/// `KEY= cmd` は KEY を「空文字に設定」するため、CLAUDE_CONFIG_DIR を空文字で
+/// 渡すと claude code 側が CWD 相対の設定ディレクトリと解釈し、対象プロジェクト
+/// 直下に projects/ sessions/ backups/ をぶちまける。空文字 → unset 変換で
+/// 「親環境継承を封じる」設計意図（環境を上書きする）を保ったまま、claude 側に
+/// 空文字パスを渡さないようにする。
+///
+/// 戻り値の例:
+/// - 全て非空: `["K1='v1'", "K2='v2'"]`
+/// - 一部空: `["env", "-u", "K1", "K2='v2'"]`
+/// - 全て空: `["env", "-u", "K1", "-u", "K2"]`
+/// - env マップ自体が空: `[]`
 fn env_prefix_parts(env: &std::collections::BTreeMap<String, String>) -> Vec<String> {
-    env.iter()
-        .map(|(k, v)| format!("{k}={}", shell_escape(v)))
-        .collect()
+    let mut unset_keys: Vec<&str> = Vec::new();
+    let mut set_pairs: Vec<String> = Vec::new();
+    for (k, v) in env.iter() {
+        if v.is_empty() {
+            unset_keys.push(k.as_str());
+        } else {
+            set_pairs.push(format!("{k}={}", shell_escape(v)));
+        }
+    }
+    if unset_keys.is_empty() {
+        return set_pairs;
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(1 + unset_keys.len() * 2 + set_pairs.len());
+    parts.push("env".to_string());
+    for k in unset_keys {
+        parts.push("-u".to_string());
+        parts.push(k.to_string());
+    }
+    parts.extend(set_pairs);
+    parts
 }
 
 /// ai-usage の `--json` 取得コマンドから monitor 表示用の statusline コマンドを組み立てる。
@@ -1807,6 +1836,55 @@ mod tests {
     }
 
     #[test]
+    fn build_statusline_cmd_unsets_empty_env_value() {
+        // 空文字値は `env -u KEY` で除去し、statusline 側にも CLAUDE_CONFIG_DIR="" を
+        // 渡さない。空文字を渡すと ai-usage / claude が CWD 相対の設定ディレクトリと
+        // 解釈する余地が残るため。
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("CLAUDE_CONFIG_DIR".to_string(), String::new());
+        env.insert("CODEX_HOME".to_string(), "/home/u/.codex".to_string());
+        let cmd = build_statusline_cmd(
+            &["ai-usage".to_string(), "--json".to_string()],
+            std::path::Path::new("/tmp/c.json"),
+            &env,
+            "Home",
+            "codex",
+        )
+        .expect("non-empty command");
+        assert_eq!(
+            cmd,
+            "env -u CLAUDE_CONFIG_DIR CODEX_HOME='/home/u/.codex' 'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile' 'Home' '--active-provider' 'codex'"
+        );
+    }
+
+    #[test]
+    fn env_prefix_parts_empty_value_becomes_unset() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("FOO".to_string(), String::new());
+        env.insert("BAR".to_string(), "v".to_string());
+        let parts = env_prefix_parts(&env);
+        // BTreeMap の決定的な順序 (BAR, FOO) に従って、unset は先頭の env コマンドに集約される
+        assert_eq!(parts, vec!["env", "-u", "FOO", "BAR='v'"]);
+    }
+
+    #[test]
+    fn env_prefix_parts_all_set_keeps_legacy_form() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("A".to_string(), "1".to_string());
+        env.insert("B".to_string(), "2".to_string());
+        let parts = env_prefix_parts(&env);
+        // 全て非空なら従来通り `K='v'` のみで env コマンドは付かない（後方互換）
+        assert_eq!(parts, vec!["A='1'", "B='2'"]);
+    }
+
+    #[test]
+    fn env_prefix_parts_empty_map_is_empty() {
+        let env = std::collections::BTreeMap::new();
+        let parts = env_prefix_parts(&env);
+        assert!(parts.is_empty());
+    }
+
+    #[test]
     fn shell_escape_escapes_single_quotes() {
         assert_eq!(shell_escape("a'b"), "'a'\\''b'");
     }
@@ -1952,6 +2030,41 @@ mod tests {
         let dir = std::path::Path::new("/repo");
         let result = build_shell_command(&cmd, &env, prompt, dir);
         assert!(result.contains("&& 'codex' \"$(cat"));
+    }
+
+    #[test]
+    fn build_shell_command_unsets_empty_env_value() {
+        // 値が空文字の env キーは `env -u KEY` 形式で子プロセスから完全に除去する。
+        // bash の `KEY= cmd` だと KEY を空文字に設定するため、claude code が
+        // CLAUDE_CONFIG_DIR="" を CWD 相対の設定ディレクトリと解釈し、対象プロジェクト
+        // 直下に projects/ sessions/ backups/ をぶちまける問題があった（owa profile）。
+        let cmd = vec!["claude".to_string(), "-p".to_string()];
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("CLAUDE_CONFIG_DIR".to_string(), String::new());
+        env.insert("CODEX_HOME".to_string(), "/home/u/.codex".to_string());
+        let prompt = std::path::Path::new("/tmp/prompt.txt");
+        let dir = std::path::Path::new("/repo");
+        let result = build_shell_command(&cmd, &env, prompt, dir);
+        assert!(
+            result.contains("env -u CLAUDE_CONFIG_DIR CODEX_HOME='/home/u/.codex' 'claude' '-p'"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn build_shell_command_unsets_all_empty_env_values() {
+        // 全ての env 値が空文字でも、`env -u K1 -u K2 cmd ...` で正しく unset される。
+        let cmd = vec!["claude".to_string(), "-p".to_string()];
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("CLAUDE_CONFIG_DIR".to_string(), String::new());
+        env.insert("CODEX_HOME".to_string(), String::new());
+        let prompt = std::path::Path::new("/tmp/prompt.txt");
+        let dir = std::path::Path::new("/repo");
+        let result = build_shell_command(&cmd, &env, prompt, dir);
+        assert!(
+            result.contains("env -u CLAUDE_CONFIG_DIR -u CODEX_HOME 'claude' '-p'"),
+            "got: {result}"
+        );
     }
 
     fn make_agent(command: Vec<&str>) -> RuntimeAgent {
