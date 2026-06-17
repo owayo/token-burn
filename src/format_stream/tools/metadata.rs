@@ -148,6 +148,12 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     {
         attrs.push(format!("command:{command_name}"));
     }
+    // Skill / Agent の許可ツール件数。件数のみ表示し、具体的なツール名は冗長になるため省略する。
+    if let Some(allowed) = obj.get("allowedTools").and_then(|value| value.as_array())
+        && !allowed.is_empty()
+    {
+        attrs.push(format!("allowed-tools:{}", allowed.len()));
+    }
     if let Some(change) = obj.get("statusChange").and_then(|value| value.as_object()) {
         let from = change
             .get("from")

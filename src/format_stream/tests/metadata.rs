@@ -378,6 +378,28 @@ fn tool_result_metadata_auto_backgrounded_and_background_task_id() {
 }
 
 #[test]
+fn tool_result_metadata_shows_allowed_tools_count() {
+    // Skill が許可されたツール一覧（allowedTools）を返したときに件数を表示する。
+    // 実データでは Skill 起動時に "allowedTools": ["Bash(astro-sight:*)"] のような
+    // 配列が返ることがあるため、件数だけ補足する。
+    let value = serde_json::json!({
+        "commandName": "astro-sight",
+        "allowedTools": ["Bash(astro-sight:*)", "Read"],
+        "success": true
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(metadata.contains("command:astro-sight"), "{metadata}");
+    assert!(metadata.contains("allowed-tools:2"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_empty_allowed_tools_is_omitted() {
+    // 空配列のときは表示しない（ノイズ防止）
+    let value = serde_json::json!({"allowedTools": []});
+    assert_eq!(tool_result_metadata(&value), "");
+}
+
+#[test]
 fn tool_result_metadata_empty_background_task_id_is_omitted() {
     // backgroundTaskId が空文字なら表示しない
     let value = serde_json::json!({"backgroundTaskId": ""});

@@ -295,6 +295,27 @@ fn extract_tool_detail_tavily_extract_single_url() {
 }
 
 #[test]
+fn extract_tool_detail_tavily_search_underscore_variant() {
+    // 実データでハイフン版とアンダースコア版の両方が観測されたため、
+    // mcp__tavily__tavily_search（アンダースコア版）でも同じ詳細を抽出すること。
+    let input = r#"{"query":"Bevy 0.18 release notes","max_results":3}"#;
+    assert_eq!(
+        extract_tool_detail("mcp__tavily__tavily_search", input),
+        "Bevy 0.18 release notes (max=3)"
+    );
+}
+
+#[test]
+fn extract_tool_detail_tavily_extract_underscore_variant() {
+    // tavily-extract のアンダースコア版も同じく対応する
+    let input = r#"{"urls":["https://example.com/spec"],"extract_depth":"basic"}"#;
+    assert_eq!(
+        extract_tool_detail("mcp__tavily__tavily_extract", input),
+        "https://example.com/spec (depth:basic)"
+    );
+}
+
+#[test]
 fn extract_tool_detail_monitor_prefers_description() {
     let input = r#"{"description":"codexレビュー完了を待機","timeout_ms":600000,"persistent":false,"command":"until grep -q \"tokens used\" /tmp/codex-review-output.log; do sleep 5; done"}"#;
     assert_eq!(

@@ -90,11 +90,21 @@ fn is_rate_limit_message(msg: &str) -> bool {
     if lower.contains("usage limit reached") {
         return true;
     }
+    // "resets <数字>[<数字>...]<am|pm>" のパターンに厳密にマッチする。
+    // `after.contains("am")` のような緩い判定だと、数字と "am"/"pm" が離れた位置にある
+    // 一般のエラーメッセージを誤って RateLimited 扱いして state.json への記録を欠落させる。
     if let Some(idx) = lower.find("resets ") {
         let after = &lower[idx + "resets ".len()..];
-        let has_digit = after.chars().next().is_some_and(|c| c.is_ascii_digit());
-        if has_digit && (after.contains("am") || after.contains("pm")) {
-            return true;
+        let digit_end = after
+            .as_bytes()
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(after.len());
+        if digit_end > 0 {
+            let tail = &after[digit_end..];
+            if tail.starts_with("am") || tail.starts_with("pm") {
+                return true;
+            }
         }
     }
     false
@@ -296,6 +306,26 @@ mod tests {
         // 大文字メッセージでも検出する
         assert!(is_rate_limit_message("CLAUDE AI USAGE LIMIT REACHED"));
         assert!(is_rate_limit_message("Resets 11PM"));
+    }
+
+    #[test]
+    fn is_rate_limit_message_does_not_match_distant_am_pm() {
+        // "resets <数字>" の後に直接 am/pm が続かない場合は誤検知しない。
+        // 緩いマッチング（after.contains("am")）だと "resets 5 times max ... at 8am" のような
+        // 一般エラーメッセージを RateLimited 扱いして state.json の記録を欠落させていた。
+        assert!(!is_rate_limit_message(
+            "API error: resets 5 times max. Please retry tomorrow at 8am"
+        ));
+        assert!(!is_rate_limit_message(
+            "resets 100 entries before sample.pm processing"
+        ));
+    }
+
+    #[test]
+    fn is_rate_limit_message_matches_multi_digit_clock() {
+        // "resets 12pm" / "resets 09am" のような複数桁の時刻表記を検出する
+        assert!(is_rate_limit_message("resets 12pm"));
+        assert!(is_rate_limit_message("resets 09am tomorrow"));
     }
 
     #[test]

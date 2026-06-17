@@ -792,6 +792,7 @@ while true; do
             echo " 📁 Logs: $REPORT_DIR"
             echo ""
             echo " Press Ctrl-C to close session."
+            restore_terminal
             exec sleep infinity
         fi
     fi
@@ -1656,7 +1657,11 @@ mod tests {
         // exec sleep infinity の直前でも復元する。
         assert!(script.contains("restore_terminal() {"));
         assert!(script.contains("trap restore_terminal EXIT"));
+        // 完了時ブロック（8スペースインデント）の復元呼び出し
         assert!(script.contains("restore_terminal\n        exec sleep infinity"));
+        // 停止時ブロック（12スペースインデント）でも復元しないと、カーソル非表示と autowrap 無効が
+        // ユーザーの端末に残ってしまうため、復元呼び出しが必須
+        assert!(script.contains("restore_terminal\n            exec sleep infinity"));
     }
 
     #[test]

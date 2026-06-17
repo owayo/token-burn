@@ -54,8 +54,9 @@ fn tool_specific_detail(tool_name: &str, v: &serde_json::Value) -> DetailResult 
         "TaskStop" => detail_task_stop(v),
         "TaskOutput" => detail_task_output(v),
         "AskUserQuestion" => detail_ask_user_question(v),
-        "mcp__tavily__tavily-search" => detail_tavily_search(v),
-        "mcp__tavily__tavily-extract" => detail_tavily_extract(v),
+        // tavily MCP は実データでハイフン版とアンダースコア版の両方が観測されるため両方サポートする
+        "mcp__tavily__tavily-search" | "mcp__tavily__tavily_search" => detail_tavily_search(v),
+        "mcp__tavily__tavily-extract" | "mcp__tavily__tavily_extract" => detail_tavily_extract(v),
         "mcp__codex__codex" => detail_codex(v),
         name if name.starts_with("mcp__context7__resolve-library-id") => {
             detail_context7_resolve_library(v)
