@@ -612,3 +612,69 @@ fn tool_result_metadata_read_missing_total_lines_omits_ratio() {
     });
     assert_eq!(tool_result_metadata(&value), "");
 }
+
+#[test]
+fn tool_result_metadata_async_agent_is_marked() {
+    // Agent を run_in_background=true で起動した際の応答は async と表示される
+    let value = serde_json::json!({
+        "isAsync": true,
+        "status": "async_launched",
+        "agentId": "a32bc162897eb706d",
+        "outputFile": "/tmp/agent-output",
+        "canReadOutputFile": true
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(metadata.contains("async"), "{metadata}");
+    // agentId は識別子としてのみ用いられ、表示はしない
+    assert!(!metadata.contains("a32bc162"), "{metadata}");
+    // 既存の output-file:readable と共存する
+    assert!(metadata.contains("output-file:readable"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_sync_agent_does_not_mark_async() {
+    // 同期 Agent 結果（isAsync が無い）には async マークを付けない
+    let value = serde_json::json!({
+        "agentId": "a32bc162897eb706d",
+        "status": "completed",
+        "totalDurationMs": 5000
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(!metadata.contains("async"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_updated_fields_status_only_is_omitted() {
+    // updatedFields=["status"] は statusChange と重複するため非表示
+    let value = serde_json::json!({
+        "updatedFields": ["status"],
+        "statusChange": {"from": "pending", "to": "completed"}
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(metadata.contains("status:pending->completed"), "{metadata}");
+    assert!(!metadata.contains("updated:"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_updated_fields_non_status_is_shown() {
+    // status 以外のフィールド変更があるときは updated:... を表示する
+    let value = serde_json::json!({
+        "updatedFields": ["description", "status", "subject"]
+    });
+    let metadata = tool_result_metadata(&value);
+    // sort + dedup によりアルファベット順、status を除外
+    assert!(
+        metadata.contains("updated:description,subject"),
+        "{metadata}"
+    );
+}
+
+#[test]
+fn tool_result_metadata_updated_fields_empty_is_omitted() {
+    // 空配列・空文字列フィールドは表示しない
+    let value = serde_json::json!({"updatedFields": []});
+    assert_eq!(tool_result_metadata(&value), "");
+
+    let value = serde_json::json!({"updatedFields": ["", "status"]});
+    assert_eq!(tool_result_metadata(&value), "");
+}

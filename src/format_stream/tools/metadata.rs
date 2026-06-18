@@ -167,6 +167,31 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
             attrs.push(format!("status:{from}->{to}"));
         }
     }
+    // TaskUpdate の updatedFields: 変更されたフィールド一覧。
+    // status は statusChange と重複するため除外し、残りがあるときだけ表示する。
+    // 実データでは 98% が ["status"] 単独であり、フィルタ後の表示頻度は十分低い。
+    if let Some(fields) = obj.get("updatedFields").and_then(|value| value.as_array()) {
+        let mut non_status: Vec<&str> = fields
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "status")
+            .collect();
+        non_status.sort();
+        non_status.dedup();
+        if !non_status.is_empty() {
+            attrs.push(format!("updated:{}", non_status.join(",")));
+        }
+    }
+    // Agent を `run_in_background:true` で起動したときの async-launched 応答。
+    // 同期実行の Agent 結果には isAsync が無いため、フィールド存在で判定する。
+    // agentId はユーザがアクションに使える識別子ではないため表示しない（ノイズ回避）。
+    if obj
+        .get("isAsync")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        attrs.push("async".to_string());
+    }
     // Agent: 起動したサブエージェント種別（どのエージェントが実行したかの文脈）。
     if let Some(agent_type) = obj
         .get("agentType")

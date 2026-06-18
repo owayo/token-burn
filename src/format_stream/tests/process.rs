@@ -845,6 +845,42 @@ fn process_stream_event_ping_is_silent() {
 }
 
 #[test]
+fn process_async_agent_launch_shows_async_marker() {
+    // Agent を run_in_background=true で起動した async-launched 応答が
+    // tool 完了行で [async, output-file:readable] として表示されることを確認。
+    let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_async","name":"Agent","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"description\":\"bg task\",\"run_in_background\":true}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu_async","type":"tool_result","content":"Async agent launched successfully."}]},"tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"a32bc162897eb706d","outputFile":"/tmp/agent.output","canReadOutputFile":true}}"#,
+        ]
+        .join("\n");
+    let output = run_process(&input);
+    let clean = strip_ansi(&output);
+    assert!(clean.contains("\u{2713} Agent"), "{clean}");
+    assert!(clean.contains("async"), "{clean}");
+    assert!(clean.contains("output-file:readable"), "{clean}");
+    // agentId そのものは表示しない
+    assert!(!clean.contains("a32bc162"), "{clean}");
+}
+
+#[test]
+fn process_task_update_status_only_omits_updated_field() {
+    // TaskUpdate で status のみ変更したケースは statusChange のみ表示され、updated: は出ない。
+    let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_up","name":"TaskUpdate","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"taskId\":\"1\",\"status\":\"completed\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tu_up","type":"tool_result","content":"updated"}]},"tool_use_result":{"updatedFields":["status"],"statusChange":{"from":"pending","to":"completed"}}}"#,
+        ]
+        .join("\n");
+    let output = run_process(&input);
+    let clean = strip_ansi(&output);
+    assert!(clean.contains("status:pending->completed"), "{clean}");
+    assert!(!clean.contains("updated:"), "{clean}");
+}
+
+#[test]
 fn process_system_status_subtype_is_silent() {
     // 実データに頻出する {"type":"system","subtype":"status","status":"requesting"} は
     // 表示するとノイズになるため、サイレントに無視されること。
