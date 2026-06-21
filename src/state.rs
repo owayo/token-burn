@@ -3,7 +3,7 @@ use chrono::{DateTime, Local, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// エージェントごとのディレクトリパス → 最終処理タイムスタンプのマップ
@@ -68,6 +68,8 @@ impl State {
 /// エージェントに対してディレクトリの処理完了をアトミックに記録する。
 /// 排他ファイルロックを取得し、並行ワーカープロセス間で
 /// 更新が上書きされないようにする。
+/// 書き込みは「同一ディレクトリのテンポラリファイルへ書く → rename」で行うため、
+/// 書き込み途中のクラッシュや ENOSPC でも本体 state.json は壊れない。
 pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) -> Result<()> {
     use std::fs::OpenOptions;
 
@@ -75,36 +77,70 @@ pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) ->
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut file = OpenOptions::new()
+    let lock_file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)?;
 
-    file.lock_exclusive()?;
+    lock_file.lock_exclusive()?;
 
-    let mut content = String::new();
-    file.seek(SeekFrom::Start(0))?;
-    file.read_to_string(&mut content)?;
+    let result = (|| -> Result<()> {
+        // ロック取得後に直接ファイルを読み直す（lock_file のシークオフセットに依存しない）
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let mut state = if content.trim().is_empty() {
+            State::default()
+        } else {
+            serde_json::from_str(&content).unwrap_or_default()
+        };
+        state.mark_completed(agent_name, directory);
 
-    let mut state = if content.trim().is_empty() {
-        State::default()
-    } else {
-        serde_json::from_str(&content).unwrap_or_default()
-    };
-    state.mark_completed(agent_name, directory);
+        let serialized = serde_json::to_string_pretty(&state)?;
 
-    let serialized = serde_json::to_string_pretty(&state)?;
-    // set_len(0) を write_all より先に行うと、書き込み失敗時に
-    // state.json が空になり全データを失う。
-    // 書き込み完了後に末尾を切り詰めることで data loss を防止する。
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(serialized.as_bytes())?;
-    file.set_len(serialized.len() as u64)?;
-    file.sync_data()?;
-    file.unlock()?;
-    Ok(())
+        // 同一ディレクトリ内のテンポラリファイルに書き出し、rename でアトミックに置換する。
+        // PID とナノ秒タイムスタンプでファイル名を一意化し、並行ワーカー間での衝突を避ける。
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "state.json".to_string());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_path = parent.join(format!(
+            ".{}.tmp.{}.{}",
+            file_name,
+            std::process::id(),
+            unique
+        ));
+
+        let write_result = (|| -> Result<()> {
+            let mut tmp_file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            tmp_file.write_all(serialized.as_bytes())?;
+            tmp_file.sync_data()?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        Ok(())
+    })();
+
+    let _ = lock_file.unlock();
+    result
 }
 
 pub fn state_path(config_path: &Path) -> PathBuf {
@@ -444,6 +480,38 @@ mod tests {
         // 末尾にゴミ（古い書き込みの残り）が無いことを serde で検証
         let _: serde_json::Value =
             serde_json::from_str(&content).expect("有効な JSON でなければならない");
+    }
+
+    #[test]
+    fn mark_completed_atomic_does_not_leave_tempfile() {
+        // 書き込み完了後にテンポラリファイル（.state.json.tmp.*）が残らないこと。
+        // rename ベースの実装で「temp の作りっぱなし」になっていないかの回帰テスト。
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let state_file = tmp.path().join("state.json");
+
+        for i in 0..3 {
+            let dir = format!("/tmp/repo-{}", i);
+            mark_completed_atomic(&state_file, "claude", Path::new(&dir)).expect("書き込み成功");
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("temp dir should be readable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+
+        let leftover: Vec<&String> = entries
+            .iter()
+            .filter(|name| name.starts_with(".state.json.tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "テンポラリファイルが残っている: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|name| name == "state.json"),
+            "本体ファイルが存在しない: {entries:?}"
+        );
     }
 
     #[test]

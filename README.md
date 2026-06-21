@@ -341,6 +341,8 @@ public_first = false
 
 When `username` is set, visibility lookup uses the repository name parsed from each repository's `origin` remote URL (case-insensitive), so local directory names can differ from remote repository names.
 
+Owner and repository names are extracted from the last two segments of the remote URL path, so GitLab subgroup URLs such as `git@gitlab.example.com:group/subgroup/repo.git` resolve to `subgroup` as the owner and `repo` as the repository name.
+
 When `username` is not set, repositories are included even if they do not have an `origin` remote. In that case visibility remains `Unknown`.
 
 Symlinks are skipped during directory scanning to prevent infinite recursion from circular links.

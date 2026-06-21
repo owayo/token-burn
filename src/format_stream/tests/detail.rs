@@ -204,6 +204,22 @@ fn extract_tool_detail_truncates_long_values() {
 }
 
 #[test]
+fn extract_tool_detail_edit_without_file_path_falls_back() {
+    // partial_json の確定タイミング等で file_path が欠落した不完全な入力は、
+    // 「 (+0/-0)」のような中身の無い表示を避けて汎用フォールバックへ委ねる。
+    let input = r#"{"old_string":"a","new_string":"a"}"#;
+    let result = extract_tool_detail("Edit", input);
+    assert!(
+        !result.starts_with(' '),
+        "file_path 空時は先頭空白付きの不格好な表示を残さない: {result:?}"
+    );
+    assert!(
+        !result.contains("(+0/-0)"),
+        "差分行数の体裁が無意味に残らない: {result:?}"
+    );
+}
+
+#[test]
 fn extract_tool_detail_invalid_json() {
     assert_eq!(extract_tool_detail("Read", "not json"), "");
 }

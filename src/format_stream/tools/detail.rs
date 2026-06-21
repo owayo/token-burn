@@ -33,7 +33,7 @@ pub(crate) fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
 fn tool_specific_detail(tool_name: &str, v: &serde_json::Value) -> DetailResult {
     match tool_name {
         "Read" => detail_read(v),
-        "Edit" => DetailResult::Handled(detail_edit(v)),
+        "Edit" => detail_edit(v),
         "Bash" => DetailResult::Handled(detail_bash(v)),
         "Grep" | "Glob" => detail_grep_or_glob(v),
         "Task" | "Agent" => detail_task_or_agent(v),
@@ -85,11 +85,15 @@ fn detail_read(v: &serde_json::Value) -> DetailResult {
     DetailResult::Fallback
 }
 
-/// Edit: ファイルパスと差分行数(+追加/-削除)、replace_all を表示。常に確定。
-fn detail_edit(v: &serde_json::Value) -> String {
+/// Edit: ファイルパスと差分行数(+追加/-削除)、replace_all を表示。
+/// `file_path` が無い不完全な入力では空表示を避けて汎用フォールバックへ委ねる。
+fn detail_edit(v: &serde_json::Value) -> DetailResult {
     let file = v["file_path"].as_str().unwrap_or("");
     let old = first_string(v, &["old_string", "old_str"]);
     let new = first_string(v, &["new_string", "new_str"]);
+    if file.is_empty() {
+        return DetailResult::Fallback;
+    }
     let old_lines = old.lines().count();
     let new_lines = new.lines().count();
     let added = new_lines.saturating_sub(old_lines);
@@ -98,7 +102,7 @@ fn detail_edit(v: &serde_json::Value) -> String {
     if v["replace_all"].as_bool() == Some(true) {
         attrs.push("replace_all".to_string());
     }
-    format!("{} ({})", truncate_str(file, 80), attrs.join(", "))
+    DetailResult::Handled(format!("{} ({})", truncate_str(file, 80), attrs.join(", ")))
 }
 
 /// Bash: コマンドと timeout/background 属性、description を表示。常に確定。

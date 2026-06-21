@@ -258,23 +258,27 @@ fn extract_remote_owner_and_repo(remote_url: &str) -> Option<(String, String)> {
     let trimmed = remote_url.trim().trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
 
-    if let Some((host_part, path_part)) = trimmed.split_once(':')
+    // SSH 形式 (git@host:path) と HTTPS 形式 (scheme://host/path) を一段に正規化する。
+    let path_part: &str = if let Some((host_part, rest)) = trimmed.split_once(':')
         && host_part.contains('@')
         && !host_part.contains("://")
     {
-        let mut parts = path_part.split('/');
-        let owner = parts.next()?;
-        let repo = parts.next()?;
-        if !owner.is_empty() && !repo.is_empty() {
-            return Some((owner.to_string(), repo.to_string()));
-        }
-    }
+        rest
+    } else if let Some((_, after_scheme)) = trimmed.split_once("://") {
+        let (_, path) = after_scheme.split_once('/')?;
+        path
+    } else {
+        return None;
+    };
 
-    let (_, after_scheme) = trimmed.split_once("://")?;
-    let (_, path) = after_scheme.split_once('/')?;
-    let mut parts = path.split('/');
-    let owner = parts.next()?;
-    let repo = parts.next()?;
+    // GitLab のサブグループ (group/subgroup/repo) にも対応するため、末尾 2 セグメントを
+    // owner / repo として採用する。GitHub の owner/repo はそのまま 2 セグメントとして扱う。
+    let segments: Vec<&str> = path_part.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let repo = segments[segments.len() - 1];
+    let owner = segments[segments.len() - 2];
     if owner.is_empty() || repo.is_empty() {
         return None;
     }
@@ -391,6 +395,30 @@ mod tests {
     #[test]
     fn extract_remote_returns_none_for_empty_owner() {
         assert!(extract_remote_owner_and_repo("https://github.com//repo.git").is_none());
+    }
+
+    #[test]
+    fn extract_remote_owner_and_repo_handles_gitlab_subgroup_ssh() {
+        // GitLab のサブグループを含む SSH URL では末尾 2 セグメント (subgroup/repo) を返す。
+        // 直近の親 (subgroup) を owner として扱うことで visibility マップの照合が成立する。
+        let parsed =
+            extract_remote_owner_and_repo("git@gitlab.example.com:group/subgroup/repo.git");
+        assert_eq!(parsed, Some(("subgroup".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn extract_remote_owner_and_repo_handles_gitlab_subgroup_https() {
+        // GitLab のサブグループを含む HTTPS URL でも末尾 2 セグメントを返す。
+        let parsed =
+            extract_remote_owner_and_repo("https://gitlab.example.com/group/sub/project.git");
+        assert_eq!(parsed, Some(("sub".to_string(), "project".to_string())));
+    }
+
+    #[test]
+    fn extract_remote_owner_and_repo_handles_deeply_nested_subgroup() {
+        // 3 段以上のサブグループでも、末尾 2 セグメントが採用される。
+        let parsed = extract_remote_owner_and_repo("git@gitlab.example.com:a/b/c/d/repo.git");
+        assert_eq!(parsed, Some(("d".to_string(), "repo".to_string())));
     }
 
     #[test]

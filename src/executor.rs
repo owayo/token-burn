@@ -82,6 +82,21 @@ fn is_codex_command(command: &[String]) -> bool {
 }
 
 /// RuntimeAgent が claude provider かを判定する。
+/// 指定したパスのファイルに実行ビットを付与する。
+/// `chmod` の非ゼロ終了は無視されないことを保証し、tmux ワーカー起動時の
+/// 「permission denied」を未然に検知できるようにする。
+fn ensure_executable(path: &Path) -> Result<()> {
+    let output = std::process::Command::new("chmod")
+        .args(["+x", &path.to_string_lossy()])
+        .output()
+        .with_context(|| format!("Failed to run chmod on {}", path.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("chmod +x {} failed: {}", path.display(), stderr.trim());
+    }
+    Ok(())
+}
+
 /// provider が明示されていればそれを優先し、無ければ実行ファイル名から推論する。
 fn agent_is_claude(agent: &RuntimeAgent) -> bool {
     match agent.provider.as_deref() {
@@ -471,9 +486,7 @@ pub fn execute_plan_tmux(
             usage_gate_cmd: usage_gate_cmd.as_deref(),
         });
         std::fs::write(&script_path, &worker_script)?;
-        std::process::Command::new("chmod")
-            .args(["+x", &script_path.to_string_lossy()])
-            .output()?;
+        ensure_executable(&script_path)?;
         script_paths.push(script_path);
     }
 
@@ -494,9 +507,7 @@ pub fn execute_plan_tmux(
         usage_statusline_cmd.as_deref(),
     );
     std::fs::write(&monitor_path, &monitor_script)?;
-    std::process::Command::new("chmod")
-        .args(["+x", &monitor_path.to_string_lossy()])
-        .output()?;
+    ensure_executable(&monitor_path)?;
 
     // モニター（左ペイン）付き tmux セッションを作成
     std::process::Command::new("tmux")

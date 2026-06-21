@@ -73,7 +73,12 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     if iter.next().is_none() {
         return prefix;
     }
-    let kept: String = prefix.chars().take(max.saturating_sub(3)).collect();
+    // max が 3 以下の場合は省略記号 "..." を付けると max 文字を超えるため、
+    // 単純に max 文字までで切り詰める（契約：返却文字列の char 数は max 以下）。
+    if max <= 3 {
+        return prefix;
+    }
+    let kept: String = prefix.chars().take(max - 3).collect();
     format!("{kept}...")
 }
 

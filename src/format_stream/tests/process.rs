@@ -451,36 +451,36 @@ fn truncate_str_empty_string() {
 
 #[test]
 fn truncate_str_max_three() {
-    // max=3 の場合、3文字以下は変化なし、4文字以上は "..." のみ
+    // max=3 では "..." を付けると 4 文字になり契約違反のため、
+    // 単純に先頭 3 文字までで切り詰める。
     assert_eq!(truncate_str("abc", 3), "abc");
-    assert_eq!(truncate_str("abcd", 3), "...");
+    assert_eq!(truncate_str("abcd", 3), "abc");
 }
 
 #[test]
 fn truncate_str_max_zero() {
-    // max=0: 空文字なら空、非空なら即 "..."（kept は take(0) で空）
+    // max=0: "..." の余地が無いため、いかなる入力に対しても空文字を返す。
     assert_eq!(truncate_str("", 0), "");
-    assert_eq!(truncate_str("a", 0), "...");
-    assert_eq!(truncate_str("abc", 0), "...");
+    assert_eq!(truncate_str("a", 0), "");
+    assert_eq!(truncate_str("abc", 0), "");
 }
 
 #[test]
-fn truncate_str_max_one_and_two_saturating_sub() {
-    // max < 3 で切り詰めが発生すると saturating_sub(3) が 0 になり kept が空 → "..."
-    // ただし「ちょうど max 文字」や「max 文字以下」は変化しない
+fn truncate_str_max_one_and_two_boundary() {
+    // max <= 3 では "..." を付けない。文字数で単純切り詰めし、char 数が max 以下になることを保証する。
     assert_eq!(truncate_str("a", 1), "a"); // ちょうど 1 文字
-    assert_eq!(truncate_str("ab", 1), "..."); // 1 文字超過
+    assert_eq!(truncate_str("ab", 1), "a"); // 1 文字超過 → 先頭 1 文字
     assert_eq!(truncate_str("ab", 2), "ab"); // ちょうど 2 文字
-    assert_eq!(truncate_str("abc", 2), "..."); // 2 文字超過
+    assert_eq!(truncate_str("abc", 2), "ab"); // 2 文字超過 → 先頭 2 文字
 }
 
 #[test]
 fn truncate_str_multibyte_at_truncation_boundary() {
     // マルチバイト文字でも切り詰めは「文字数」基準。max=4 で 5 文字なら 1 文字 + "..."
     assert_eq!(truncate_str("あいうえお", 4), "あ...");
-    // max=3 ちょうどで 3 文字なら変化なし、4 文字なら "..."（kept take(0)）
+    // max=3 ちょうどで 3 文字なら変化なし、4 文字でも単純に先頭 3 文字へ切り詰め。
     assert_eq!(truncate_str("あいう", 3), "あいう");
-    assert_eq!(truncate_str("あいうえ", 3), "...");
+    assert_eq!(truncate_str("あいうえ", 3), "あいう");
 }
 
 #[test]
