@@ -461,6 +461,13 @@ pub fn execute_plan_tmux(
     let usage_statusline_cmd = plan.usage_gate.as_ref().and_then(|g| {
         build_statusline_cmd(&g.command, &cache_file, &g.env, &g.profile, &g.provider)
     });
+    // monitor の 10 秒ループで使う ai-usage --json コマンド（env prefix 付き）。
+    // 取得結果を `--input` で読む statusline と同じキャッシュファイルへ atomic に
+    // 書き戻すため、usage-gate も含めて表示・判定が同じ値で同期する。
+    let usage_refresh_cmd = plan
+        .usage_gate
+        .as_ref()
+        .and_then(|g| build_refresh_cmd(&g.command, &g.env));
     // 起動時に ai-usage キャッシュを初期化し、monitor 起動直後から statusline を表示できるようにする
     // （以後は usage-gate が各タスク完了時に 20 秒 TTL で更新する）。
     if let Some(g) = plan.usage_gate.as_ref()
@@ -505,6 +512,8 @@ pub fn execute_plan_tmux(
         &stop_file,
         &run_dir,
         usage_statusline_cmd.as_deref(),
+        usage_refresh_cmd.as_deref(),
+        plan.usage_gate.as_ref().map(|_| cache_file.as_path()),
     );
     std::fs::write(&monitor_path, &monitor_script)?;
     ensure_executable(&monitor_path)?;
@@ -651,6 +660,8 @@ fn generate_monitor_script(
     stop_file: &std::path::Path,
     report_dir: &std::path::Path,
     ai_usage_statusline_cmd: Option<&str>,
+    ai_usage_refresh_cmd: Option<&str>,
+    ai_usage_cache_file: Option<&std::path::Path>,
 ) -> String {
     let agent_escaped = shell_escape(agent_name);
     let command_escaped = shell_escape(command_str);
@@ -663,6 +674,16 @@ fn generate_monitor_script(
     // monitor 側の eval で 1 段戻して実行する）。未設定は空文字列で monitor が無効判定する。
     let ai_usage_cmd_escaped = ai_usage_statusline_cmd
         .map(shell_escape)
+        .unwrap_or_else(|| "''".to_string());
+    // ai-usage --json を bash で実行してキャッシュを atomic 更新するための文字列。
+    // statusline は `--input <cache>` でキャッシュを読むだけなので、monitor 側で
+    // キャッシュを更新しないと長時間タスク中に表示が固定される。usage-gate と同じ
+    // キャッシュファイルを共有するため、並列ワーカー側も新しい値を読める。
+    let ai_usage_refresh_escaped = ai_usage_refresh_cmd
+        .map(shell_escape)
+        .unwrap_or_else(|| "''".to_string());
+    let ai_usage_cache_escaped = ai_usage_cache_file
+        .map(|p| shell_escape(&p.to_string_lossy()))
         .unwrap_or_else(|| "''".to_string());
 
     format!(
@@ -678,6 +699,8 @@ WORKER_COUNT={worker_count}
 STOP_FILE={stop_file}
 REPORT_DIR={report_dir}
 AI_USAGE_CMD={ai_usage_cmd}
+AI_USAGE_REFRESH_CMD={ai_usage_refresh_cmd}
+AI_USAGE_CACHE_FILE={ai_usage_cache_file}
 STOPPED=0
 USAGE_DISPLAY=""
 LAST_USAGE=0
@@ -688,6 +711,18 @@ restore_terminal() {{ tput cnorm 2>/dev/null; printf '\033[?7h'; }}
 
 fetch_usage() {{
     [ -z "$AI_USAGE_CMD" ] && return
+    # まず ai-usage --json を実行してキャッシュを atomic 更新する。statusline は
+    # `--input <cache>` でキャッシュを読むだけなので、ここで更新しないと表示が
+    # 固定される。usage-gate と同じキャッシュファイルを共有するため、並列
+    # ワーカーの使用率判定も最新の値を読める。tmp ファイル経由で mv するのは
+    # 読み手が壊れた JSON を読まないようにするため。
+    if [ -n "$AI_USAGE_REFRESH_CMD" ] && [ -n "$AI_USAGE_CACHE_FILE" ]; then
+        if eval "$AI_USAGE_REFRESH_CMD" > "$AI_USAGE_CACHE_FILE.tmp" 2>/dev/null; then
+            mv "$AI_USAGE_CACHE_FILE.tmp" "$AI_USAGE_CACHE_FILE" 2>/dev/null
+        else
+            rm -f "$AI_USAGE_CACHE_FILE.tmp" 2>/dev/null
+        fi
+    fi
     local new
     new=$(eval "$AI_USAGE_CMD" 2>/dev/null)
     [ -n "$new" ] && USAGE_DISPLAY="$new"
@@ -850,6 +885,8 @@ done
         stop_file = stop_file_escaped,
         report_dir = report_dir_escaped,
         ai_usage_cmd = ai_usage_cmd_escaped,
+        ai_usage_refresh_cmd = ai_usage_refresh_escaped,
+        ai_usage_cache_file = ai_usage_cache_escaped,
     )
 }
 
@@ -1290,6 +1327,23 @@ fn build_statusline_cmd(
     Some(all.join(" "))
 }
 
+/// ai-usage の `--json` 取得コマンドに env prefix を付けて bash で実行できる
+/// 文字列を組み立てる。monitor 側で `eval $CMD > $cache.tmp && mv $cache.tmp $cache`
+/// の atomic 更新に使い、`--input <cache>` で読む statusline と同じファイルを
+/// 共有する。これにより monitor のリフレッシュが usage-gate にも反映され、
+/// 長時間タスク中に表示が古いまま固定される問題を解消する。空コマンドなら None。
+fn build_refresh_cmd(
+    command: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    if command.is_empty() {
+        return None;
+    }
+    let mut all = env_prefix_parts(env);
+    all.extend(command.iter().map(|s| shell_escape(s)));
+    Some(all.join(" "))
+}
+
 fn sanitize_filename(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -1647,6 +1701,8 @@ mod tests {
             std::path::Path::new("/tmp/stop file"),
             std::path::Path::new("/tmp/report dir"),
             None,
+            None,
+            None,
         );
 
         assert!(script.contains("AGENT='ag\"$(touch /tmp/pwn)\"'"));
@@ -1658,8 +1714,10 @@ mod tests {
         // 全体再描画方式: render 関数とマーカー由来のエラー表示を持つ
         assert!(script.contains("render() {"));
         assert!(script.contains(r" ❌ %s\n"));
-        // ai-usage 連携なしのときは AI_USAGE_CMD は空文字列
+        // ai-usage 連携なしのときは AI_USAGE_CMD / REFRESH_CMD / CACHE_FILE は空文字列
         assert!(script.contains("AI_USAGE_CMD=''"));
+        assert!(script.contains("AI_USAGE_REFRESH_CMD=''"));
+        assert!(script.contains("AI_USAGE_CACHE_FILE=''"));
         // 進捗バーは BSD seq(macOS) の "seq 1 0 → 1 0" 問題を避けるため算術ループで描画する
         assert!(script.contains("while [ $i -lt $FILLED ]"));
         assert!(script.contains("while [ $i -lt $EMPTY ]"));
@@ -1677,6 +1735,7 @@ mod tests {
 
     #[test]
     fn generate_monitor_script_includes_statusline_when_enabled() {
+        let cache = std::path::Path::new("/tmp/cache.json");
         let script = generate_monitor_script(
             "claude",
             "claude",
@@ -1689,6 +1748,8 @@ mod tests {
             std::path::Path::new("/tmp/stop"),
             std::path::Path::new("/tmp/report"),
             Some("'ai-usage' --statusline --logos --input '/tmp/cache.json'"),
+            Some("'ai-usage' '--json'"),
+            Some(cache),
         );
         // statusline コマンドが AI_USAGE_CMD に埋め込まれ、10秒ごとに再取得・再描画する
         assert!(script.contains("AI_USAGE_CMD="));
@@ -1696,15 +1757,29 @@ mod tests {
         assert!(script.contains("fetch_usage"));
         assert!(script.contains("$((NOW - LAST_USAGE)) -ge 10"));
         assert!(script.contains("AI Usage:"));
+        // refresh コマンドが atomic にキャッシュを更新するロジックが入っていること。
+        assert!(script.contains("AI_USAGE_REFRESH_CMD="));
+        assert!(script.contains("AI_USAGE_CACHE_FILE="));
+        assert!(script.contains("> \"$AI_USAGE_CACHE_FILE.tmp\""));
+        assert!(
+            script.contains("mv \"$AI_USAGE_CACHE_FILE.tmp\" \"$AI_USAGE_CACHE_FILE\""),
+            "refresh must atomically swap cache via mv"
+        );
     }
 
     #[test]
     fn generate_monitor_script_is_valid_bash() {
         // statusline あり/なしの両方で、生成されるスクリプトが bash 構文として妥当なこと。
-        for cmd in [
-            None,
-            Some("'ai-usage' --statusline --logos --input '/tmp/c.json'"),
-        ] {
+        let cache = std::path::Path::new("/tmp/c.json");
+        let cases: [(Option<&str>, Option<&str>, Option<&std::path::Path>); 2] = [
+            (None, None, None),
+            (
+                Some("'ai-usage' --statusline --logos --input '/tmp/c.json'"),
+                Some("'ai-usage' '--json'"),
+                Some(cache),
+            ),
+        ];
+        for (statusline, refresh, cache_path) in cases {
             let script = generate_monitor_script(
                 "claude",
                 "claude --model opus",
@@ -1716,7 +1791,9 @@ mod tests {
                 2,
                 std::path::Path::new("/tmp/stop"),
                 std::path::Path::new("/tmp/report"),
-                cmd,
+                statusline,
+                refresh,
+                cache_path,
             );
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("monitor.sh");
@@ -1729,9 +1806,30 @@ mod tests {
             assert!(
                 status.success(),
                 "monitor script must be valid bash (statusline={})",
-                cmd.is_some()
+                statusline.is_some()
             );
         }
+    }
+
+    #[test]
+    fn build_refresh_cmd_includes_env_prefix_and_command() {
+        // env を前置きしつつ、ai-usage --json をそのまま実行できる文字列になる。
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/home/u/.claude".to_string(),
+        );
+        let cmd = build_refresh_cmd(&["ai-usage".to_string(), "--json".to_string()], &env)
+            .expect("non-empty command");
+        assert_eq!(
+            cmd,
+            "CLAUDE_CONFIG_DIR='/home/u/.claude' 'ai-usage' '--json'"
+        );
+    }
+
+    #[test]
+    fn build_refresh_cmd_none_for_empty_command() {
+        assert!(build_refresh_cmd(&[], &std::collections::BTreeMap::new()).is_none());
     }
 
     #[test]
