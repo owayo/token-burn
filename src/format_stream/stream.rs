@@ -83,9 +83,9 @@ pub(crate) fn handle_stream_event(
                 "thinking_delta" => {
                     if let Some(text) = delta["thinking"].as_str() {
                         block.ensure_thinking_started(out)?;
-                        let prev = block.thinking_chars / 100;
-                        block.thinking_chars += text.len();
-                        let curr = block.thinking_chars / 100;
+                        let prev = block.thinking_bytes / 100;
+                        block.thinking_bytes += text.len();
+                        let curr = block.thinking_bytes / 100;
                         for _ in prev..curr {
                             write!(out, ".")?;
                         }

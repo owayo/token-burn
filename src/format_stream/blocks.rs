@@ -22,7 +22,8 @@ pub(crate) struct ContentBlockState {
     pub(crate) tool_name: String,
     pub(crate) tool_input: String,
     pub(crate) text: String,
-    pub(crate) thinking_chars: usize,
+    /// 思考デルタの累積バイト数。100 バイトごとに進捗ドットを 1 つ出すために使う。
+    pub(crate) thinking_bytes: usize,
     pub(crate) thinking_started: bool,
 }
 
@@ -33,7 +34,7 @@ impl ContentBlockState {
             tool_name: String::new(),
             tool_input: String::new(),
             text: String::new(),
-            thinking_chars: 0,
+            thinking_bytes: 0,
             thinking_started: false,
         }
     }

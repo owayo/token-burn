@@ -2,7 +2,6 @@
 //! モジュール。
 
 use anyhow::Result;
-use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
@@ -126,9 +125,13 @@ fn format_timestamp_clock(info: &serde_json::Value, key: &str) -> Option<String>
         .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
 }
 
-/// stop_file が指定されていれば作成する（全ワーカーの後続タスクを停止するシグナル）。
+/// stop_file が指定されていれば冪等に作成する（全ワーカーの後続タスクを停止するシグナル）。
+/// 既存ファイルは上書きせず、`create_new` で並列ワーカー間の race を回避する。
 fn touch_stop_file(stop_file: Option<&Path>) {
     if let Some(path) = stop_file {
-        let _ = File::create(path);
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path);
     }
 }

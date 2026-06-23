@@ -301,10 +301,17 @@ pub async fn run_usage_gate(
     let snapshot = match load_usage_cached(command, cache_file).await {
         Ok(s) => s,
         Err(e) => {
+            // fail-closed: ai-usage の取得に失敗したら stop_file を作って停止する。
+            // 既に他ワーカーが stop_file を作成済みなら write_stop_file は false を返す
+            // が、その場合も他経路で停止シグナルは伝わるため正常終了でよい。
             if write_stop_file(stop_file, &format!("usage-gate failed: {e}")) {
                 println!(
                     "\x1b[31m  \u{26d4} usage-gate: ai-usage を確認できないため停止 ({e})\x1b[0m"
                 );
+            } else if !stop_file.exists() {
+                // 書き込みに失敗し、かつ stop_file が存在しない（既存ではなく作成失敗）。
+                // フェイルオープン状態を避けるため、エラーを伝搬してワーカーを止める。
+                anyhow::bail!("usage-gate: failed to write stop file: {e}");
             }
             return Ok(());
         }
@@ -366,10 +373,32 @@ async fn load_usage_cached(command: &[String], cache_file: &Path) -> Result<AiUs
     let parsed: AiUsageOutput =
         serde_json::from_slice(&output.stdout).context("failed to parse ai-usage --json output")?;
     // 取得成功時のみ raw JSON をキャッシュへ書き込む。
-    let _ = std::fs::write(cache_file, &output.stdout);
+    // 並列ワーカーが同時に読みうるため atomic rename で更新する
+    // （途中書き込みの不完全 JSON を別ワーカーが読むのを防ぐ）。
+    write_cache_atomic(cache_file, &output.stdout);
     Ok(AiUsageSnapshot {
         accounts: parsed.accounts,
     })
+}
+
+/// キャッシュファイルへ atomic に書き込む。同一ディレクトリの一時ファイルへ書き出し、
+/// rename で本体に置き換える。エラーは握りつぶす（キャッシュ更新は best-effort）。
+fn write_cache_atomic(cache_file: &Path, content: &[u8]) {
+    let Some(dir) = cache_file.parent() else {
+        return;
+    };
+    let file_name = match cache_file.file_name().and_then(|s| s.to_str()) {
+        Some(n) => n,
+        None => return,
+    };
+    let tmp_path = dir.join(format!(".{}.tmp.{}", file_name, std::process::id()));
+    if std::fs::write(&tmp_path, content).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    if std::fs::rename(&tmp_path, cache_file).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
 }
 
 /// stop_file を冪等に作成する。新規作成できたら true、既存なら false。
@@ -744,5 +773,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&stop).unwrap(), "pre-existing");
+    }
+
+    #[test]
+    fn write_cache_atomic_replaces_existing_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = tmp.path().join("cache.json");
+        std::fs::write(&cache, b"old content").unwrap();
+        write_cache_atomic(&cache, b"new content");
+        assert_eq!(std::fs::read(&cache).unwrap(), b"new content");
+    }
+
+    #[test]
+    fn write_cache_atomic_creates_new_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = tmp.path().join("new-cache.json");
+        write_cache_atomic(&cache, b"first content");
+        assert_eq!(std::fs::read(&cache).unwrap(), b"first content");
+    }
+
+    #[test]
+    fn write_cache_atomic_leaves_no_tmp_file_after_success() {
+        // atomic rename 成功時、`.cache.json.tmp.<pid>` のような一時ファイルが残らないこと。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = tmp.path().join("cache.json");
+        write_cache_atomic(&cache, b"data");
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        // 期待: "cache.json" のみが残る（一時ファイルは rename で消費される）。
+        assert_eq!(entries.len(), 1, "tmp ファイルが残っている: {:?}", entries);
+        assert_eq!(entries[0].to_string_lossy(), "cache.json");
     }
 }

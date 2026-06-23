@@ -83,6 +83,24 @@ fn extract_tool_detail_bash_shows_runtime_attrs() {
 }
 
 #[test]
+fn extract_tool_detail_bash_timeout_under_one_second_uses_millis() {
+    // 1000ms 未満の timeout を秒で除算すると "timeout=0s" になってしまうため
+    // ミリ秒表記でフォールバックすることを確認する。
+    let input = r#"{"command":"echo hi","timeout":500}"#;
+    assert_eq!(
+        extract_tool_detail("Bash", input),
+        "echo hi [timeout=500ms]"
+    );
+}
+
+#[test]
+fn extract_tool_detail_bash_timeout_exactly_one_second_uses_seconds() {
+    // 境界値: 1000ms ちょうどは "timeout=1s" として表示する。
+    let input = r#"{"command":"echo hi","timeout":1000}"#;
+    assert_eq!(extract_tool_detail("Bash", input), "echo hi [timeout=1s]");
+}
+
+#[test]
 fn extract_tool_detail_bash_shows_disabled_sandbox() {
     // 実 jsonl の Bash 入力では、サンドボックス無効化が明示されることがある。
     let input = r#"{"command":"make install","dangerouslyDisableSandbox":true}"#;

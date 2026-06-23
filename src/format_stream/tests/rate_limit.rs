@@ -172,6 +172,25 @@ fn process_rate_limit_no_stop_file_path_still_shows_message() {
 }
 
 #[test]
+fn process_rate_limit_stop_file_is_idempotent_and_preserves_existing_content() {
+    // 既存の stop_file が存在する場合、`create_new` により上書きされず内容を保持する。
+    // 別ワーカーが先に書き込んだ理由を後続イベントが消してしまうのを防ぐため。
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    let existing = "preexisting reason\n";
+    std::fs::write(&stop_file, existing).unwrap();
+
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"}}"#;
+    let _ = run_process_with_opts(input, None, Some(&stop_file), 95);
+
+    let after = std::fs::read_to_string(&stop_file).unwrap();
+    assert_eq!(
+        after, existing,
+        "既存の stop file 内容は維持されるべき (create_new で上書きしない)"
+    );
+}
+
+#[test]
 fn process_rate_limit_warning_shows_resets_at() {
     // resetsAt タイムスタンプがローカル時刻で表示される
     let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.80,"resetsAt":1776009600}}"#;

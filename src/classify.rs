@@ -33,11 +33,15 @@ impl ResultClass {
 }
 
 /// jsonl ファイルから最後の `"type":"result"` イベントを取り出して分類する。
+/// ファイルが存在しない場合は Success（result イベントなしと等価）として扱うが、
+/// 権限エラーや I/O エラーで読めない場合は Failed として返す（成功扱いで
+/// state.json に誤記録するのを防ぐ）。
 pub fn classify_jsonl(path: &Path) -> ResultClass {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return ResultClass::Success;
-    };
-    classify_content(&content)
+    match std::fs::read_to_string(path) {
+        Ok(content) => classify_content(&content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ResultClass::Success,
+        Err(e) => ResultClass::Failed(format!("failed to read jsonl {}: {}", path.display(), e)),
+    }
 }
 
 pub fn classify_content(content: &str) -> ResultClass {
@@ -214,6 +218,19 @@ mod tests {
     fn classify_jsonl_missing_file_is_success() {
         let path = std::path::Path::new("/nonexistent/token-burn-missing.jsonl");
         assert_eq!(classify_jsonl(path), ResultClass::Success);
+    }
+
+    /// 権限エラーや I/O エラーでファイルが読めない場合は Failed として扱う。
+    /// （NotFound 以外のエラーを Success と誤分類すると state.json に誤記録されてしまう）
+    #[test]
+    fn classify_jsonl_io_error_is_failed() {
+        // 既存のディレクトリをパスとして渡すと EISDIR で読み込み失敗するため、
+        // NotFound 以外の I/O エラー経路を確認できる。
+        let dir = tempfile::tempdir().unwrap();
+        match classify_jsonl(dir.path()) {
+            ResultClass::Failed(msg) => assert!(msg.contains("failed to read jsonl")),
+            other => panic!("expected Failed for I/O error, got {other:?}"),
+        }
     }
 
     #[test]

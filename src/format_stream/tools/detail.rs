@@ -111,7 +111,12 @@ fn detail_bash(v: &serde_json::Value) -> String {
     let desc = v["description"].as_str().unwrap_or("");
     let mut attrs = Vec::new();
     if let Some(timeout) = v["timeout"].as_u64() {
-        attrs.push(format!("timeout={}s", timeout / 1000));
+        // ミリ秒未満で切り捨てて "0s" にならないよう、1000ms 未満はミリ秒表示にする。
+        if timeout >= 1000 {
+            attrs.push(format!("timeout={}s", timeout / 1000));
+        } else {
+            attrs.push(format!("timeout={}ms", timeout));
+        }
     }
     if v["run_in_background"].as_bool() == Some(true) {
         attrs.push("background".to_string());

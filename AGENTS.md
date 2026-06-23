@@ -88,9 +88,9 @@ make release  # リリースビルド
 
 ai-usage 連携が有効なとき、`rate_limit_threshold`（%）は 2 経路で後続タスクを止めます。1 つは既存の `claude` stream-json `rate_limit_event` によるリアルタイム監視（タスク実行中の `utilization` が閾値超過で stop file 作成）。もう 1 つが **usage-gate** で、各タスク完了後（ワーカーが次の pending を claim する前）に内部サブコマンド `token-burn usage-gate` が `ai-usage --json` を実行し、その agent の `(profile, provider)` の weekly / five_hour `used_percent` のうち**いずれかが `rate_limit_threshold` 以上なら stop file を作成**して後続を停止します。`claude` / `codex` 両方に効きます（codex は従来リアルタイム監視が無かったため特に有効）。
 
-- ai-usage 出力は短 TTL（20 秒）でファイルキャッシュし、並列ワーカーからの重複取得を抑えます。
-- 取得失敗時は fail-closed（使用率を確認できない以上、安全側で停止）。該当エントリ無し・`used_percent` 欠損時は過剰停止を避けて続行します。
-- stop file 作成は `create_new` で冪等（並列ワーカーから同時に呼ばれても安全）。既に走行中のタスクは止められませんが、次のタスク開始前チェックで停止します。
+- ai-usage 出力は短 TTL（20 秒）でファイルキャッシュし、並列ワーカーからの重複取得を抑えます。キャッシュは同一ディレクトリの `.<cache>.tmp.<PID>` に書き出し → `rename` で本体に置き換える atomic rename で更新するため、別ワーカーが書き込み途中の不完全 JSON を読むことはありません。
+- 取得失敗時は fail-closed（使用率を確認できない以上、安全側で停止）。該当エントリ無し・`used_percent` 欠損時は過剰停止を避けて続行します。`stop_file` の作成にも失敗した場合（ディスクフル等）は黙って継続せず、エラーを伝搬してワーカーを止めます。
+- stop file 作成は `create_new` で冪等（並列ワーカーから同時に呼ばれても安全）。既に走行中のタスクは止められませんが、次のタスク開始前チェックで停止します。これは usage-gate と `claude` stream-json の rate_limit_event 経路の両方で共通の挙動です。
 
 ### モニターペインの ai-usage 表示
 
@@ -109,9 +109,11 @@ statusline コマンドは usage-gate / 起動時キャッシュ初期化と同�
 - プロバイダ側リトライ可能エラー (`api_error_status` が 408/429/5xx) → `retry-N` マーカー。`state.json` には記録しないため次回実行で再処理される。ワーカーは継続
 - その他のプロバイダエラー → `failed-N` マーカーとエラーメッセージ（`result` フィールド）を表示し、ワーカーは停止
 
+jsonl ファイルが存在しない場合は result イベント無しと等価で Success として扱いますが、ファイルは存在するのに権限エラーや I/O エラーで読めない場合は `Failed` として返します（読み込み失敗を Success と誤分類して `state.json` に誤記録するのを防ぐため）。
+
 `format-stream` は `tool_result` の `is_error:true` を検出した場合、エラー内容の先頭の有意な 1 行をサマリーとして表示します（単一行/複数行の `<tool_use_error>...</tool_use_error>` ラッパーは除去）。配列形式の `content` にも対応し、120 文字を超える場合は末尾を `...` で省略します。
 
-`tool_use_result` の top-level メタデータに `truncated`、`appliedLimit`、`staleReadFileStateHint`、`success:false` / `error` / `message`、`assistantAutoBackgrounded`、`backgroundTaskId`、`wasClamped` / `clampedDelaySeconds`、`persistedOutputPath` / `persistedOutputSize`、`returnCodeInterpretation`、`totalDurationMs` / `durationMs` / `totalTokens` / `totalToolUseCount`、`agentType`（Agent のサブエージェント種別。`agent:<type>` 形式）、`resolvedModel`（Skill / Agent が解決したモデル名。`model:<...>` 形式）、`toolStats`（サブエージェントの編集行数。加除いずれか非ゼロのとき `edits:+<追加>/-<削除>` 形式）、`numFiles` / `numLines`、`file.numLines` / `file.totalLines`（Read の部分読み取り。`lines:<n>/<total>` 形式）、`file.truncatedByTokenCap`（Read の token cap 切り詰め。`truncated:token-cap` 形式）、`matches`（ToolSearch）/ `numMatches`（Grep の count モード）/ `mode` / `total_deferred_tools`、`results` / `searchCount` / `durationSeconds`（WebSearch の結果件数・検索回数・所要時間）、`code` / `codeText` / `bytes`（WebFetch の HTTP ステータス・応答サイズ。`http:<code> <text>` 形式）、`gitOperation`（git commit の sha / kind。`commit:<sha> <kind>` 形式）、`structuredContent.content`（Codex MCP 等の構造化応答。`structured:<summary>` 形式）、`tasks` / `task` / `taskId` / `task_id` / `task_type`、`retrieval_status`、`outputFile` / `canReadOutputFile`、`timeoutMs` / `persistent`、`statusChange`、`updatedFields`（TaskUpdate の変更フィールド一覧。`status` のみのときは `statusChange` と重複するため非表示、それ以外は `updated:<field1>,<field2>` 形式）、`isAsync`（Agent を `run_in_background=true` で起動した async-launched 応答。`async` として表示）、`scheduledFor`、`commandName`、`allowedTools`（Skill が許可するツール一覧。非空配列のときに件数を `allowed-tools:<n>` 形式で表示） が含まれる場合は、ツール完了行に短い補足として表示します。`matches` 配列は ToolSearch 専用で Grep の結果には存在しないため、Grep の count モードでは `numMatches` 整数から件数を表示します。Read の行数は実データでは `file` オブジェクトに入れ子で入り、部分読み取り（`numLines < totalLines`）のときのみ `lines:<n>/<total>` を表示します（全行読み取り時はノイズ回避のため省略）。`file.truncatedByTokenCap` が true の場合は、行数比率とは独立して `truncated:token-cap` を表示します。WebSearch の `searchCount` は通常 1 のため 2 以上のときのみ表示します。
+`tool_use_result` の top-level メタデータに `truncated`、`appliedLimit`、`staleReadFileStateHint`、`userModified`（Edit/Write 等で書き込み前にユーザがファイルを変更していた場合。`user-modified` 形式）、`success:false` / `error` / `message`、`assistantAutoBackgrounded`、`backgroundTaskId`、`wasClamped` / `clampedDelaySeconds`、`persistedOutputPath` / `persistedOutputSize`、`returnCodeInterpretation`、`totalDurationMs` / `durationMs` / `totalTokens` / `totalToolUseCount`、`agentType`（Agent のサブエージェント種別。`agent:<type>` 形式）、`resolvedModel`（Skill / Agent が解決したモデル名。`model:<...>` 形式）、`toolStats`（サブエージェントの編集行数。加除いずれか非ゼロのとき `edits:+<追加>/-<削除>` 形式）、`numFiles` / `numLines`、`file.numLines` / `file.totalLines`（Read の部分読み取り。`lines:<n>/<total>` 形式）、`file.truncatedByTokenCap`（Read の token cap 切り詰め。`truncated:token-cap` 形式）、`matches`（ToolSearch）/ `numMatches`（Grep の count モード）/ `mode` / `total_deferred_tools`、`results` / `searchCount` / `durationSeconds`（WebSearch の結果件数・検索回数・所要時間）、`code` / `codeText` / `bytes`（WebFetch の HTTP ステータス・応答サイズ。`http:<code> <text>` 形式）、`gitOperation`（git commit の sha / kind。`commit:<sha> <kind>` 形式）、`structuredContent.content`（Codex MCP 等の構造化応答。`structured:<summary>` 形式）、`tasks` / `task` / `taskId` / `task_id` / `task_type`、`retrieval_status`、`outputFile` / `canReadOutputFile`、`timeoutMs` / `persistent`、`statusChange`、`updatedFields`（TaskUpdate の変更フィールド一覧。`status` のみのときは `statusChange` と重複するため非表示、それ以外は `updated:<field1>,<field2>` 形式）、`isAsync`（Agent を `run_in_background=true` で起動した async-launched 応答。`async` として表示）、`scheduledFor`、`commandName`、`allowedTools`（Skill が許可するツール一覧。非空配列のときに件数を `allowed-tools:<n>` 形式で表示） が含まれる場合は、ツール完了行に短い補足として表示します。`matches` 配列は ToolSearch 専用で Grep の結果には存在しないため、Grep の count モードでは `numMatches` 整数から件数を表示します。Read の行数は実データでは `file` オブジェクトに入れ子で入り、部分読み取り（`numLines < totalLines`）のときのみ `lines:<n>/<total>` を表示します（全行読み取り時はノイズ回避のため省略）。`file.truncatedByTokenCap` が true の場合は、行数比率とは独立して `truncated:token-cap` を表示します。WebSearch の `searchCount` は通常 1 のため 2 以上のときのみ表示します。
 
 モニターペインの進捗は `fail:<n> retry:<n>` を併記し、完了時も `%d succeeded / %d failed / %d retry` の形で表示します。
 
@@ -133,7 +135,7 @@ statusline コマンドは usage-gate / 起動時キャッシュ初期化と同�
 - テキスト応答のストリーミング表示
 - 思考ブロック（`thinking`）のプログレスインジケーター
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`（小文字 `bash` を含む）/`Agent`/`Task`/`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`/`TaskStop`/`TaskOutput`/`TeamCreate`/`Skill`/`TodoWrite`/`Monitor`/`Grep`/`Glob`/`ScheduleWakeup`/`WebFetch`/`WebSearch`/`ToolSearch`/`SendMessage`/`AskUserQuestion`/Context7・Tavily・Codex MCP 等）の詳細表示と差分出力
-- `Read` の `file_path` と `offset` / `limit`、`Bash` の `timeout` / `run_in_background` / `dangerouslyDisableSandbox`、`Agent` の `run_in_background` を表示
+- `Read` の `file_path` と `offset` / `limit`、`Bash` の `timeout`（1000ms 以上は `timeout=<秒>s`、未満は `timeout=<n>ms` でミリ秒切り捨てによる "0s" 誤表示を回避）/ `run_in_background` / `dangerouslyDisableSandbox`、`Agent` の `run_in_background` を表示
 - `Edit` は `new_string` に加えて実データで確認された `new_str` 入力も差分表示に使用し、`replace_all` が true の場合は一括置換として表示する
 - `Grep` / `Glob` の検索パターン、対象パス、`output_mode`、`type`、`glob`、`head_limit`、`context`、`offset`、`-A` / `-B` / `-C` / `-n` / `-i` / `-o`、`multiline` を表示
 - `ScheduleWakeup` の待機時間と理由を表示
@@ -149,7 +151,7 @@ statusline コマンドは usage-gate / 起動時キャッシュ初期化と同�
 - 異常終了時の `terminal_reason`（`completed` 以外の場合）と `permission_denials` の件数・ツール名表示
 - result の `usage.service_tier`、`usage.speed`、空でない `usage.inference_geo`、`usage.iterations` 件数、`origin.kind` の表示
 - レート制限警告（`rate_limit_event`）の使用率表示、リクエスト拒否通知、および `allowed` 時の補足情報表示（`resetsAt` / `overageResetsAt` / overage 情報がある場合）。`allowed_warning` 時に `surpassedThreshold` が含まれている場合は通過済み警告閾値（例: `warning at 90%`）を併記する
-- レート制限使用率が `rate_limit_threshold`（デフォルト: 95%）を超えた場合、stop file を作成して後続タスクを自動停止
+- レート制限使用率が `rate_limit_threshold`（デフォルト: 95%）を超えた場合、stop file を作成して後続タスクを自動停止。stop file の作成は usage-gate と同じく `create_new` で冪等（並列ワーカーから同時に呼ばれても既存内容は上書きしない）
 - APIリトライ（`api_retry`）の試行回数とエラー情報の表示
 - `status`（リクエスト状態通知）と `thinking_tokens`（思考トークンの推定累積値 `estimated_tokens` / `estimated_tokens_delta`）は高頻度（1 セッションで数千件）に出力されるノイズイベントのため、明示的に無視します。思考中の進捗は `thinking_delta` のドット表示、トークン総数は `result.usage` の集計表示で代替するため、これらを表示すると重複・冗長になります
 
