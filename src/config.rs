@@ -164,7 +164,7 @@ pub enum StateWindowPolicy {
 pub struct RuntimeAgent {
     /// 展開名（例: "claude" または "claude-owa"）。state.json キー・レポート名に使う。
     pub name: String,
-    /// provider（"claude" | "codex" | "antigravity"）。
+    /// 提供元（"claude" | "codex" | "antigravity"）。
     pub provider: Option<String>,
     pub command: Vec<String>,
     /// `~` 展開済みの環境変数。

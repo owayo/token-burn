@@ -2,8 +2,8 @@
 //! 短い補足文字列として組み立てるモジュール。
 
 use crate::format_stream::util::{
-    format_byte_size, format_epoch_millis_clock, format_millis_as_seconds, format_number,
-    truncate_inline,
+    first_string, format_byte_size, format_epoch_millis_clock, format_millis_as_seconds,
+    format_number, truncate_inline,
 };
 
 /// `tool_use_result` の補足情報から、見落とすと判断材料を失うものだけ短く表示する。
@@ -33,6 +33,20 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
         .is_some_and(|success| !success)
     {
         attrs.push("failed".to_string());
+    }
+    if let Some(error) = obj
+        .get("error")
+        .and_then(|value| value.as_str())
+        .filter(|error| !error.is_empty())
+    {
+        attrs.push(format!("error:{}", truncate_inline(error, 70)));
+    }
+    if let Some(message) = obj
+        .get("message")
+        .and_then(|value| value.as_str())
+        .filter(|message| !message.is_empty())
+    {
+        attrs.push(format!("message:{}", truncate_inline(message, 70)));
     }
     // Bash 経由の git commit など、git 操作が完了した事実は進捗上の重要なマイルストーン。
     // sha は短縮済み(7桁)、kind は committed / amended 等。
@@ -148,6 +162,14 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     {
         attrs.push(format!("command:{command_name}"));
     }
+    if let Some(content) = obj
+        .get("structuredContent")
+        .and_then(|value| value.get("content"))
+        .and_then(|value| value.as_str())
+        .filter(|content| !content.is_empty())
+    {
+        attrs.push(format!("structured:{}", truncate_inline(content, 70)));
+    }
     // Skill / Agent の許可ツール件数。件数のみ表示し、具体的なツール名は冗長になるため省略する。
     if let Some(allowed) = obj.get("allowedTools").and_then(|value| value.as_array())
         && !allowed.is_empty()
@@ -239,6 +261,16 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     }
     if let Some(tasks) = obj.get("tasks").and_then(|value| value.as_array()) {
         attrs.push(format!("tasks:{}", tasks.len()));
+    }
+    if !obj.contains_key("task") {
+        let task_id = first_string(result, &["taskId", "task_id"]);
+        if !task_id.is_empty() {
+            attrs.push(format!("task:{}", truncate_inline(task_id, 40)));
+        }
+    }
+    let task_type = first_string(result, &["taskType", "task_type"]);
+    if !task_type.is_empty() {
+        attrs.push(format!("task-type:{}", truncate_inline(task_type, 40)));
     }
     if let Some(task) = obj.get("task").and_then(|value| value.as_object()) {
         let id = task

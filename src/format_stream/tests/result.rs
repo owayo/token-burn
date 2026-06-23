@@ -65,7 +65,7 @@ fn process_result_with_full_stats() {
     assert!(clean.contains("$0.5565"), "expected cost in: {}", clean);
     assert!(clean.contains("0m 41s"), "expected duration in: {}", clean);
     assert!(clean.contains("(9 turns)"), "expected turns in: {}", clean);
-    // input = 14 + 54926 + 372099 = 427039
+    // 入力トークン合計: 14 + 54926 + 372099 = 427039
     assert!(
         clean.contains("in:427,039"),
         "expected input tokens with cache creation in: {}",
@@ -93,7 +93,7 @@ fn process_result_with_model_usage() {
     assert!(clean.contains("$1.2340"), "expected cost in: {}", clean);
     assert!(clean.contains("2m 0s"), "expected duration in: {}", clean);
     assert!(clean.contains("(15 turns)"), "expected turns in: {}", clean);
-    // input = 500 + 50000 = 50500
+    // 入力トークン合計: 500 + 50000 = 50500
     assert!(
         clean.contains("in:50,500"),
         "expected input tokens in: {}",

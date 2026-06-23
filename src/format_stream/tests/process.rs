@@ -190,16 +190,16 @@ fn process_multi_turn_read_edit_bash() {
     let output = run_process(&input);
     let clean = strip_ansi(&output);
 
-    // Read
+    // Read ツール
     assert!(clean.contains("\u{1f527} Read"));
     assert!(clean.contains("/src/index.ts"));
     assert!(clean.contains("\u{2713} Read"));
-    // Edit
+    // Edit ツール
     assert!(clean.contains("\u{1f527} Edit"));
     assert!(clean.contains("/src/index.test.ts"));
     assert!(clean.contains("(+2/-0)"));
     assert!(clean.contains("\u{2713} Edit"));
-    // Bash
+    // Bash ツール
     assert!(clean.contains("\u{1f527} Bash"));
     assert!(clean.contains("pnpm exec tsc --noEmit"));
     assert!(clean.contains("(Type check)"));
@@ -267,7 +267,7 @@ fn process_team_create_then_task_spawn() {
         "expected checkmark for TeamCreate in: {}",
         clean
     );
-    // Task
+    // Task ツール
     assert!(
         clean.contains("\u{1f527} Task"),
         "expected Task tool in: {}",

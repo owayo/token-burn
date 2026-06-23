@@ -135,6 +135,27 @@ fn process_tool_result_shows_top_level_result_metadata() {
 }
 
 #[test]
+fn process_tool_result_shows_structured_content_metadata() {
+    // mcp__codex__codex の実 jsonl と同じく、top-level tool_use_result の
+    // structuredContent.content を完了行の補足に出す。
+    let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t_codex","name":"mcp__codex__codex","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"prompt\":\"レビューして\",\"cwd\":\"/repo\",\"sandbox\":\"read-only\",\"approval-policy\":\"never\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","tool_use_result":{"structuredContent":{"threadId":"t","content":"**指摘**\n重要な指摘"}},"message":{"role":"user","content":[{"tool_use_id":"t_codex","type":"tool_result","is_error":false,"content":"{}"}]}}"#,
+        ]
+        .join("\n");
+
+    let output = run_process(&input);
+    let clean = strip_ansi(&output);
+
+    assert!(
+        clean.contains("structured:**指摘** 重要な指摘"),
+        "structured content metadata should be shown: {clean}"
+    );
+}
+
+#[test]
 fn tool_result_metadata_shows_actual_jsonl_result_counts() {
     // 実 jsonl で確認した Grep / ToolSearch の result メタデータを完了行に出す
     let value = serde_json::json!({
@@ -152,6 +173,47 @@ fn tool_result_metadata_shows_actual_jsonl_result_counts() {
     assert!(metadata.contains("matches:2"), "{metadata}");
     assert!(metadata.contains("deferred:34"), "{metadata}");
     assert!(metadata.contains("command:codex"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_shows_structured_content_summary() {
+    // mcp__codex__codex の実 jsonl では structuredContent.content に回答本文が入る。
+    let value = serde_json::json!({
+        "structuredContent": {
+            "threadId": "019ed11e-c8f2",
+            "content": "**指摘**\n[src/lib/services/team.ts:25] の条件不足"
+        }
+    });
+
+    let metadata = tool_result_metadata(&value);
+
+    assert!(
+        metadata.contains("structured:**指摘** [src/lib/services/team.ts:25] の条件不足"),
+        "{metadata}"
+    );
+}
+
+#[test]
+fn tool_result_metadata_shows_error_message_and_task_identity() {
+    // 実 jsonl の TaskStop / TaskUpdate 系では snake_case の task 情報と error/message が返る。
+    let value = serde_json::json!({
+        "success": false,
+        "error": "Task not found",
+        "message": "Successfully stopped task: byc5hl3kr",
+        "task_id": "byc5hl3kr",
+        "task_type": "local_bash"
+    });
+
+    let metadata = tool_result_metadata(&value);
+
+    assert!(metadata.contains("failed"), "{metadata}");
+    assert!(metadata.contains("error:Task not found"), "{metadata}");
+    assert!(
+        metadata.contains("message:Successfully stopped task: byc5hl3kr"),
+        "{metadata}"
+    );
+    assert!(metadata.contains("task:byc5hl3kr"), "{metadata}");
+    assert!(metadata.contains("task-type:local_bash"), "{metadata}");
 }
 
 #[test]
@@ -408,7 +470,7 @@ fn tool_result_metadata_empty_background_task_id_is_omitted() {
 
 #[test]
 fn tool_result_metadata_clamped_with_delay_seconds() {
-    // wasClamped + clampedDelaySeconds → "clamped:<n>s"
+    // wasClamped と clampedDelaySeconds が揃うと "clamped:<n>s" と表示する
     let value = serde_json::json!({
         "wasClamped": true,
         "clampedDelaySeconds": 30

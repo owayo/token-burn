@@ -4,7 +4,7 @@
 
 use crate::format_stream::blocks::{BlockKind, block_kind, infer_block_kind_from_delta};
 
-// --- block_kind: content_block.type → BlockKind ---
+// --- content_block.type から BlockKind への変換 ---
 
 #[test]
 fn block_kind_maps_known_block_types() {
@@ -33,7 +33,7 @@ fn block_kind_is_case_sensitive() {
     assert_eq!(block_kind("TOOL_USE"), BlockKind::Unknown);
 }
 
-// --- infer_block_kind_from_delta: delta.type → BlockKind ---
+// --- delta.type から BlockKind への推論 ---
 // delta が content_block_start より先に届いた場合の復旧分類に使われる。
 
 #[test]

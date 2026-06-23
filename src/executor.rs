@@ -81,7 +81,6 @@ fn is_codex_command(command: &[String]) -> bool {
     basename == "codex" || basename.starts_with("codex-") || basename.starts_with("codex_")
 }
 
-/// RuntimeAgent が claude provider かを判定する。
 /// 指定したパスのファイルに実行ビットを付与する。
 /// `chmod` の非ゼロ終了は無視されないことを保証し、tmux ワーカー起動時の
 /// 「permission denied」を未然に検知できるようにする。

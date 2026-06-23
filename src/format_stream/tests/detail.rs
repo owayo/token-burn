@@ -64,6 +64,16 @@ fn extract_tool_detail_command() {
 }
 
 #[test]
+fn extract_tool_detail_lowercase_bash_matches_bash() {
+    // 実 jsonl では一部の Bash 互換ツールが小文字 `bash` として出る。
+    let input = r#"{"command":"grep -A 5 \"needle\" file"}"#;
+    assert_eq!(
+        extract_tool_detail("bash", input),
+        "grep -A 5 \"needle\" file"
+    );
+}
+
+#[test]
 fn extract_tool_detail_bash_shows_runtime_attrs() {
     let input = r#"{"command":"cargo test","description":"Run tests","timeout":300000,"run_in_background":true}"#;
     assert_eq!(

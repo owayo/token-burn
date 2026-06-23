@@ -65,9 +65,21 @@ impl State {
     }
 }
 
+fn state_lock_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "state.json".to_string());
+    parent.join(format!(".{file_name}.lock"))
+}
+
 /// エージェントに対してディレクトリの処理完了をアトミックに記録する。
 /// 排他ファイルロックを取得し、並行ワーカープロセス間で
 /// 更新が上書きされないようにする。
+/// ロックは state.json 本体ではなく sidecar ファイルに取る。state.json は rename で
+/// inode が置き換わるため、本体をロックすると rename 後に別ワーカーが新 inode を
+/// 同時ロックできてしまう。
 /// 書き込みは「同一ディレクトリのテンポラリファイルへ書く → rename」で行うため、
 /// 書き込み途中のクラッシュや ENOSPC でも本体 state.json は壊れない。
 pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) -> Result<()> {
@@ -77,12 +89,13 @@ pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) ->
         std::fs::create_dir_all(parent)?;
     }
 
+    let lock_path = state_lock_path(path);
     let lock_file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)?;
+        .open(&lock_path)?;
 
     lock_file.lock_exclusive()?;
 
@@ -198,7 +211,7 @@ pub fn parse_duration(s: &str) -> Result<chrono::Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::{State, mark_completed_atomic, parse_duration, state_path};
+    use super::{State, mark_completed_atomic, parse_duration, state_lock_path, state_path};
     use chrono::{DateTime, Utc};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
@@ -240,6 +253,15 @@ mod tests {
         let input = format!("{}s1s", i64::MAX);
         let err = parse_duration(&input).expect_err("overflowing duration must fail");
         assert!(err.to_string().contains("Duration is too large"));
+    }
+
+    #[test]
+    fn state_lock_path_uses_stable_sidecar_file() {
+        let path = Path::new("/tmp/token-burn/state.json");
+        assert_eq!(
+            state_lock_path(path),
+            PathBuf::from("/tmp/token-burn/.state.json.lock")
+        );
     }
 
     #[test]

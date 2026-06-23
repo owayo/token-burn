@@ -82,7 +82,7 @@ fn format_millis_as_seconds_sub_second_shows_decimal() {
 fn format_millis_as_seconds_fractional_rounds_one_decimal() {
     // 14837ms → 14.8s（CLAUDE.md の例）
     assert_eq!(format_millis_as_seconds(14837), "14.8s");
-    // 1500ms → 1.5s
+    // 1500 ミリ秒は 1.5 秒として表示する
     assert_eq!(format_millis_as_seconds(1500), "1.5s");
 }
 

@@ -34,7 +34,7 @@ fn tool_specific_detail(tool_name: &str, v: &serde_json::Value) -> DetailResult 
     match tool_name {
         "Read" => detail_read(v),
         "Edit" => detail_edit(v),
-        "Bash" => DetailResult::Handled(detail_bash(v)),
+        "Bash" | "bash" => DetailResult::Handled(detail_bash(v)),
         "Grep" | "Glob" => detail_grep_or_glob(v),
         "Task" | "Agent" => detail_task_or_agent(v),
         "TeamCreate" => detail_team_create(v),

@@ -512,7 +512,7 @@ mod tests {
         );
         let sched = r.schedule_for(&agent).unwrap().expect("should resolve");
         assert_eq!(sched.source, ScheduleSource::AiUsage(UsageWindow::Weekly));
-        // state_cutoff = next_reset - 7d
+        // 状態カットオフは次回リセットの 7 日前
         let diff = sched.next_reset - sched.state_cutoff;
         assert_eq!(diff.num_days(), 7);
     }
