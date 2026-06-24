@@ -58,6 +58,31 @@ fn extract_tool_detail_read_shows_offset_and_limit() {
 }
 
 #[test]
+fn extract_tool_detail_read_shows_view_range_string() {
+    let input = r#"{"file_path":"/src/main.rs","view_range":"[120, 200]"}"#;
+    assert_eq!(
+        extract_tool_detail("Read", input),
+        "/src/main.rs (range=[120, 200])"
+    );
+}
+
+#[test]
+fn extract_tool_detail_read_shows_view_range_array() {
+    let input = r#"{"file_path":"/src/main.rs","view_range":[120,200]}"#;
+    assert_eq!(
+        extract_tool_detail("Read", input),
+        "/src/main.rs (range=120-200)"
+    );
+}
+
+#[test]
+fn extract_tool_detail_read_shows_unparsed_input_len() {
+    let input =
+        r#"{"__unparsedToolInput":{"raw":"{\"file_path\":\"/tmp/a\",\"offset\":1, 2}","len":37}}"#;
+    assert_eq!(extract_tool_detail("Read", input), "unparsed:37 chars");
+}
+
+#[test]
 fn extract_tool_detail_command() {
     let input = r#"{"command":"cargo test"}"#;
     assert_eq!(extract_tool_detail("Bash", input), "cargo test");

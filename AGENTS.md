@@ -82,7 +82,7 @@ make release  # リリースビルド
 
 解決に失敗した場合（ai-usage コマンドが無い/失敗、該当 `(profile, provider)` が無い、`ok:false`、該当枠が `null`）は `fallback` に従います: `fixed` は曜日ベースの固定計算に戻り（`status` / `run` の source 表示は `fixed fallback: <理由>`）、`skip` はそのエージェントを選択候補から除外し、`error` は即エラーで停止します。`window = "nearest"` で `five_hour` が選ばれても、`state_window = "weekly"` のときは処理済みカットオフは weekly（`resets_at - 7d`）を基準にします（weekly が無い場合のみ選択枠の period に落ちます）。
 
-リセット時刻は `DateTime<FixedOffset>` で保持します。ai-usage の `resets_at`（RFC3339、オフセット付き）と固定計算（タイムゾーンのオフセット）を同じ型で統一し、ローカル時刻成分を保つためです。`status` と `run` は各エージェントのスケジュールの導出元（`ai-usage (weekly)` / `fixed` / `fixed fallback: <理由>`）を表示し、ai-usage が静かに固定計算へ戻ることはありません。
+リセット時刻は `DateTime<FixedOffset>` で保持します。ai-usage の `resets_at`（RFC3339、オフセット付き）は瞬間を保ったまま実行環境のローカル固定オフセットへ変換し、固定計算（タイムゾーンのオフセット）と同じ型で統一します。UTC で返る ai-usage 出力も `status` / `run` ではユーザーのローカル時刻として表示されます。`status` と `run` は各エージェントのスケジュールの導出元（`ai-usage (weekly)` / `fixed` / `fixed fallback: <理由>`）を表示し、ai-usage が静かに固定計算へ戻ることはありません。
 
 ### 使用率ゲート（usage-gate）
 
@@ -135,7 +135,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - テキスト応答のストリーミング表示
 - 思考ブロック（`thinking`）のプログレスインジケーター
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`（小文字 `bash` を含む）/`Agent`/`Task`/`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`/`TaskStop`/`TaskOutput`/`TeamCreate`/`Skill`/`TodoWrite`/`Monitor`/`Grep`/`Glob`/`ScheduleWakeup`/`WebFetch`/`WebSearch`/`ToolSearch`/`SendMessage`/`AskUserQuestion`/Context7・Tavily・Codex MCP 等）の詳細表示と差分出力
-- `Read` の `file_path` と `offset` / `limit`、`Bash` の `timeout`（1000ms 以上は `timeout=<秒>s`、未満は `timeout=<n>ms` でミリ秒切り捨てによる "0s" 誤表示を回避）/ `run_in_background` / `dangerouslyDisableSandbox`、`Agent` の `run_in_background` を表示
+- `Read` の `file_path` と `offset` / `limit` / `view_range`、malformed 入力時の `__unparsedToolInput.len`、`Bash` の `timeout`（1000ms 以上は `timeout=<秒>s`、未満は `timeout=<n>ms` でミリ秒切り捨てによる "0s" 誤表示を回避）/ `run_in_background` / `dangerouslyDisableSandbox`、`Agent` の `run_in_background` を表示
 - `Edit` は `new_string` に加えて実データで確認された `new_str` 入力も差分表示に使用し、`replace_all` が true の場合は一括置換として表示する
 - `Grep` / `Glob` の検索パターン、対象パス、`output_mode`、`type`、`glob`、`head_limit`、`context`、`offset`、`-A` / `-B` / `-C` / `-n` / `-i` / `-o`、`multiline` を表示
 - `ScheduleWakeup` の待機時間と理由を表示

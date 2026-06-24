@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde::Deserialize;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -257,7 +257,9 @@ fn nearest_window(acc: &AiUsageAccount) -> Option<(UsageWindow, &UsageWindowData
 
 fn parse_resets_at(data: &UsageWindowData) -> Option<DateTime<FixedOffset>> {
     let s = data.resets_at.as_deref()?;
-    DateTime::parse_from_rfc3339(s).ok()
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Local).fixed_offset())
 }
 
 async fn run_ai_usage(command: &[String]) -> Result<AiUsageSnapshot> {
@@ -480,6 +482,16 @@ mod tests {
         let d = window_data(Some("2099-01-02T03:04:05+00:00"));
         let parsed = parse_resets_at(&d).expect("RFC3339 should parse");
         assert_eq!(parsed.to_utc().to_rfc3339(), "2099-01-02T03:04:05+00:00");
+        let expected = DateTime::parse_from_rfc3339("2099-01-02T03:04:05+00:00")
+            .unwrap()
+            .with_timezone(&Local)
+            .fixed_offset();
+        assert_eq!(parsed, expected);
+        assert_eq!(parsed.naive_local(), expected.naive_local());
+        assert_eq!(
+            parsed.offset().local_minus_utc(),
+            expected.offset().local_minus_utc()
+        );
     }
 
     #[test]

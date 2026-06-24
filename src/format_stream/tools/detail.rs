@@ -66,7 +66,7 @@ fn tool_specific_detail(tool_name: &str, v: &serde_json::Value) -> DetailResult 
     }
 }
 
-/// Read: ファイルパスと offset/limit を表示。パス未指定なら汎用フォールバックへ。
+/// Read: ファイルパスと読み取り範囲を表示。パス未指定なら汎用フォールバックへ。
 fn detail_read(v: &serde_json::Value) -> DetailResult {
     let file = first_string(v, &["file_path", "path"]);
     let mut attrs = Vec::new();
@@ -76,13 +76,33 @@ fn detail_read(v: &serde_json::Value) -> DetailResult {
     if let Some(limit) = v["limit"].as_u64() {
         attrs.push(format!("limit={limit}"));
     }
+    if let Some(view_range) = format_view_range(&v["view_range"]) {
+        attrs.push(format!("range={view_range}"));
+    }
     if !file.is_empty() && !attrs.is_empty() {
         return DetailResult::Handled(format!("{} ({})", truncate_str(file, 80), attrs.join(", ")));
     }
     if !file.is_empty() {
         return DetailResult::Handled(truncate_str(file, 100).to_string());
     }
+    if let Some(raw_len) = v
+        .get("__unparsedToolInput")
+        .and_then(|value| value.get("len"))
+        .and_then(|value| value.as_u64())
+    {
+        return DetailResult::Handled(format!("unparsed:{raw_len} chars"));
+    }
     DetailResult::Fallback
+}
+
+fn format_view_range(value: &serde_json::Value) -> Option<String> {
+    if let Some(range) = value.as_str().filter(|range| !range.is_empty()) {
+        return Some(truncate_inline(range, 40));
+    }
+    let range = value.as_array()?;
+    let start = range.first()?.as_i64()?;
+    let end = range.get(1)?.as_i64()?;
+    Some(format!("{start}-{end}"))
 }
 
 /// Edit: ファイルパスと差分行数(+追加/-削除)、replace_all を表示。
