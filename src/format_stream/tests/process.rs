@@ -160,6 +160,36 @@ fn process_bash_tool_with_description() {
 }
 
 #[test]
+fn process_malformed_tool_input_shows_unparsed() {
+    // 実データで観測したケース: モデルが不正な JSON をツール入力として出力すると、
+    // ストリーミングで蓄積した partial_json がパースできない（"offset": 1, 110 の
+    // ように余分な値が混入）。従来は「🔧 Read」だけの詳細空行だったが、修正後は
+    // unparsed:<n> chars として malformed を可視化する。直後の tool_result エラー
+    // サマリーも併記される。
+    let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t_bad","name":"Read","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\": \"/tmp/a.ts\", \"offset\": 1, 110, \"limit\": 40}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t_bad","type":"tool_result","is_error":true,"content":"<tool_use_error>InputValidationError: Read was called with input that could not be parsed as JSON.</tool_use_error>"}]}}"#,
+        ]
+        .join("\n");
+
+    let output = run_process(&input);
+    let clean = strip_ansi(&output);
+
+    assert!(
+        clean.contains("\u{1f527} Read unparsed:"),
+        "malformed 入力は unparsed として可視化されるべき: {}",
+        clean
+    );
+    assert!(
+        clean.contains("\u{2717} Read"),
+        "tool_result のエラーが併記されるべき: {}",
+        clean
+    );
+}
+
+#[test]
 fn process_multi_turn_read_edit_bash() {
     // Read → Edit → Bash の複数ツール連続実行
     let input = [

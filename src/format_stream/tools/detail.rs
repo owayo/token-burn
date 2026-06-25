@@ -17,13 +17,33 @@ enum DetailResult {
 pub(crate) fn extract_tool_detail(tool_name: &str, input_json: &str) -> String {
     let v: serde_json::Value = match serde_json::from_str(input_json) {
         Ok(v) => v,
-        Err(_) => return String::new(),
+        Err(_) => return unparseable_input_detail(input_json),
     };
 
     match tool_specific_detail(tool_name, &v) {
         DetailResult::Handled(detail) => detail,
         DetailResult::Fallback => generic_tool_detail(&v).unwrap_or_default(),
     }
+}
+
+/// ツール入力（ストリーミングで蓄積した `input_json_delta`）が JSON として
+/// パースできなかった場合の詳細表示を生成する。
+///
+/// モデルが不正な JSON をツール入力として出力した場合（実データで
+/// `InputValidationError: ... could not be parsed as JSON` として観測される）や、
+/// レート制限・セッション切断によりツール呼び出しがストリーム途中で打ち切られた場合、
+/// 蓄積した文字列はパースできない。空文字を返すと「ツール名だけで詳細なし」の行に
+/// なり、malformed / truncated を判別できないため、生入力の文字数を
+/// `unparsed:<n> chars` として補足表示する。
+///
+/// 引数なしツール（`TaskList` 等で `input_json` が空文字）は従来どおり空表示を維持する。
+/// 有効な JSON 内に `__unparsedToolInput` を含む形（assistant メッセージ側の最終形）は
+/// 各ツールの専用ハンドラ（例: `detail_read`）が別途処理する。
+fn unparseable_input_detail(input_json: &str) -> String {
+    if input_json.trim().is_empty() {
+        return String::new();
+    }
+    format!("unparsed:{} chars", input_json.chars().count())
 }
 
 /// ツール名ごとに専用の表示関数へディスパッチする。

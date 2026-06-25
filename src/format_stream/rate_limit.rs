@@ -58,12 +58,12 @@ pub(crate) fn handle_rate_limit_event(
                 .map(|v| format!(" (warning at {:.0}%)", v * 100.0))
                 .unwrap_or_default();
             if pct >= threshold as f64 {
-                touch_stop_file(stop_file);
                 writeln!(
                     out,
                     "\x1b[31m  \u{26d4} Rate limit auto-stop: {:.0}% used ({}){} >= threshold {}%{}\x1b[0m",
                     pct, limit_type, surpassed, threshold, resets_at
                 )?;
+                touch_stop_file(out, stop_file)?;
             } else {
                 writeln!(
                     out,
@@ -74,12 +74,12 @@ pub(crate) fn handle_rate_limit_event(
         }
         "rejected" => {
             let limit_type = info["rateLimitType"].as_str().unwrap_or("");
-            touch_stop_file(stop_file);
             writeln!(
                 out,
                 "\x1b[31m  \u{1f6ab} Rate limited: request rejected ({}){}\x1b[0m",
                 limit_type, resets_at
             )?;
+            touch_stop_file(out, stop_file)?;
         }
         _ => {} // "allowed" は表示不要
     }
@@ -127,11 +127,30 @@ fn format_timestamp_clock(info: &serde_json::Value, key: &str) -> Option<String>
 
 /// stop_file が指定されていれば冪等に作成する（全ワーカーの後続タスクを停止するシグナル）。
 /// 既存ファイルは上書きせず、`create_new` で並列ワーカー間の race を回避する。
-fn touch_stop_file(stop_file: Option<&Path>) {
+///
+/// 既存ファイル（`AlreadyExists`）は別ワーカーが既に作成済みの冪等な正常系として無視する。
+/// それ以外の作成失敗（ENOSPC・権限不足等）は、後続タスクを止める停止シグナルが
+/// 生成されないことを意味する。`format-stream` はパイプ中段（`cmd | format-stream | tee`）で
+/// 動くため exit code も観測されず、握り潰すと安全機構が無言で失効する。よって失敗は
+/// `out` に明示してログ上で可視化する。
+fn touch_stop_file(out: &mut impl Write, stop_file: Option<&Path>) -> Result<()> {
     if let Some(path) = stop_file {
-        let _ = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(path);
+            .open(path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                writeln!(
+                    out,
+                    "\x1b[31m  \u{26d4} stop file ({}) の作成に失敗しました: {}（後続タスクの自動停止が効きません）\x1b[0m",
+                    path.display(),
+                    e
+                )?;
+            }
+        }
     }
+    Ok(())
 }

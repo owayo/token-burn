@@ -191,6 +191,33 @@ fn process_rate_limit_stop_file_is_idempotent_and_preserves_existing_content() {
 }
 
 #[test]
+fn process_rate_limit_stop_file_creation_failure_is_surfaced() {
+    // stop file の親ディレクトリが存在しない等で作成に失敗した場合、握り潰さずに
+    // 警告を出力へ明示する。後続タスクの自動停止シグナル（stop file）が生成されない
+    // ことを可視化するため（format-stream はパイプ中段で exit code が観測されない）。
+    let tmp = tempfile::TempDir::new().unwrap();
+    // 存在しないサブディレクトリ配下を指定 → create_new が NotFound で失敗する。
+    let stop_file = tmp.path().join("missing-dir").join("stop");
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"weekly"}}"#;
+    let output = run_process_with_opts(input, None, Some(&stop_file), 95);
+    let clean = strip_ansi(&output);
+    assert!(
+        clean.contains("rejected"),
+        "拒否メッセージは表示されるべき: {}",
+        clean
+    );
+    assert!(
+        clean.contains("作成に失敗"),
+        "stop file 作成失敗の警告が表示されるべき: {}",
+        clean
+    );
+    assert!(
+        !stop_file.exists(),
+        "作成に失敗したので stop file は存在しない"
+    );
+}
+
+#[test]
 fn process_rate_limit_warning_shows_resets_at() {
     // resetsAt タイムスタンプがローカル時刻で表示される
     let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.80,"resetsAt":1776009600}}"#;

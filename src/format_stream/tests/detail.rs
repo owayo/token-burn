@@ -274,7 +274,40 @@ fn extract_tool_detail_edit_without_file_path_falls_back() {
 
 #[test]
 fn extract_tool_detail_invalid_json() {
-    assert_eq!(extract_tool_detail("Read", "not json"), "");
+    // パースできない非空入力は空表示ではなく unparsed:<n> chars を返す
+    // （malformed / truncated なツール入力を可視化する）。"not json" は 8 文字。
+    assert_eq!(extract_tool_detail("Read", "not json"), "unparsed:8 chars");
+}
+
+#[test]
+fn extract_tool_detail_streaming_malformed_input_shows_unparsed() {
+    // 実データで観測したケース: モデルが不正な JSON をツール入力として出力すると
+    // ストリーミングで蓄積した partial_json がパースできず、従来は詳細空だった。
+    // 修正後は生入力の文字数を unparsed として補足する。
+    let input = r#"{"file_path": "/tmp/a.ts", "offset": 1, 110, "limit": 40}"#;
+    assert_eq!(
+        extract_tool_detail("Read", input),
+        format!("unparsed:{} chars", input.chars().count())
+    );
+}
+
+#[test]
+fn extract_tool_detail_truncated_input_shows_unparsed() {
+    // レート制限・セッション切断でツール呼び出しがストリーム途中で切れた場合、
+    // 蓄積した JSON は途中までしか無くパースできない。これも可視化する。
+    let input = r#"{"command": "cargo te"#;
+    assert_eq!(
+        extract_tool_detail("Bash", input),
+        format!("unparsed:{} chars", input.chars().count())
+    );
+}
+
+#[test]
+fn extract_tool_detail_empty_input_stays_empty() {
+    // 引数なしツール（入力が空文字／空白のみ）は従来どおり空表示を維持し、
+    // unparsed 補足を出さない。
+    assert_eq!(extract_tool_detail("TaskList", ""), "");
+    assert_eq!(extract_tool_detail("Read", "   "), "");
 }
 
 #[test]

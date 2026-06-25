@@ -141,6 +141,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - `ScheduleWakeup` の待機時間と理由を表示
 - `WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results` を表示
 - `Monitor` の説明・タイムアウト・condition・persistent、`TaskStop` の task id / task ids / reason、`TaskList`、`TaskGet` の task id、`TaskOutput` の task id / `block` / `timeout`、`TaskCreate` の `subject` / `description` / `activeForm`、`TaskUpdate` の `taskId` / `status` / `owner` / `subject` / `description`、`SendMessage` の送信先/要約、`AskUserQuestion` の質問数・選択肢数、Tavily search の query/max/time range/search depth と Tavily extract の先頭 URL/件数(+N more)/extract_depth（`mcp__tavily__tavily-search` / `mcp__tavily__tavily_search` のハイフン版・アンダースコア版いずれも対応）、Codex MCP の prompt/cwd/model/sandbox/approval-policy、Context7 MCP ツールの library/query を表示
+- ツール入力（`input_json_delta` で蓄積した JSON）がパースできない場合は、詳細を空にせず生入力の文字数を `unparsed:<n> chars` として表示し、malformed / truncated を可視化する。これはモデルが不正な JSON をツール入力として出力したケース（`InputValidationError: ... could not be parsed as JSON`）や、レート制限・セッション切断でツール呼び出しがストリーム途中で打ち切られたケースで発生する。`format-stream` はストリーミング経路（`content_block_start` で空入力 → `input_json_delta` で生 JSON 蓄積 → `content_block_stop` で確定）で処理するため、assistant メッセージ最終形の `__unparsedToolInput.len`（`Read` 等の専用ハンドラが別途処理）はストリーミングには現れない。引数なしツールの空入力（`TaskList` 等）は従来どおり空表示を維持する
 - サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）。`task_notification` は `completed` / `failed` に加え `stopped` も表示し、`usage` が無い場合は duration/token を 0 として表示しない
 - Claude Code のシステム通知（`notification`。例: stop hook エラー）と、出力を伴う hook 診断（`hook_progress` / `hook_response` の stderr / output）
 - `tool_use_result` の出力切り詰め、適用 limit、stale read ヒント、失敗理由（`error:`）や結果メッセージ（`message:`）、構造化応答の要約（`structured:`）、自動バックグラウンド化、clamp、永続化出力サイズ、戻りコード解釈、Agent の duration/token/tool 数・サブエージェント種別（`agent:`）・解決モデル（`model:`）・編集行数（`edits:+追加/-削除`）、Grep/ToolSearch の結果件数と mode、WebSearch の結果件数/検索回数/所要時間、WebFetch の HTTP ステータス/応答サイズ、Read の部分読み取り行数（`lines:<n>/<total>`）と token cap 切り詰め（`truncated:token-cap`）、タスク件数/task id/task type、TaskOutput の取得状態、Agent 出力ファイル、Monitor の timeout/persistent、TaskUpdate の状態遷移、ScheduleWakeup の予定時刻、Skill のコマンド名の補足表示
@@ -151,7 +152,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - 異常終了時の `terminal_reason`（`completed` 以外の場合）と `permission_denials` の件数・ツール名表示
 - result の `usage.service_tier`、`usage.speed`、空でない `usage.inference_geo`、`usage.iterations` 件数、`origin.kind` の表示
 - レート制限警告（`rate_limit_event`）の使用率表示、リクエスト拒否通知、および `allowed` 時の補足情報表示（`resetsAt` / `overageResetsAt` / overage 情報がある場合）。`allowed_warning` 時に `surpassedThreshold` が含まれている場合は通過済み警告閾値（例: `warning at 90%`）を併記する
-- レート制限使用率が `rate_limit_threshold`（デフォルト: 95%）を超えた場合、stop file を作成して後続タスクを自動停止。stop file の作成は usage-gate と同じく `create_new` で冪等（並列ワーカーから同時に呼ばれても既存内容は上書きしない）
+- レート制限使用率が `rate_limit_threshold`（デフォルト: 95%）を超えた場合、stop file を作成して後続タスクを自動停止。stop file の作成は usage-gate と同じく `create_new` で冪等（並列ワーカーから同時に呼ばれても既存内容は上書きしない）。`AlreadyExists`（別ワーカーが作成済み）は正常系として無視するが、ENOSPC・権限不足等で作成に失敗した場合は黙って握り潰さず、停止シグナル（stop file）が生成されない旨を出力に明示する（`format-stream` はパイプ中段のため exit code が観測されない）
 - APIリトライ（`api_retry`）の試行回数とエラー情報の表示
 - `status`（リクエスト状態通知）と `thinking_tokens`（思考トークンの推定累積値 `estimated_tokens` / `estimated_tokens_delta`）は高頻度（1 セッションで数千件）に出力されるノイズイベントのため、明示的に無視します。思考中の進捗は `thinking_delta` のドット表示、トークン総数は `result.usage` の集計表示で代替するため、これらを表示すると重複・冗長になります
 
