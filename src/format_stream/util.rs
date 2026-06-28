@@ -125,3 +125,14 @@ pub(crate) fn format_millis_as_seconds(ms: u64) -> String {
         format!("{:.1}s", ms as f64 / 1000.0)
     }
 }
+
+/// ツールの timeout（ミリ秒）を `timeout=` 表示用の短い文字列にする。
+/// 1000ms 以上は秒（例: 14000ms → `14s`）、未満はミリ秒（例: 500ms → `500ms`）で
+/// 表示し、整数除算による "0s" 誤表示を避ける（Bash / Monitor / TaskOutput 共通）。
+pub(crate) fn format_timeout_ms(ms: u64) -> String {
+    if ms >= 1000 {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{ms}ms")
+    }
+}

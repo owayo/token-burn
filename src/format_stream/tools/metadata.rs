@@ -262,7 +262,16 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     if let Some(tasks) = obj.get("tasks").and_then(|value| value.as_array()) {
         attrs.push(format!("tasks:{}", tasks.len()));
     }
-    if !obj.contains_key("task") {
+    // 入れ子 `task` が有効な id を持つときだけ top-level の taskId/task_id を抑止する。
+    // contains_key だと `task:null` / `task:{}` でも真になり、下の as_object 経由の
+    // 表示も発火しないため top-level の task id を取りこぼしていた。
+    let nested_task_has_id = obj
+        .get("task")
+        .and_then(|value| value.as_object())
+        .and_then(|task| task.get("id"))
+        .and_then(|id| id.as_str())
+        .is_some_and(|id| !id.is_empty());
+    if !nested_task_has_id {
         let task_id = first_string(result, &["taskId", "task_id"]);
         if !task_id.is_empty() {
             attrs.push(format!("task:{}", truncate_inline(task_id, 40)));

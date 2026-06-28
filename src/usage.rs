@@ -333,14 +333,23 @@ pub async fn run_usage_gate(
 
     if let Some(used) = max_used
         && used >= threshold as f64
-        && write_stop_file(
+    {
+        if write_stop_file(
             stop_file,
             &format!("usage {used:.0}% >= threshold {threshold}%"),
-        )
-    {
-        println!(
-            "\x1b[31m  \u{26d4} usage-gate: {profile}/{provider} 使用率 {used:.0}% >= {threshold}% のため後続を停止\x1b[0m"
-        );
+        ) {
+            println!(
+                "\x1b[31m  \u{26d4} usage-gate: {profile}/{provider} 使用率 {used:.0}% >= {threshold}% のため後続を停止\x1b[0m"
+            );
+        } else if !stop_file.exists() {
+            // 閾値超過なのに stop_file を作成できず、既存でもない（ENOSPC・権限不足
+            // 等の作成失敗）。fail-closed パスと同様、フェイルオープンを避けるため
+            // エラーを伝搬してワーカーを止める。既存（別ワーカーが作成済み）の場合は
+            // 停止シグナルが既にあるため正常終了でよい。
+            anyhow::bail!(
+                "usage-gate: failed to write stop file (usage {used:.0}% >= {threshold}%)"
+            );
+        }
     }
     Ok(())
 }
@@ -711,6 +720,25 @@ mod tests {
             .await
             .unwrap();
         assert!(stop.exists(), "閾値超過で stop_file が作られるべき");
+    }
+
+    #[tokio::test]
+    async fn usage_gate_errors_when_stop_file_write_fails_over_threshold() {
+        // 閾値超過だが stop_file を作成できず（親ディレクトリが存在しない）、
+        // 既存でもない場合は、フェイルオープンせずエラーを伝搬する。
+        let tmp = tempfile::TempDir::new().unwrap();
+        // 存在しないサブディレクトリ配下を指すため create_new が必ず失敗する。
+        let stop = tmp.path().join("missing-dir").join("stop");
+        let cache = tmp.path().join("cache.json");
+        std::fs::write(
+            &cache,
+            r#"{"accounts":[{"profile":"Work","provider":"claude","ok":true,"weekly":{"used_percent":95.0}}]}"#,
+        )
+        .unwrap();
+        let result =
+            run_usage_gate("Work", "claude", 90, &stop, &cache, &["false".to_string()]).await;
+        assert!(result.is_err(), "stop_file 作成失敗時はエラーを返すべき");
+        assert!(!stop.exists());
     }
 
     #[tokio::test]

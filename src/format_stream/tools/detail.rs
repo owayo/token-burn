@@ -2,7 +2,7 @@
 //! `tool_specific_detail` がツール名ごとに専用関数へディスパッチし、条件不足の
 //! 場合は `generic_tool_detail` の汎用フォールバックへ委ねる。
 
-use crate::format_stream::util::{first_string, truncate_inline, truncate_str};
+use crate::format_stream::util::{first_string, format_timeout_ms, truncate_inline, truncate_str};
 
 /// ツール固有の表示処理の結果。
 /// `Handled` はそのツールが文字列を確定した状態（空文字を含む）、
@@ -55,11 +55,13 @@ fn tool_specific_detail(tool_name: &str, v: &serde_json::Value) -> DetailResult 
         "Read" => detail_read(v),
         "Edit" => detail_edit(v),
         "Bash" | "bash" => DetailResult::Handled(detail_bash(v)),
+        "BashOutput" => detail_bash_output(v),
         "Grep" | "Glob" => detail_grep_or_glob(v),
         "Task" | "Agent" => detail_task_or_agent(v),
         "TeamCreate" => detail_team_create(v),
         "Write" => DetailResult::Handled(detail_write(v)),
         "Skill" => DetailResult::Handled(detail_skill(v)),
+        "SlashCommand" => detail_slash_command(v),
         "TodoWrite" => detail_todo_write(v),
         "ScheduleWakeup" => detail_schedule_wakeup(v),
         "WebFetch" => detail_web_fetch(v),
@@ -152,11 +154,7 @@ fn detail_bash(v: &serde_json::Value) -> String {
     let mut attrs = Vec::new();
     if let Some(timeout) = v["timeout"].as_u64() {
         // ミリ秒未満で切り捨てて "0s" にならないよう、1000ms 未満はミリ秒表示にする。
-        if timeout >= 1000 {
-            attrs.push(format!("timeout={}s", timeout / 1000));
-        } else {
-            attrs.push(format!("timeout={}ms", timeout));
-        }
+        attrs.push(format!("timeout={}", format_timeout_ms(timeout)));
     }
     if v["run_in_background"].as_bool() == Some(true) {
         attrs.push("background".to_string());
@@ -409,9 +407,12 @@ fn detail_monitor(v: &serde_json::Value) -> String {
     let desc = v["description"].as_str().unwrap_or("");
     let cmd = v["command"].as_str().unwrap_or("");
     let condition = v["condition"].as_str().unwrap_or("");
-    let timeout_seconds = v["timeout_seconds"]
+    // timeout_seconds（秒）を優先し、無ければ timeout_ms（ミリ秒）を整形する。
+    // ms を秒へ整数除算すると 1〜999ms が "0s" になるため format_timeout_ms を使う。
+    let timeout_text = v["timeout_seconds"]
         .as_u64()
-        .or_else(|| v["timeout_ms"].as_u64().map(|ms| ms / 1000));
+        .map(|s| format!("{s}s"))
+        .or_else(|| v["timeout_ms"].as_u64().map(format_timeout_ms));
     let persistent = v["persistent"].as_bool().unwrap_or(false);
 
     let mut detail = if !desc.is_empty() {
@@ -425,8 +426,8 @@ fn detail_monitor(v: &serde_json::Value) -> String {
     };
 
     let mut attrs = Vec::new();
-    if let Some(seconds) = timeout_seconds {
-        attrs.push(format!("timeout={seconds}s"));
+    if let Some(timeout) = timeout_text {
+        attrs.push(format!("timeout={timeout}"));
     }
     if persistent {
         attrs.push("persistent".to_string());
@@ -617,8 +618,7 @@ fn detail_task_output(v: &serde_json::Value) -> DetailResult {
         attrs.push("block".to_string());
     }
     if let Some(ms) = timeout_ms {
-        let secs = ms / 1000;
-        attrs.push(format!("timeout={secs}s"));
+        attrs.push(format!("timeout={}", format_timeout_ms(ms)));
     }
     if !task_id.is_empty() {
         if attrs.is_empty() {
@@ -827,6 +827,32 @@ fn detail_context7_query_docs(v: &serde_json::Value) -> DetailResult {
 
 /// 汎用フォールバック: よくあるフィールド名を優先順に試行する。
 /// `as_str()` が `Some` を返した時点で（空文字でも）即 return する現状挙動を保持する。
+/// BashOutput: 出力を取得する対象の background bash の id を表示する。
+/// 入力は `{"bash_id":"..."}`（任意で `filter`）。bash_id は generic_tool_detail の
+/// 候補キーに無く、専用化しないと空表示になるため個別ハンドラを設ける。
+fn detail_bash_output(v: &serde_json::Value) -> DetailResult {
+    let bash_id = v["bash_id"].as_str().unwrap_or("");
+    if bash_id.is_empty() {
+        return DetailResult::Fallback;
+    }
+    let mut detail = format!("bash:{}", truncate_str(bash_id, 60));
+    // 出力フィルタ（正規表現）が指定されていれば併記する。
+    if let Some(filter) = v["filter"].as_str().filter(|s| !s.is_empty()) {
+        detail = format!("{} (filter:{})", detail, truncate_inline(filter, 40));
+    }
+    DetailResult::Handled(detail)
+}
+
+/// SlashCommand: 実行するスラッシュコマンド文字列（例: `/get-md ...`）を表示する。
+/// generic_tool_detail でも `command` は拾えるが、専用化して表示とテストを固定する。
+fn detail_slash_command(v: &serde_json::Value) -> DetailResult {
+    let command = v["command"].as_str().unwrap_or("");
+    if command.is_empty() {
+        return DetailResult::Fallback;
+    }
+    DetailResult::Handled(truncate_inline(command, 100))
+}
+
 fn generic_tool_detail(v: &serde_json::Value) -> Option<String> {
     for key in [
         "file_path",

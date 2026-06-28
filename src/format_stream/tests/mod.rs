@@ -17,6 +17,7 @@ mod metadata;
 mod process;
 mod rate_limit;
 mod result;
+mod system;
 mod util;
 
 fn strip_ansi(s: &str) -> String {

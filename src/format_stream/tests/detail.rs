@@ -757,3 +757,37 @@ fn extract_tool_detail_todo_write_shows_progress() {
     let result = extract_tool_detail("TodoWrite", input);
     assert_eq!(result, "1/3 completed");
 }
+
+#[test]
+fn bash_output_shows_bash_id() {
+    // BashOutput は background bash の id を表示する（旧実装では generic
+    // フォールバックの候補キーに bash_id が無く空表示になっていた）。
+    let detail = extract_tool_detail("BashOutput", r#"{"bash_id":"bbb497"}"#);
+    assert_eq!(detail, "bash:bbb497");
+}
+
+#[test]
+fn bash_output_includes_filter() {
+    let detail = extract_tool_detail("BashOutput", r#"{"bash_id":"da3d96","filter":"error"}"#);
+    assert_eq!(detail, "bash:da3d96 (filter:error)");
+}
+
+#[test]
+fn bash_output_without_bash_id_is_empty() {
+    // bash_id が無い入力は generic フォールバックへ委ねられ、候補キーに
+    // bash_id が無いため空表示になる。
+    let detail = extract_tool_detail("BashOutput", r#"{}"#);
+    assert_eq!(detail, "");
+}
+
+#[test]
+fn slash_command_shows_command() {
+    let detail = extract_tool_detail("SlashCommand", r#"{"command":"/get-md is:pr 123"}"#);
+    assert_eq!(detail, "/get-md is:pr 123");
+}
+
+#[test]
+fn slash_command_without_command_is_empty() {
+    let detail = extract_tool_detail("SlashCommand", r#"{}"#);
+    assert_eq!(detail, "");
+}
