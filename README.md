@@ -130,6 +130,9 @@ token-burn status
 # Preview execution plan
 token-burn run -n
 
+# List all target directories in processing order (without `--limit`)
+token-burn list
+
 # Run only specific repositories
 token-burn run ~/GitHub/repo-a ./repo-b
 
@@ -142,6 +145,7 @@ token-burn run
 | Command | Description |
 |---------|-------------|
 | `run` | Execute token consumption (default) |
+| `list` | List target directories in processing order (ignores `--limit`, does not execute) |
 | `status` | Show agent reset status |
 | `init` | Initialize config file and prompt templates |
 | `clean` | Clean up old report directories |

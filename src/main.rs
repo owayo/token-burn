@@ -104,6 +104,12 @@ enum Commands {
     },
     /// エージェントのリセット状況を表示する
     Status,
+    /// 処理する順番でターゲットディレクトリを一覧する（limit 無視、実行しない）
+    List {
+        /// 強制的に対象とするディレクトリパス（指定時はスキャン・状態フィルタをスキップ）
+        #[arg(value_name = "PATH")]
+        paths: Vec<PathBuf>,
+    },
     /// 設定ファイルとプロンプト雛形を初期化する
     Init {
         /// 確認なしで既存ファイルを上書きする
@@ -265,6 +271,17 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
+        Commands::List { paths } => {
+            list(ListOptions {
+                config,
+                config_path,
+                agent_name,
+                fresh,
+                public_only,
+                force_paths: paths,
+            })
+            .await?;
+        }
         Commands::Clean { older_than } => {
             run_clean(&config, older_than)?;
         }
@@ -287,6 +304,105 @@ struct RunOptions {
     limit_override: Option<usize>,
     public_only: bool,
     force_paths: Vec<PathBuf>,
+}
+
+struct ListOptions {
+    config: config::Config,
+    config_path: PathBuf,
+    agent_name: Option<String>,
+    fresh: bool,
+    public_only: bool,
+    force_paths: Vec<PathBuf>,
+}
+
+async fn list(opts: ListOptions) -> Result<()> {
+    let ListOptions {
+        config,
+        config_path,
+        agent_name,
+        fresh,
+        public_only,
+        force_paths,
+    } = opts;
+    let runtime_agents = config.expand_runtime_agents()?;
+    let resolver = usage::ScheduleResolver::load(&config).await;
+    let (agent_idx, sched) = if let Some(name) = &agent_name {
+        let idx = runtime_agents
+            .iter()
+            .position(|a| a.name == *name)
+            .ok_or_else(|| anyhow::anyhow!("Agent not found: {}", name))?;
+        let s = resolver
+            .schedule_for(&runtime_agents[idx])?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Selected agent '{}' is skipped (ai-usage fallback=skip)",
+                    name
+                )
+            })?;
+        (idx, s)
+    } else {
+        resolver.select_nearest(&runtime_agents)?
+    };
+
+    let agent = &runtime_agents[agent_idx];
+    println!(
+        "{} {} (reset in {}, source: {})",
+        "Selected agent:".bold(),
+        sched.agent_name.cyan(),
+        display::format_duration(sched.time_until_reset).red(),
+        sched.source.label().dimmed(),
+    );
+    println!();
+
+    let targets = if force_paths.is_empty() {
+        scanner::resolve_targets(&config, agent).await?
+    } else {
+        resolve_force_paths(&config, agent, &force_paths)?
+    };
+
+    let (targets, public_filtered) = if public_only {
+        let before = targets.len();
+        let filtered: Vec<_> = targets
+            .into_iter()
+            .filter(|t| t.visibility == scanner::Visibility::Public)
+            .collect();
+        let removed = before - filtered.len();
+        (filtered, removed)
+    } else {
+        (targets, 0usize)
+    };
+
+    let state_file = state::state_path(&config_path);
+    let run_state = state::State::load(&state_file);
+    let (targets, skipped) = if fresh || !force_paths.is_empty() {
+        (targets, 0usize)
+    } else {
+        filter_by_state(targets, &run_state, agent, &config, &sched)
+    };
+
+    display::print_targets(&targets);
+
+    if public_filtered > 0 {
+        println!(
+            "  {} {} targets (non-public)",
+            "Filtered:".dimmed(),
+            public_filtered
+        );
+    }
+
+    if skipped > 0 {
+        println!(
+            "  {} {} targets (already processed)",
+            "Skipped:".dimmed(),
+            skipped
+        );
+    }
+
+    if public_filtered > 0 || skipped > 0 {
+        println!();
+    }
+
+    Ok(())
 }
 
 async fn run(opts: RunOptions) -> Result<()> {

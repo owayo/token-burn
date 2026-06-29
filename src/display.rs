@@ -56,6 +56,7 @@ pub fn print_targets(targets: &[ResolvedTarget]) {
             vis_colored,
             target.display_name
         );
+        println!("      {}", target.directory.display().to_string().dimmed());
     }
     println!();
 }
