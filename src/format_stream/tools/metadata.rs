@@ -48,6 +48,25 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     {
         attrs.push(format!("message:{}", truncate_inline(message, 70)));
     }
+    // Bash の実行結果は tool_result.content に短い完了文だけ入り、実出力は
+    // top-level の stdout/stderr に分離されることがある。成功時でも判断材料を失わないよう
+    // 先頭の有意な 1 行へ畳み込んで表示する。
+    if let Some(stdout) = obj
+        .get("stdout")
+        .and_then(|value| value.as_str())
+        .map(|stdout| truncate_inline(stdout, 70))
+        .filter(|stdout| !stdout.is_empty())
+    {
+        attrs.push(format!("stdout:{stdout}"));
+    }
+    if let Some(stderr) = obj
+        .get("stderr")
+        .and_then(|value| value.as_str())
+        .map(|stderr| truncate_inline(stderr, 70))
+        .filter(|stderr| !stderr.is_empty())
+    {
+        attrs.push(format!("stderr:{stderr}"));
+    }
     // Bash 経由の git commit など、git 操作が完了した事実は進捗上の重要なマイルストーン。
     // sha は短縮済み(7桁)、kind は committed / amended 等。
     if let Some(commit) = obj

@@ -176,6 +176,41 @@ fn tool_result_metadata_shows_actual_jsonl_result_counts() {
 }
 
 #[test]
+fn tool_result_metadata_shows_stdout_and_stderr_summary() {
+    // Bash の実 jsonl では tool_result.content が完了文だけになり、
+    // 実際のコマンド出力は top-level の stdout/stderr に入る。
+    let value = serde_json::json!({
+        "stdout": "main\nfeature/docs",
+        "stderr": "warning: slow command\nsecond line"
+    });
+
+    let metadata = tool_result_metadata(&value);
+
+    assert!(metadata.contains("stdout:main feature/docs"), "{metadata}");
+    assert!(
+        metadata.contains("stderr:warning: slow command second line"),
+        "{metadata}"
+    );
+}
+
+#[test]
+fn process_tool_result_shows_stdout_metadata_from_top_level_result() {
+    let input = [
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t_branch","name":"Bash"}]}}"#,
+        r#"{"type":"user","tool_use_result":{"stdout":"main\nrelease","stderr":""},"message":{"role":"user","content":[{"tool_use_id":"t_branch","type":"tool_result","is_error":false,"content":"main"}]}}"#,
+    ]
+    .join("\n");
+
+    let output = run_process(&input);
+    let clean = strip_ansi(&output);
+
+    assert!(
+        clean.contains("Bash [stdout:main release]"),
+        "stdout metadata should be shown: {clean}"
+    );
+}
+
+#[test]
 fn tool_result_metadata_shows_structured_content_summary() {
     // mcp__codex__codex の実 jsonl では structuredContent.content に回答本文が入る。
     let value = serde_json::json!({
