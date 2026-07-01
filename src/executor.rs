@@ -13,6 +13,16 @@ const CLAUDE_BLOCKED_INTERACTIVE_TOOL: &str = "AskUserQuestion";
 /// オプション表面に依存しない top-level の `-c approval_policy=never` を使う。
 const CODEX_APPROVAL_OVERRIDE: &str = "approval_policy=never";
 
+/// 起動時 ai-usage キャッシュ初期化のハング検知タイムアウト。
+/// これを超えたら子プロセスを SIGKILL してキャッシュ初期化をスキップし、
+/// monitor 起動を進める。tmux 起動前に token-burn 全体が固まるのを防ぐ。
+const AI_USAGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// monitor ペイン内で `eval $AI_USAGE_CMD` / `eval $AI_USAGE_REFRESH_CMD` を包む
+/// タイムアウト（秒）。10 秒ループ内で 1 回でもハングすると進捗バーの `\r` 更新も
+/// 止まって「表示が止まった」ように見えるため、必ずキルする。
+const AI_USAGE_MONITOR_TIMEOUT_SECS: u64 = 30;
+
 pub struct ExecutionPlan {
     pub agent: RuntimeAgent,
     pub tasks: Vec<ResolvedTarget>,
@@ -79,6 +89,62 @@ fn is_claude_command(command: &[String]) -> bool {
 fn is_codex_command(command: &[String]) -> bool {
     let basename = command_basename(command);
     basename == "codex" || basename.starts_with("codex-") || basename.starts_with("codex_")
+}
+
+/// 同期パスで ai-usage を起動し、`timeout` を超えたら SIGKILL してキルする。
+/// tokio ランタイムに依存せず std::process::Command と try_wait ポーリングで実現する。
+///
+/// 成功時は raw stdout を返す。ai-usage は数 KB の JSON を返すため、パイプバッファ
+/// (64KB) に収まる想定で stdout を piped で受ける。非ゼロ終了・spawn 失敗・タイムアウトは
+/// エラー。呼び出し側で fail-soft（キャッシュ初期化スキップ）にする。
+fn spawn_ai_usage_sync_with_timeout(
+    command: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(!command.is_empty(), "ai_usage.command is empty");
+    let mut child = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn ai-usage command: {}", command.join(" ")))?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                use std::io::Read;
+                let mut stdout_buf = Vec::new();
+                if let Some(mut s) = child.stdout.take() {
+                    let _ = s.read_to_end(&mut stdout_buf);
+                }
+                if !status.success() {
+                    let mut stderr_buf = Vec::new();
+                    if let Some(mut s) = child.stderr.take() {
+                        let _ = s.read_to_end(&mut stderr_buf);
+                    }
+                    let stderr = String::from_utf8_lossy(&stderr_buf);
+                    anyhow::bail!("ai-usage exited with {}: {}", status, stderr.trim());
+                }
+                return Ok(stdout_buf);
+            }
+            None => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "ai-usage timed out after {}s: {}",
+                        timeout.as_secs(),
+                        command.join(" ")
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 /// 指定したパスのファイルに実行ビットを付与する。
@@ -469,15 +535,22 @@ pub fn execute_plan_tmux(
         .and_then(|g| build_refresh_cmd(&g.command, &g.env));
     // 起動時に ai-usage キャッシュを初期化し、monitor 起動直後から statusline を表示できるようにする
     // （以後は usage-gate が各タスク完了時に 20 秒 TTL で更新する）。
-    if let Some(g) = plan.usage_gate.as_ref()
-        && let Some(exe) = g.command.first()
-        && let Ok(output) = std::process::Command::new(exe)
-            .args(&g.command[1..])
-            .envs(&g.env)
-            .output()
-        && output.status.success()
-    {
-        let _ = std::fs::write(&cache_file, &output.stdout);
+    // ai-usage コマンド自体がハングすると tmux 起動前に token-burn 全体が固まるため、
+    // AI_USAGE_STARTUP_TIMEOUT でキルする。失敗時はキャッシュ更新をスキップし、
+    // monitor 側の初回 fetch_usage に委ねる。
+    if let Some(g) = plan.usage_gate.as_ref() {
+        match spawn_ai_usage_sync_with_timeout(&g.command, &g.env, AI_USAGE_STARTUP_TIMEOUT) {
+            Ok(bytes) => {
+                let _ = std::fs::write(&cache_file, &bytes);
+            }
+            Err(e) => {
+                eprintln!(
+                    "{}: failed to initialize ai-usage cache: {} (continuing without startup cache)",
+                    "warning".yellow(),
+                    e
+                );
+            }
+        }
     }
 
     let mut script_paths = Vec::new();
@@ -720,6 +793,7 @@ REPORT_DIR={report_dir}
 AI_USAGE_CMD={ai_usage_cmd}
 AI_USAGE_REFRESH_CMD={ai_usage_refresh_cmd}
 AI_USAGE_CACHE_FILE={ai_usage_cache_file}
+AI_USAGE_TIMEOUT={ai_usage_timeout}
 STOPPED=0
 USAGE_DISPLAY=""
 LAST_USAGE=0
@@ -728,6 +802,23 @@ STATUS_MSG=""
 
 restore_terminal() {{ tput cnorm 2>/dev/null; printf '\033[?7h'; }}
 
+# ai-usage サブプロセスがハングしても monitor ループを止めないための timeout ラッパー。
+# `$1` 秒で子プロセスを SIGTERM → 1 秒後 SIGKILL する。stdout はそのまま親に伝搬するため
+# `$(run_with_timeout N bash -c "$CMD")` の形で捕捉できる。
+run_with_timeout() {{
+    local secs=$1
+    shift
+    "$@" &
+    local cpid=$!
+    ( sleep "$secs"; kill -TERM $cpid 2>/dev/null; sleep 1; kill -KILL $cpid 2>/dev/null ) 2>/dev/null &
+    local wpid=$!
+    wait $cpid 2>/dev/null
+    local rc=$?
+    kill -TERM $wpid 2>/dev/null
+    wait $wpid 2>/dev/null
+    return $rc
+}}
+
 fetch_usage() {{
     [ -z "$AI_USAGE_CMD" ] && return
     # まず ai-usage --json を実行してキャッシュを atomic 更新する。statusline は
@@ -735,15 +826,16 @@ fetch_usage() {{
     # 固定される。usage-gate と同じキャッシュファイルを共有するため、並列
     # ワーカーの使用率判定も最新の値を読める。tmp ファイル経由で mv するのは
     # 読み手が壊れた JSON を読まないようにするため。
+    # `run_with_timeout` で包み、ai-usage がハングしても monitor ループが固まらないようにする。
     if [ -n "$AI_USAGE_REFRESH_CMD" ] && [ -n "$AI_USAGE_CACHE_FILE" ]; then
-        if eval "$AI_USAGE_REFRESH_CMD" > "$AI_USAGE_CACHE_FILE.tmp" 2>/dev/null; then
+        if run_with_timeout "$AI_USAGE_TIMEOUT" bash -c "$AI_USAGE_REFRESH_CMD" > "$AI_USAGE_CACHE_FILE.tmp" 2>/dev/null; then
             mv "$AI_USAGE_CACHE_FILE.tmp" "$AI_USAGE_CACHE_FILE" 2>/dev/null
         else
             rm -f "$AI_USAGE_CACHE_FILE.tmp" 2>/dev/null
         fi
     fi
     local new
-    new=$(eval "$AI_USAGE_CMD" 2>/dev/null)
+    new=$(run_with_timeout "$AI_USAGE_TIMEOUT" bash -c "$AI_USAGE_CMD" 2>/dev/null)
     [ -n "$new" ] && USAGE_DISPLAY="$new"
 }}
 
@@ -918,6 +1010,7 @@ done
         ai_usage_cmd = ai_usage_cmd_escaped,
         ai_usage_refresh_cmd = ai_usage_refresh_escaped,
         ai_usage_cache_file = ai_usage_cache_escaped,
+        ai_usage_timeout = AI_USAGE_MONITOR_TIMEOUT_SECS,
     )
 }
 
@@ -1474,6 +1567,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spawn_ai_usage_sync_kills_hanging_child_within_timeout() {
+        // ハングする子プロセス（sleep 60）を 1 秒でキルできることを確認する。
+        // タイムアウトなしだと token-burn 起動が固まる回帰を検知するためのテスト。
+        let start = std::time::Instant::now();
+        let result = spawn_ai_usage_sync_with_timeout(
+            &["sleep".to_string(), "60".to_string()],
+            &Default::default(),
+            Duration::from_secs(1),
+        );
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "hanging child should return Err");
+        let msg = format!("{}", result.err().unwrap());
+        assert!(
+            msg.contains("timed out"),
+            "error should mention timeout, got: {msg}"
+        );
+        // 1 秒タイムアウト + 50ms ポーリング粒度で最大 ~1.5s まで許容。
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "timeout should fire promptly (took {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn spawn_ai_usage_sync_returns_stdout_for_fast_command() {
+        // 早く終わるコマンドはタイムアウト前に stdout を返す。
+        let result = spawn_ai_usage_sync_with_timeout(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf 'hello world'".to_string(),
+            ],
+            &Default::default(),
+            Duration::from_secs(5),
+        );
+        let bytes = result.expect("should succeed");
+        assert_eq!(bytes, b"hello world");
+    }
+
+    #[test]
     fn build_task_header_script_escapes_display_name() {
         let script = build_task_header_script(1, 3, "repo'; touch /tmp/pwn #");
         assert!(
@@ -1869,6 +2002,26 @@ mod tests {
         assert!(
             script.contains("mv \"$AI_USAGE_CACHE_FILE.tmp\" \"$AI_USAGE_CACHE_FILE\""),
             "refresh must atomically swap cache via mv"
+        );
+        // fetch_usage は必ずタイムアウトラッパー経由で ai-usage を起動する
+        // （ai-usage がハングしても monitor ループが固まらないため）。
+        assert!(
+            script.contains("run_with_timeout() {"),
+            "monitor script must define run_with_timeout"
+        );
+        assert!(
+            script.contains("AI_USAGE_TIMEOUT="),
+            "monitor script must set AI_USAGE_TIMEOUT"
+        );
+        assert!(
+            script.contains(
+                "run_with_timeout \"$AI_USAGE_TIMEOUT\" bash -c \"$AI_USAGE_REFRESH_CMD\""
+            ),
+            "refresh must be wrapped in run_with_timeout"
+        );
+        assert!(
+            script.contains("run_with_timeout \"$AI_USAGE_TIMEOUT\" bash -c \"$AI_USAGE_CMD\""),
+            "statusline fetch must be wrapped in run_with_timeout"
         );
     }
 

@@ -262,13 +262,15 @@ fn parse_resets_at(data: &UsageWindowData) -> Option<DateTime<FixedOffset>> {
         .map(|dt| dt.with_timezone(&Local).fixed_offset())
 }
 
+/// ai-usage --json のハング検知タイムアウト。
+/// ai-usage は通常数秒で完了するため、30 秒を超えたら異常と見なして子プロセスを
+/// キルしエラーを返す。タイムアウト時は usage-gate の fail-closed 経路が発火し、
+/// 後続タスクの停止・監視ペインの停止判定が正しく伝わる。
+const AI_USAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn run_ai_usage(command: &[String]) -> Result<AiUsageSnapshot> {
     anyhow::ensure!(!command.is_empty(), "ai_usage.command is empty");
-    let output = tokio::process::Command::new(&command[0])
-        .args(&command[1..])
-        .output()
-        .await
-        .with_context(|| format!("failed to run ai-usage command: {}", command.join(" ")))?;
+    let output = spawn_ai_usage_with_timeout(command).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("ai-usage exited with {}: {}", output.status, stderr.trim());
@@ -278,6 +280,24 @@ async fn run_ai_usage(command: &[String]) -> Result<AiUsageSnapshot> {
     Ok(AiUsageSnapshot {
         accounts: parsed.accounts,
     })
+}
+
+/// `tokio::process::Command` で ai-usage を実行し、`AI_USAGE_TIMEOUT` を超えたら
+/// `kill_on_drop` により子プロセスをキルしてエラーを返す。
+/// 呼び出し側で status / stdout を判定する。
+async fn spawn_ai_usage_with_timeout(command: &[String]) -> Result<std::process::Output> {
+    let mut cmd = tokio::process::Command::new(&command[0]);
+    cmd.args(&command[1..]).kill_on_drop(true);
+    match tokio::time::timeout(AI_USAGE_TIMEOUT, cmd.output()).await {
+        Ok(res) => {
+            res.with_context(|| format!("failed to run ai-usage command: {}", command.join(" ")))
+        }
+        Err(_) => anyhow::bail!(
+            "ai-usage timed out after {}s: {}",
+            AI_USAGE_TIMEOUT.as_secs(),
+            command.join(" ")
+        ),
+    }
 }
 
 /// 使用率ゲート: `(profile, provider)` の weekly / five_hour 使用率のうち、いずれかが
@@ -372,11 +392,7 @@ async fn load_usage_cached(command: &[String], cache_file: &Path) -> Result<AiUs
     }
 
     anyhow::ensure!(!command.is_empty(), "ai_usage.command is empty");
-    let output = tokio::process::Command::new(&command[0])
-        .args(&command[1..])
-        .output()
-        .await
-        .with_context(|| format!("failed to run ai-usage command: {}", command.join(" ")))?;
+    let output = spawn_ai_usage_with_timeout(command).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("ai-usage exited with {}: {}", output.status, stderr.trim());
