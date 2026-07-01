@@ -856,19 +856,22 @@ while true; do
         exec sleep infinity
     fi
 
-    # 停止中の場合は全ワーカーの終了を確認
-    if [ $STOPPED -eq 1 ]; then
-        WORKERS_DONE=$(find "$MARKER_DIR" -name 'worker-done-*' 2>/dev/null | wc -l | tr -d ' ')
-        if [ "$WORKERS_DONE" -ge "$WORKER_COUNT" ]; then
-            render
-            printf " ⏹ Stopped: %d/%d processed (fail:%d retry:%d)\n" "$PROCESSED" "$TOTAL" "$FAILED" "$RETRY"
-            echo ""
-            echo " 📁 Logs: $REPORT_DIR"
-            echo ""
-            echo " Press Ctrl-C to close session."
-            restore_terminal
-            exec sleep infinity
-        fi
+    # 全ワーカーが終了していれば、STOPPED かどうかに関わらず停止と判定する。
+    # 上の PROCESSED>=TOTAL で正常完了は既に抜けているため、ここに来るのは「全ワーカーが
+    # 終了したのにタスクが処理し切れていない」ケース＝早期停止（stop file 検出、usage-gate
+    # の fail-closed による break、タスクスクリプト欠落など）。STOPPED の内側に閉じ込めると、
+    # usage-gate が stop file を作れずに fail-closed した場合にモニターがデッドラインまで
+    # ハングするため、ワーカー全滅は独立した終了条件として扱う。
+    WORKERS_DONE=$(find "$MARKER_DIR" -name 'worker-done-*' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$WORKERS_DONE" -ge "$WORKER_COUNT" ]; then
+        render
+        printf " ⏹ Stopped: %d/%d processed (fail:%d retry:%d)\n" "$PROCESSED" "$TOTAL" "$FAILED" "$RETRY"
+        echo ""
+        echo " 📁 Logs: $REPORT_DIR"
+        echo ""
+        echo " Press Ctrl-C to close session."
+        restore_terminal
+        exec sleep infinity
     fi
 
     # 進捗バー（画面最下部、毎秒 \r 上書き）
@@ -1664,6 +1667,33 @@ mod tests {
     }
 
     #[test]
+    fn build_worker_script_breaks_loop_when_usage_gate_fails_closed() {
+        // usage-gate が非ゼロ終了（fail-closed）したら、ワーカーはループを break して停止する。
+        // 終了コードを握り潰すと、stop file を作れなかった fail-closed 時に後続タスクを
+        // 処理し続けてしまうため。break 後はループ末尾で worker-done マーカーが作られる。
+        let tmp = std::path::PathBuf::from("/tmp/burn");
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &tmp.join("queue"),
+            task_dir: &tmp.join("tasks"),
+            marker_dir: &tmp.join("markers"),
+            stop_file: &tmp.join("stop"),
+            usage_gate_cmd: Some("tb usage-gate --profile P --provider claude"),
+        });
+        // 非ゼロ終了で break する分岐を持つこと
+        assert!(
+            script.contains("if ! tb usage-gate --profile P --provider claude; then"),
+            "gate must guard on non-zero exit: {script}"
+        );
+        // gate の break はループ末尾の worker-done 生成より前にある（break 後に到達する）
+        let gate_break = script
+            .find("failed closed — stopping")
+            .expect("gate break branch missing");
+        let worker_done = script.find("worker-done-0").expect("worker-done missing");
+        assert!(gate_break < worker_done);
+    }
+
+    #[test]
     fn build_worker_script_omits_usage_gate_when_unset() {
         let tmp = std::path::PathBuf::from("/tmp/burn");
         let script = build_worker_script(&WorkerCtx {
@@ -1760,11 +1790,52 @@ mod tests {
         // exec sleep infinity の直前でも復元する。
         assert!(script.contains("restore_terminal() {"));
         assert!(script.contains("trap restore_terminal EXIT"));
-        // 完了時ブロック（8スペースインデント）の復元呼び出し
-        assert!(script.contains("restore_terminal\n        exec sleep infinity"));
-        // 停止時ブロック（12スペースインデント）でも復元しないと、カーソル非表示と autowrap 無効が
-        // ユーザーの端末に残ってしまうため、復元呼び出しが必須
-        assert!(script.contains("restore_terminal\n            exec sleep infinity"));
+        // 完了時ブロック・停止時ブロックのいずれも 8 スペースインデントで、exec sleep infinity の
+        // 直前に端末状態を復元する。EXIT trap は exec で発火しないため復元呼び出しが必須。
+        // （ワーカー全滅判定を STOPPED の内側から出したため、停止時ブロックも 8 スペースになった）
+        assert_eq!(
+            script
+                .matches("restore_terminal\n        exec sleep infinity")
+                .count(),
+            2,
+            "both completion and stopped blocks must restore terminal before exec: {script}"
+        );
+    }
+
+    #[test]
+    fn generate_monitor_script_transitions_to_stopped_when_stop_file_appears() {
+        // usage-gate / rate_limit_event がワーカー側で stop file を作った場合も、モニターが
+        // STOPPED に遷移して全ワーカー完了判定を発火させること。これが無いとデッドラインまで
+        // ハングする。
+        let script = generate_monitor_script(
+            "claude",
+            "claude -p",
+            "2026/02/24 09:00",
+            2,
+            60,
+            std::path::Path::new("/tmp/markers"),
+            "token-burn",
+            2,
+            std::path::Path::new("/tmp/stop"),
+            std::path::Path::new("/tmp/report"),
+            None,
+            None,
+            None,
+        );
+        // stop file を検出して STOPPED=1 に遷移する分岐を持つこと（STATUS_MSG 表示用）
+        assert!(
+            script.contains("[ $STOPPED -eq 0 ] && [ -f \"$STOP_FILE\" ]"),
+            "monitor must observe stop file created by workers: {script}"
+        );
+        // 全ワーカー終了判定は STOPPED に依存しない独立した終了条件であること。
+        // これが STOPPED の内側に閉じ込められていると、usage-gate が stop file を作れずに
+        // fail-closed した場合にモニターがデッドラインまでハングする。
+        assert!(
+            !script.contains("if [ $STOPPED -eq 1 ]; then"),
+            "workers-done check must not be gated on STOPPED: {script}"
+        );
+        assert!(script.contains("WORKERS_DONE=$(find \"$MARKER_DIR\" -name 'worker-done-*'"));
+        assert!(script.contains("if [ \"$WORKERS_DONE\" -ge \"$WORKER_COUNT\" ]; then"));
     }
 
     #[test]
