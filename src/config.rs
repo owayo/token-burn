@@ -450,6 +450,21 @@ impl Config {
                 .as_ref()
                 .map(|u| u.profiles.as_slice())
                 .unwrap_or(&[]);
+            // 同一 agent 内での profile 重複参照を弾く。重複すると同名の RuntimeAgent が
+            // 複数生成され、status/list での重複表示や list --agent が 2 件目を選べない
+            // 挙動を招く。グローバル profiles 側の name 重複は validate() で既に弾いており、
+            // 参照側も同じ方針で揃える。
+            let mut seen_profiles = std::collections::HashSet::new();
+            for pname in profile_names {
+                if !seen_profiles.insert(pname.as_str()) {
+                    anyhow::bail!(
+                        "Agent '{}' references duplicate ai_usage profile '{}'",
+                        agent.name,
+                        pname
+                    );
+                }
+            }
+
             // profile を 1 つだけ参照する agent は展開名を agent 名のまま保つ。
             // 「claude-home」が「claude-home-home」になる冗長化を避け、state.json の
             // キー互換（既存の agent 名のまま）も維持する。複数参照時のみサフィックスを付ける。
@@ -1160,6 +1175,20 @@ mod tests {
         config.ai_usage = Some(ai_usage_global(true, vec![("work", "Work")]));
         let err = config.validate().expect_err("未知の profile 参照はエラー");
         assert!(err.to_string().contains("unknown ai_usage profile"));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_profile_reference() {
+        // 同一 agent が同じ profile を 2 回参照すると、同名の RuntimeAgent が二重生成
+        // されるため validate で弾く。
+        let mut config = base_config();
+        config.agents[0].provider = Some("claude".to_string());
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["work", "work"], None));
+        config.ai_usage = Some(ai_usage_global(true, vec![("work", "Work")]));
+        let err = config
+            .validate()
+            .expect_err("同一 profile の重複参照はエラー");
+        assert!(err.to_string().contains("duplicate ai_usage profile"));
     }
 
     #[test]

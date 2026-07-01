@@ -181,6 +181,15 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     {
         attrs.push(format!("command:{command_name}"));
     }
+    // Workflow: 起動したワークフロー名。どのワークフローが走ったかの判断材料になる。
+    // runId は内部識別子でユーザ操作に使えないため出さず、name のみ表示する。
+    if let Some(name) = obj
+        .get("workflowName")
+        .and_then(|value| value.as_str())
+        .filter(|name| !name.is_empty())
+    {
+        attrs.push(format!("workflow:{}", truncate_inline(name, 50)));
+    }
     if let Some(content) = obj
         .get("structuredContent")
         .and_then(|value| value.get("content"))

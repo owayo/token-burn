@@ -75,6 +75,7 @@ fn tool_specific_detail(tool_name: &str, v: &serde_json::Value) -> DetailResult 
         "TaskUpdate" => detail_task_update(v),
         "TaskStop" => detail_task_stop(v),
         "TaskOutput" => detail_task_output(v),
+        "Workflow" => detail_workflow(v),
         "AskUserQuestion" => detail_ask_user_question(v),
         // tavily MCP は実データでハイフン版とアンダースコア版の両方が観測されるため両方サポートする
         "mcp__tavily__tavily-search" | "mcp__tavily__tavily_search" => detail_tavily_search(v),
@@ -841,6 +842,61 @@ fn detail_bash_output(v: &serde_json::Value) -> DetailResult {
         detail = format!("{} (filter:{})", detail, truncate_inline(filter, 40));
     }
     DetailResult::Handled(detail)
+}
+
+/// Workflow: 起動するワークフローの識別情報を表示する。
+/// - named workflow（保存済みを名前で実行）は `name`
+/// - インライン script は `meta.name` を best-effort 抽出（不能ならスクリプト文字数）
+/// - `scriptPath` 指定（保存済みスクリプトの再実行・resume）はファイル名
+///
+/// いずれも取れなければ汎用フォールバックへ委ねる。
+fn detail_workflow(v: &serde_json::Value) -> DetailResult {
+    // named workflow を名前で実行するケース。
+    if let Some(name) = v["name"].as_str().filter(|s| !s.is_empty()) {
+        return DetailResult::Handled(truncate_str(name, 80).to_string());
+    }
+    // インライン script: meta.name を抽出できれば名前とスクリプト規模を併記する。
+    if let Some(script) = v["script"].as_str().filter(|s| !s.is_empty()) {
+        let chars = script.chars().count();
+        return DetailResult::Handled(match extract_workflow_meta_name(script) {
+            Some(name) => format!("{} (script:{chars} chars)", truncate_str(&name, 60)),
+            None => format!("script:{chars} chars"),
+        });
+    }
+    // scriptPath 指定（再実行・resume）。
+    if let Some(path) = v["scriptPath"].as_str().filter(|s| !s.is_empty()) {
+        let base = path.rsplit('/').next().unwrap_or(path);
+        return DetailResult::Handled(truncate_str(base, 80).to_string());
+    }
+    DetailResult::Fallback
+}
+
+/// Workflow の script 文字列から `meta.name` を best-effort で抽出する。
+/// `export const meta = { name: 'xxx', ... }` の最初の `name:` を対象にする
+/// （meta は先頭が name のため、phases 内の name 等を誤検出しにくい）。抽出に
+/// 失敗しても呼び出し側がスクリプト文字数へフォールバックするため None を返してよい。
+fn extract_workflow_meta_name(script: &str) -> Option<String> {
+    // meta ブロック以降に絞る（先頭の `export const meta = {` を基準にする）。
+    let after_meta = &script[script.find("meta")?..];
+    let name_pos = after_meta.find("name")?;
+    let after_name = &after_meta[name_pos + "name".len()..];
+    let colon = after_name.find(':')?;
+    // name と : の間は空白のみ許容（`namespace:` 等の別トークン誤検出を防ぐ）。
+    if !after_name[..colon].trim().is_empty() {
+        return None;
+    }
+    // : の直後（空白除去後）は文字列リテラルの引用符でなければならない
+    // （遠くの description 内の引用符を誤って拾わないようにする）。
+    let after_colon = after_name[colon + 1..].trim_start();
+    let mut chars = after_colon.chars();
+    let quote = match chars.next() {
+        Some(q @ ('\'' | '"' | '`')) => q,
+        _ => return None,
+    };
+    let value = chars.as_str();
+    let end = value.find(quote)?;
+    let name = value[..end].trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// SlashCommand: 実行するスラッシュコマンド文字列（例: `/get-md ...`）を表示する。

@@ -775,3 +775,22 @@ fn tool_result_metadata_updated_fields_empty_is_omitted() {
     let value = serde_json::json!({"updatedFields": ["", "status"]});
     assert_eq!(tool_result_metadata(&value), "");
 }
+
+#[test]
+fn tool_result_metadata_shows_workflow_name() {
+    // Workflow の async 起動結果は workflowName を表示する（どのワークフローが走ったか）。
+    // 実 jsonl の形: {status, taskId, taskType:local_workflow, workflowName, runId, ...}
+    let value = serde_json::json!({
+        "status": "async_launched",
+        "taskId": "wl9rh41wo",
+        "taskType": "local_workflow",
+        "workflowName": "claw-hooks-audit",
+        "runId": "wf_a821ec7d-5bb"
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(metadata.contains("workflow:claw-hooks-audit"), "{metadata}");
+    // taskType も併記される（既存挙動）。
+    assert!(metadata.contains("task-type:local_workflow"), "{metadata}");
+    // runId は内部識別子のため表示しない。
+    assert!(!metadata.contains("wf_a821ec7d"), "{metadata}");
+}

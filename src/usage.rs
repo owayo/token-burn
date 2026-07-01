@@ -344,6 +344,25 @@ pub async fn run_usage_gate(
         return Ok(());
     };
 
+    // アカウントが ok:false（認証切れ等で ai-usage がエラーを報告）の場合は、使用率を
+    // 信頼できないため fail-closed で停止する。ai-usage の取得自体には成功していても、
+    // 「使用率を確認できない」という点は load 失敗と同じであり、ScheduleResolver も
+    // ok:false を失敗として fallback している（一貫性）。この検査が無いと、ok:false かつ
+    // used_percent 欠損のとき max_used=None となり stop_file を作らず走り続ける（fail-open）。
+    if !acc.ok {
+        let reason = acc.error.as_deref().unwrap_or("ai-usage account not ok");
+        if write_stop_file(stop_file, &format!("usage-gate account not ok: {reason}")) {
+            println!(
+                "\x1b[31m  \u{26d4} usage-gate: {profile}/{provider} の使用率を確認できないため停止 ({reason})\x1b[0m"
+            );
+        } else if !stop_file.exists() {
+            // 作成失敗かつ既存でもない（ENOSPC・権限不足等）。フェイルオープンを避ける
+            // ため、取得失敗パスと同様にエラーを伝搬してワーカーを止める。
+            anyhow::bail!("usage-gate: failed to write stop file (account not ok: {reason})");
+        }
+        return Ok(());
+    }
+
     // weekly / five_hour のうち最大の使用率で判定する（安全側）。
     let max_used = [acc.weekly.as_ref(), acc.five_hour.as_ref()]
         .into_iter()
@@ -800,6 +819,49 @@ mod tests {
             .await
             .unwrap();
         assert!(stop.exists(), "取得失敗時は fail-closed で停止すべき");
+    }
+
+    #[tokio::test]
+    async fn usage_gate_fail_closed_when_account_not_ok() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let cache = tmp.path().join("cache.json");
+        // 該当エントリは存在するが ok:false（認証切れ等）かつ used_percent 欠損。
+        // acc.ok を見ずに used_percent だけで判定すると max_used=None で走り続ける
+        // （fail-open）ため、ok:false を fail-closed で停止することを確認する。
+        std::fs::write(
+            &cache,
+            r#"{"accounts":[{"profile":"Work","provider":"claude","ok":false,"error":"auth expired"}]}"#,
+        )
+        .unwrap();
+        run_usage_gate("Work", "claude", 90, &stop, &cache, &["false".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            stop.exists(),
+            "ok:false のアカウントは使用率を確認できないため fail-closed で停止すべき"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_gate_errors_when_stop_file_write_fails_for_not_ok_account() {
+        // ok:false かつ stop_file を作成できず既存でもない場合はフェイルオープンせず
+        // エラーを伝搬する（取得失敗パスと同じ扱い）。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("missing-dir").join("stop");
+        let cache = tmp.path().join("cache.json");
+        std::fs::write(
+            &cache,
+            r#"{"accounts":[{"profile":"Work","provider":"claude","ok":false,"error":"auth expired"}]}"#,
+        )
+        .unwrap();
+        let result =
+            run_usage_gate("Work", "claude", 90, &stop, &cache, &["false".to_string()]).await;
+        assert!(
+            result.is_err(),
+            "ok:false で stop_file 作成失敗時はエラーを返すべき"
+        );
+        assert!(!stop.exists());
     }
 
     #[tokio::test]

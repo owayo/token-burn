@@ -791,3 +791,54 @@ fn slash_command_without_command_is_empty() {
     let detail = extract_tool_detail("SlashCommand", r#"{}"#);
     assert_eq!(detail, "");
 }
+
+#[test]
+fn workflow_named_shows_name() {
+    // 保存済みワークフローを名前で実行するケースは name を表示する。
+    let detail = extract_tool_detail("Workflow", r#"{"name":"find-flaky-tests"}"#);
+    assert_eq!(detail, "find-flaky-tests");
+}
+
+#[test]
+fn workflow_inline_script_extracts_meta_name() {
+    // インライン script は meta.name を抽出し、スクリプト規模も併記する。
+    let input = r#"{"script":"export const meta = {\n  name: 'review-changes',\n  description: 'x',\n}\nphase('Review')"}"#;
+    let detail = extract_tool_detail("Workflow", input);
+    assert!(
+        detail.starts_with("review-changes (script:"),
+        "got: {detail}"
+    );
+    assert!(detail.ends_with("chars)"), "got: {detail}");
+}
+
+#[test]
+fn workflow_inline_script_double_quoted_meta_name() {
+    // meta.name がダブルクォートでも抽出できる。
+    let input = r#"{"script":"export const meta = { name: \"audit\", description: \"d\" }"}"#;
+    let detail = extract_tool_detail("Workflow", input);
+    assert!(detail.starts_with("audit (script:"), "got: {detail}");
+}
+
+#[test]
+fn workflow_inline_script_without_meta_name_shows_char_count() {
+    // meta.name を抽出できない script はスクリプト文字数のみ表示する（空表示にしない）。
+    let input = r#"{"script":"const x = 1; phase('go')"}"#;
+    let detail = extract_tool_detail("Workflow", input);
+    assert!(detail.starts_with("script:"), "got: {detail}");
+    assert!(detail.ends_with("chars"), "got: {detail}");
+}
+
+#[test]
+fn workflow_script_path_shows_basename() {
+    // scriptPath 指定（再実行・resume）はファイル名を表示する。
+    let input = r#"{"scriptPath":"/tmp/session/workflows/scripts/my-wf-wf_abc.js"}"#;
+    let detail = extract_tool_detail("Workflow", input);
+    assert_eq!(detail, "my-wf-wf_abc.js");
+}
+
+#[test]
+fn workflow_empty_falls_back() {
+    // script/name/scriptPath いずれも無ければ汎用フォールバックへ。
+    let detail = extract_tool_detail("Workflow", r#"{"description":"fallback desc"}"#);
+    assert_eq!(detail, "fallback desc");
+}

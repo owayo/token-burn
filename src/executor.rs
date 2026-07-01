@@ -94,9 +94,9 @@ fn is_codex_command(command: &[String]) -> bool {
 /// 同期パスで ai-usage を起動し、`timeout` を超えたら SIGKILL してキルする。
 /// tokio ランタイムに依存せず std::process::Command と try_wait ポーリングで実現する。
 ///
-/// 成功時は raw stdout を返す。ai-usage は数 KB の JSON を返すため、パイプバッファ
-/// (64KB) に収まる想定で stdout を piped で受ける。非ゼロ終了・spawn 失敗・タイムアウトは
-/// エラー。呼び出し側で fail-soft（キャッシュ初期化スキップ）にする。
+/// 成功時は raw stdout を返す。stdout/stderr は別スレッドで並行に drain するため、
+/// 出力サイズがパイプバッファを超えてもデッドロックしない。非ゼロ終了・spawn 失敗・
+/// タイムアウトはエラー。呼び出し側で fail-soft（キャッシュ初期化スキップ）にする。
 fn spawn_ai_usage_sync_with_timeout(
     command: &[String],
     env: &std::collections::BTreeMap<String, String>,
@@ -112,20 +112,37 @@ fn spawn_ai_usage_sync_with_timeout(
         .spawn()
         .with_context(|| format!("failed to spawn ai-usage command: {}", command.join(" ")))?;
 
+    // stdout/stderr は必ず別スレッドで並行に drain する。子の終了を待ってから読むと、
+    // 出力がパイプバッファ（macOS では 16KB 程度）を超えたとき子の write(2) がブロックして
+    // 終了できず、try_wait が永遠に None を返してタイムアウトまでハングするデッドロックに
+    // 陥る（大きな stdout や stderr へのログ出力で発生）。読み取りを終了監視から分離する。
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let stdout_handle = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Some(s) = stdout.as_mut() {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Some(s) = stderr.as_mut() {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+
     let start = std::time::Instant::now();
     loop {
         match child.try_wait()? {
             Some(status) => {
-                use std::io::Read;
-                let mut stdout_buf = Vec::new();
-                if let Some(mut s) = child.stdout.take() {
-                    let _ = s.read_to_end(&mut stdout_buf);
-                }
+                // 子は終了済みでパイプは EOF に達するため、join はブロックせず全出力を回収できる。
+                let stdout_buf = stdout_handle.join().unwrap_or_default();
+                let stderr_buf = stderr_handle.join().unwrap_or_default();
                 if !status.success() {
-                    let mut stderr_buf = Vec::new();
-                    if let Some(mut s) = child.stderr.take() {
-                        let _ = s.read_to_end(&mut stderr_buf);
-                    }
                     let stderr = String::from_utf8_lossy(&stderr_buf);
                     anyhow::bail!("ai-usage exited with {}: {}", status, stderr.trim());
                 }
@@ -135,6 +152,9 @@ fn spawn_ai_usage_sync_with_timeout(
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // kill でパイプが閉じ drain スレッドは EOF で終了する。join してリークを防ぐ。
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
                     anyhow::bail!(
                         "ai-usage timed out after {}s: {}",
                         timeout.as_secs(),
@@ -1538,8 +1558,16 @@ fn strip_ansi(s: &str) -> String {
                         }
                     }
                 }
+                Some('(' | ')' | '*' | '+' | '-' | '.' | '/') => {
+                    // charset designation (例: \x1b(B = G0 を ASCII 集合に指定)。
+                    // introducer( ( ) * + - . / )＋終端バイトの 2 文字構成のため、
+                    // introducer だけ捨てると終端バイト(例: B)が通常文字として漏れる。
+                    // 両方スキップする。
+                    chars.next(); // introducer
+                    chars.next(); // 終端バイト
+                }
                 Some(_) => {
-                    // その他のエスケープシーケンス (例: \x1b(B) — 次の文字をスキップ
+                    // その他の 2 バイトエスケープ (例: \x1b= / \x1b> / \x1bM) — 次の 1 文字をスキップ
                     chars.next();
                 }
                 None => break,
@@ -1604,6 +1632,25 @@ mod tests {
         );
         let bytes = result.expect("should succeed");
         assert_eq!(bytes, b"hello world");
+    }
+
+    #[test]
+    fn spawn_ai_usage_sync_handles_output_larger_than_pipe_buffer() {
+        // stdout がパイプバッファ（macOS で ~16KB）を大きく超えても、別スレッドで並行に
+        // drain するためデッドロックせず全出力を返す。旧実装（子の終了後にまとめて読む）では
+        // 子が write(2) でブロックして終了できず、タイムアウトまでハングする回帰を検知する。
+        let size = 100_000;
+        let result = spawn_ai_usage_sync_with_timeout(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("head -c {size} /dev/zero"),
+            ],
+            &Default::default(),
+            Duration::from_secs(5),
+        );
+        let bytes = result.expect("large stdout should not deadlock");
+        assert_eq!(bytes.len(), size, "全出力が回収されるべき");
     }
 
     #[test]
@@ -2297,6 +2344,28 @@ mod tests {
     }
 
     #[test]
+    fn strip_ansi_removes_charset_designation() {
+        // \x1b(B (G0 を ASCII に指定) は 3 バイト構成。introducer だけ捨てると
+        // 終端バイト "B" が漏れる回帰。両方スキップされることを確認する。
+        let input = "before\x1b(Bafter";
+        assert_eq!(strip_ansi(input), "beforeafter");
+    }
+
+    #[test]
+    fn strip_ansi_removes_line_drawing_charset() {
+        // \x1b(0 (G0 を DEC 罫線集合に指定) も終端バイト "0" を残さない。
+        let input = "\x1b(0lqk\x1b(Bplain";
+        assert_eq!(strip_ansi(input), "lqkplain");
+    }
+
+    #[test]
+    fn strip_ansi_charset_designation_at_end() {
+        // 末尾の不完全な charset designation (introducer のみ) でも panic せず消費される。
+        let input = "text\x1b(";
+        assert_eq!(strip_ansi(input), "text");
+    }
+
+    #[test]
     fn strip_ansi_lone_esc_at_end() {
         // 末尾の孤立ESCは安全に消費される
         let input = "text\x1b";
@@ -2319,8 +2388,10 @@ mod tests {
 
     #[test]
     fn strip_ansi_other_escape_skips_one_char() {
-        // ESC + 非 `[`/`]` 文字 → ESCと次の1文字のみスキップ
-        let input = "before\x1b(after";
+        // ESC + 非 `[`/`]`/charset-introducer 文字（例: \x1b= = DECKPAM）は
+        // ESC と次の 1 文字のみスキップする。charset designation (\x1b( 等) は
+        // strip_ansi_removes_charset_designation で別途カバー。
+        let input = "before\x1b=after";
         assert_eq!(strip_ansi(input), "beforeafter");
     }
 
