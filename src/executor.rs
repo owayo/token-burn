@@ -517,8 +517,11 @@ pub fn execute_plan_tmux(
     std::fs::write(&monitor_path, &monitor_script)?;
     ensure_executable(&monitor_path)?;
 
-    // モニター（左ペイン）付き tmux セッションを作成
-    std::process::Command::new("tmux")
+    // モニター（左ペイン）付き tmux セッションを作成。
+    // `.status()?` は tmux の起動失敗しか捕まえない（tmux が non-zero 終了しても Ok）。
+    // ここで ExitStatus を検証しないと、セッション/ペイン生成に失敗してもワーカーが
+    // 起動しないままモニターだけが走り、進捗が進まずデッドラインまでハングする。
+    let new_session_status = std::process::Command::new("tmux")
         .args([
             "new-session",
             "-d",
@@ -528,9 +531,14 @@ pub fn execute_plan_tmux(
         ])
         .status()
         .context("Failed to create tmux session")?;
+    anyhow::ensure!(
+        new_session_status.success(),
+        "tmux new-session failed (exit {:?})",
+        new_session_status.code()
+    );
 
     // 最初のワーカー用に右ペインを分割
-    std::process::Command::new("tmux")
+    let split_status = std::process::Command::new("tmux")
         .args([
             "split-window",
             "-h",
@@ -538,12 +546,18 @@ pub fn execute_plan_tmux(
             session,
             &script_paths[0].to_string_lossy(),
         ])
-        .status()?;
+        .status()
+        .context("Failed to split tmux window for worker")?;
+    anyhow::ensure!(
+        split_status.success(),
+        "tmux split-window failed (exit {:?})",
+        split_status.code()
+    );
 
     // 残りのワーカーを右エリアに垂直分割で追加
     for script in &script_paths[1..] {
         // 右側の最後のペインに垂直分割で追加
-        std::process::Command::new("tmux")
+        let split_status = std::process::Command::new("tmux")
             .args([
                 "split-window",
                 "-v",
@@ -551,7 +565,13 @@ pub fn execute_plan_tmux(
                 &format!("{}:.right", session),
                 &script.to_string_lossy(),
             ])
-            .status()?;
+            .status()
+            .context("Failed to split tmux window for worker")?;
+        anyhow::ensure!(
+            split_status.success(),
+            "tmux split-window failed (exit {:?})",
+            split_status.code()
+        );
     }
 
     // 右側ペインのサイズを均等化
@@ -806,6 +826,15 @@ while true; do
         STOPPED=1
         touch "$STOP_FILE"
         STATUS_MSG=" ⚠ DEADLINE REACHED — waiting for current tasks (Ctrl-C to force kill)"
+        NEED_RENDER=1
+    fi
+
+    # usage-gate / rate_limit_event がワーカー側で stop file を作った場合も STOPPED に遷移する。
+    # これが無いと、シグナルもデッドラインも来ていないのに STOPPED=0 のままとなり、全ワーカー
+    # 完了判定（STOPPED=1 の内側）が発火せず、モニターがデッドラインまで張り付いてしまう。
+    if [ $STOPPED -eq 0 ] && [ -f "$STOP_FILE" ]; then
+        STOPPED=1
+        STATUS_MSG=" ⛔ Usage/rate limit reached — waiting for current tasks to finish"
         NEED_RENDER=1
     fi
 
@@ -1128,8 +1157,14 @@ fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
     );
     // ai-usage 連携時は各タスク完了後（次の pending を claim する前）に usage-gate を実行する。
     // 未設定なら空文字列で、ワーカースクリプトに行は追加されない。
+    // usage-gate が非ゼロ終了した場合（使用率確認不能や stop file 作成失敗による
+    // fail-closed）はループを break して止める。終了コードを無視すると、stop file を
+    // 作れなかった fail-closed 時にワーカーが後続タスクを処理し続けてしまう。break 後は
+    // ループ末尾で worker-done マーカーを作るため、モニターの停止判定も正しく発火する。
     let gate_line = match ctx.usage_gate_cmd {
-        Some(cmd) => format!("  {cmd}\n"),
+        Some(cmd) => format!(
+            "  if ! {cmd}; then\n    echo '━━━ usage-gate failed closed — stopping ━━━'\n    break\n  fi\n"
+        ),
         None => String::new(),
     };
 
