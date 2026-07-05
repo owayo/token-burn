@@ -99,6 +99,28 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     if let Some(lines) = obj.get("numLines").and_then(|value| value.as_u64()) {
         attrs.push(format!("lines:{lines}"));
     }
+    // Edit/Write 系の実データでは top-level に filePath と structuredPatch が入る。
+    // originalFile / oldString / newString は巨大になり得るため、完了行にはファイル名と
+    // patch 規模だけを出して、どの編集が完了したかを短く追跡できるようにする。
+    if let Some(file_path) = obj
+        .get("filePath")
+        .or_else(|| obj.get("file_path"))
+        .and_then(|value| value.as_str())
+        .filter(|path| !path.is_empty())
+    {
+        attrs.push(format!("file:{}", truncate_path_tail(file_path, 60)));
+    }
+    if let Some(summary) = structured_patch_summary(obj.get("structuredPatch")) {
+        attrs.push(summary);
+    }
+    if obj
+        .get("replaceAll")
+        .or_else(|| obj.get("replace_all"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        attrs.push("replace_all".to_string());
+    }
     // Read は読み取り結果を file オブジェクトに格納する。部分読み取り（limit 指定や
     // ファイル途中までの読み取り）では numLines < totalLines となり、切り詰めの判断材料になる。
     if let Some(file) = obj.get("file").and_then(|value| value.as_object()) {
@@ -433,4 +455,50 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     }
 
     attrs.join(", ")
+}
+
+fn structured_patch_summary(value: Option<&serde_json::Value>) -> Option<String> {
+    let hunks = value?.as_array()?;
+    if hunks.is_empty() {
+        return None;
+    }
+
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for hunk in hunks {
+        let Some(lines) = hunk.get("lines").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for line in lines {
+            let Some(line) = line.as_str() else {
+                continue;
+            };
+            if line.starts_with('+') && !line.starts_with("+++") {
+                added += 1;
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                removed += 1;
+            }
+        }
+    }
+
+    let hunk_label = if hunks.len() == 1 { "hunk" } else { "hunks" };
+    Some(format!(
+        "patch:{} {hunk_label} +{added}/-{removed}",
+        hunks.len()
+    ))
+}
+
+fn truncate_path_tail(path: &str, max_chars: usize) -> String {
+    let char_count = path.chars().count();
+    if char_count <= max_chars {
+        return path.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let keep = max_chars - 3;
+    let mut tail = path.chars().rev().take(keep).collect::<Vec<_>>();
+    tail.reverse();
+    format!("...{}", tail.into_iter().collect::<String>())
 }

@@ -176,6 +176,42 @@ fn tool_result_metadata_shows_actual_jsonl_result_counts() {
 }
 
 #[test]
+fn tool_result_metadata_shows_edit_file_and_patch_summary() {
+    // 実 jsonl の Edit 結果は top-level に filePath / structuredPatch / originalFile を持つ。
+    // originalFile は巨大なので出さず、ファイル名と patch 規模だけを短く表示する。
+    let value = serde_json::json!({
+        "filePath": "/workspace/gui-git-editor/src/components/rebase/RebaseEditor.tsx",
+        "originalFile": "x".repeat(10_000),
+        "structuredPatch": [
+            {
+                "oldStart": 81,
+                "oldLines": 6,
+                "newStart": 81,
+                "newLines": 13,
+                "lines": [
+                    "   const handleKeyDown = useCallback(",
+                    "+      if (document.querySelector(\"[aria-modal='true']\")) {",
+                    "+        return;",
+                    "+      }",
+                    "-      if (event.defaultPrevented) {",
+                    "       // 入力中はショートカットを無効化する"
+                ]
+            }
+        ],
+        "replaceAll": true
+    });
+
+    let metadata = tool_result_metadata(&value);
+
+    assert!(metadata.contains("file:"), "{metadata}");
+    assert!(metadata.contains("RebaseEditor.tsx"), "{metadata}");
+    assert!(metadata.contains("patch:1 hunk +3/-1"), "{metadata}");
+    assert!(metadata.contains("replace_all"), "{metadata}");
+    assert!(!metadata.contains("originalFile"), "{metadata}");
+    assert!(!metadata.contains(&"x".repeat(120)), "{metadata}");
+}
+
+#[test]
 fn tool_result_metadata_shows_stdout_and_stderr_summary() {
     // Bash の実 jsonl では tool_result.content が完了文だけになり、
     // 実際のコマンド出力は top-level の stdout/stderr に入る。
