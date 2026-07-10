@@ -616,6 +616,21 @@ fn extract_tool_detail_agent_shows_background_and_type() {
 }
 
 #[test]
+fn extract_tool_detail_agent_shows_model_and_isolation() {
+    let input = r#"{"description":"Review","model":"opus","isolation":"worktree"}"#;
+    assert_eq!(
+        extract_tool_detail("Agent", input),
+        "Review (model:opus, isolation:worktree)"
+    );
+}
+
+#[test]
+fn extract_tool_detail_agent_omits_empty_model_and_isolation() {
+    let input = r#"{"description":"Review","model":"","isolation":""}"#;
+    assert_eq!(extract_tool_detail("Agent", input), "Review");
+}
+
+#[test]
 fn extract_tool_detail_team_create() {
     let input = r#"{"team_name":"demo-team","description":"Working on feature X"}"#;
     assert_eq!(extract_tool_detail("TeamCreate", input), "demo-team");

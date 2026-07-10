@@ -212,6 +212,25 @@ fn tool_result_metadata_shows_edit_file_and_patch_summary() {
 }
 
 #[test]
+fn tool_result_metadata_counts_content_resembling_diff_headers() {
+    let value = serde_json::json!({
+        "structuredPatch": [
+            {
+                "lines": [
+                    "+++追加内容",
+                    "---削除内容",
+                    " 変更なし"
+                ]
+            }
+        ]
+    });
+
+    let metadata = tool_result_metadata(&value);
+
+    assert!(metadata.contains("patch:1 hunk +1/-1"), "{metadata}");
+}
+
+#[test]
 fn tool_result_metadata_shows_stdout_and_stderr_summary() {
     // Bash の実 jsonl では tool_result.content が完了文だけになり、
     // 実際のコマンド出力は top-level の stdout/stderr に入る。
@@ -473,6 +492,15 @@ fn tool_result_metadata_interrupted_and_failed_flags() {
 }
 
 #[test]
+fn tool_result_metadata_marks_image_results() {
+    let value = serde_json::json!({
+        "isImage": true
+    });
+
+    assert_eq!(tool_result_metadata(&value), "image");
+}
+
+#[test]
 fn tool_result_metadata_success_true_is_not_shown() {
     // success:true は正常系なので "failed" を出さない
     let value = serde_json::json!({"success": true});
@@ -485,6 +513,7 @@ fn tool_result_metadata_false_bool_flags_are_omitted() {
     let value = serde_json::json!({
         "truncated": false,
         "interrupted": false,
+        "isImage": false,
         "userModified": false,
         "assistantAutoBackgrounded": false,
         "wasClamped": false

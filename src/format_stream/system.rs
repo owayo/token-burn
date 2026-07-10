@@ -27,6 +27,12 @@ pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -
             // いずれも表示するとノイズになる。思考中の進捗は thinking_delta のドット
             // 表示、正確なトークン総数は result.usage の集計表示に委ねる。
         }
+        "background_tasks_changed" => {
+            // 実行中バックグラウンドタスク一覧のスナップショット通知。タスクの増減の
+            // たびに発火する（実データで 1 セッション十数回）が、個々の開始・完了は
+            // task_started / task_notification で既に表示しており、重複表示は
+            // ノイズになるため明示的に無視する。
+        }
         _ => {} // init, hook_started 等は無視
     }
     Ok(())

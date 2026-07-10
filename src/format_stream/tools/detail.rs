@@ -270,6 +270,18 @@ fn detail_task_or_agent(v: &serde_json::Value) -> DetailResult {
     if v["run_in_background"].as_bool() == Some(true) {
         attrs.push("background".to_string());
     }
+    // model 上書き・isolation はサブエージェントの起動条件（コスト・分離環境）を左右する
+    // ため、指定時のみ短く併記する。
+    if let Some(model) = v["model"].as_str()
+        && !model.is_empty()
+    {
+        attrs.push(format!("model:{model}"));
+    }
+    if let Some(isolation) = v["isolation"].as_str()
+        && !isolation.is_empty()
+    {
+        attrs.push(format!("isolation:{isolation}"));
+    }
     if !detail.is_empty() && !attrs.is_empty() {
         return DetailResult::Handled(format!("{} ({})", detail, attrs.join(", ")));
     }

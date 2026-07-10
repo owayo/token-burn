@@ -27,6 +27,15 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     {
         attrs.push("interrupted".to_string());
     }
+    // 結果が画像の場合、テキスト内容が表示されない理由を示すマーカーを出す
+    // （実データでは Bash 結果等に isImage:false が常設されるため true のときだけ表示）。
+    if obj
+        .get("isImage")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        attrs.push("image".to_string());
+    }
     if obj
         .get("success")
         .and_then(|value| value.as_bool())
@@ -473,9 +482,9 @@ fn structured_patch_summary(value: Option<&serde_json::Value>) -> Option<String>
             let Some(line) = line.as_str() else {
                 continue;
             };
-            if line.starts_with('+') && !line.starts_with("+++") {
+            if line.starts_with('+') {
                 added += 1;
-            } else if line.starts_with('-') && !line.starts_with("---") {
+            } else if line.starts_with('-') {
                 removed += 1;
             }
         }

@@ -939,6 +939,17 @@ fn process_system_thinking_tokens_subtype_is_silent() {
 }
 
 #[test]
+fn process_system_background_tasks_changed_is_silent() {
+    let input = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"id":"task-1","status":"running"}],"uuid":"abc","session_id":"s1"}"#;
+    let output = run_process(input);
+    assert!(
+        output.is_empty(),
+        "system.subtype=background_tasks_changed は表示されるべきでない: {}",
+        output
+    );
+}
+
+#[test]
 fn usage_summary_merge_from_none_is_noop() {
     // None 値を渡しても既存の値が変わらないことを確認する
     let mut usage = UsageSummary {
