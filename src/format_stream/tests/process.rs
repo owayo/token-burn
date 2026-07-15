@@ -262,6 +262,18 @@ fn process_system_task_started_shows_description() {
 }
 
 #[test]
+fn process_system_task_started_prefers_concrete_subagent_type() {
+    // 実データでは local_agent と具体的な subagent_type が併記される。
+    let input = r#"{"type":"system","subtype":"task_started","task_type":"local_agent","subagent_type":"general-purpose","task_id":"abc-123","tool_use_id":"tu_1","description":"Review the implementation"}"#;
+
+    let output = run_process(input);
+    let clean = strip_ansi(&output);
+
+    assert!(clean.contains("Review the implementation (general-purpose)"));
+    assert!(!clean.contains("(local_agent)"));
+}
+
+#[test]
 fn process_team_create_then_task_spawn() {
     // TeamCreate → Task の順でチームエージェントを起動する流れ
     let input = [
@@ -607,6 +619,17 @@ fn process_task_notification_failed() {
 }
 
 #[test]
+fn process_task_notification_failed_shows_actual_summary() {
+    // 実データの failed 通知には原因を含む summary があるため捨てずに表示する。
+    let input = r#"{"type":"system","subtype":"task_notification","task_id":"abc","tool_use_id":"tu1","status":"failed","output_file":"/tmp/task.output","summary":"Agent failed because the review process exited with status 1"}"#;
+
+    let output = run_process(input);
+    let clean = strip_ansi(&output);
+
+    assert!(clean.contains("Task failed: Agent failed because the review process exited"));
+}
+
+#[test]
 fn process_task_notification_stopped_with_summary() {
     // TaskStop 経由で停止された場合: summary 付きで表示する
     let input = r#"{"type":"system","subtype":"task_notification","task_id":"bnrpvucd1","tool_use_id":"tu1","status":"stopped","output_file":"","summary":"Codex review completion (output file growth)","usage":{"total_tokens":1000,"tool_uses":2,"duration_ms":12000}}"#;
@@ -671,6 +694,17 @@ fn process_task_updated_completed_shows_status() {
         "expected task_updated completion in: {}",
         clean
     );
+}
+
+#[test]
+fn process_task_updated_killed_is_shown_as_failure() {
+    // 実データに出る killed は正常な状態遷移ではなく終了失敗として強調する。
+    let input =
+        r#"{"type":"system","subtype":"task_updated","task_id":"abc","patch":{"status":"killed"}}"#;
+    let output = run_process(input);
+    let clean = strip_ansi(&output);
+
+    assert!(clean.contains("\u{274c} Task killed"));
 }
 
 #[test]

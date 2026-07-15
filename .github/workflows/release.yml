@@ -255,7 +255,7 @@ jobs:
           sed -i "s|URL_X86_64_PLACEHOLDER|https://github.com/owayo/token-burn/releases/download/${TAG}/token-burn-x86_64-apple-darwin.tar.gz|g" Formula/token-burn.rb
           sed -i "s|SHA256_X86_64_PLACEHOLDER|${SHA256_X86_64}|g" Formula/token-burn.rb
 
-          # Remove leading spaces from heredoc
+          # ヒアドキュメントの先頭空白を除去
           sed -i 's/^          //' Formula/token-burn.rb
 
           git config user.name "github-actions[bot]"

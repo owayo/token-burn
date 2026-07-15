@@ -38,17 +38,26 @@ pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -
     Ok(())
 }
 
-/// `task_started`: サブエージェント開始の説明と task_type を表示する。
+/// `task_started`: サブエージェント開始の説明と具体的なエージェント種別を表示する。
 fn write_task_started(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
     let desc = v["description"].as_str().unwrap_or("");
     let task_type = v["task_type"].as_str().unwrap_or("");
+    let subagent_type = v["subagent_type"].as_str().unwrap_or("");
+    // local_agent のような実行方式より general-purpose / Explore などの具体的な
+    // サブエージェント種別を優先する。local_bash には subagent_type が無いため、
+    // 従来どおり task_type を表示する。
+    let display_type = if subagent_type.is_empty() {
+        task_type
+    } else {
+        subagent_type
+    };
     if !desc.is_empty() {
-        if !task_type.is_empty() {
+        if !display_type.is_empty() {
             writeln!(
                 out,
                 "\x1b[2m  \u{23f3} {} ({})\x1b[0m",
                 truncate_str(desc, 80),
-                task_type
+                display_type
             )?;
         } else {
             writeln!(out, "\x1b[2m  \u{23f3} {}\x1b[0m", truncate_str(desc, 80))?;
@@ -102,11 +111,16 @@ fn write_task_notification(v: &serde_json::Value, out: &mut impl Write) -> Resul
             )?;
         }
     } else if status == "failed" {
-        writeln!(
-            out,
-            "\x1b[31m  \u{274c} Task {}{}\x1b[0m",
-            status, usage_text
-        )?;
+        if !summary.is_empty() {
+            writeln!(
+                out,
+                "\x1b[31m  \u{274c} Task failed: {}{}\x1b[0m",
+                truncate_str(summary, 100),
+                usage_text
+            )?;
+        } else {
+            writeln!(out, "\x1b[31m  \u{274c} Task failed{}\x1b[0m", usage_text)?;
+        }
     } else if status == "stopped" {
         // TaskStop で停止された場合
         if !summary.is_empty() {
@@ -130,7 +144,7 @@ fn write_task_updated(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
         "completed" => {
             writeln!(out, "\x1b[32m  \u{2705} Task completed\x1b[0m")?;
         }
-        "failed" | "cancelled" => {
+        "failed" | "cancelled" | "killed" => {
             writeln!(out, "\x1b[31m  \u{274c} Task {}\x1b[0m", status)?;
         }
         status if !status.is_empty() => {
