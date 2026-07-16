@@ -239,6 +239,8 @@ timezone = "Asia/Tokyo"
 
 **Claude auto-injected flags**: When the executable is `claude`, the following flags are enforced: `-p`, `--verbose`, `--output-format stream-json`, `--include-partial-messages`, and `--disallowedTools=AskUserQuestion`. Missing flags are appended automatically, an existing `--output-format` value is normalized to `stream-json` (including `--output-format=...` form), and an existing `--disallowedTools` / `--disallowed-tools` list is normalized and extended with `AskUserQuestion` when needed. The logging flags are required for proper log capture and progress monitoring; `AskUserQuestion` is denied so unattended token-burn jobs cannot stop on an interactive question. You do not need to include them in your config.
 
+**Claude auto-injected environment**: `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` is added to the Claude process environment by default. Without it, `claude -p` waits at most 600s for background tasks (backgrounded subagents / workflows) after the main turn ends, then kills them ("Background tasks still running after 600s; terminating.") and reports success even though the work never finished. `0` waits indefinitely so background agents can complete and re-drive the main loop. Set the variable explicitly in the agent or profile `env` to override (an empty string unsets it, restoring Claude's default ceiling).
+
 `reset_weekday` accepts: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday` (or short forms: `mon` `tue` `wed` `thu` `fri` `sat` `sun`)
 
 ### ai-usage integration (optional)

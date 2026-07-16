@@ -2557,6 +2557,51 @@ mod tests {
     }
 
     #[test]
+    fn ensure_required_flags_injects_bg_wait_env_for_claude() {
+        let mut agent = make_agent(vec!["claude"]);
+        ensure_required_flags(&mut agent);
+        assert_eq!(
+            agent.env.get(CLAUDE_PRINT_BG_WAIT_ENV).map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn ensure_required_flags_respects_user_bg_wait_env() {
+        let mut agent = make_agent(vec!["claude"]);
+        agent
+            .env
+            .insert(CLAUDE_PRINT_BG_WAIT_ENV.to_string(), "600000".to_string());
+        ensure_required_flags(&mut agent);
+        assert_eq!(
+            agent.env.get(CLAUDE_PRINT_BG_WAIT_ENV).map(String::as_str),
+            Some("600000")
+        );
+
+        // 空文字（= unset 指定）も上書きしない。env -u で claude 既定に戻せる余地を残す。
+        let mut agent = make_agent(vec!["claude"]);
+        agent
+            .env
+            .insert(CLAUDE_PRINT_BG_WAIT_ENV.to_string(), String::new());
+        ensure_required_flags(&mut agent);
+        assert_eq!(
+            agent.env.get(CLAUDE_PRINT_BG_WAIT_ENV).map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn ensure_required_flags_does_not_inject_bg_wait_env_for_codex() {
+        let mut agent = RuntimeAgent {
+            name: "codex".to_string(),
+            command: vec!["codex".to_string(), "exec".to_string()],
+            ..Default::default()
+        };
+        ensure_required_flags(&mut agent);
+        assert!(!agent.env.contains_key(CLAUDE_PRINT_BG_WAIT_ENV));
+    }
+
+    #[test]
     fn ensure_required_flags_skips_existing_flags() {
         let mut agent = make_agent(vec![
             "claude",
@@ -2725,6 +2770,39 @@ mod tests {
             plan.agent
                 .command
                 .contains(&"--disallowedTools=AskUserQuestion".to_string())
+        );
+    }
+
+    #[test]
+    fn build_plan_usage_gate_env_excludes_injected_bg_wait() {
+        let mut agent = make_agent(vec!["claude", "-p"]);
+        agent.ai_usage = Some(crate::config::RuntimeAiUsage {
+            profile: "Work".to_string(),
+            provider: "claude".to_string(),
+        });
+        agent.env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/home/u/.claude".to_string(),
+        );
+        let plan = build_plan(
+            &agent,
+            vec![],
+            Some(vec!["ai-usage".to_string(), "--json".to_string()]),
+        );
+        let gate = plan.usage_gate.expect("usage_gate should be set");
+        // ユーザー設定の env は usage-gate に引き継ぐが、claude 専用の注入 env は含めない
+        assert_eq!(
+            gate.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("/home/u/.claude")
+        );
+        assert!(!gate.env.contains_key(CLAUDE_PRINT_BG_WAIT_ENV));
+        // タスク実行側の env には注入済み
+        assert_eq!(
+            plan.agent
+                .env
+                .get(CLAUDE_PRINT_BG_WAIT_ENV)
+                .map(String::as_str),
+            Some("0")
         );
     }
 

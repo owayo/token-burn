@@ -66,7 +66,7 @@ make release  # リリースビルド
 
 `[[agents]]` の `name` は空文字不可、`command` は1要素以上必須（先頭要素は実行ファイル名）です。`reset_weekday` / `reset_time` / `timezone` は ai-usage 連携かつ fallback が `fixed` 以外のときは省略可、それ以外（ai-usage 非連携、または fallback=fixed）では必須です。`env`（環境変数マップ）のキーは `[A-Za-z_][A-Za-z0-9_]*` に制限され、値は読み込み時に `~` 展開されます。
 
-実行ファイルが `claude` の場合、`-p`、`--verbose`、`--output-format stream-json`、`--include-partial-messages`、`--disallowedTools=AskUserQuestion` は自動付与されます。`--output-format` が既存でも値は `stream-json` に正規化されます。既存の `--disallowedTools` / `--disallowed-tools` がある場合は、必要に応じて equals 形式へ正規化して `AskUserQuestion` を追記します。
+実行ファイルが `claude` の場合、`-p`、`--verbose`、`--output-format stream-json`、`--include-partial-messages`、`--disallowedTools=AskUserQuestion` は自動付与されます。`--output-format` が既存でも値は `stream-json` に正規化されます。既存の `--disallowedTools` / `--disallowed-tools` がある場合は、必要に応じて equals 形式へ正規化して `AskUserQuestion` を追記します。さらに env に `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` をデフォルト注入します。`claude -p` はメインターン終了後にバックグラウンドタスク（background 起動のサブエージェント / Workflow）を既定 600 秒しか待たず強制終了し、未完のまま `is_error:false` で成功終了してしまうため、無期限待機に切り替えて完走させます。agent / profile の `env` に同キーが明示されていれば尊重します（空文字なら unset）。この注入はタスク実行コマンドだけに効かせ、usage-gate / monitor statusline に渡す env スナップショットには含めません。
 
 実行ファイルが `codex` の場合、無人実行で承認待ちにより停止しないよう `-c approval_policy=never` を実行ファイル直後に自動付与します（`codex -c approval_policy=never exec ...`）。`codex exec` には `--ask-for-approval` フラグが無い（0.136.0）ため、サブコマンドのオプション表面に依存しない top-level の config override として挿入します。`--sandbox`（サンドボックス）とは独立した軸のため、サンドボックス指定の有無に関わらず付与します。ユーザーが承認方針を明示済みの場合（`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）は上書きしません。
 

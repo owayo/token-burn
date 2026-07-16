@@ -237,6 +237,8 @@ timezone = "Asia/Tokyo"
 
 **Claude 必須フラグの自動付与**: コマンドの実行ファイルが `claude` の場合、ログ出力と進捗モニタリングに必要な `-p`、`--verbose`、`--output-format stream-json`、`--include-partial-messages` と、対話回答待ちを防ぐ `--disallowedTools=AskUserQuestion` が必ず有効化されます。未指定フラグは自動追加され、既存の `--output-format` 値（`--output-format=...` 形式を含む）は `stream-json` に正規化されます。既存の `--disallowedTools` / `--disallowed-tools` がある場合は、必要に応じて equals 形式へ正規化して `AskUserQuestion` を追記します。設定ファイルへの記述は不要です。
 
+**Claude 環境変数の自動付与**: Claude プロセスの環境にはデフォルトで `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` が追加されます。これが無いと `claude -p` はメインターン終了後にバックグラウンドタスク（background 起動のサブエージェント / ワークフロー）を最大 600 秒しか待たず、"Background tasks still running after 600s; terminating." と共に全タスクを強制終了し、仕事が未完のまま成功として報告されます。`0` は無期限待機を意味し、バックグラウンドエージェントの完了通知でメインループが再開して完走できるようになります。agent / profile の `env` で明示すれば上書きできます（空文字を指定すると unset され、Claude 既定の 600 秒に戻ります）。
+
 `reset_weekday` に指定可能な値: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday`（短縮形: `mon` `tue` `wed` `thu` `fri` `sat` `sun`）
 
 ### ai-usage 連携（任意）
