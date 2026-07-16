@@ -8,6 +8,13 @@ use crate::display;
 use crate::scanner::{ResolvedTarget, Visibility};
 
 const CLAUDE_BLOCKED_INTERACTIVE_TOOL: &str = "AskUserQuestion";
+/// `claude -p` はメインターン終了後にバックグラウンドタスク（Agent
+/// run_in_background / Workflow 等）が残っていると、既定 600 秒で
+/// "Background tasks still running after 600s; terminating." を出して全タスクを
+/// 強制終了し、仕事が未完のまま `is_error:false` の result で正常終了してしまう。
+/// 無期限待機（=0）に切り替えて、サブエージェントの完了通知でメインループが
+/// 再開し実際に完走できるようにする。agent/profile の env で明示済みなら尊重する。
+const CLAUDE_PRINT_BG_WAIT_ENV: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
 /// codex を無人実行する際、コマンド承認待ちで停止しないための config override。
 /// `codex exec` には `--ask-for-approval` フラグが無い（0.136.0）ため、サブコマンドの
 /// オプション表面に依存しない top-level の `-c approval_policy=never` を使う。
@@ -47,6 +54,11 @@ pub fn build_plan(
     ai_usage_command: Option<Vec<String>>,
 ) -> ExecutionPlan {
     let mut agent = agent.clone();
+    // usage-gate / monitor statusline に渡す env は、ユーザーが設定した実行文脈
+    // （CLAUDE_CONFIG_DIR 等）のスナップショット。ensure_required_flags が注入する
+    // claude 専用のデフォルト env（CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS）を
+    // ai-usage 起動にまで持ち込まないよう、注入前に取得する。
+    let gate_env = agent.env.clone();
     ensure_required_flags(&mut agent);
     // ai-usage 連携 agent かつグローバルで ai-usage が有効なときだけゲートを設定する。
     let usage_gate = match (agent.ai_usage.as_ref(), ai_usage_command) {
@@ -54,7 +66,7 @@ pub fn build_plan(
             profile: rt.profile.clone(),
             provider: rt.provider.clone(),
             command,
-            env: agent.env.clone(),
+            env: gate_env,
         }),
         _ => None,
     };
@@ -213,7 +225,13 @@ fn ensure_required_flags(agent: &mut RuntimeAgent) {
 /// `--include-partial-messages` はログ取得に必須であり、常に存在しなければならない。
 /// また、token-burn は無人実行のため、
 /// ユーザー回答待ちで停止する `AskUserQuestion` を禁止する。
+/// さらにバックグラウンドタスクの 600 秒強制終了を無効化する env を注入する
+/// （[`CLAUDE_PRINT_BG_WAIT_ENV`] のドキュメント参照）。
 fn ensure_claude_required_flags(agent: &mut RuntimeAgent) {
+    agent
+        .env
+        .entry(CLAUDE_PRINT_BG_WAIT_ENV.to_string())
+        .or_insert_with(|| "0".to_string());
     let needs_print = !agent.command.iter().any(|s| s == "-p" || s == "--print");
     let needs_verbose = !agent.command.iter().any(|s| s == "--verbose");
     let needs_partial = !agent
