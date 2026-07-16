@@ -14,7 +14,11 @@ token-burn/
 │   ├── scanner.rs          # ディレクトリスキャン・リポジトリ探索・gh CLI連携
 │   ├── schedule.rs         # 固定リセット計算（曜日ベース）・AgentSchedule/ScheduleSource
 │   ├── usage.rs            # ai-usage --json 連携・ScheduleResolver（スケジュール解決・最寄り選択）
-│   ├── executor.rs         # プロセス起動・並列実行管理（tokio）
+│   ├── executor/           # プロセス起動・並列実行管理（tokio、モジュール分割）
+│   │   ├── mod.rs          # ExecutionPlan / build_plan / print_plan / execute_plan_tmux / ai-usage 同期起動
+│   │   ├── flags.rs        # claude/codex 判定と必須フラグ・env（CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS 等）の自動注入
+│   │   ├── scripts.rs      # tmux 用シェルスクリプト生成（task/worker/monitor/statusline、shell_escape/env 前置き）
+│   │   └── util.rs         # sanitize_filename / task_log_base / strip_ansi / truncate
 │   ├── format_stream/      # claude stream-json出力のフォーマッター（モジュール分割）
 │   │   ├── mod.rs          # pub run / process（JSON行のトップレベル dispatch）
 │   │   ├── state.rs        # StreamState / StreamSummary / UsageSummary
@@ -191,8 +195,8 @@ remote URL の owner / repo 抽出は末尾 2 セグメントを採用するた�
 - リセット時刻が DST（夏時間）遷移に重なる場合も `resolve_local_datetime` (`schedule.rs`) で解決します。曖昧な時刻（秋の繰り戻しで 2 回出現する時刻）は早い方を採用し、存在しない時刻（春の繰り上げでスキップされる時刻）は遷移直後の最初の有効な瞬間にフォールバックします。`from_local_datetime().earliest()` は存在しない時刻に対して `None` を返すため、`America/New_York` の `02:30` のように DST ギャップへ重なるリセット時刻だと、設定読み込みは成功するのに `status` / `run` が実行時に毎回失敗していました。これを防ぐ実装です。
 - 状態ファイル (`state.json`) の書き込みは「同一ディレクトリのテンポラリファイル (`.state.json.tmp.<PID>.<nanos>`) に書き出し → `rename` で本体に置き換える」 atomic rename パターンで行います。排他ロックは `state.json` 本体ではなく sidecar の `.state.json.lock` に取ります。本体をロックすると `rename` 後にロック対象 inode が古くなり、別ワーカーが新しい `state.json` を同時ロックできて更新を失うためです。`write_all` 途中の ENOSPC やプロセスクラッシュでも本体が壊れず、書き込み失敗時はテンポラリファイルを掃除します（次回起動時に残骸が積み重ならない）。
 - tmux ワーカー / モニター起動前の `chmod +x` は終了コードを検証します。`output()` の戻り値だけ確認する旧実装では `chmod` が非ゼロで終了しても無視されてしまい、`permission denied` が tmux ペイン内で初めて顕在化していました。
-- 起動時キャッシュ初期化で ai-usage を同期起動する `spawn_ai_usage_sync_with_timeout` (`executor.rs`) は、子プロセスの stdout/stderr を**別スレッドで並行に drain** します。子の終了を待ってからまとめて読む実装では、出力がパイプバッファ（macOS では 16KB 程度）を超えたとき子の `write(2)` がブロックして終了できず、`try_wait` が永遠に `None` を返してタイムアウトまでハングするデッドロックに陥ります（大きな JSON や stderr へのログ出力で発生）。読み取りを終了監視から分離することでこれを防ぎます。
+- 起動時キャッシュ初期化で ai-usage を同期起動する `spawn_ai_usage_sync_with_timeout` (`executor/mod.rs`) は、子プロセスの stdout/stderr を**別スレッドで並行に drain** します。子の終了を待ってからまとめて読む実装では、出力がパイプバッファ（macOS では 16KB 程度）を超えたとき子の `write(2)` がブロックして終了できず、`try_wait` が永遠に `None` を返してタイムアウトまでハングするデッドロックに陥ります（大きな JSON や stderr へのログ出力で発生）。読み取りを終了監視から分離することでこれを防ぎます。
 - `format-stream` の `truncate_str` は「返却文字列の char 数を `max` 以下に保つ」契約を満たします。省略記号 `"..."` を付ける余地が無い `max <= 3` の場合は先頭から `max` 文字までで切り詰めます（実コードの呼び出しサイトは最小でも 30 程度のため、契約強化に伴う表示変更はありません）。
 - レポートディレクトリのクリーンアップ (`cleanup.rs`) はシンボリックリンクをスキップします。`Path::is_dir()` はリンクを追跡するため、リンク先のディレクトリを誤って削除しないよう `is_symlink()` で除外します。
 - モニタースクリプトのエラーマーカー走査は `while IFS= read -r ... < <(find ...)` 方式を使用しており、`TMPDIR` のパスに空白が含まれる環境でもワードスプリットが発生しません。エラー内容の表示は `printf '%s'` 経由で行い、ファイル内容を `echo` のダブルクォート内で再解釈しないようにしています。
-- デタッチ実行後のログを整形する `strip_ansi` (`executor.rs`) は、charset designation エスケープ（`\x1b(B` = G0 を ASCII 集合に指定、`\x1b(0` = DEC 罫線集合等）を introducer（`( ) * + - . /`）＋終端バイトの 3 バイトとして扱い両方を除去します。introducer だけをスキップする実装では終端バイト（`\x1b(B` の `B` 等）が通常文字としてログに漏れます。その他の 2 バイトエスケープ（`\x1b=` / `\x1b>` / `\x1bM` 等）は従来どおり ESC ＋ 1 文字だけスキップします。
+- デタッチ実行後のログを整形する `strip_ansi` (`executor/util.rs`) は、charset designation エスケープ（`\x1b(B` = G0 を ASCII 集合に指定、`\x1b(0` = DEC 罫線集合等）を introducer（`( ) * + - . /`）＋終端バイトの 3 バイトとして扱い両方を除去します。introducer だけをスキップする実装では終端バイト（`\x1b(B` の `B` 等）が通常文字としてログに漏れます。その他の 2 バイトエスケープ（`\x1b=` / `\x1b>` / `\x1bM` 等）は従来どおり ESC ＋ 1 文字だけスキップします。
