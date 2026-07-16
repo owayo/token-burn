@@ -20,7 +20,7 @@ use result::handle_result;
 use state::{StreamState, StreamSummary};
 use stream::handle_stream_event;
 use system::handle_system_event;
-use tools::metadata::tool_result_metadata;
+use tools::metadata::{tool_result_metadata, tool_result_string_summary};
 use util::extract_tool_result_summary;
 
 /// `claude -p` の stream-json 出力を読みやすいテキストに変換する。
@@ -105,7 +105,17 @@ fn process(
                             let id = item["tool_use_id"].as_str().unwrap_or("");
                             let name = tool_id_map.get(id).map(|s| s.as_str()).unwrap_or("?");
                             let is_error = item["is_error"].as_bool().unwrap_or(false);
-                            let metadata = tool_result_metadata(&v["tool_use_result"]);
+                            let mut metadata = tool_result_metadata(&v["tool_use_result"]);
+                            // tool_use_result が文字列の応答（MCP ツール等）には object
+                            // メタデータが無い。エラー時は content 側のサマリーと同文に
+                            // なるため、成功時のみ result: として先頭行を補足する。
+                            if metadata.is_empty()
+                                && !is_error
+                                && let Some(text_summary) =
+                                    tool_result_string_summary(&v["tool_use_result"])
+                            {
+                                metadata = text_summary;
+                            }
                             let metadata = if metadata.is_empty() {
                                 String::new()
                             } else {

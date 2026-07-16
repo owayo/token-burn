@@ -63,3 +63,22 @@ fn hook_started_is_ignored() {
     let out = render(r#"{"type":"system","subtype":"hook_started","hook_name":"PostToolUse"}"#);
     assert!(out.is_empty(), "hook_started は無視されるはず: {out:?}");
 }
+
+#[test]
+fn api_retry_with_error_shows_error_text() {
+    let out = render(
+        r#"{"type":"system","subtype":"api_retry","attempt":2,"max_retries":10,"error":"Overloaded","error_status":529}"#,
+    );
+    assert!(out.contains("API retry 2/10: Overloaded (529)"), "{out:?}");
+}
+
+#[test]
+fn api_retry_without_error_omits_unknown_placeholder() {
+    // 実データには error フィールドの無い api_retry がある。
+    // 旧実装は "API retry 1/10: unknown" と表示し、"unknown" が
+    // エラー名のように見えていた（実ログで確認）。
+    let out = render(r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10}"#);
+    assert!(out.contains("API retry 1/10"), "{out:?}");
+    assert!(!out.contains("unknown"), "{out:?}");
+    assert!(!out.contains("1/10:"), "{out:?}");
+}

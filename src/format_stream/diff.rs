@@ -19,28 +19,22 @@ pub(crate) fn format_tool_diff(tool_name: &str, input_json: &str) -> Option<Stri
     }
 }
 
-/// 新旧テキスト間のカラー差分を生成する。
-/// 共通のプレフィックス/サフィックス行を検出し、変更部分のみ表示する。
-pub(crate) fn format_diff_lines(old: &str, new: &str) -> String {
-    let old_lines: Vec<&str> = if old.is_empty() {
+/// 空文字列を 0 行として扱う行分割（`"".lines()` は 0 要素だが意図を明示する）。
+fn split_lines(s: &str) -> Vec<&str> {
+    if s.is_empty() {
         Vec::new()
     } else {
-        old.lines().collect()
-    };
-    let new_lines: Vec<&str> = if new.is_empty() {
-        Vec::new()
-    } else {
-        new.lines().collect()
-    };
+        s.lines().collect()
+    }
+}
 
-    // 共通プレフィックス行を検出
+/// 共通プレフィックス行数と、それ以降の共通サフィックス行数を返す。
+fn common_affix_lens(old_lines: &[&str], new_lines: &[&str]) -> (usize, usize) {
     let prefix_len = old_lines
         .iter()
         .zip(new_lines.iter())
         .take_while(|(a, b)| a == b)
         .count();
-
-    // 共通サフィックス行を検出（プレフィックス以降）
     let old_rest = &old_lines[prefix_len..];
     let new_rest = &new_lines[prefix_len..];
     let suffix_len = old_rest
@@ -49,6 +43,28 @@ pub(crate) fn format_diff_lines(old: &str, new: &str) -> String {
         .zip(new_rest.iter().rev())
         .take_while(|(a, b)| a == b)
         .count();
+    (prefix_len, suffix_len)
+}
+
+/// 共通プレフィックス/サフィックスを除いた実変更行数を (追加, 削除) で返す。
+/// `format_diff_lines` が表示する `+` / `-` 行数と常に一致する。
+/// 行数差分（new - old）ではないため、同一行数の in-place 置換でも
+/// `(+1/-1)` のように実変更が表れる。
+pub(crate) fn changed_line_counts(old: &str, new: &str) -> (usize, usize) {
+    let old_lines = split_lines(old);
+    let new_lines = split_lines(new);
+    let (prefix_len, suffix_len) = common_affix_lens(&old_lines, &new_lines);
+    let added = new_lines.len() - prefix_len - suffix_len;
+    let removed = old_lines.len() - prefix_len - suffix_len;
+    (added, removed)
+}
+
+/// 新旧テキスト間のカラー差分を生成する。
+/// 共通のプレフィックス/サフィックス行を検出し、変更部分のみ表示する。
+pub(crate) fn format_diff_lines(old: &str, new: &str) -> String {
+    let old_lines = split_lines(old);
+    let new_lines = split_lines(new);
+    let (prefix_len, suffix_len) = common_affix_lens(&old_lines, &new_lines);
 
     let old_changed = &old_lines[prefix_len..old_lines.len() - suffix_len];
     let new_changed = &new_lines[prefix_len..new_lines.len() - suffix_len];

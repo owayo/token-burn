@@ -130,6 +130,9 @@ fn format_view_range(value: &serde_json::Value) -> Option<String> {
 
 /// Edit: ファイルパスと差分行数(+追加/-削除)、replace_all を表示。
 /// `file_path` が無い不完全な入力では空表示を避けて汎用フォールバックへ委ねる。
+/// 行数は行数差分（new - old）ではなく、共通プレフィックス/サフィックス除去後の
+/// 実変更行数を数える。行数差分だと同一行数の in-place 置換が `(+0/-0)` になり、
+/// 直下に実 diff が出ているのに「変更なし」に見えてしまう（実ログで確認）。
 fn detail_edit(v: &serde_json::Value) -> DetailResult {
     let file = v["file_path"].as_str().unwrap_or("");
     let old = first_string(v, &["old_string", "old_str"]);
@@ -137,10 +140,7 @@ fn detail_edit(v: &serde_json::Value) -> DetailResult {
     if file.is_empty() {
         return DetailResult::Fallback;
     }
-    let old_lines = old.lines().count();
-    let new_lines = new.lines().count();
-    let added = new_lines.saturating_sub(old_lines);
-    let removed = old_lines.saturating_sub(new_lines);
+    let (added, removed) = crate::format_stream::diff::changed_line_counts(old, new);
     let mut attrs = vec![format!("+{added}/-{removed}")];
     if v["replace_all"].as_bool() == Some(true) {
         attrs.push("replace_all".to_string());

@@ -6,6 +6,16 @@ use crate::format_stream::util::{
     format_number, truncate_inline,
 };
 
+/// `tool_use_result` が object でなく文字列だった場合の要約（先頭の有意な 1 行、80 文字まで）。
+/// 実データでは MCP ツール応答等が文字列で入る（例: "initialize OK, protocol: 2025-06-18"）。
+/// エラー文字列は content 側のサマリー（extract_tool_result_summary）と同文になり
+/// 重複するため、呼び出し側は成功時に限って使う。
+pub(crate) fn tool_result_string_summary(result: &serde_json::Value) -> Option<String> {
+    let text = result.as_str()?;
+    let first_line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    Some(format!("result:{}", truncate_inline(first_line, 80)))
+}
+
 /// `tool_use_result` の補足情報から、見落とすと判断材料を失うものだけ短く表示する。
 pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     let Some(obj) = result.as_object() else {

@@ -2,7 +2,7 @@
 //! 共有ヘルパー（ANSI 除去・`process` 実行ラッパー）と、各サブモジュールが
 //! `use super::*` で参照する import プレリュードをここに集約する。
 
-use super::diff::{format_diff_lines, format_tool_diff};
+use super::diff::{changed_line_counts, format_diff_lines, format_tool_diff};
 use super::rate_limit::format_resets_at;
 use super::state::UsageSummary;
 use super::tools::detail::extract_tool_detail;

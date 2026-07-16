@@ -215,3 +215,36 @@ fn process_edit_pure_deletion_shows_diff() {
         clean
     );
 }
+
+#[test]
+fn changed_line_counts_pure_addition_and_removal() {
+    assert_eq!(changed_line_counts("a\nb", "a\nb\nc\nd"), (2, 0));
+    assert_eq!(changed_line_counts("a\nb\nc", "a"), (0, 2));
+    assert_eq!(changed_line_counts("", "x\ny"), (2, 0));
+    assert_eq!(changed_line_counts("x\ny", ""), (0, 2));
+}
+
+#[test]
+fn changed_line_counts_inplace_replacement_is_not_zero() {
+    // 行数差分方式では (0, 0) になっていた同一行数の置換
+    assert_eq!(changed_line_counts("a", "b"), (1, 1));
+    assert_eq!(changed_line_counts("a\nb\nc", "a\nX\nc"), (1, 1));
+}
+
+#[test]
+fn changed_line_counts_identical_is_zero() {
+    assert_eq!(changed_line_counts("a\nb", "a\nb"), (0, 0));
+    assert_eq!(changed_line_counts("", ""), (0, 0));
+}
+
+#[test]
+fn changed_line_counts_matches_rendered_diff() {
+    // ヘッダーの +N/-M は format_diff_lines が実際に表示する +/- 行数と一致する。
+    let old = "fn a() {}\nfn b() {}\nfn c() {}";
+    let new = "fn a() {}\nfn bb() {}\nfn cc() {}\nfn d() {}";
+    let (added, removed) = changed_line_counts(old, new);
+    let rendered = format_diff_lines(old, new);
+    let plus = rendered.lines().filter(|l| l.contains("  + ")).count();
+    let minus = rendered.lines().filter(|l| l.contains("  - ")).count();
+    assert_eq!((added, removed), (plus, minus), "rendered:\n{rendered}");
+}

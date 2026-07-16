@@ -244,8 +244,17 @@ fn extract_tool_detail_edit_shows_replace_all() {
     let input =
         r#"{"file_path":"/src/main.rs","old_string":"a","new_string":"b","replace_all":true}"#;
     let result = extract_tool_detail("Edit", input);
-    assert!(result.contains("+0/-0"), "got: {result}");
+    assert!(result.contains("+1/-1"), "got: {result}");
     assert!(result.contains("replace_all"), "got: {result}");
+}
+
+#[test]
+fn extract_tool_detail_edit_inplace_replacement_counts_changed_lines() {
+    // 同一行数の in-place 置換。行数差分方式では (+0/-0) となり「変更なし」に
+    // 見えていた実ログの再発防止（表示 diff の -/+ 行数と一致させる）。
+    let input = r#"{"file_path":"/docs/AGENTS.md","old_string":"a\nb\nc","new_string":"a\nX\nc"}"#;
+    let result = extract_tool_detail("Edit", input);
+    assert!(result.contains("(+1/-1)"), "got: {result}");
 }
 
 #[test]

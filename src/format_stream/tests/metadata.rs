@@ -859,3 +859,53 @@ fn tool_result_metadata_shows_workflow_name() {
     // runId は内部識別子のため表示しない。
     assert!(!metadata.contains("wf_a821ec7d"), "{metadata}");
 }
+
+#[test]
+fn tool_result_string_summary_returns_first_meaningful_line() {
+    // 実データ例: MCP ツール応答が文字列で入るケース
+    let value = serde_json::json!("initialize OK, protocol: 2025-06-18");
+    assert_eq!(
+        tool_result_string_summary(&value).as_deref(),
+        Some("result:initialize OK, protocol: 2025-06-18")
+    );
+    // 先頭の空行はスキップして有意な行を採用する
+    let value = serde_json::json!("\n  \n  second line here\nrest");
+    assert_eq!(
+        tool_result_string_summary(&value).as_deref(),
+        Some("result:second line here")
+    );
+    // 空文字列・object は対象外
+    assert_eq!(tool_result_string_summary(&serde_json::json!("")), None);
+    assert_eq!(
+        tool_result_string_summary(&serde_json::json!({"stdout":"x"})),
+        None
+    );
+}
+
+#[test]
+fn process_string_tool_use_result_shown_on_success_only() {
+    // 成功時: 文字列 tool_use_result を result: として補足表示する
+    let input = [
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t_mcp","name":"mcp__probe__init","input":{}}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t_mcp","type":"tool_result","content":"initialize OK, protocol: 2025-06-18"}]},"tool_use_result":"initialize OK, protocol: 2025-06-18"}"#,
+    ]
+    .join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert!(
+        clean.contains("[result:initialize OK, protocol: 2025-06-18]"),
+        "{clean}"
+    );
+
+    // エラー時: content 側サマリーと同文になるため補足しない（重複防止）
+    let input = [
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t_e","name":"Write","input":{}}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t_e","type":"tool_result","is_error":true,"content":"Error: File has not been read yet. Read it first before writing to it."}]},"tool_use_result":"Error: File has not been read yet. Read it first before writing to it."}"#,
+    ]
+    .join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert!(
+        clean.contains("Error: File has not been read yet"),
+        "{clean}"
+    );
+    assert!(!clean.contains("[result:"), "{clean}");
+}

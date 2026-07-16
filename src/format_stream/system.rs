@@ -178,16 +178,26 @@ fn write_notification(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
 fn write_api_retry(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
     let attempt = v["attempt"].as_u64().unwrap_or(0);
     let max_retries = v["max_retries"].as_u64().unwrap_or(0);
-    let error = v["error"].as_str().unwrap_or("unknown");
+    let error = v["error"].as_str().unwrap_or("");
     let status = v["error_status"]
         .as_u64()
         .map(|s| format!(" ({})", s))
         .unwrap_or_default();
-    writeln!(
-        out,
-        "\x1b[33m  \u{26a0} API retry {}/{}: {}{}\x1b[0m",
-        attempt, max_retries, error, status
-    )?;
+    // 実データには error フィールドの無い api_retry がある。"unknown" を補うと
+    // それ自体がエラー名のように見えて紛らわしいため、試行回数と status だけ出す。
+    if error.is_empty() || error == "unknown" {
+        writeln!(
+            out,
+            "\x1b[33m  \u{26a0} API retry {}/{}{}\x1b[0m",
+            attempt, max_retries, status
+        )?;
+    } else {
+        writeln!(
+            out,
+            "\x1b[33m  \u{26a0} API retry {}/{}: {}{}\x1b[0m",
+            attempt, max_retries, error, status
+        )?;
+    }
     Ok(())
 }
 
