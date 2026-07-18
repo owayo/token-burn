@@ -23,6 +23,23 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     };
 
     let mut attrs = Vec::new();
+    append_outcome_metadata(obj, &mut attrs);
+    append_git_and_count_metadata(obj, &mut attrs);
+    append_file_metadata(obj, &mut attrs);
+    append_search_metadata(obj, &mut attrs);
+    append_status_metadata(obj, &mut attrs);
+    append_agent_metadata(obj, &mut attrs);
+    append_task_metadata(result, obj, &mut attrs);
+    append_runtime_metadata(obj, &mut attrs);
+    append_background_metadata(obj, &mut attrs);
+
+    attrs.join(", ")
+}
+
+fn append_outcome_metadata(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    attrs: &mut Vec<String>,
+) {
     if obj
         .get("truncated")
         .and_then(|value| value.as_bool())
@@ -86,6 +103,12 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     {
         attrs.push(format!("stderr:{stderr}"));
     }
+}
+
+fn append_git_and_count_metadata(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    attrs: &mut Vec<String>,
+) {
     // Bash 経由の git commit など、git 操作が完了した事実は進捗上の重要なマイルストーン。
     // sha は短縮済み(7桁)、kind は committed / amended 等。
     if let Some(commit) = obj
@@ -118,6 +141,9 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     if let Some(lines) = obj.get("numLines").and_then(|value| value.as_u64()) {
         attrs.push(format!("lines:{lines}"));
     }
+}
+
+fn append_file_metadata(obj: &serde_json::Map<String, serde_json::Value>, attrs: &mut Vec<String>) {
     // Edit/Write 系の実データでは top-level に filePath と structuredPatch が入る。
     // originalFile / oldString / newString は巨大になり得るため、完了行にはファイル名と
     // patch 規模だけを出して、どの編集が完了したかを短く追跡できるようにする。
@@ -157,6 +183,12 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
             attrs.push("truncated:token-cap".to_string());
         }
     }
+}
+
+fn append_search_metadata(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    attrs: &mut Vec<String>,
+) {
     if let Some(matches) = obj.get("matches").and_then(|value| value.as_array()) {
         // ToolSearch は matches 配列で結果を返す
         attrs.push(format!("matches:{}", matches.len()));
@@ -245,6 +277,12 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     {
         attrs.push(format!("allowed-tools:{}", allowed.len()));
     }
+}
+
+fn append_status_metadata(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    attrs: &mut Vec<String>,
+) {
     if let Some(change) = obj.get("statusChange").and_then(|value| value.as_object()) {
         let from = change
             .get("from")
@@ -273,6 +311,12 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
             attrs.push(format!("updated:{}", non_status.join(",")));
         }
     }
+}
+
+fn append_agent_metadata(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    attrs: &mut Vec<String>,
+) {
     // Agent を `run_in_background:true` で起動したときの async-launched 応答。
     // 同期実行の Agent 結果には isAsync が無いため、フィールド存在で判定する。
     // agentId はユーザがアクションに使える識別子ではないため表示しない（ノイズ回避）。
@@ -331,6 +375,13 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     if let Some(tasks) = obj.get("tasks").and_then(|value| value.as_array()) {
         attrs.push(format!("tasks:{}", tasks.len()));
     }
+}
+
+fn append_task_metadata(
+    result: &serde_json::Value,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    attrs: &mut Vec<String>,
+) {
     // 入れ子 `task` が有効な id を持つときだけ top-level の taskId/task_id を抑止する。
     // contains_key だと `task:null` / `task:{}` でも真になり、下の as_object 経由の
     // 表示も発火しないため top-level の task id を取りこぼしていた。
@@ -365,6 +416,12 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
             attrs.push(format!("task:{id}"));
         }
     }
+}
+
+fn append_runtime_metadata(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    attrs: &mut Vec<String>,
+) {
     if let Some(status) = obj
         .get("retrieval_status")
         .and_then(|value| value.as_str())
@@ -411,6 +468,12 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     {
         attrs.push(format!("stale-read:{}", truncate_inline(hint, 70)));
     }
+}
+
+fn append_background_metadata(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    attrs: &mut Vec<String>,
+) {
     if obj
         .get("assistantAutoBackgrounded")
         .and_then(|value| value.as_bool())
@@ -472,8 +535,6 @@ pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     {
         attrs.push(format!("return:{}", truncate_inline(interpretation, 50)));
     }
-
-    attrs.join(", ")
 }
 
 fn structured_patch_summary(value: Option<&serde_json::Value>) -> Option<String> {

@@ -21,6 +21,7 @@ token-burn/
 │   │   └── util.rs         # sanitize_filename / task_log_base / strip_ansi / truncate
 │   ├── format_stream/      # claude stream-json出力のフォーマッター（モジュール分割）
 │   │   ├── mod.rs          # pub run / process（JSON行のトップレベル dispatch）
+│   │   ├── assistant.rs    # assistant メッセージのモデル切替・キャッシュミス診断
 │   │   ├── state.rs        # StreamState / StreamSummary / UsageSummary
 │   │   ├── blocks.rs       # ContentBlockState・ブロック確定（finalize_block 等）
 │   │   ├── stream.rs       # handle_stream_event（content_block_* ハンドラ）
@@ -143,6 +144,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - テキスト応答のストリーミング表示
 - 思考ブロック（`thinking`）のプログレスインジケーター
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`（小文字 `bash` を含む）/`BashOutput`/`Agent`/`Task`/`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`/`TaskStop`/`TaskOutput`/`Workflow`/`TeamCreate`/`Skill`/`SlashCommand`/`TodoWrite`/`Monitor`/`Grep`/`Glob`/`ScheduleWakeup`/`WebFetch`/`WebSearch`/`ToolSearch`/`SendMessage`/`AskUserQuestion`/Context7・Tavily・Codex MCP 等）の詳細表示と差分出力
+- assistant メッセージの `fallback` コンテンツによるモデル切り替え（`from.model` → `to.model`）と、`message.diagnostics.cache_miss_reason` によるキャッシュミス理由・対象 input token 数の表示。`--include-partial-messages` が同一 message id の assistant メッセージを繰り返し出力しても、同じ診断は 1 回だけ表示する
 - `Read` の `file_path` と `offset` / `limit` / `view_range`、malformed 入力時の `__unparsedToolInput.len`、`Bash` の `timeout`（1000ms 以上は `timeout=<秒>s`、未満は `timeout=<n>ms` でミリ秒切り捨てによる "0s" 誤表示を回避。同じ整形を `Monitor` / `TaskOutput` の `timeout` でも使用）/ `run_in_background` / `dangerouslyDisableSandbox`、`BashOutput` の `bash_id`（出力取得対象の background bash。`bash:<id>` 形式）と任意の `filter`、`Agent` の `run_in_background` を表示
 - `Agent` の任意 `model` / `isolation` を指定時だけ `model:<...>` / `isolation:<...>` として表示
 - `Edit` は `new_string` に加えて実データで確認された `new_str` 入力も差分表示に使用し、`replace_all` が true の場合は一括置換として表示する。詳細行の `(+追加/-削除)` は行数差分（new − old）ではなく、共通プレフィックス/サフィックス除去後の実変更行数（表示 diff の `+` / `-` 行数と常に一致）。行数差分だと同一行数の in-place 置換が `(+0/-0)` になり「変更なし」に見える（実ログで確認）
@@ -193,7 +195,7 @@ remote URL の owner / repo 抽出は末尾 2 セグメントを採用するた�
 
 - リセット日時計算 (`schedule.rs`) は `naive_local()` をベースに行います。`DateTime::date_naive()` は UTC 日付を返すため、`weekday()` のローカル曜日と整合させるためにローカルタイムゾーンの日付を基準とします。Asia/Tokyo のような UTC+N のタイムゾーンで深夜帯（UTC 前日）に実行しても曜日がずれない設計です。
 - リセット時刻が DST（夏時間）遷移に重なる場合も `resolve_local_datetime` (`schedule.rs`) で解決します。曖昧な時刻（秋の繰り戻しで 2 回出現する時刻）は早い方を採用し、存在しない時刻（春の繰り上げでスキップされる時刻）は遷移直後の最初の有効な瞬間にフォールバックします。`from_local_datetime().earliest()` は存在しない時刻に対して `None` を返すため、`America/New_York` の `02:30` のように DST ギャップへ重なるリセット時刻だと、設定読み込みは成功するのに `status` / `run` が実行時に毎回失敗していました。これを防ぐ実装です。
-- 状態ファイル (`state.json`) の書き込みは「同一ディレクトリのテンポラリファイル (`.state.json.tmp.<PID>.<nanos>`) に書き出し → `rename` で本体に置き換える」 atomic rename パターンで行います。排他ロックは `state.json` 本体ではなく sidecar の `.state.json.lock` に取ります。本体をロックすると `rename` 後にロック対象 inode が古くなり、別ワーカーが新しい `state.json` を同時ロックできて更新を失うためです。`write_all` 途中の ENOSPC やプロセスクラッシュでも本体が壊れず、書き込み失敗時はテンポラリファイルを掃除します（次回起動時に残骸が積み重ならない）。
+- 状態ファイル (`state.json`) の書き込みは「同一ディレクトリのテンポラリファイル (`.state.json.tmp.<PID>.<nanos>`) に書き出し → `rename` で本体に置き換える」 atomic rename パターンで行います。排他ロックは `state.json` 本体ではなく sidecar の `.state.json.lock` に取ります。本体をロックすると `rename` 後にロック対象 inode が古くなり、別ワーカーが新しい `state.json` を同時ロックできて更新を失うためです。`write_all` 途中の ENOSPC やプロセスクラッシュでも本体が壊れず、書き込み失敗時はテンポラリファイルを掃除します（次回起動時に残骸が積み重ならない）。ロック取得後に既存の JSON が壊れていた場合は、空状態として上書きせず更新をエラーで中断し、原本と処理済み履歴を保全します。
 - tmux ワーカー / モニター起動前の `chmod +x` は終了コードを検証します。`output()` の戻り値だけ確認する旧実装では `chmod` が非ゼロで終了しても無視されてしまい、`permission denied` が tmux ペイン内で初めて顕在化していました。
 - 起動時キャッシュ初期化で ai-usage を同期起動する `spawn_ai_usage_sync_with_timeout` (`executor/mod.rs`) は、子プロセスの stdout/stderr を**別スレッドで並行に drain** します。子の終了を待ってからまとめて読む実装では、出力がパイプバッファ（macOS では 16KB 程度）を超えたとき子の `write(2)` がブロックして終了できず、`try_wait` が永遠に `None` を返してタイムアウトまでハングするデッドロックに陥ります（大きな JSON や stderr へのログ出力で発生）。読み取りを終了監視から分離することでこれを防ぎます。
 - `format-stream` の `truncate_str` は「返却文字列の char 数を `max` 以下に保つ」契約を満たします。省略記号 `"..."` を付ける余地が無い `max <= 3` の場合は先頭から `max` 文字までで切り詰めます（実コードの呼び出しサイトは最小でも 30 程度のため、契約強化に伴う表示変更はありません）。

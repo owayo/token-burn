@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
+mod assistant;
 mod blocks;
 mod diff;
 mod rate_limit;
@@ -14,6 +15,7 @@ pub(crate) mod system;
 mod tools;
 mod util;
 
+use assistant::handle_assistant_event;
 use blocks::{ContentBlockState, finalize_open_blocks};
 use rate_limit::handle_rate_limit_event;
 use result::handle_result;
@@ -40,6 +42,7 @@ fn process(
     threshold: u8,
 ) -> Result<()> {
     let mut tool_id_map: HashMap<String, String> = HashMap::new();
+    let mut shown_notices = std::collections::HashSet::new();
     let mut blocks: HashMap<usize, ContentBlockState> = HashMap::new();
     let mut summary = StreamSummary::default();
     let mut raw_writer = match raw_output {
@@ -85,17 +88,7 @@ fn process(
                 )?;
             }
             "assistant" => {
-                // assistant メッセージから tool_use ID を抽出（サブエージェントのツール結果に必要）
-                if let Some(content) = v["message"]["content"].as_array() {
-                    for item in content {
-                        if matches!(item["type"].as_str(), Some("tool_use" | "server_tool_use"))
-                            && let (Some(id), Some(name)) =
-                                (item["id"].as_str(), item["name"].as_str())
-                        {
-                            tool_id_map.insert(id.to_string(), name.to_string());
-                        }
-                    }
-                }
+                handle_assistant_event(&v, &mut out, &mut tool_id_map, &mut shown_notices)?;
             }
             "user" => {
                 // ツール結果 — 完了したツール名を表示

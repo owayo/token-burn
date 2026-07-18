@@ -58,7 +58,7 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **サブエージェント停止の可視化**: `task_notification` の `status="stopped"`（`TaskStop` 等で停止された場合）もモニターに表示。`usage` が無い通知では duration/token を 0 として表示しない
 - **ツールエラー要約**: `tool_result` の `is_error:true` を検出すると、エラー内容の先頭の有意な 1 行を 120 文字までに省略してモニターに併記（単一行/複数行の `<tool_use_error>` ラッパーは除去）。jsonl を開かずに失敗の原因が分かる
 - **ツール結果メタデータ**: top-level `tool_use_result` に含まれる出力切り詰め、適用 limit、stale read ヒント、Edit/Write が書き込み前にユーザによる変更を検出した場合の `user-modified` マーカー、失敗理由（`error:` / `message:`）、Bash 等の標準出力/標準エラー要約（`stdout:` / `stderr:`）、MCP/Codex の構造化応答要約（`structured:`）、Edit 結果のファイルパスと structured patch 規模（`file:<path>`、`patch:<hunks> ... +追加/-削除`、`replace_all`）、自動バックグラウンド化、待機時間の clamp、永続化出力サイズ、戻りコード解釈、Agent の duration/token/tool 数・サブエージェント種別（`agent:`）・解決モデル（`model:`）・サブエージェントの編集行数（`edits:+追加/-削除`）、Grep/ToolSearch の結果件数と mode、WebSearch の結果件数/検索回数/所要時間、WebFetch の HTTP ステータスコードと応答サイズ（`http:200 OK`、`bytes:120.2KB`）、Read の部分読み取り行数（`lines:<n>/<total>`）と token cap 切り詰め（`truncated:token-cap`）、git commit 操作（sha/kind）、タスク件数/task id/task type、TaskOutput の取得状態、読み取り可能な Agent 出力ファイル、Monitor の timeout/persistent 状態、TaskUpdate の状態遷移と status 以外の変更フィールド（`updated:<field1>,<field2>`）、async Agent 起動（`run_in_background=true` 時に `async`）、ScheduleWakeup の予定時刻、Skill のコマンド名と許可ツール件数（`allowed-tools:<n>`）、起動したワークフロー名（`workflow:<name>`）などの重要情報を表示
-- **実 stream-json の境界形式**: タスクイベントと重複する高頻度の `background_tasks_changed` スナップショットは非表示にし、Agent 起動時の任意 `model` / `isolation`、`isImage:true` の `image` マーカーを表示。`structuredPatch[].lines` は `+` / `-` で始まる全行を数え、内容自体が `++` / `--` で始まる追加・削除行も取りこぼさない
+- **実 stream-json の境界形式**: assistant レベルのモデル切り替え（`from.model` → `to.model`）と、キャッシュミス理由・対象 input token 数を表示し、partial message の繰り返しは message id 単位で重複抑止。タスクイベントと重複する高頻度の `background_tasks_changed` スナップショットは非表示にし、Agent 起動時の任意 `model` / `isolation`、`isImage:true` の `image` マーカーを表示。`structuredPatch[].lines` は `+` / `-` で始まる全行を数え、内容自体が `++` / `--` で始まる追加・削除行も取りこぼさない
 - **ログパイプラインの安全性**: `format-stream`、`tee`、raw jsonl 保存に失敗したタスクを完了扱いにせず失敗として記録
 - **モデル別使用量**: 結果サマリーにモデルごと（Opus、Haiku等）のトークン使用量・コスト・キャッシュ読み取り/書き込み・Web検索回数、そして各モデルのコンテキスト上限/最大出力上限（例: `ctx:1M` / `max_out:64K`）を表示
 - **API応答時間**: 実行時間に加えてAPI応答時間・初回トークン到達時間（`ttft`）・初回ストリームトークン到達時間（`stream:`。キュー/リトライ待ちを除いた純粋なストリーム遅延）・リクエスト送信までの所要時間（`req:<n>ms`）を表示
@@ -72,7 +72,7 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **ログ衝突回避**: タスクごとのログに連番を付け、同名リポジトリでも上書きしない
 - **プロンプトファイル**: `.md` ファイルまたはインライン文字列でプロンプトを指定可能
 - **レジューム**: 処理済みディレクトリを自動スキップ、スキップ期間を設定可能
-- **状態更新の競合対策**: 並列ワーカーが安定した sidecar lock file の下で `state.json` を atomic rename 更新
+- **状態更新の競合対策**: 並列ワーカーが安定した sidecar lock file の下で `state.json` を atomic rename 更新。既存 JSON が壊れている場合は上書きせず中断し、処理済み履歴を保全
 - **ドライラン**: コマンドを実行せずに実行計画をプレビュー
 
 ## 動作環境
@@ -196,7 +196,7 @@ skip_within = "7d"    # 任意
 
 `skip_within` と `cleanup_after` には、`d`（日）、`h`（時間）、`m`（分）、`s`（秒）を使った期間文字列を指定します。不正な値は設定ファイルの読み込み時点でエラーになります。`skip_within` を省略した場合は前回リセット以降に処理済みのターゲットをスキップします。過大な値もエラーになります。`--fresh` を指定すると保存済み状態を無視して全ターゲットを処理します。
 
-状態ファイル: `<config-dir>/state.json`（有効な設定ファイルと同じディレクトリ）。更新時は同一ディレクトリのテンポラリファイルへ書き出してから `rename` で atomic に差し替え、`.state.json.lock` のような安定した sidecar lock file で並列ワーカーを直列化します。デフォルト設定パスの場合は `~/.config/token-burn/state.json`。
+状態ファイル: `<config-dir>/state.json`（有効な設定ファイルと同じディレクトリ）。更新時は同一ディレクトリのテンポラリファイルへ書き出してから `rename` で atomic に差し替え、`.state.json.lock` のような安定した sidecar lock file で並列ワーカーを直列化します。既存ファイルが不正な JSON の場合は、空状態として置き換えず更新を失敗させ、復旧に必要な原本と処理済み履歴を保全します。デフォルト設定パスの場合は `~/.config/token-burn/state.json`。
 
 ### エージェント
 

@@ -105,7 +105,9 @@ pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) ->
         let mut state = if content.trim().is_empty() {
             State::default()
         } else {
-            serde_json::from_str(&content).unwrap_or_default()
+            serde_json::from_str(&content).map_err(|e| {
+                anyhow::anyhow!("Failed to parse existing state {}: {}", path.display(), e)
+            })?
         };
         state.mark_completed(agent_name, directory);
 
@@ -441,6 +443,24 @@ mod tests {
         mark_completed_atomic(&state_file, "agent", Path::new("/tmp/repo"))
             .expect("親ディレクトリが自動作成されるべき");
         assert!(state_file.exists());
+    }
+
+    #[test]
+    fn mark_completed_atomic_preserves_malformed_state() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let state_file = tmp.path().join("state.json");
+        let malformed = br#"{"claude":{"/tmp/repo":"broken"}"#;
+        std::fs::write(&state_file, malformed).expect("不正 JSON の準備に成功するべき");
+
+        let error = mark_completed_atomic(&state_file, "claude", Path::new("/tmp/new-repo"))
+            .expect_err("既存状態が壊れている場合は上書きせず失敗するべき");
+
+        assert!(error.to_string().contains("Failed to parse existing state"));
+        assert_eq!(
+            std::fs::read(&state_file).expect("元ファイルを読み直せるべき"),
+            malformed,
+            "壊れた既存状態を空の状態として上書きしてはならない"
+        );
     }
 
     #[test]
