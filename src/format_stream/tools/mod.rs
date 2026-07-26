@@ -2,3 +2,4 @@
 
 pub(crate) mod detail;
 pub(crate) mod metadata;
+pub(crate) mod progress;

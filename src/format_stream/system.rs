@@ -1,6 +1,6 @@
-//! `system` イベント（サブエージェント進捗・通知・完了通知・API リトライ・フック
-//! 診断）の表示を担うモジュール。`handle_system_event` は subtype ごとに `write_*`
-//! ヘルパーへディスパッチする薄い入口。
+//! `system` イベント（サブエージェント進捗・通知・完了通知・API リトライ・モデル
+//! フォールバック・フック診断）の表示を担うモジュール。`handle_system_event` は
+//! subtype ごとに `write_*` ヘルパーへディスパッチする薄い入口。
 
 use anyhow::Result;
 use std::io::Write;
@@ -17,6 +17,7 @@ pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -
         "task_updated" => write_task_updated(v, out)?,
         "notification" => write_notification(v, out)?,
         "api_retry" => write_api_retry(v, out)?,
+        "model_refusal_fallback" => write_model_refusal_fallback(v, out)?,
         "hook_progress" | "hook_response" => {
             handle_hook_output(v, out)?;
         }
@@ -35,6 +36,35 @@ pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -
         }
         _ => {} // init, hook_started 等は無視
     }
+    Ok(())
+}
+
+/// `model_refusal_fallback`: 拒否後に再試行するモデルと拒否カテゴリを表示する。
+///
+/// `content` と `api_refusal_explanation` は拒否された本文や長いポリシー説明を含むため、
+/// 出力せず、モデル名と構造化カテゴリだけを表示する。
+fn write_model_refusal_fallback(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    let original = v["original_model"].as_str().unwrap_or("");
+    let fallback = v["fallback_model"].as_str().unwrap_or("");
+    if original.is_empty() && fallback.is_empty() {
+        return Ok(());
+    }
+
+    let original = if original.is_empty() { "?" } else { original };
+    let fallback = if fallback.is_empty() { "?" } else { fallback };
+    let category = v["api_refusal_category"].as_str().unwrap_or("");
+    let category = if category.is_empty() {
+        String::new()
+    } else {
+        format!(" (category:{})", truncate_inline(category, 30))
+    };
+    writeln!(
+        out,
+        "\x1b[33m  \u{21aa} Model refusal fallback: {} \u{2192} {}{}\x1b[0m",
+        truncate_inline(original, 40),
+        truncate_inline(fallback, 40),
+        category
+    )?;
     Ok(())
 }
 

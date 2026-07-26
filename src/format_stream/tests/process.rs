@@ -77,6 +77,30 @@ fn process_non_json_passthrough() {
 }
 
 #[test]
+fn process_tool_progress_shows_elapsed_time() {
+    let input = [
+        r#"{"type":"tool_progress","tool_name":"Bash","tool_use_id":"tool_1","elapsed_time_seconds":30,"heartbeat":true}"#,
+        r#"{"type":"tool_progress","tool_name":"Bash","tool_use_id":"tool_1","elapsed_time_seconds":570,"heartbeat":true}"#,
+        r#"{"type":"tool_progress","tool_name":"Bash","tool_use_id":"tool_1","elapsed_time_seconds":3600,"heartbeat":true}"#,
+    ]
+    .join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert!(clean.contains("Bash running (30s)"));
+    assert!(clean.contains("Bash running (9m 30s)"));
+    assert!(clean.contains("Bash running (1h 0m 0s)"));
+}
+
+#[test]
+fn process_tool_progress_ignores_incomplete_events() {
+    let input = [
+        r#"{"type":"tool_progress","tool_use_id":"tool_1","elapsed_time_seconds":30}"#,
+        r#"{"type":"tool_progress","tool_name":"Bash","tool_use_id":"tool_1"}"#,
+    ]
+    .join("\n");
+    assert!(run_process(&input).is_empty());
+}
+
+#[test]
 fn process_text_then_tool_use_inserts_newline() {
     // テキストブロックが改行なしで終わった直後にツール使用が来ても、
     // 同じ行に "...します。🔧 WebFetch" のように連結されないこと。

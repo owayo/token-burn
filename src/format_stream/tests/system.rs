@@ -82,3 +82,16 @@ fn api_retry_without_error_omits_unknown_placeholder() {
     assert!(!out.contains("unknown"), "{out:?}");
     assert!(!out.contains("1/10:"), "{out:?}");
 }
+
+#[test]
+fn model_refusal_fallback_shows_models_and_category_without_content() {
+    let out = render(
+        r#"{"type":"system","subtype":"model_refusal_fallback","original_model":"claude-fable-5","fallback_model":"claude-opus-4-8","api_refusal_category":"cyber","content":"拒否された本文","api_refusal_explanation":"長い説明"}"#,
+    );
+    assert!(out.contains("Model refusal fallback"));
+    assert!(out.contains("claude-fable-5"));
+    assert!(out.contains("claude-opus-4-8"));
+    assert!(out.contains("category:cyber"));
+    assert!(!out.contains("拒否された本文"));
+    assert!(!out.contains("長い説明"));
+}

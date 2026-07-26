@@ -669,7 +669,17 @@ fn filter_by_state(
     // カットオフ時刻を決定: この時刻以降に処理済みのディレクトリをスキップ
     let cutoff = if let Some(ref skip_within) = config.settings.skip_within {
         match state::parse_duration(skip_within) {
-            Ok(dur) => Utc::now() - dur,
+            Ok(dur) => match Utc::now().checked_sub_signed(dur) {
+                Some(cutoff) => cutoff,
+                None => {
+                    eprintln!(
+                        "{}: skip_within '{}' is too large; using the previous reset",
+                        "Warning".yellow(),
+                        skip_within
+                    );
+                    sched.state_cutoff.with_timezone(&Utc)
+                }
+            },
             Err(e) => {
                 eprintln!(
                     "{}: Invalid skip_within '{}': {}",
@@ -935,6 +945,60 @@ mod tests {
         );
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].display_name, "old-repo");
+    }
+
+    #[test]
+    fn filter_by_state_with_out_of_range_skip_within_uses_schedule_cutoff() {
+        use chrono::Utc;
+
+        let agent = config::Agent {
+            name: "claude".to_string(),
+            command: vec!["echo".to_string()],
+            reset_weekday: Some("monday".to_string()),
+            reset_time: Some("09:00".to_string()),
+            timezone: Some("UTC".to_string()),
+            ..Default::default()
+        };
+        let conf = config::Config {
+            config_dir: std::path::PathBuf::from("."),
+            settings: config::Settings {
+                parallelism: 1,
+                // chrono::Duration では表現できるが、現在時刻からの減算は日時範囲を超える。
+                skip_within: Some("9223372036854775s".to_string()),
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+                rate_limit_threshold: 95,
+            },
+            prompts: config::Prompts {
+                default: "review".to_string(),
+            },
+            agents: vec![agent.clone()],
+            scan: vec![],
+            targets: vec![],
+            ai_usage: None,
+        };
+        let runtime = conf.expand_runtime_agents().expect("expand");
+        let runtime_agent = &runtime[0];
+        let sched = schedule::calculate_fixed_reset(runtime_agent).unwrap();
+        let targets = vec![scanner::ResolvedTarget {
+            directory: std::path::PathBuf::from("/tmp/processed-repo"),
+            display_name: "processed-repo".to_string(),
+            prompt: "review".to_string(),
+            visibility: scanner::Visibility::Unknown,
+            defer: false,
+        }];
+        let mut run_state = state::State::default();
+        run_state
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .insert("/tmp/processed-repo".to_string(), Utc::now());
+
+        let (kept, skipped) = filter_by_state(targets, &run_state, runtime_agent, &conf, &sched);
+
+        assert_eq!(skipped, 1, "スケジュールのカットオフへ戻るべき");
+        assert!(kept.is_empty());
     }
 
     #[test]

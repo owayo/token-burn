@@ -19,7 +19,10 @@ fn parse_dir_timestamp(name: &str) -> Option<NaiveDateTime> {
 /// 削除されたディレクトリパスのリストを返す。
 pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<Vec<PathBuf>> {
     let duration = parse_duration(max_age)?;
-    let cutoff = Local::now().naive_local() - duration;
+    let cutoff = Local::now()
+        .naive_local()
+        .checked_sub_signed(duration)
+        .ok_or_else(|| anyhow::anyhow!("cleanup_after is too large: {max_age}"))?;
 
     let entries = match std::fs::read_dir(report_dir) {
         Ok(entries) => entries,
@@ -203,6 +206,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = cleanup_old_reports(tmp.path(), "invalid");
         assert!(result.is_err(), "不正な max_age はエラーになるべき");
+    }
+
+    #[test]
+    fn cleanup_old_reports_rejects_datetime_range_overflow() {
+        let tmp = TempDir::new().unwrap();
+        let result = cleanup_old_reports(tmp.path(), "9000000000000000s");
+        let error = result.expect_err("日時の表現範囲を超える期間は失敗するべき");
+        assert!(error.to_string().contains("cleanup_after is too large"));
     }
 
     #[cfg(unix)]

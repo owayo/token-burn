@@ -371,49 +371,33 @@ pub fn execute_plan_tmux(
     // `.status()?` は tmux の起動失敗しか捕まえない（tmux が non-zero 終了しても Ok）。
     // ここで ExitStatus を検証しないと、セッション/ペイン生成に失敗してもワーカーが
     // 起動しないままモニターだけが走り、進捗が進まずデッドラインまでハングする。
-    let new_session_status = std::process::Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            session,
-            &monitor_path.to_string_lossy(),
-        ])
-        .status()
-        .context("Failed to create tmux session")?;
-    anyhow::ensure!(
-        new_session_status.success(),
-        "tmux new-session failed (exit {:?})",
-        new_session_status.code()
-    );
+    let mut session_created = false;
+    let setup_result = (|| -> Result<()> {
+        let new_session_status = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                &monitor_path.to_string_lossy(),
+            ])
+            .status()
+            .context("Failed to create tmux session")?;
+        anyhow::ensure!(
+            new_session_status.success(),
+            "tmux new-session failed (exit {:?})",
+            new_session_status.code()
+        );
+        session_created = true;
 
-    // 最初のワーカー用に右ペインを分割
-    let split_status = std::process::Command::new("tmux")
-        .args([
-            "split-window",
-            "-h",
-            "-t",
-            session,
-            &script_paths[0].to_string_lossy(),
-        ])
-        .status()
-        .context("Failed to split tmux window for worker")?;
-    anyhow::ensure!(
-        split_status.success(),
-        "tmux split-window failed (exit {:?})",
-        split_status.code()
-    );
-
-    // 残りのワーカーを右エリアに垂直分割で追加
-    for script in &script_paths[1..] {
-        // 右側の最後のペインに垂直分割で追加
+        // 最初のワーカー用に右ペインを分割
         let split_status = std::process::Command::new("tmux")
             .args([
                 "split-window",
-                "-v",
+                "-h",
                 "-t",
-                &format!("{}:.right", session),
-                &script.to_string_lossy(),
+                session,
+                &script_paths[0].to_string_lossy(),
             ])
             .status()
             .context("Failed to split tmux window for worker")?;
@@ -422,6 +406,39 @@ pub fn execute_plan_tmux(
             "tmux split-window failed (exit {:?})",
             split_status.code()
         );
+
+        // 残りのワーカーを右エリアに垂直分割で追加
+        for script in &script_paths[1..] {
+            // 右側の最後のペインに垂直分割で追加
+            let split_status = std::process::Command::new("tmux")
+                .args([
+                    "split-window",
+                    "-v",
+                    "-t",
+                    &format!("{}:.right", session),
+                    &script.to_string_lossy(),
+                ])
+                .status()
+                .context("Failed to split tmux window for worker")?;
+            anyhow::ensure!(
+                split_status.success(),
+                "tmux split-window failed (exit {:?})",
+                split_status.code()
+            );
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = setup_result {
+        if session_created {
+            // セッション作成後にペイン初期化が失敗した場合、モニターだけが残って
+            // デッドラインまで動き続けないよう、自分で起動したセッションを回収する。
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", session])
+                .status();
+        }
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(error);
     }
 
     // 右側ペインのサイズを均等化

@@ -25,7 +25,7 @@ token-burn/
 │   │   ├── state.rs        # StreamState / StreamSummary / UsageSummary
 │   │   ├── blocks.rs       # ContentBlockState・ブロック確定（finalize_block 等）
 │   │   ├── stream.rs       # handle_stream_event（content_block_* ハンドラ）
-│   │   ├── system.rs       # handle_system_event（task通知 / hook / api_retry）
+│   │   ├── system.rs       # handle_system_event（task通知 / hook / api_retry / model_refusal_fallback）
 │   │   ├── result.rs       # handle_result（コスト・トークン・モデル別使用量等の各行生成）
 │   │   ├── rate_limit.rs   # handle_rate_limit_event（reset時刻 / stop_file）
 │   │   ├── diff.rs         # format_tool_diff / format_diff_lines
@@ -33,7 +33,8 @@ token-burn/
 │   │   ├── tools/          # ツール詳細・結果メタデータ表示
 │   │   │   ├── mod.rs
 │   │   │   ├── detail.rs   # tool_specific_detail / extract_tool_detail / detail_* 系
-│   │   │   └── metadata.rs # tool_result_metadata
+│   │   │   ├── metadata.rs # tool_result_metadata
+│   │   │   └── progress.rs # tool_progress の経過時間表示
 │   │   └── tests/          # 機能別に分割した #[cfg(test)] テスト群
 │   ├── classify.rs         # 完了 jsonl の分類（success / failed / rate-limited / retryable）
 │   ├── cleanup.rs          # レポートディレクトリの自動クリーンアップ
@@ -124,6 +125,8 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 
 `tool_use_result` が object でなく文字列の応答（MCP ツール等。実データで確認）は、成功時のみ先頭の有意な 1 行を `result:<要約>` として補足表示します。エラー時は content 側のサマリー表示と同文になるため補足しません。
 
+実データで確認した `timedOutAfterMs` は、コマンド失敗ではなくバックグラウンド移行までの待機期限なので `wait-timeout:<期間>` と表示します。`backgroundCwdHint` は `cwd-hint:<要約>`、top-level `tool_result_meta[].non_execution_kind` は対象の tool use id と照合し、`not-executed:<理由>` として表示します。
+
 モニターペインの進捗は `fail:<n> retry:<n>` を併記し、完了時も `%d succeeded / %d failed / %d retry` の形で表示します。
 
 ## 並列実行モデル
@@ -136,6 +139,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - タスクがエラー終了してもワーカーは `exec sleep infinity` せず、即座に次の `pending-*` を取りに行く
 - ワーカーは claim できる pending が尽きるまで処理を続け、尽きて初めて `worker-done-<w>` を作成して終了する
 - ユーザーが tmux をデタッチした場合、tmux セッションが生存していれば `/tmp/token-burn` は削除しない。ワーカーのキュー・タスクスクリプト・プロンプトファイルを保持し、バックグラウンド実行を継続できるようにする
+- tmux セッション作成後のペイン構築に失敗した場合は、作成途中のセッションを kill して一時実行ディレクトリも削除する
 - レポートディレクトリ名に使うエージェント名は `sanitize_filename` でパス成分を無害化する
 
 結果として、`parallelism` で指定した並列数はタスクが尽きるまで維持されます（一部タスクが失敗しても他ワーカーは止まらない）。エラーは `marker_dir/error-<idx>` にタスク単位で記録されるため、同一ワーカーで複数エラーが起きてもモニターに全て表示されます。
@@ -143,8 +147,10 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 `format-stream` は以下の stream-json イベントを処理します:
 - テキスト応答のストリーミング表示
 - 思考ブロック（`thinking`）のプログレスインジケーター
+- 長時間ツールの `tool_progress` を経過時間付き（例: `Bash running (1m 30s)`）で表示
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`（小文字 `bash` を含む）/`BashOutput`/`Agent`/`Task`/`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`/`TaskStop`/`TaskOutput`/`Workflow`/`TeamCreate`/`Skill`/`SlashCommand`/`TodoWrite`/`Monitor`/`Grep`/`Glob`/`ScheduleWakeup`/`WebFetch`/`WebSearch`/`ToolSearch`/`SendMessage`/`AskUserQuestion`/Context7・Tavily・Codex MCP 等）の詳細表示と差分出力
 - assistant メッセージの `fallback` コンテンツによるモデル切り替え（`from.model` → `to.model`）と、`message.diagnostics.cache_miss_reason` によるキャッシュミス理由・対象 input token 数の表示。`--include-partial-messages` が同一 message id の assistant メッセージを繰り返し出力しても、同じ診断は 1 回だけ表示する
+- `model_refusal_fallback` は切り替え元・切り替え先モデルとカテゴリを表示する。拒否対象の内容や explanation はモニターへ出さない
 - `Read` の `file_path` と `offset` / `limit` / `view_range`、malformed 入力時の `__unparsedToolInput.len`、`Bash` の `timeout`（1000ms 以上は `timeout=<秒>s`、未満は `timeout=<n>ms` でミリ秒切り捨てによる "0s" 誤表示を回避。同じ整形を `Monitor` / `TaskOutput` の `timeout` でも使用）/ `run_in_background` / `dangerouslyDisableSandbox`、`BashOutput` の `bash_id`（出力取得対象の background bash。`bash:<id>` 形式）と任意の `filter`、`Agent` の `run_in_background` を表示
 - `Agent` の任意 `model` / `isolation` を指定時だけ `model:<...>` / `isolation:<...>` として表示
 - `Edit` は `new_string` に加えて実データで確認された `new_str` 入力も差分表示に使用し、`replace_all` が true の場合は一括置換として表示する。詳細行の `(+追加/-削除)` は行数差分（new − old）ではなく、共通プレフィックス/サフィックス除去後の実変更行数（表示 diff の `+` / `-` 行数と常に一致）。行数差分だと同一行数の in-place 置換が `(+0/-0)` になり「変更なし」に見える（実ログで確認）
@@ -175,7 +181,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 
 `[settings]` の `limit` は 1 以上である必要があります。
 `[settings]` の `rate_limit_threshold` は 1〜100 の範囲で指定する必要があります（デフォルト: 95）。レート制限使用率がこの閾値を超えると、現在のタスク完了後に後続タスクの実行を停止します。`rejected` イベント受信時も同様に停止します。ai-usage 連携が有効な場合は、各タスク完了後に該当 agent の実使用率（weekly / five_hour の最大）でも `usage-gate` が判定し、閾値以上なら停止します。
-`[settings]` の `skip_within` と `cleanup_after` には `d` / `h` / `m` / `s` を使った有効な期間文字列を指定する必要があり、不正な値は設定読み込み時にエラーになります。
+`[settings]` の `skip_within` と `cleanup_after` には `d` / `h` / `m` / `s` を使った有効な期間文字列を指定する必要があり、不正または `chrono::Duration` で表現できない値は設定読み込み時にエラーになります。期間自体は表現できても日時の減算範囲を超える場合、`skip_within` は警告後に前回リセット時刻へフォールバックし、レポートクリーンアップはエラーを返します。
 
 `[[scan]]` で `username` を指定した場合、リポジトリ可視性（public/private）はローカルディレクトリ名ではなく `origin` の remote URL に含まれるリポジトリ名（大文字小文字を無視）で照合されます。`username` を指定しない通常スキャンでは `origin` remote がなくても対象に含まれ、可視性は `Unknown` になります。
 
@@ -195,8 +201,9 @@ remote URL の owner / repo 抽出は末尾 2 セグメントを採用するた�
 
 - リセット日時計算 (`schedule.rs`) は `naive_local()` をベースに行います。`DateTime::date_naive()` は UTC 日付を返すため、`weekday()` のローカル曜日と整合させるためにローカルタイムゾーンの日付を基準とします。Asia/Tokyo のような UTC+N のタイムゾーンで深夜帯（UTC 前日）に実行しても曜日がずれない設計です。
 - リセット時刻が DST（夏時間）遷移に重なる場合も `resolve_local_datetime` (`schedule.rs`) で解決します。曖昧な時刻（秋の繰り戻しで 2 回出現する時刻）は早い方を採用し、存在しない時刻（春の繰り上げでスキップされる時刻）は遷移直後の最初の有効な瞬間にフォールバックします。`from_local_datetime().earliest()` は存在しない時刻に対して `None` を返すため、`America/New_York` の `02:30` のように DST ギャップへ重なるリセット時刻だと、設定読み込みは成功するのに `status` / `run` が実行時に毎回失敗していました。これを防ぐ実装です。
-- 状態ファイル (`state.json`) の書き込みは「同一ディレクトリのテンポラリファイル (`.state.json.tmp.<PID>.<nanos>`) に書き出し → `rename` で本体に置き換える」 atomic rename パターンで行います。排他ロックは `state.json` 本体ではなく sidecar の `.state.json.lock` に取ります。本体をロックすると `rename` 後にロック対象 inode が古くなり、別ワーカーが新しい `state.json` を同時ロックできて更新を失うためです。`write_all` 途中の ENOSPC やプロセスクラッシュでも本体が壊れず、書き込み失敗時はテンポラリファイルを掃除します（次回起動時に残骸が積み重ならない）。ロック取得後に既存の JSON が壊れていた場合は、空状態として上書きせず更新をエラーで中断し、原本と処理済み履歴を保全します。
+- 状態ファイル (`state.json`) の書き込みは「同一ディレクトリのテンポラリファイル (`.state.json.tmp.<PID>.<nanos>`) に書き出し → `rename` で本体に置き換える」 atomic rename パターンで行います。排他ロックは `state.json` 本体ではなく sidecar の `.state.json.lock` に取ります。本体をロックすると `rename` 後にロック対象 inode が古くなり、別ワーカーが新しい `state.json` を同時ロックできて更新を失うためです。`write_all` 途中の ENOSPC やプロセスクラッシュでも本体が壊れず、書き込み失敗時はテンポラリファイルを掃除します（次回起動時に残骸が積み重ならない）。ロック取得後に既存の JSON が壊れていた場合や、権限・I/O エラーで読み取れない場合は、空状態として上書きせず更新をエラーで中断し、原本と処理済み履歴を保全します。
 - tmux ワーカー / モニター起動前の `chmod +x` は終了コードを検証します。`output()` の戻り値だけ確認する旧実装では `chmod` が非ゼロで終了しても無視されてしまい、`permission denied` が tmux ペイン内で初めて顕在化していました。
+- tmux セッション作成後にペイン分割・ワーカー起動が失敗した場合は、そのセッションを kill して一時実行ディレクトリを削除します。セッションだけ作成されて後続コマンドが失敗すると、従来は孤立セッションと `/tmp/token-burn` 配下の実行資産が残っていました。
 - 起動時キャッシュ初期化で ai-usage を同期起動する `spawn_ai_usage_sync_with_timeout` (`executor/mod.rs`) は、子プロセスの stdout/stderr を**別スレッドで並行に drain** します。子の終了を待ってからまとめて読む実装では、出力がパイプバッファ（macOS では 16KB 程度）を超えたとき子の `write(2)` がブロックして終了できず、`try_wait` が永遠に `None` を返してタイムアウトまでハングするデッドロックに陥ります（大きな JSON や stderr へのログ出力で発生）。読み取りを終了監視から分離することでこれを防ぎます。
 - `format-stream` の `truncate_str` は「返却文字列の char 数を `max` 以下に保つ」契約を満たします。省略記号 `"..."` を付ける余地が無い `max <= 3` の場合は先頭から `max` 文字までで切り詰めます（実コードの呼び出しサイトは最小でも 30 程度のため、契約強化に伴う表示変更はありません）。
 - レポートディレクトリのクリーンアップ (`cleanup.rs`) はシンボリックリンクをスキップします。`Path::is_dir()` はリンクを追跡するため、リンク先のディレクトリを誤って削除しないよう `is_symlink()` で除外します。

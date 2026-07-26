@@ -16,6 +16,23 @@ pub(crate) fn tool_result_string_summary(result: &serde_json::Value) -> Option<S
     Some(format!("result:{}", truncate_inline(first_line, 80)))
 }
 
+/// `tool_result_meta` から、対象ツールが実行されなかった理由を抽出する。
+///
+/// 実データでは `[{ "id": "...", "non_execution_kind": "permission-rule" }]`
+/// の形で入り、`tool_result.content` だけでは構造化された未実行理由を追跡できない。
+pub(crate) fn tool_result_meta_metadata(meta: &serde_json::Value, tool_use_id: &str) -> String {
+    let Some(entries) = meta.as_array() else {
+        return String::new();
+    };
+    entries
+        .iter()
+        .find(|entry| entry["id"].as_str() == Some(tool_use_id))
+        .and_then(|entry| entry["non_execution_kind"].as_str())
+        .filter(|kind| !kind.is_empty())
+        .map(|kind| format!("not-executed:{}", truncate_inline(kind, 40)))
+        .unwrap_or_default()
+}
+
 /// `tool_use_result` の補足情報から、見落とすと判断材料を失うものだけ短く表示する。
 pub(crate) fn tool_result_metadata(result: &serde_json::Value) -> String {
     let Some(obj) = result.as_object() else {
@@ -447,6 +464,13 @@ fn append_runtime_metadata(
     if let Some(timeout) = obj.get("timeoutMs").and_then(|value| value.as_u64()) {
         attrs.push(format!("timeout:{}", format_millis_as_seconds(timeout)));
     }
+    if let Some(timeout) = obj.get("timedOutAfterMs").and_then(|value| value.as_u64()) {
+        // コマンド自体はバックグラウンドで継続するため、実行失敗ではなく待機期限として表示する。
+        attrs.push(format!(
+            "wait-timeout:{}",
+            format_millis_as_seconds(timeout)
+        ));
+    }
     if obj
         .get("persistent")
         .and_then(|value| value.as_bool())
@@ -487,6 +511,13 @@ fn append_background_metadata(
         .filter(|task_id| !task_id.is_empty())
     {
         attrs.push(format!("background:{}", truncate_inline(task_id, 40)));
+    }
+    if let Some(hint) = obj
+        .get("backgroundCwdHint")
+        .and_then(|value| value.as_str())
+        .filter(|hint| !hint.is_empty())
+    {
+        attrs.push(format!("cwd-hint:{}", truncate_inline(hint, 70)));
     }
     if obj
         .get("wasClamped")

@@ -540,6 +540,43 @@ fn tool_result_metadata_auto_backgrounded_and_background_task_id() {
 }
 
 #[test]
+fn tool_result_metadata_shows_actual_background_timeout_fields() {
+    let result = serde_json::json!({
+        "backgroundTaskId": "task-123",
+        "timedOutAfterMs": 600_000,
+        "backgroundCwdHint": "Session cwd remains /tmp/project; directory changes do not persist."
+    });
+    let metadata = tool_result_metadata(&result);
+    assert!(metadata.contains("background:task-123"));
+    assert!(metadata.contains("wait-timeout:600s"));
+    assert!(metadata.contains("cwd-hint:Session cwd remains /tmp/project"));
+}
+
+#[test]
+fn process_tool_result_shows_non_execution_kind() {
+    let input = [
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool_1","name":"Bash","input":{"command":"rm file"}}]}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool_1","is_error":true,"content":"blocked"}]},"tool_use_result":"Error: blocked","tool_result_meta":[{"id":"tool_1","non_execution_kind":"permission-rule"}]}"#,
+    ]
+    .join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert!(clean.contains("not-executed:permission-rule"));
+}
+
+#[test]
+fn tool_result_meta_metadata_matches_tool_use_id() {
+    let meta = serde_json::json!([
+        {"id": "tool_1", "non_execution_kind": "permission-rule"},
+        {"id": "tool_2", "non_execution_kind": "policy-rule"}
+    ]);
+    assert_eq!(
+        tool_result_meta_metadata(&meta, "tool_2"),
+        "not-executed:policy-rule"
+    );
+    assert!(tool_result_meta_metadata(&meta, "missing").is_empty());
+}
+
+#[test]
 fn tool_result_metadata_shows_allowed_tools_count() {
     // Skill が許可されたツール一覧（allowedTools）を返したときに件数を表示する。
     // 実データでは Skill 起動時に "allowedTools": ["Bash(astro-sight:*)"] のような

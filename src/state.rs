@@ -101,7 +101,17 @@ pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) ->
 
     let result = (|| -> Result<()> {
         // ロック取得後に直接ファイルを読み直す（lock_file のシークオフセットに依存しない）
-        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                anyhow::bail!(
+                    "Failed to read existing state {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        };
         let mut state = if content.trim().is_empty() {
             State::default()
         } else {
@@ -208,7 +218,8 @@ pub fn parse_duration(s: &str) -> Result<chrono::Duration> {
         anyhow::bail!("Duration must be positive: {}", s);
     }
 
-    Ok(chrono::Duration::seconds(total_secs))
+    chrono::Duration::try_seconds(total_secs)
+        .ok_or_else(|| anyhow::anyhow!("Duration is too large: {}", s))
 }
 
 #[cfg(test)]
@@ -254,6 +265,13 @@ mod tests {
     fn parse_duration_rejects_addition_overflow() {
         let input = format!("{}s1s", i64::MAX);
         let err = parse_duration(&input).expect_err("overflowing duration must fail");
+        assert!(err.to_string().contains("Duration is too large"));
+    }
+
+    #[test]
+    fn parse_duration_rejects_chrono_range_overflow() {
+        let input = format!("{}s", i64::MAX);
+        let err = parse_duration(&input).expect_err("Chrono の表現範囲外は失敗するべき");
         assert!(err.to_string().contains("Duration is too large"));
     }
 
@@ -460,6 +478,31 @@ mod tests {
             std::fs::read(&state_file).expect("元ファイルを読み直せるべき"),
             malformed,
             "壊れた既存状態を空の状態として上書きしてはならない"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mark_completed_atomic_preserves_unreadable_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().expect("一時ディレクトリを作成できるべき");
+        let state_file = tmp.path().join("state.json");
+        let original = br#"{"claude":{"/tmp/repo":"2026-01-01T00:00:00Z"}}"#;
+        std::fs::write(&state_file, original).expect("既存状態を書き込めるべき");
+        std::fs::set_permissions(&state_file, std::fs::Permissions::from_mode(0o000))
+            .expect("読み取り権限を外せるべき");
+
+        let result = mark_completed_atomic(&state_file, "claude", Path::new("/tmp/new-repo"));
+
+        std::fs::set_permissions(&state_file, std::fs::Permissions::from_mode(0o600))
+            .expect("検証のため権限を戻せるべき");
+        let error = result.expect_err("既存状態を読めない場合は上書きせず失敗するべき");
+        assert!(error.to_string().contains("Failed to read existing state"));
+        assert_eq!(
+            std::fs::read(&state_file).expect("元ファイルを読み直せるべき"),
+            original,
+            "読めなかった既存状態を空の状態で上書きしてはならない"
         );
     }
 
