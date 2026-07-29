@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use colored::Colorize;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::config::{Config, Scan};
 
@@ -321,6 +323,76 @@ async fn fetch_visibility_map(username: &str) -> Result<HashMap<String, Visibili
         .collect())
 }
 
+/// リポジトリの「最終ファイル変更日時」を返す。
+///
+/// `git ls-files` が列挙する追跡対象ファイルの mtime の最大値を採用する。
+/// ディレクトリを素朴に走査すると `target/` や `node_modules/` のビルド成果物が
+/// 混ざり、`cargo build` しただけのリポジトリが「たった今変更された」ように
+/// 見えてしまう。追跡対象に限定すればビルド成果物と `.gitignore` 対象は自然に
+/// 除外され、未コミットの編集は mtime としてそのまま拾える。
+///
+/// git が使えない・追跡ファイルが無い・全ファイルの stat に失敗した場合は `None`。
+pub fn repo_last_modified(dir: &Path) -> Option<DateTime<Utc>> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["ls-files", "-z"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut newest: Option<SystemTime> = None;
+    for entry in output.stdout.split(|b| *b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        // 非 UTF-8 のファイル名は稀なので、最大値の候補から外すだけに留める
+        let Ok(name) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        // シンボリックリンクはリンク自体の mtime を見る（リンク先を追わない）
+        let Ok(meta) = std::fs::symlink_metadata(dir.join(name)) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if newest.is_none_or(|current| modified > current) {
+            newest = Some(modified);
+        }
+    }
+
+    newest.map(DateTime::<Utc>::from)
+}
+
+/// 各ターゲットの最終ファイル変更日時をまとめて取得する。
+///
+/// 1 リポジトリあたり `git ls-files` の子プロセス起動が必要で、ターゲットが数十件に
+/// なると逐次実行では体感できる待ちになるため、blocking タスクとして並行に走らせる。
+/// 取得できなかったリポジトリはマップに載らない。
+pub async fn repo_last_modified_map(
+    dirs: &[std::path::PathBuf],
+) -> HashMap<PathBuf, DateTime<Utc>> {
+    let mut set = tokio::task::JoinSet::new();
+    for dir in dirs {
+        let dir = dir.clone();
+        set.spawn_blocking(move || {
+            let modified = repo_last_modified(&dir);
+            (dir, modified)
+        });
+    }
+
+    let mut map = HashMap::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((dir, Some(modified))) = joined {
+            map.insert(dir, modified);
+        }
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +491,74 @@ mod tests {
         // 3 段以上のサブグループでも、末尾 2 セグメントが採用される。
         let parsed = extract_remote_owner_and_repo("git@gitlab.example.com:a/b/c/d/repo.git");
         assert_eq!(parsed, Some(("d".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn repo_last_modified_ignores_untracked_build_artifacts() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let repo_dir = std::env::temp_dir().join(format!("token-burn-mtime-test-{unique}"));
+        std::fs::create_dir_all(&repo_dir).expect("test temp dir should be created");
+
+        let status = std::process::Command::new("git")
+            .args(["-C", &repo_dir.to_string_lossy(), "init", "--quiet"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        // 追跡対象のソースは十分に古い mtime にする
+        let source = repo_dir.join("src.txt");
+        std::fs::write(&source, "hello").expect("source file should be written");
+        let status = std::process::Command::new("git")
+            .args(["-C", &repo_dir.to_string_lossy(), "add", "src.txt"])
+            .status()
+            .expect("git add should run");
+        assert!(status.success(), "git add should succeed");
+
+        let old = SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 24 * 30);
+        let old_file = std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .expect("source file should reopen");
+        old_file
+            .set_modified(old)
+            .expect("source mtime should be adjustable");
+        drop(old_file);
+
+        // 未追跡のビルド成果物は「たった今」変更されたことにする
+        let artifacts = repo_dir.join("target");
+        std::fs::create_dir_all(&artifacts).expect("artifact dir should be created");
+        std::fs::write(artifacts.join("binary"), "built").expect("artifact should be written");
+
+        let detected = repo_last_modified(&repo_dir).expect("mtime should be detected");
+        let old_utc: DateTime<Utc> = old.into();
+        assert_eq!(
+            detected.timestamp(),
+            old_utc.timestamp(),
+            "追跡対象のソースだけが最終変更日時に反映されるべき（ビルド成果物は無視）"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn repo_last_modified_returns_none_outside_git_repo() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let plain_dir = std::env::temp_dir().join(format!("token-burn-mtime-nogit-{unique}"));
+        std::fs::create_dir_all(&plain_dir).expect("test temp dir should be created");
+        std::fs::write(plain_dir.join("file.txt"), "x").expect("file should be written");
+
+        assert!(
+            repo_last_modified(&plain_dir).is_none(),
+            "git 管理外のディレクトリは None を返すべき"
+        );
+
+        let _ = std::fs::remove_dir_all(&plain_dir);
     }
 
     #[test]

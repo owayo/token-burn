@@ -389,6 +389,14 @@ prompt = "prompts/test-coverage.md"
 
 If a target's `directory` matches a scan result, the explicit target takes precedence.
 
+### Processing order
+
+Targets are processed **least-recently-modified first**: the repository whose newest file change is the oldest goes first. `defer` and visibility (`public_first`) keep their priority — the reordering happens within those groups, and it is a stable sort, so targets sharing a modification time keep their original order. Repositories whose modification time cannot be determined go last within their group. `token-burn run PATH...` keeps the order given on the command line.
+
+Without this, the processing order was fixed, so every run took the first `limit` targets from the same list head. The already-processed cutoff (`skip_within`, or the previous reset) is an absolute time window, so once a run falls outside it the whole history is invalidated at once and the same head repositories are picked again — while the tail is never reached.
+
+The order is based on the repository's own last file modification time rather than the recorded processing time, so a run that was cut short by a rate limit (and therefore changed nothing) is not treated as progress. The timestamp comes from the newest mtime among files listed by `git ls-files`, which naturally excludes build artifacts and `.gitignore`d paths while still picking up uncommitted edits. `list` and `run` print it next to each target as `(modified: ...)` so the resulting order can be verified at a glance.
+
 ## Development
 
 ```bash

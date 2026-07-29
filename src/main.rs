@@ -45,8 +45,10 @@ mod test_support {
 }
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -374,13 +376,23 @@ async fn list(opts: ListOptions) -> Result<()> {
 
     let state_file = state::state_path(&config_path);
     let run_state = state::State::load(&state_file);
-    let (targets, skipped) = if fresh || !force_paths.is_empty() {
+    let (mut targets, skipped) = if fresh || !force_paths.is_empty() {
         (targets, 0usize)
     } else {
         filter_by_state(targets, &run_state, agent, &config, &sched)
     };
 
-    display::print_targets(&targets);
+    // 最終ファイル変更日時が古い順に並べ替える（force_paths 指定時は CLI 指定順を尊重）
+    let modified = if force_paths.is_empty() {
+        let dirs: Vec<_> = targets.iter().map(|t| t.directory.clone()).collect();
+        let modified = scanner::repo_last_modified_map(&dirs).await;
+        sort_by_least_recent(&mut targets, &modified);
+        modified
+    } else {
+        HashMap::new()
+    };
+
+    display::print_targets(&targets, &modified);
 
     if public_filtered > 0 {
         println!(
@@ -478,10 +490,22 @@ async fn run(opts: RunOptions) -> Result<()> {
     // force_paths 指定時は状態フィルタリングをスキップ
     let state_file = state::state_path(&config_path);
     let run_state = state::State::load(&state_file);
-    let (targets, skipped) = if fresh || !force_paths.is_empty() {
+    let (mut targets, skipped) = if fresh || !force_paths.is_empty() {
         (targets, 0usize)
     } else {
         filter_by_state(targets, &run_state, agent, &config, &sched)
+    };
+
+    // 最終ファイル変更日時が古い順に並べ替えてから limit を適用する。
+    // これをしないと limit で毎回リストの先頭だけが選ばれ、末尾のリポジトリに到達しない。
+    // force_paths 指定時は CLI 指定順を尊重する。
+    let modified = if force_paths.is_empty() {
+        let dirs: Vec<_> = targets.iter().map(|t| t.directory.clone()).collect();
+        let modified = scanner::repo_last_modified_map(&dirs).await;
+        sort_by_least_recent(&mut targets, &modified);
+        modified
+    } else {
+        HashMap::new()
     };
 
     // 制限適用: CLIオプションが設定値を上書き
@@ -493,7 +517,7 @@ async fn run(opts: RunOptions) -> Result<()> {
     };
     let targets: Vec<_> = targets.into_iter().take(limit).collect();
 
-    display::print_targets(&targets);
+    display::print_targets(&targets, &modified);
 
     if truncated > 0 {
         println!(
@@ -655,6 +679,36 @@ fn resolve_force_paths(
     }
 
     Ok(targets)
+}
+
+/// 「しばらく触っていないリポジトリ」を先頭に寄せる。
+///
+/// 処理済みカットオフ (`skip_within` / 前回リセット) は絶対時刻の窓なので、窓をまたいだ
+/// 時点で処理済み履歴が一斉に無効化される。ターゲット順が固定のままだと、そのたびに
+/// リストの先頭 `limit` 件だけが再処理され、末尾のリポジトリには永遠に到達しない。
+/// 最終ファイル変更日時が古い順に並べ替えることで、カットオフが切れても前回処理した分は
+/// 後ろへ回り、放置されているリポジトリから消化される。
+///
+/// 順序の基準は `state.json` の処理時刻ではなく、リポジトリ自身の最終ファイル変更日時
+/// (`scanner::repo_last_modified`)。実際に変更が入ったかどうかを見るため、レート制限で
+/// 中断されて何も変更できなかった実行を「処理済み」と数えてしまうことがない。
+///
+/// `defer` と `visibility` (`public_first`) の優先度は従来どおり維持し、その内側だけを
+/// 並べ替える。安定ソートなので、変更日時が同じターゲット同士の順序も変わらない。
+/// 変更日時を取得できなかったリポジトリは、判断材料が無いので各グループの末尾に置く。
+fn sort_by_least_recent(
+    targets: &mut [scanner::ResolvedTarget],
+    modified: &HashMap<PathBuf, DateTime<Utc>>,
+) {
+    targets.sort_by_cached_key(|t| {
+        let last_modified = modified.get(&t.directory).copied();
+        (
+            t.defer,
+            t.visibility.clone(),
+            last_modified.is_none(),
+            last_modified,
+        )
+    });
 }
 
 fn filter_by_state(
@@ -858,6 +912,111 @@ mod tests {
         let (kept, skipped) = filter_by_state(targets, &empty_state, runtime_agent, &conf, &sched);
         assert_eq!(skipped, 0);
         assert_eq!(kept.len(), original_len);
+    }
+
+    fn target_at(
+        name: &str,
+        visibility: scanner::Visibility,
+        defer: bool,
+    ) -> scanner::ResolvedTarget {
+        scanner::ResolvedTarget {
+            directory: std::path::PathBuf::from(format!("/tmp/{name}")),
+            display_name: name.to_string(),
+            prompt: "review".to_string(),
+            visibility,
+            defer,
+        }
+    }
+
+    fn modified_at(entries: &[(&str, i64)]) -> HashMap<PathBuf, DateTime<Utc>> {
+        entries
+            .iter()
+            .map(|(name, days_ago)| {
+                (
+                    std::path::PathBuf::from(format!("/tmp/{name}")),
+                    Utc::now() - chrono::Duration::days(*days_ago),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sort_by_least_recent_puts_stale_repos_first() {
+        use scanner::Visibility;
+        // 実行順が固定だと limit で先頭だけが繰り返し処理されるため、
+        // 長く触られていないリポジトリが先に来ることを確認する
+        let mut targets = vec![
+            target_at("fresh", Visibility::Public, false),
+            target_at("stale", Visibility::Public, false),
+            target_at("middle", Visibility::Public, false),
+        ];
+        let modified = modified_at(&[("fresh", 1), ("stale", 60), ("middle", 10)]);
+
+        sort_by_least_recent(&mut targets, &modified);
+
+        let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
+        assert_eq!(order, vec!["stale", "middle", "fresh"]);
+    }
+
+    #[test]
+    fn sort_by_least_recent_keeps_visibility_and_defer_priority() {
+        use scanner::Visibility;
+        // public_first と defer の優先度は並べ替え後も維持される
+        let mut targets = vec![
+            target_at("deferred-stale", Visibility::Public, true),
+            target_at("private-stale", Visibility::Private, false),
+            target_at("public-fresh", Visibility::Public, false),
+        ];
+        let modified = modified_at(&[
+            ("deferred-stale", 90),
+            ("private-stale", 90),
+            ("public-fresh", 1),
+        ]);
+
+        sort_by_least_recent(&mut targets, &modified);
+
+        let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["public-fresh", "private-stale", "deferred-stale"]
+        );
+    }
+
+    #[test]
+    fn sort_by_least_recent_puts_unknown_modified_last() {
+        use scanner::Visibility;
+        // 変更日時を取得できなかったリポジトリは判断材料が無いので末尾へ
+        let mut targets = vec![
+            target_at("unknown", Visibility::Public, false),
+            target_at("known-fresh", Visibility::Public, false),
+        ];
+        let modified = modified_at(&[("known-fresh", 1)]);
+
+        sort_by_least_recent(&mut targets, &modified);
+
+        let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
+        assert_eq!(order, vec!["known-fresh", "unknown"]);
+    }
+
+    #[test]
+    fn sort_by_least_recent_is_stable_for_equal_timestamps() {
+        use scanner::Visibility;
+        // 変更日時が同じなら元の順序（scan / [[targets]] の並び）を保つ
+        let mut targets = vec![
+            target_at("first", Visibility::Public, false),
+            target_at("second", Visibility::Public, false),
+            target_at("third", Visibility::Public, false),
+        ];
+        let same = Utc::now() - chrono::Duration::days(3);
+        let modified: HashMap<PathBuf, DateTime<Utc>> = targets
+            .iter()
+            .map(|t| (t.directory.clone(), same))
+            .collect();
+
+        sort_by_least_recent(&mut targets, &modified);
+
+        let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
+        assert_eq!(order, vec!["first", "second", "third"]);
     }
 
     #[test]

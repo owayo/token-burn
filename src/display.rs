@@ -1,4 +1,7 @@
+use chrono::{DateTime, Local, Utc};
 use colored::Colorize;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config::RuntimeAgent;
@@ -39,7 +42,11 @@ pub fn print_status(agents: &[RuntimeAgent], resolver: &ScheduleResolver) -> any
     Ok(())
 }
 
-pub fn print_targets(targets: &[ResolvedTarget]) {
+/// ターゲット一覧を表示する。
+///
+/// `modified` は実行順の根拠になった最終ファイル変更日時。渡された分だけローカル時刻で
+/// 併記し、「なぜこの順番になったのか」を目視で確認できるようにする。
+pub fn print_targets(targets: &[ResolvedTarget], modified: &HashMap<PathBuf, DateTime<Utc>>) {
     println!("{}", "=== Targets ===".bold());
     println!("  Found {} repositories", targets.len());
     println!();
@@ -50,11 +57,19 @@ pub fn print_targets(targets: &[ResolvedTarget]) {
             Visibility::Private => vis.yellow(),
             Visibility::Unknown => vis.dimmed(),
         };
+        let last_modified = match modified.get(&target.directory) {
+            Some(ts) => format!(
+                " (modified: {})",
+                ts.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+            ),
+            None => String::new(),
+        };
         println!(
-            "  {} {} {}",
+            "  {} {} {}{}",
             format!("[{}]", i + 1).yellow(),
             vis_colored,
-            target.display_name
+            target.display_name,
+            last_modified.dimmed()
         );
         println!("      {}", target.directory.display().to_string().dimmed());
     }
