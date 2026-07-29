@@ -983,6 +983,48 @@ mod tests {
     }
 
     #[test]
+    fn sort_by_least_recent_sorts_within_visibility_groups() {
+        use scanner::Visibility;
+        // public 群を変更日時順、private 群を変更日時順に並べ、それを連結した順序になる。
+        // public 優先は変更日時に負けないので、public の最新 (1日前) は
+        // private の最古 (200日前) よりも先に来る。
+        let mut targets = vec![
+            target_at("private-fresh", Visibility::Private, false),
+            target_at("public-fresh", Visibility::Public, false),
+            target_at("unknown-stale", Visibility::Unknown, false),
+            target_at("private-stale", Visibility::Private, false),
+            target_at("public-stale", Visibility::Public, false),
+            target_at("private-middle", Visibility::Private, false),
+            target_at("public-middle", Visibility::Public, false),
+        ];
+        let modified = modified_at(&[
+            ("private-fresh", 2),
+            ("public-fresh", 1),
+            ("unknown-stale", 300),
+            ("private-stale", 200),
+            ("public-stale", 60),
+            ("private-middle", 100),
+            ("public-middle", 30),
+        ]);
+
+        sort_by_least_recent(&mut targets, &modified);
+
+        let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "public-stale",
+                "public-middle",
+                "public-fresh",
+                "private-stale",
+                "private-middle",
+                "private-fresh",
+                "unknown-stale",
+            ]
+        );
+    }
+
+    #[test]
     fn sort_by_least_recent_puts_unknown_modified_last() {
         use scanner::Visibility;
         // 変更日時を取得できなかったリポジトリは判断材料が無いので末尾へ
