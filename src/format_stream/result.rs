@@ -231,13 +231,18 @@ fn write_model_usage(v: &serde_json::Value, out: &mut impl Write) -> Result<()> 
     Ok(())
 }
 
-/// fast_mode / origin / 終了理由 / 権限拒否件数を表示する。
+/// fast_mode / 無効化理由 / origin / 終了理由 / 権限拒否件数を表示する。
 fn write_terminal_info(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
     // fast_mode の表示（off 以外の場合）
     if let Some(fast_mode) = v["fast_mode_state"].as_str()
         && fast_mode != "off"
     {
         writeln!(out, "\x1b[2m   fast_mode {}\x1b[0m", fast_mode)?;
+    }
+    if let Some(reason) = v["fast_mode_disabled_reason"].as_str()
+        && !reason.is_empty()
+    {
+        writeln!(out, "\x1b[2m   fast_mode disabled:{}\x1b[0m", reason)?;
     }
     if let Some(origin_kind) = v["origin"]["kind"].as_str()
         && !origin_kind.is_empty()

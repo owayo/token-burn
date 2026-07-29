@@ -528,6 +528,19 @@ fn tool_result_metadata_user_modified_flag() {
 }
 
 #[test]
+fn tool_result_metadata_shows_actual_stale_recovery_flag() {
+    // 実データの Edit 成功結果に含まれる staleRecovered を回帰テストする。
+    let value = serde_json::json!({
+        "filePath": "/tmp/example.rs",
+        "userModified": false,
+        "staleRecovered": true
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(metadata.contains("stale-recovered"), "{metadata}");
+    assert!(!metadata.contains("user-modified"), "{metadata}");
+}
+
+#[test]
 fn tool_result_metadata_auto_backgrounded_and_background_task_id() {
     // 自動バックグラウンド化フラグと backgroundTaskId の併記
     let value = serde_json::json!({

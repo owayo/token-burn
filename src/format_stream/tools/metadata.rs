@@ -485,6 +485,14 @@ fn append_runtime_metadata(
     {
         attrs.push("user-modified".to_string());
     }
+    if obj
+        .get("staleRecovered")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        // Edit が古い読み取り状態から自動回復した事実は、競合調査の判断材料になる。
+        attrs.push("stale-recovered".to_string());
+    }
     if let Some(hint) = obj
         .get("staleReadFileStateHint")
         .and_then(|value| value.as_str())

@@ -296,6 +296,17 @@ fn process_result_with_fast_mode_off() {
 }
 
 #[test]
+fn process_result_with_actual_fast_mode_disabled_reason() {
+    let input = r#"{"type":"result","subtype":"success","duration_ms":1000,"fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required"}"#;
+    let output = run_process(input);
+    let clean = strip_ansi(&output);
+    assert!(
+        clean.contains("fast_mode disabled:sdk_opt_in_required"),
+        "fast mode の無効化理由が表示されるべき: {clean}"
+    );
+}
+
+#[test]
 fn process_result_without_fast_mode() {
     // fast_mode_state フィールドがない場合も表示されない
     let input = r#"{"type":"result","subtype":"success","total_cost_usd":0.5,"duration_ms":30000}"#;
