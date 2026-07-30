@@ -176,6 +176,59 @@ fn tool_result_metadata_shows_actual_jsonl_result_counts() {
 }
 
 #[test]
+fn tool_result_metadata_shows_file_unchanged_type() {
+    // 実ログの Read 結果には type:"file_unchanged" が現れる。前回読み取りから内容が
+    // 変わらず本文が返らなかったケースで、表示しないと通常の Read 成功と区別できず、
+    // ポーリング中の Read が実は何も取得していないという判断材料を失う。
+    let value = serde_json::json!({
+        "type": "file_unchanged",
+        "filePath": "/workspace/token-burn/src/main.rs"
+    });
+
+    let metadata = tool_result_metadata(&value);
+
+    assert!(metadata.contains("file-unchanged"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_omits_unchanged_marker_for_other_types() {
+    // "text"（通常の読み取り）/"update"（書き込み）では属性を出さない。
+    // ここが緩むと全ての Read 結果に file-unchanged が付いて意味を失う。
+    for kind in ["text", "update"] {
+        let value = serde_json::json!({"type": kind, "filePath": "/src/main.rs"});
+        let metadata = tool_result_metadata(&value);
+        assert!(
+            !metadata.contains("file-unchanged"),
+            "type={kind} で file-unchanged が出てはいけない: {metadata}"
+        );
+    }
+}
+
+#[test]
+fn tool_result_metadata_omits_unchanged_marker_when_type_absent() {
+    // type フィールドを持たない結果でも属性は出ない。
+    let value = serde_json::json!({"filePath": "/src/main.rs"});
+    assert!(!tool_result_metadata(&value).contains("file-unchanged"));
+}
+
+#[test]
+fn process_tool_result_shows_file_unchanged_marker() {
+    // process パイプライン経由でも完了行の [...] に補足されること。
+    let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t_unchanged","name":"Read","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/main.rs\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"user","tool_use_result":{"type":"file_unchanged","filePath":"/src/main.rs"},"message":{"role":"user","content":[{"tool_use_id":"t_unchanged","type":"tool_result","is_error":false,"content":"<file unchanged>"}]}}"#,
+        ]
+        .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+
+    assert!(clean.contains("\u{2713} Read"), "{clean}");
+    assert!(clean.contains("file-unchanged"), "{clean}");
+}
+
+#[test]
 fn tool_result_metadata_shows_edit_file_and_patch_summary() {
     // 実 jsonl の Edit 結果は top-level に filePath / structuredPatch / originalFile を持つ。
     // originalFile は巨大なので出さず、ファイル名と patch 規模だけを短く表示する。

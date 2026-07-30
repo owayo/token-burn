@@ -6,7 +6,10 @@ use super::diff::{changed_line_counts, format_diff_lines, format_tool_diff};
 use super::rate_limit::format_resets_at;
 use super::state::UsageSummary;
 use super::tools::detail::extract_tool_detail;
-use super::util::{format_number, format_token_size, truncate_str};
+use super::tools::metadata::{
+    tool_result_meta_metadata, tool_result_metadata, tool_result_string_summary,
+};
+use super::util::{extract_tool_result_summary, format_number, format_token_size, truncate_str};
 use super::*;
 use std::io::Cursor;
 

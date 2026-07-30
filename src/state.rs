@@ -13,6 +13,29 @@ pub struct State {
     pub agents: HashMap<String, HashMap<String, DateTime<Utc>>>,
 }
 
+/// エージェント 1 件分の「パス → 処理時刻」を、与えられた Vec の順序のまま
+/// JSON オブジェクトへ書き出すラッパー。
+///
+/// `serde_json::Map` へ `collect()` してはいけない。`preserve_order` feature を
+/// 有効にしていない serde_json の `Map` は `BTreeMap` であり、collect した時点で
+/// キー（パス）昇順に再ソートされて、タイムスタンプ降順の並びが丸ごと捨てられる。
+/// 実際の `state.json` も全エージェントがパスのアルファベット順になっていた。
+struct OrderedEntries<'a>(Vec<(&'a String, &'a DateTime<Utc>)>);
+
+impl Serialize for OrderedEntries<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (path, ts) in &self.0 {
+            let local_ts: DateTime<Local> = (**ts).into();
+            map.serialize_entry(
+                *path,
+                &local_ts.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false),
+            )?;
+        }
+        map.end()
+    }
+}
+
 impl Serialize for State {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         // エージェント名でソートし、各エージェント内はタイムスタンプ降順でソート
@@ -22,21 +45,11 @@ impl Serialize for State {
         let mut map = serializer.serialize_map(Some(sorted_agents.len()))?;
         for (agent_name, entries) in sorted_agents {
             let mut sorted_entries: Vec<_> = entries.iter().collect();
-            sorted_entries.sort_by(|(_, ts_a), (_, ts_b)| ts_b.cmp(ts_a));
-
-            let ordered: serde_json::Map<String, serde_json::Value> = sorted_entries
-                .into_iter()
-                .map(|(path, ts)| {
-                    let local_ts: DateTime<Local> = (*ts).into();
-                    (
-                        path.clone(),
-                        serde_json::Value::String(
-                            local_ts.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false),
-                        ),
-                    )
-                })
-                .collect();
-            map.serialize_entry(agent_name, &ordered)?;
+            // 同一タイムスタンプ同士はパス昇順で安定させ、書き込みごとに順序が揺れないようにする。
+            sorted_entries.sort_by(|(path_a, ts_a), (path_b, ts_b)| {
+                ts_b.cmp(ts_a).then_with(|| path_a.cmp(path_b))
+            });
+            map.serialize_entry(agent_name, &OrderedEntries(sorted_entries))?;
         }
         map.end()
     }
@@ -669,5 +682,96 @@ mod tests {
             repo_a_pos < repo_z_pos,
             "新しいタイムスタンプのエントリが先に来るべき"
         );
+    }
+
+    /// タイムスタンプ降順とパス昇順が食い違う並びで、降順が保たれることを確認する。
+    ///
+    /// 以前は `serde_json::Map` へ `collect()` していたため、`preserve_order` 無効の
+    /// serde_json では `BTreeMap` になり、ソート済みの並びがキー昇順へ再ソートされて
+    /// 丸ごと捨てられていた。上の `state_serialization_orders_agents_and_entries` は
+    /// 新しい方が `/repo-a`（アルファベット順でも先頭）なので、この取り違えを
+    /// 検出できていなかった。
+    #[test]
+    fn state_serialization_keeps_timestamp_desc_against_path_order() {
+        let mut state = State::default();
+        let ts_old = DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ts_mid = DateTime::parse_from_rfc3339("2025-03-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ts_new = DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let entries = state.agents.entry("claude".to_string()).or_default();
+        // パス昇順 (aaa < mmm < zzz) と タイムスタンプ降順 (zzz > mmm > aaa) が逆になる配置
+        entries.insert("/repo-aaa".to_string(), ts_old);
+        entries.insert("/repo-mmm".to_string(), ts_mid);
+        entries.insert("/repo-zzz".to_string(), ts_new);
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let pos = |needle: &str| {
+            json.find(needle)
+                .unwrap_or_else(|| panic!("{needle} が無い"))
+        };
+        assert!(
+            pos("/repo-zzz") < pos("/repo-mmm") && pos("/repo-mmm") < pos("/repo-aaa"),
+            "タイムスタンプ降順で並ぶべき: {json}"
+        );
+    }
+
+    /// 同じタイムスタンプ同士はパス昇順で安定させ、書き込みのたびに順序が揺れないようにする。
+    #[test]
+    fn state_serialization_breaks_timestamp_ties_by_path() {
+        let mut state = State::default();
+        let ts = DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let entries = state.agents.entry("claude".to_string()).or_default();
+        entries.insert("/repo-zzz".to_string(), ts);
+        entries.insert("/repo-aaa".to_string(), ts);
+        entries.insert("/repo-mmm".to_string(), ts);
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let pos = |needle: &str| {
+            json.find(needle)
+                .unwrap_or_else(|| panic!("{needle} が無い"))
+        };
+        assert!(
+            pos("/repo-aaa") < pos("/repo-mmm") && pos("/repo-mmm") < pos("/repo-zzz"),
+            "同時刻はパス昇順で安定するべき: {json}"
+        );
+    }
+
+    /// シリアライズ結果は再度読み込める（round-trip で値が失われない）。
+    #[test]
+    fn state_serialization_round_trips() {
+        let mut state = State::default();
+        let ts = DateTime::parse_from_rfc3339("2025-06-01T09:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        state
+            .agents
+            .entry("claude-work".to_string())
+            .or_default()
+            .insert("/repo-a".to_string(), ts);
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.last_processed("claude-work", std::path::Path::new("/repo-a")),
+            Some(ts)
+        );
+    }
+
+    /// エントリが 0 件のエージェントも空オブジェクトとして出力される（キー欠落しない）。
+    #[test]
+    fn state_serialization_keeps_agent_with_no_entries() {
+        let mut state = State::default();
+        state.agents.entry("empty-agent".to_string()).or_default();
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, r#"{"empty-agent":{}}"#);
     }
 }

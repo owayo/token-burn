@@ -20,12 +20,19 @@ pub(crate) fn format_tool_diff(tool_name: &str, input_json: &str) -> Option<Stri
 }
 
 /// 空文字列を 0 行として扱う行分割（`"".lines()` は 0 要素だが意図を明示する）。
+///
+/// 末尾の改行は「空の最終行」として保持する。`str::lines()` は末尾改行を落とすため、
+/// これが無いと `"foo"` と `"foo\n"` が同じ行集合になり、EOF 改行を足すだけの Edit が
+/// `(+0/-0)` かつ差分表示なしで「変更なし」に見えてしまう。
 fn split_lines(s: &str) -> Vec<&str> {
     if s.is_empty() {
-        Vec::new()
-    } else {
-        s.lines().collect()
+        return Vec::new();
     }
+    let mut lines: Vec<&str> = s.lines().collect();
+    if s.ends_with('\n') {
+        lines.push("");
+    }
+    lines
 }
 
 /// 共通プレフィックス行数と、それ以降の共通サフィックス行数を返す。

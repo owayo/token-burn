@@ -237,6 +237,86 @@ fn changed_line_counts_identical_is_zero() {
     assert_eq!(changed_line_counts("", ""), (0, 0));
 }
 
+// --- 末尾改行（EOF newline）の扱い ---
+// `str::lines()` は末尾改行を落とすため、split_lines が空の最終行を補わないと
+// "foo" と "foo\n" が同じ行集合になり、EOF 改行を足すだけの Edit が
+// (+0/-0) かつ差分表示なしで「変更なし」に見えてしまう（実ログで確認）。
+
+#[test]
+fn changed_line_counts_trailing_newline_addition_is_counted() {
+    // 末尾改行を足すだけの Edit。旧実装では (0, 0) になっていた。
+    assert_eq!(
+        changed_line_counts("fn main() {}", "fn main() {}\n"),
+        (1, 0)
+    );
+}
+
+#[test]
+fn changed_line_counts_trailing_newline_removal_is_counted() {
+    // 逆方向（末尾改行を消す Edit）も検出できること。
+    assert_eq!(
+        changed_line_counts("fn main() {}\n", "fn main() {}"),
+        (0, 1)
+    );
+}
+
+#[test]
+fn changed_line_counts_both_trailing_newlines_is_zero() {
+    // 両方に末尾改行がある場合は差分なし（空の最終行同士が一致する）。
+    assert_eq!(changed_line_counts("a\nb\n", "a\nb\n"), (0, 0));
+    assert_eq!(changed_line_counts("a\n", "a\n"), (0, 0));
+}
+
+#[test]
+fn changed_line_counts_empty_versus_newline_only() {
+    // 空文字は 0 行、"\n" は lines() の 1 行 + 補われた空の最終行で 2 行になる。
+    assert_eq!(changed_line_counts("", "\n"), (2, 0));
+    assert_eq!(changed_line_counts("\n", ""), (0, 2));
+}
+
+#[test]
+fn format_diff_lines_trailing_newline_addition_is_rendered() {
+    // カウントだけでなく差分表示も出ること（旧実装は空文字列を返していた）。
+    let diff = format_diff_lines("fn main() {}", "fn main() {}\n");
+    assert!(
+        !diff.is_empty(),
+        "末尾改行の追加でも差分が表示されるはず: {diff:?}"
+    );
+    let clean = strip_ansi(&diff);
+    // 追加された空の最終行が "+ " として出る
+    assert!(clean.contains("  + "), "got: {clean:?}");
+}
+
+#[test]
+fn format_tool_diff_edit_trailing_newline_only_is_some() {
+    // Edit ツール入力としても差分ありと判定されること。
+    let input =
+        r#"{"file_path":"/src/main.rs","old_string":"fn main() {}","new_string":"fn main() {}\n"}"#;
+    assert!(
+        format_tool_diff("Edit", input).is_some(),
+        "末尾改行だけの Edit も差分ありと判定されるはず"
+    );
+}
+
+#[test]
+fn process_edit_trailing_newline_only_shows_nonzero_stats() {
+    // process パイプライン経由でも (+0/-0) にならないこと。
+    let input = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t_nl","name":"Edit","input":{}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/main.rs\",\"old_string\":\"fn main() {}\",\"new_string\":\"fn main() {}\\n\"}"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        ]
+        .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+
+    assert!(clean.contains("(+1/-0)"), "expected diff stats: {clean}");
+    assert!(
+        !clean.contains("(+0/-0)"),
+        "末尾改行の追加が「変更なし」に見えてはいけない: {clean}"
+    );
+}
+
 #[test]
 fn changed_line_counts_matches_rendered_diff() {
     // ヘッダーの +N/-M は format_diff_lines が実際に表示する +/- 行数と一致する。

@@ -58,6 +58,59 @@ fn hook_with_stderr_is_shown() {
 }
 
 #[test]
+fn hook_response_with_empty_output_falls_back_to_stderr() {
+    // 実データの hook_response は output / stdout / stderr を常に持ち、
+    // 失敗時は stderr にだけ内容が入る。旧実装（first_string）は「文字列であれば
+    // 空文字でも確定」する仕様のため output:"" を採用してしまい、最も診断が
+    // 欲しい失敗時に本文が丸ごと落ちて "no output" にしかならなかった。
+    let out = render(
+        r#"{"type":"system","subtype":"hook_response","hook_name":"Stop:git-sc","output":"","stdout":"","stderr":"fatal: could not read Username","exit_code":1,"outcome":"error"}"#,
+    );
+    assert!(
+        out.contains("fatal: could not read Username"),
+        "stderr の内容が表示されるはず: {out:?}"
+    );
+    assert!(out.contains("Stop:git-sc"), "{out:?}");
+    assert!(out.contains("outcome:error"), "{out:?}");
+    assert!(out.contains("exit:1"), "{out:?}");
+    assert!(
+        !out.contains("no output"),
+        "stderr があるのに no output 表示になってはいけない: {out:?}"
+    );
+}
+
+#[test]
+fn hook_response_with_empty_output_and_stderr_falls_back_to_stdout() {
+    // output / stderr の両方が空でも stdout に内容があればそこまで辿る。
+    let out = render(
+        r#"{"type":"system","subtype":"hook_response","hook_name":"PostToolUse","output":"","stderr":"","stdout":"formatted 3 files","outcome":"success","exit_code":0}"#,
+    );
+    assert!(out.contains("formatted 3 files"), "{out:?}");
+}
+
+#[test]
+fn hook_output_takes_priority_over_stderr() {
+    // 空文字スキップ後もキー順（output → stderr → stdout）の優先度は変わらない。
+    let out = render(
+        r#"{"type":"system","subtype":"hook_response","hook_name":"Stop","output":"primary","stderr":"secondary","stdout":"tertiary","outcome":"success","exit_code":0}"#,
+    );
+    assert!(out.contains("primary"), "{out:?}");
+    assert!(!out.contains("secondary"), "{out:?}");
+    assert!(!out.contains("tertiary"), "{out:?}");
+}
+
+#[test]
+fn hook_name_empty_falls_back_to_hook_event() {
+    // hook 名も同じ空文字スキップが必要。hook_name:"" が常設される実データで
+    // フック種別が空欄になるのを防ぐ。
+    let out = render(
+        r#"{"type":"system","subtype":"hook_response","hook_name":"","hook_event":"SessionStart","output":"","stderr":"boom","outcome":"error","exit_code":1}"#,
+    );
+    assert!(out.contains("SessionStart"), "{out:?}");
+    assert!(out.contains("boom"), "{out:?}");
+}
+
+#[test]
 fn hook_started_is_ignored() {
     // hook_started は開始通知で出力を伴わないため無視する。
     let out = render(r#"{"type":"system","subtype":"hook_started","hook_name":"PostToolUse"}"#);
@@ -94,4 +147,41 @@ fn model_refusal_fallback_shows_models_and_category_without_content() {
     assert!(out.contains("category:cyber"));
     assert!(!out.contains("拒否された本文"));
     assert!(!out.contains("長い説明"));
+}
+
+/// `init` はモデル・CLI バージョン・権限モードを 1 行で表示する。
+/// これらは他のどのイベントにも現れず、以前は `init` を丸ごと無視していたため
+/// CLI バージョンと `bypassPermissions` で走ったかどうかが完全に失われていた。
+#[test]
+fn init_shows_model_version_and_permission_mode() {
+    let out = render(
+        r#"{"type":"system","subtype":"init","model":"claude-opus-5[1m]","claude_code_version":"2.1.220","permissionMode":"bypassPermissions","cwd":"/repo","session_id":"s1"}"#,
+    );
+    assert!(out.contains("Session claude-opus-5[1m]"), "{out:?}");
+    assert!(out.contains("v2.1.220"), "{out:?}");
+    assert!(out.contains("bypassPermissions"), "{out:?}");
+}
+
+/// version / permissionMode が無くてもモデルだけで表示する（属性の括弧は付けない）。
+#[test]
+fn init_with_model_only_omits_attribute_parentheses() {
+    let out = render(r#"{"type":"system","subtype":"init","model":"claude-fable-5"}"#);
+    assert!(out.contains("Session claude-fable-5"), "{out:?}");
+    assert!(!out.contains('('), "{out:?}");
+}
+
+/// モデルが無く属性だけある場合は "?" で埋めて属性を表示する。
+#[test]
+fn init_without_model_falls_back_to_question_mark() {
+    let out = render(
+        r#"{"type":"system","subtype":"init","claude_code_version":"2.1.218","permissionMode":"default"}"#,
+    );
+    assert!(out.contains("Session ? (v2.1.218, default)"), "{out:?}");
+}
+
+/// 表示材料が何も無い init は行を出さない（session_id / cwd だけの形）。
+#[test]
+fn init_without_display_fields_writes_nothing() {
+    let out = render(r#"{"type":"system","subtype":"init","session_id":"s1","cwd":"/repo"}"#);
+    assert!(out.is_empty(), "{out:?}");
 }

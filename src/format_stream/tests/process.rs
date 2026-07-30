@@ -402,6 +402,120 @@ fn process_assistant_fallback_and_cache_miss_notices_are_deduplicated() {
 }
 
 #[test]
+fn process_cache_miss_notice_breaks_open_thinking_line() {
+    // ensure_thinking_started は "\x1b[2m💭 " を改行なしで書く。
+    // --include-partial-messages では思考の途中で assistant イベントが届くため、
+    // 通知をそのまま書くと 💭 の行に連結され、通知末尾の \x1b[0m が思考ブロックの
+    // dim を打ち消していた（実ログで確認）。通知は必ず独立した行から始める。
+    let thinking_delta = format!(
+        r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{}"}}}}}}"#,
+        "analyzing ".repeat(25)
+    );
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+        thinking_delta.as_str(),
+        r#"{"type":"assistant","message":{"id":"msg-cache","content":[],"diagnostics":{"cache_miss_reason":{"type":"model_changed","cache_missed_input_tokens":152448}}}}"#,
+        thinking_delta.as_str(),
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+
+    assert!(clean.contains("Cache miss: model_changed"), "{clean:?}");
+    // 💭 と通知が同じ行に載っていないこと
+    assert!(
+        !clean
+            .lines()
+            .any(|line| line.contains('\u{1f4ad}') && line.contains("Cache miss")),
+        "通知が思考行に連結されている: {clean:?}"
+    );
+    // 通知は行頭（直前が改行）から始まる
+    assert!(
+        clean.contains("\n  \u{26a0} Cache miss:"),
+        "通知が独立した行から始まっていない: {clean:?}"
+    );
+}
+
+#[test]
+fn process_notice_after_thinking_restores_dim_prefix() {
+    // 行を閉じたら thinking_started をリセットし、次の thinking_delta で
+    // 💭 プレフィックスから描き直す。リセットしないと通知以降の進捗ドットが
+    // dim 無しの裸の "." として散らばる。
+    let thinking_delta = format!(
+        r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{}"}}}}}}"#,
+        "analyzing ".repeat(25)
+    );
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+        thinking_delta.as_str(),
+        r#"{"type":"assistant","message":{"id":"msg-cache","content":[],"diagnostics":{"cache_miss_reason":{"type":"model_changed","cache_missed_input_tokens":152448}}}}"#,
+        thinking_delta.as_str(),
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+
+    assert_eq!(
+        clean.matches('\u{1f4ad}').count(),
+        2,
+        "通知の前後で 💭 が 2 回描かれるはず: {clean:?}"
+    );
+}
+
+#[test]
+fn process_assistant_without_notice_keeps_thinking_line_open() {
+    // assistant イベントは 1 セッションで数千件届くが大半は通知を伴わない。
+    // 通知の有無に関わらず毎回行を閉じると、💭 の進捗ドットが 1 行ずつ分断される。
+    // 通知をバッファして「出力がある場合だけ」閉じる実装であることを固定する。
+    let thinking_delta = format!(
+        r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{}"}}}}}}"#,
+        "analyzing ".repeat(25)
+    );
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+        thinking_delta.as_str(),
+        r#"{"type":"assistant","message":{"id":"msg-plain","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/x.rs"}}],"diagnostics":null}}"#,
+        thinking_delta.as_str(),
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+
+    assert_eq!(
+        clean.matches('\u{1f4ad}').count(),
+        1,
+        "通知の無い assistant で思考行を分断してはいけない: {clean:?}"
+    );
+}
+
+#[test]
+fn process_model_fallback_notice_breaks_open_text_line() {
+    // テキストブロックが改行なしで途中まで出ている状態で通知が届いても、
+    // 同じ行に連結しない。かつ finalize_block が改行を二重に足さない。
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"公式ドキュメントを取得します。"}}}"#,
+        r#"{"type":"assistant","message":{"id":"msg-fallback","content":[{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"}}],"diagnostics":null}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+
+    assert!(
+        clean.contains("します。\n  \u{21aa} Model fallback"),
+        "通知がテキスト行に連結されている: {clean:?}"
+    );
+    assert!(
+        !clean.contains("します。\n\n"),
+        "改行が二重になっている: {clean:?}"
+    );
+}
+
+#[test]
 fn process_input_json_delta_before_block_start() {
     // 実装によっては delta が start より先に見えることがあるため、
     // index 単位で入力断片を保持して後続 start と結合する。

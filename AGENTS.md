@@ -27,6 +27,7 @@ token-burn/
 │   │   ├── stream.rs       # handle_stream_event（content_block_* ハンドラ）
 │   │   ├── system.rs       # handle_system_event（task通知 / hook / api_retry / model_refusal_fallback）
 │   │   ├── result.rs       # handle_result（コスト・トークン・モデル別使用量等の各行生成）
+│   │   ├── tool_result.rs  # handle_tool_result_event（user イベントのツール完了行）
 │   │   ├── rate_limit.rs   # handle_rate_limit_event（reset時刻 / stop_file）
 │   │   ├── diff.rs         # format_tool_diff / format_diff_lines
 │   │   ├── util.rs         # truncate_str / format_number / first_string 等の小ヘルパー
@@ -111,15 +112,25 @@ statusline コマンドは usage-gate / 起動時キャッシュ初期化と同�
 `claude` エージェントのタスク完了後は `token-burn classify-result <jsonl>` により jsonl 最終 `result` イベントの `is_error` / `api_error_status` を解析して分類します。
 
 - 成功 (`is_error:false`) → `state.json` に記録
-- レート制限 (`resets <h><am|pm>` 等) → `failed-N` マーカー。`state.json` には記録しない
+- レート制限（下記の判定に合致） → `failed-N` マーカー。`state.json` には記録しない
 - プロバイダ側リトライ可能エラー (`api_error_status` が 408/429/5xx) → `retry-N` マーカー。`state.json` には記録しないため次回実行で再処理される。ワーカーは継続
 - その他のプロバイダエラー → `failed-N` マーカーとエラーメッセージ（`result` フィールド）を表示し、ワーカーは停止
+
+レート制限の判定 (`is_rate_limit_message`) は次のいずれかに合致した場合です。上限到達は `api_error_status` が 429 で返るため、この判定を漏らすとリトライ可能エラーへ落ち、回復しないまま残りのターゲット全件にエラー行が出続けます。
+
+- `usage limit reached` を含む
+- `hit your` 以降に `limit` を含む（実ログの `You've hit your session limit ...` / `You've hit your org's monthly spend limit ...`）
+- `resets ` の直後が時刻表記（`3am` / `12pm` に加え、分を含む `2:30am` 形式にも対応）
+
+`resets` の時刻判定は「時 → 任意の `:<分>` → `am`/`pm`」を明示的に読み進めます。`:` を単なる非数字として打ち切ると `:30am` が残って判定に失敗し、実ログの `resets 2:30am (Asia/Tokyo)` を取りこぼしていました。一方で `resets 5 times max. Please retry tomorrow at 8am` のように数字と `am`/`pm` が離れたメッセージは従来どおり誤検知しません。
 
 jsonl ファイルが存在しない場合は result イベント無しと等価で Success として扱いますが、ファイルは存在するのに権限エラーや I/O エラーで読めない場合は `Failed` として返します（読み込み失敗を Success と誤分類して `state.json` に誤記録するのを防ぐため）。
 
 `format-stream` は `tool_result` の `is_error:true` を検出した場合、エラー内容の先頭の有意な 1 行をサマリーとして表示します（単一行/複数行の `<tool_use_error>...</tool_use_error>` ラッパーは除去）。配列形式の `content` にも対応し、120 文字を超える場合は末尾を `...` で省略します。
 
 `tool_use_result` の top-level メタデータに `truncated`、`appliedLimit`、`staleReadFileStateHint`、`userModified`（Edit/Write 等で書き込み前にユーザがファイルを変更していた場合。`user-modified` 形式）、`staleRecovered`（Edit が古い読み取り状態から自動回復した場合。`stale-recovered` 形式）、`success:false` / `error` / `message`、`stdout` / `stderr`（Bash 等の標準出力・標準エラー要約。`stdout:<summary>` / `stderr:<summary>` 形式）、Edit 結果の `filePath` / `structuredPatch` / `replaceAll`（`file:<path>`、`patch:<hunks> ... +追加/-削除`、`replace_all` 形式。`originalFile` / `oldString` / `newString` は巨大化するため表示しない）、`assistantAutoBackgrounded`、`backgroundTaskId`、`wasClamped` / `clampedDelaySeconds`、`persistedOutputPath` / `persistedOutputSize`、`returnCodeInterpretation`、`totalDurationMs` / `durationMs` / `totalTokens` / `totalToolUseCount`、`agentType`（Agent のサブエージェント種別。`agent:<type>` 形式）、`resolvedModel`（Skill / Agent が解決したモデル名。`model:<...>` 形式）、`toolStats`（サブエージェントの編集行数。加除いずれか非ゼロのとき `edits:+<追加>/-<削除>` 形式）、`numFiles` / `numLines`、`file.numLines` / `file.totalLines`（Read の部分読み取り。`lines:<n>/<total>` 形式）、`file.truncatedByTokenCap`（Read の token cap 切り詰め。`truncated:token-cap` 形式）、`matches`（ToolSearch）/ `numMatches`（Grep の count モード）/ `mode` / `total_deferred_tools`、`results` / `searchCount` / `durationSeconds`（WebSearch の結果件数・検索回数・所要時間）、`code` / `codeText` / `bytes`（WebFetch の HTTP ステータス・応答サイズ。`http:<code> <text>` 形式）、`gitOperation`（git commit の sha / kind。`commit:<sha> <kind>` 形式）、`structuredContent.content`（Codex MCP 等の構造化応答。`structured:<summary>` 形式）、`tasks` / `task` / `taskId` / `task_id` / `task_type`、`retrieval_status`、`outputFile` / `canReadOutputFile`、`timeoutMs` / `persistent`、`statusChange`、`updatedFields`（TaskUpdate の変更フィールド一覧。`status` のみのときは `statusChange` と重複するため非表示、それ以外は `updated:<field1>,<field2>` 形式）、`isAsync`（Agent を `run_in_background=true` で起動した async-launched 応答。`async` として表示）、`scheduledFor`、`commandName`、`workflowName`（Workflow 起動結果。どのワークフローが走ったかを `workflow:<name>` 形式で表示。`runId` は内部識別子のため非表示）、`allowedTools`（Skill が許可するツール一覧。非空配列のときに件数を `allowed-tools:<n>` 形式で表示） が含まれる場合は、ツール完了行に短い補足として表示します。`matches` 配列は ToolSearch 専用で Grep の結果には存在しないため、Grep の count モードでは `numMatches` 整数から件数を表示します。Read の行数は実データでは `file` オブジェクトに入れ子で入り、部分読み取り（`numLines < totalLines`）のときのみ `lines:<n>/<total>` を表示します（全行読み取り時はノイズ回避のため省略）。`file.truncatedByTokenCap` が true の場合は、行数比率とは独立して `truncated:token-cap` を表示します。WebSearch の `searchCount` は通常 1 のため 2 以上のときのみ表示します。
+
+`tool_use_result.type` は実データで `text`（通常の読み取り）/ `update`（書き込み）/ `file_unchanged` の 3 種類が現れます。このうち `file_unchanged` のみ `file-unchanged` として表示します。前回読み取りから内容が変わらず本文が返らなかったケースで、パス情報も `file.filePath` に入れ子で入るため top-level メタデータには何も出ず、表示しないと通常の Read 成功と区別できません（サブエージェント出力ファイルをポーリングしている最中の Read が実は何も取得していない、という判断材料を失う）。
 
 `isImage` / `interrupted` は実データで `false` が常設されるため、`true` の場合だけ `image` / `interrupted` を表示します。`noOutputExpected` も同様に常設ですが、true でも「出力が無いのが正常」という意味しかなく表示価値が無いため出しません。`structuredPatch[].lines` は hunk 内の行だけを保持しファイルヘッダーを含まないため、`+` / `-` で始まる全行を加除として数えます。これにより、内容自体が `++` / `--` で始まる行が diff 上で `+++` / `---` になっても過少計上しません。
 
@@ -146,14 +157,15 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 
 `format-stream` は以下の stream-json イベントを処理します:
 - テキスト応答のストリーミング表示
+- セッション開始（`system` / `init`）のモデル・CLI バージョン・権限モードを 1 行表示（`ℹ Session <model> (v<version>, <permissionMode>)`）。これらは他のどのイベントにも現れず、`result.modelUsage` からは実際に課金されたモデルしか分からないため、CLI バージョンと `bypassPermissions` で走ったかどうかが完全に失われていた。セッションにつき 1 行のみ
 - 思考ブロック（`thinking`）のプログレスインジケーター
 - 長時間ツールの `tool_progress` を経過時間付き（例: `Bash running (1m 30s)`）で表示
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`（小文字 `bash` を含む）/`BashOutput`/`Agent`/`Task`/`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`/`TaskStop`/`TaskOutput`/`Workflow`/`TeamCreate`/`Skill`/`SlashCommand`/`TodoWrite`/`Monitor`/`Grep`/`Glob`/`ScheduleWakeup`/`WebFetch`/`WebSearch`/`ToolSearch`/`SendMessage`/`AskUserQuestion`/Context7・Tavily・Codex MCP 等）の詳細表示と差分出力
-- assistant メッセージの `fallback` コンテンツによるモデル切り替え（`from.model` → `to.model`）と、`message.diagnostics.cache_miss_reason` によるキャッシュミス理由・対象 input token 数の表示。`--include-partial-messages` が同一 message id の assistant メッセージを繰り返し出力しても、同じ診断は 1 回だけ表示する
+- assistant メッセージの `fallback` コンテンツによるモデル切り替え（`from.model` → `to.model`）と、`message.diagnostics.cache_miss_reason` によるキャッシュミス理由・対象 input token 数の表示。`--include-partial-messages` が同一 message id の assistant メッセージを繰り返し出力しても、同じ診断は 1 回だけ表示する。これらの通知は出力がある場合だけ `break_open_line` で開きっぱなしの思考/テキスト行を閉じてから書く（`handle_assistant_event` が通知をいったんバッファへ書き、非空のときだけ行を閉じる）。思考ブロックは `\x1b[2m💭 ` を改行なしで書き進めるため、そのまま通知を書くと同じ行に連結され、通知末尾の `\x1b[0m` が dim を打ち消して以降の進捗ドットが崩れる。毎回無条件に閉じると assistant イベント（1 セッションで数千件）ごとに改行が入って進捗ドット表示自体が壊れるため、出力有無で分岐する
 - `model_refusal_fallback` は切り替え元・切り替え先モデルとカテゴリを表示する。拒否対象の内容や explanation はモニターへ出さない
 - `Read` の `file_path` と `offset` / `limit` / `view_range`、malformed 入力時の `__unparsedToolInput.len`、`Bash` の `timeout`（1000ms 以上は `timeout=<秒>s`、未満は `timeout=<n>ms` でミリ秒切り捨てによる "0s" 誤表示を回避。同じ整形を `Monitor` / `TaskOutput` の `timeout` でも使用）/ `run_in_background` / `dangerouslyDisableSandbox`、`BashOutput` の `bash_id`（出力取得対象の background bash。`bash:<id>` 形式）と任意の `filter`、`Agent` の `run_in_background` を表示
 - `Agent` の任意 `model` / `isolation` を指定時だけ `model:<...>` / `isolation:<...>` として表示
-- `Edit` は `new_string` に加えて実データで確認された `new_str` 入力も差分表示に使用し、`replace_all` が true の場合は一括置換として表示する。詳細行の `(+追加/-削除)` は行数差分（new − old）ではなく、共通プレフィックス/サフィックス除去後の実変更行数（表示 diff の `+` / `-` 行数と常に一致）。行数差分だと同一行数の in-place 置換が `(+0/-0)` になり「変更なし」に見える（実ログで確認）
+- `Edit` は `new_string` に加えて実データで確認された `new_str` 入力も差分表示に使用し、`replace_all` が true の場合は一括置換として表示する。詳細行の `(+追加/-削除)` は行数差分（new − old）ではなく、共通プレフィックス/サフィックス除去後の実変更行数（表示 diff の `+` / `-` 行数と常に一致）。行数差分だと同一行数の in-place 置換が `(+0/-0)` になり「変更なし」に見える（実ログで確認）。行分割 (`split_lines`) は末尾の改行を「空の最終行」として保持する。`str::lines()` は末尾改行を落とすため、これが無いと `"foo"` と `"foo\n"` が同じ行集合になり、EOF 改行を足すだけの Edit が `(+0/-0)` かつ差分表示なしで「変更なし」に見えてしまう
 - `Grep` / `Glob` の検索パターン、対象パス、`output_mode`、`type`、`glob`、`head_limit`、`context`、`offset`、`-A` / `-B` / `-C` / `-n` / `-i` / `-o`、`multiline` を表示
 - `ScheduleWakeup` の待機時間と理由を表示
 - `WebFetch` の URL とプロンプト要約、`WebSearch` のクエリと include/exclude ドメイン件数、`ToolSearch` のクエリと `max_results` を表示
@@ -162,7 +174,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - ツール入力（`input_json_delta` で蓄積した JSON）がパースできない場合は、詳細を空にせず生入力の文字数を `unparsed:<n> chars` として表示し、malformed / truncated を可視化する。これはモデルが不正な JSON をツール入力として出力したケース（`InputValidationError: ... could not be parsed as JSON`）や、レート制限・セッション切断でツール呼び出しがストリーム途中で打ち切られたケースで発生する。`format-stream` はストリーミング経路（`content_block_start` で空入力 → `input_json_delta` で生 JSON 蓄積 → `content_block_stop` で確定）で処理するため、assistant メッセージ最終形の `__unparsedToolInput.len`（`Read` 等の専用ハンドラが別途処理）はストリーミングには現れない。引数なしツールの空入力（`TaskList` 等）は従来どおり空表示を維持する
 - サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）。`task_started` は `task_type=local_agent` のような実行方式より、存在する場合は `subagent_type`（`general-purpose` / `Explore` 等）を優先表示する。`task_notification` は `completed` / `failed` / `stopped` を表示し、`failed` の `summary` を失敗原因として併記する。`usage` が無い場合は duration/token を 0 として表示しない。`task_updated` の `killed` は `failed` / `cancelled` と同じ失敗状態として強調表示する
 - `background_tasks_changed` は実行中バックグラウンドタスク一覧の高頻度スナップショットで、個々の開始・進捗・完了は上記タスクイベントにより表示済みのため、重複ノイズとして明示的に無視する
-- Claude Code のシステム通知（`notification`。例: stop hook エラー）と、出力を伴う hook 診断（`hook_progress` / `hook_response` の stderr / output）
+- Claude Code のシステム通知（`notification`。例: stop hook エラー）と、出力を伴う hook 診断（`hook_progress` / `hook_response` の output / stderr / stdout）。候補キーの走査には `first_string` ではなく `first_non_empty_string` を使う。実データの `hook_response` は `output` / `stdout` / `stderr` を常に持ち、失敗時は stderr にだけ内容が入るため、値が文字列でありさえすれば空文字でも確定する `first_string` だと `output:""` が採用されてフォールバックが到達不能になり、診断が最も欲しい場面で "no output" にしかならなかった
 - `tool_use_result` の出力切り詰め、適用 limit、stale read ヒント、ユーザ変更検出（`user-modified`）、古い読み取り状態からの自動回復（`stale-recovered`）、失敗理由（`error:`）や結果メッセージ（`message:`）、Bash 等の標準出力/標準エラー要約（`stdout:` / `stderr:`）、構造化応答の要約（`structured:`）、Edit 結果のファイルパスと structured patch 規模（`file:<path>` / `patch:<hunks> ... +追加/-削除` / `replace_all`）、自動バックグラウンド化、clamp、永続化出力サイズ、戻りコード解釈、Agent の duration/token/tool 数・サブエージェント種別（`agent:`）・解決モデル（`model:`）・編集行数（`edits:+追加/-削除`）、Grep/ToolSearch の結果件数と mode、WebSearch の結果件数/検索回数/所要時間、WebFetch の HTTP ステータス/応答サイズ、Read の部分読み取り行数（`lines:<n>/<total>`）と token cap 切り詰め（`truncated:token-cap`）、タスク件数/task id/task type、TaskOutput の取得状態、Agent 出力ファイル、Monitor の timeout/persistent、TaskUpdate の状態遷移、ScheduleWakeup の予定時刻、Skill のコマンド名、Workflow のワークフロー名（`workflow:<name>`）の補足表示
 - トークン使用量、コスト、キャッシュ内訳、Web検索/フェッチ回数の集計表示
 - モデル別使用量（`modelUsage`）の内訳表示（キャッシュ読み取り/書き込みトークン、Web検索回数、`contextWindow` / `maxOutputTokens` を `ctx:1M` / `max_out:64K` のような単位付きで表示）
@@ -177,7 +189,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 
 なお `usage` フィールドは各 `message_start` / `message_delta` でその API 呼び出し単独の値を返し、`result` イベントに最終累計が入るため、`format-stream` は `result` の値を最終出力として優先します。
 
-処理済み状態は有効な設定ファイルと同じディレクトリの `state.json` に保存されます（デフォルト: `~/.config/token-burn/state.json`）。
+処理済み状態は有効な設定ファイルと同じディレクトリの `state.json` に保存されます（デフォルト: `~/.config/token-burn/state.json`）。エージェント名は昇順、各エージェント内のエントリは処理時刻の降順（同時刻はパス昇順で安定化）で書き出します。内側のマップを `serde_json::Map` へ `collect()` してはいけません。`preserve_order` feature を有効にしていない serde_json の `Map` は `BTreeMap` であり、collect した時点でキー（パス）昇順へ再ソートされ、並べ替えが丸ごと捨てられます（実際の `state.json` も全エージェントがパスのアルファベット順になっていました）。順序を保つために `OrderedEntries` ラッパーで `serialize_map` を直接使います。
 
 `[settings]` の `limit` は 1 以上である必要があります。
 `[settings]` の `rate_limit_threshold` は 1〜100 の範囲で指定する必要があります（デフォルト: 95）。レート制限使用率がこの閾値を超えると、現在のタスク完了後に後続タスクの実行を停止します。`rejected` イベント受信時も同様に停止します。ai-usage 連携が有効な場合は、各タスク完了後に該当 agent の実使用率（weekly / five_hour の最大）でも `usage-gate` が判定し、閾値以上なら停止します。
@@ -189,6 +201,8 @@ remote URL の owner / repo 抽出は末尾 2 セグメントを採用するた�
 
 `[[scan]]` のディレクトリスキャンではシンボリックリンクはスキップされます（循環リンクによる無限再帰を防止）。
 
+読み取りに失敗したディレクトリ（権限不足、走査中の削除等）は警告を出してスキップし、走査を続けます。存在しない `base_dirs`、取得に失敗した `DirEntry`、`origin` remote を取れないリポジトリと同じ「警告して継続」の方針です。以前は `find_repos` の `read_dir` だけがエラーを `run` / `list` まで伝播していたため、スキャン対象ですらない中間ディレクトリが 1 つ読めないだけでリポジトリを 1 件も処理せず異常終了していました。
+
 複数の `[[scan]]` 設定で同一ディレクトリが重複検出された場合、ターゲットは1件に正規化されます（同一リポジトリの重複実行を防止）。
 
 ディレクトリパスは重複排除と状態管理の前に絶対パスへ正規化されるため、`repo` と `./repo` のような等価な相対パスは同一ターゲットとして扱われます。
@@ -199,7 +213,9 @@ remote URL の owner / repo 抽出は末尾 2 セグメントを採用するた�
 
 ### 実行順（最終ファイル変更日時が古い順）
 
-処理済みフィルタ (`filter_by_state`) の後、`limit` を適用する前に `sort_by_least_recent` (`main.rs`) が **最終ファイル変更日時の古い順** にターゲットを並べ替えます。`defer` と `visibility`（`public_first`）の優先度はそのまま維持し、その内側だけを並べ替える安定ソートのため、変更日時が同じターゲット同士の順序（`scan` 内の Visibility 順 / `[[targets]]` の追加順）は変わりません。変更日時を取得できなかったリポジトリは判断材料が無いので各グループの末尾に置きます。`token-burn run PATH...` で明示指定した場合は CLI 指定順を優先するため並べ替えません。
+処理済みフィルタ (`filter_by_state`) の後、`limit` を適用する前に `sort_by_least_recent` (`main.rs`) が **最終ファイル変更日時の古い順** にターゲットを並べ替えます。`defer` の優先度はそのまま維持し、その内側だけを並べ替える安定ソートのため、変更日時が同じターゲット同士の順序（`scan` 内の Visibility 順 / `[[targets]]` の追加順）は変わりません。変更日時を取得できなかったリポジトリは判断材料が無いので各グループの末尾に置きます。`token-burn run PATH...` で明示指定した場合は CLI 指定順を優先するため並べ替えません。
+
+可視性（`public_first`）でグループ化するかどうかは `public_first_enabled` (`main.rs`) が判定し、**いずれかの `[[scan]]` が `public_first = true` のときだけ** `visibility` をソートキーへ入れます。無条件に入れていた頃は、`public_first` を読むのが `scanner::scan_directories` の 1 箇所だけなのに最終順序が必ず public 優先になり、`public_first = false` が黙って無視されていました（`limit` と併用すると、公開リポジトリが `limit` 件以上ある限り非公開リポジトリへ永久に到達しない）。`[[scan]]` が無い構成（`[[targets]]` のみ）でもグループ化しません。
 
 処理済みカットオフ（`skip_within` / 前回リセット）は絶対時刻の窓であり、窓をまたいだ時点で処理済み履歴が一斉に無効化されます。ターゲット順が固定のままだとそのたびにリストの先頭 `limit` 件だけが再処理され、末尾のリポジトリには永遠に到達しませんでした（実測: 先頭 10 件が 2 日おきに再処理される一方、11 件目以降は 2 か月近く未処理）。古い順に並べ替えることで、カットオフが切れても前回処理した分は後ろへ回り、放置されているリポジトリから消化されます。
 
@@ -219,3 +235,6 @@ remote URL の owner / repo 抽出は末尾 2 セグメントを採用するた�
 - レポートディレクトリのクリーンアップ (`cleanup.rs`) はシンボリックリンクをスキップします。`Path::is_dir()` はリンクを追跡するため、リンク先のディレクトリを誤って削除しないよう `is_symlink()` で除外します。
 - モニタースクリプトのエラーマーカー走査は `while IFS= read -r ... < <(find ...)` 方式を使用しており、`TMPDIR` のパスに空白が含まれる環境でもワードスプリットが発生しません。エラー内容の表示は `printf '%s'` 経由で行い、ファイル内容を `echo` のダブルクォート内で再解釈しないようにしています。
 - デタッチ実行後のログを整形する `strip_ansi` (`executor/util.rs`) は、charset designation エスケープ（`\x1b(B` = G0 を ASCII 集合に指定、`\x1b(0` = DEC 罫線集合等）を introducer（`( ) * + - . /`）＋終端バイトの 3 バイトとして扱い両方を除去します。introducer だけをスキップする実装では終端バイト（`\x1b(B` の `B` 等）が通常文字としてログに漏れます。その他の 2 バイトエスケープ（`\x1b=` / `\x1b>` / `\x1bM` 等）は従来どおり ESC ＋ 1 文字だけスキップします。
+- モニタースクリプトの `run_with_timeout` (`executor/scripts.rs`) は、監視サブシェルの stdout を必ず `>/dev/null 2>&1` で捨てます。呼び出し側の stdout を継承したままだと、コマンドが即座に終わってもサブシェルの子 `sleep $secs` がコマンド置換のパイプ書き込み端を握ったまま孤児化し（`kill -TERM $wpid` はサブシェル本体しか殺せない）、`new=$(run_with_timeout ...)` が EOF を待って **timeout 秒まるごとブロック**します。ハング対策のはずが、10 秒ごとの ai-usage 取得で毎回 `AI_USAGE_MONITOR_TIMEOUT_SECS`（30 秒）固まり、毎秒更新のはずの進捗バーとデッドライン残り時間が止まっていました（実測: 即終了コマンドに 8 秒指定 → 8 秒）。
+- タスクスクリプトは対象ディレクトリへの `cd` をパイプラインと分けて発行します。`build_shell_command` は `cd` を含めず、`build_task_script` が手前で `cd <dir> || { ...; return 0; }` を出します。`cd X && cmd 2>&1 | format-stream | tee log` と書くと bash は `cd X && (3 要素パイプライン)` と解釈するため、cd 失敗時はパイプラインが実行されず `PIPESTATUS` が cd の 1 要素だけになります。すると `FORMAT_EXIT` / `TEE_EXIT` が空文字に展開されて `[ "" -ne 0 ]` が `integer expression expected` を吐き（ワーカーペインに漏れる）、記録されるエラーも真因と無関係な「logging pipeline failed」になっていました。スキャンから実行までの間に対象リポジトリが削除・リネームされると発生します。
+- 実行用一時ディレクトリの準備は `prepare_run_tmp_dir` (`executor/mod.rs`) が行い、`remove_dir_all` の失敗を（`NotFound` を除き）エラーとして伝播したうえで、作成後に unix では `0o700` を設定します。旧実装の `let _ = remove_dir_all(...)` は削除失敗を握り潰して、消せなかったディレクトリをそのまま再利用していました。`temp_dir()` が共有の `/tmp` になる環境（Linux。macOS は `TMPDIR` がユーザーごと）では、他ユーザーが先に `/tmp/token-burn` を作っておくと sticky bit により削除が失敗する一方 `create_dir_all` は成功するため、他人の所有ディレクトリへワーカースクリプトやプロンプトを書き込んでしまいます。

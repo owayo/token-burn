@@ -169,8 +169,23 @@ fn find_repos(
     visibility_map: &HashMap<String, Visibility>,
     results: &mut Vec<ResolvedTarget>,
 ) -> Result<()> {
-    let entries = std::fs::read_dir(dir)
-        .with_context(|| format!("Failed to read directory: {}", dir.display()))?;
+    // 読めないディレクトリはスキップして走査を続ける。存在しない base_dir や
+    // 取得に失敗した DirEntry、remote を取れないリポジトリと同じく「警告して継続」で
+    // 揃える。ここだけエラーを伝播していたため、権限の無い中間ディレクトリが
+    // 1 つあるだけで（そのディレクトリ自体はスキャン対象ですらないのに）
+    // run / list がリポジトリを 1 件も処理せず中断していた。
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "{}: failed to read directory {}: {}, skipping",
+                "Warning".yellow(),
+                dir.display(),
+                e
+            );
+            return Ok(());
+        }
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1333,6 +1348,109 @@ mod tests {
         assert_eq!(resolved.last().unwrap().directory, repo_dir);
         assert!(resolved.last().unwrap().defer);
         assert_eq!(resolved.last().unwrap().prompt, "override");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// テスト用に空の git リポジトリを作る。
+    fn init_test_repo(path: &Path) {
+        std::fs::create_dir_all(path).expect("repo dir should be created");
+        let status = std::process::Command::new("git")
+            .args(["-C", &path.to_string_lossy(), "init", "--quiet"])
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scan_directories_skips_unreadable_subdirectory() {
+        // 読み取り権限の無いサブディレクトリが 1 つあるだけで、以前は read_dir のエラーを
+        // `?` で伝播し、run / list がリポジトリを 1 件も処理せず異常終了していた。
+        // 同ファイルの他のエラー処理（存在しない base_dir、DirEntry 取得失敗、
+        // git remote get-url 失敗）と同じく「警告して継続」に揃える回帰テスト。
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("token-burn-scanner-unreadable-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+
+        // 直下のリポジトリと、再帰の先にあるリポジトリ（走査が継続することの確認用）
+        init_test_repo(&temp_dir.join("top-repo"));
+        init_test_repo(&temp_dir.join("sub").join("nested-repo"));
+
+        // 読めないディレクトリ。.git を持たないので再帰対象になり read_dir が失敗する
+        let locked = temp_dir.join("locked");
+        std::fs::create_dir_all(locked.join("inner")).expect("locked dir should be created");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 should succeed");
+
+        // root では権限チェックが効かず read_dir が成功してしまうため、テストをスキップする
+        if std::fs::read_dir(&locked).is_ok() {
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return;
+        }
+
+        let scan = Scan {
+            base_dirs: vec![temp_dir.to_string_lossy().to_string()],
+            recursive: true,
+            username: None,
+            public_first: true,
+            exclude: vec![],
+        };
+        let result = scan_directories(&scan).await;
+
+        // 後始末で必ず権限を戻す（assert より先に実行しないと temp_dir が消せなくなる）
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("permissions should be restored");
+
+        let resolved = result.expect("読めないディレクトリがあってもスキャンは成功すべき");
+        let mut names: Vec<String> = resolved.iter().map(|t| t.display_name.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["nested-repo".to_string(), "top-repo".to_string()],
+            "他のリポジトリは検出され続けるべき"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn scan_directories_continues_after_missing_base_dir() {
+        // 存在しない base_dir も「警告して継続」。後続の base_dir が走査されること。
+        // read_dir 失敗のスキップと同じ方針であることを固定する。
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic")
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("token-burn-scanner-missing-base-test-{unique}"));
+        std::fs::create_dir_all(&temp_dir).expect("test temp dir should be created");
+        init_test_repo(&temp_dir.join("only-repo"));
+
+        let missing = temp_dir.join("does-not-exist");
+        let scan = Scan {
+            base_dirs: vec![
+                missing.to_string_lossy().to_string(),
+                temp_dir.to_string_lossy().to_string(),
+            ],
+            recursive: true,
+            username: None,
+            public_first: true,
+            exclude: vec![],
+        };
+
+        let resolved = scan_directories(&scan)
+            .await
+            .expect("存在しない base_dir があってもスキャンは成功すべき");
+        let names: Vec<&str> = resolved.iter().map(|t| t.display_name.as_str()).collect();
+        assert_eq!(names, vec!["only-repo"]);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

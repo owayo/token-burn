@@ -12,6 +12,7 @@ mod result;
 mod state;
 mod stream;
 pub(crate) mod system;
+mod tool_result;
 mod tools;
 mod util;
 
@@ -22,11 +23,8 @@ use result::handle_result;
 use state::{StreamState, StreamSummary};
 use stream::handle_stream_event;
 use system::handle_system_event;
-use tools::metadata::{
-    tool_result_meta_metadata, tool_result_metadata, tool_result_string_summary,
-};
+use tool_result::handle_tool_result_event;
 use tools::progress::handle_tool_progress;
-use util::extract_tool_result_summary;
 
 /// `claude -p` の stream-json 出力を読みやすいテキストに変換する。
 /// JSON以外の行はそのまま出力（任意のエージェントで動作）。
@@ -91,61 +89,17 @@ fn process(
                 )?;
             }
             "assistant" => {
-                handle_assistant_event(&v, &mut out, &mut tool_id_map, &mut shown_notices)?;
+                handle_assistant_event(
+                    &v,
+                    &mut out,
+                    &mut tool_id_map,
+                    &mut shown_notices,
+                    &mut blocks,
+                )?;
             }
             "user" => {
                 // ツール結果 — 完了したツール名を表示
-                if let Some(content) = v["message"]["content"].as_array() {
-                    for item in content {
-                        if item["type"].as_str() == Some("tool_result") {
-                            let id = item["tool_use_id"].as_str().unwrap_or("");
-                            let name = tool_id_map.get(id).map(|s| s.as_str()).unwrap_or("?");
-                            let is_error = item["is_error"].as_bool().unwrap_or(false);
-                            let mut metadata = tool_result_metadata(&v["tool_use_result"]);
-                            let result_meta = tool_result_meta_metadata(&v["tool_result_meta"], id);
-                            if !result_meta.is_empty() {
-                                if !metadata.is_empty() {
-                                    metadata.push_str(", ");
-                                }
-                                metadata.push_str(&result_meta);
-                            }
-                            // tool_use_result が文字列の応答（MCP ツール等）には object
-                            // メタデータが無い。エラー時は content 側のサマリーと同文に
-                            // なるため、成功時のみ result: として先頭行を補足する。
-                            if metadata.is_empty()
-                                && !is_error
-                                && let Some(text_summary) =
-                                    tool_result_string_summary(&v["tool_use_result"])
-                            {
-                                metadata = text_summary;
-                            }
-                            let metadata = if metadata.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" [{}]", metadata)
-                            };
-                            if is_error {
-                                // エラー内容のサマリーがある場合は併記する
-                                let summary = extract_tool_result_summary(&item["content"]);
-                                if summary.is_empty() {
-                                    writeln!(
-                                        out,
-                                        "\x1b[31m  \u{2717} {}{}\x1b[0m",
-                                        name, metadata
-                                    )?;
-                                } else {
-                                    writeln!(
-                                        out,
-                                        "\x1b[31m  \u{2717} {} — {}{}\x1b[0m",
-                                        name, summary, metadata
-                                    )?;
-                                }
-                            } else {
-                                writeln!(out, "\x1b[2m  \u{2713} {}{}\x1b[0m", name, metadata)?;
-                            }
-                        }
-                    }
-                }
+                handle_tool_result_event(&v, &mut out, &tool_id_map)?;
             }
             "result" => {
                 summary.update_from_result(v.as_object());

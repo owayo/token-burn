@@ -194,6 +194,35 @@ pub fn print_plan(plan: &ExecutionPlan) {
     println!();
 }
 
+/// 実行用の一時ディレクトリを、必ず自分が作った空のディレクトリとして用意する。
+///
+/// 旧実装は `let _ = remove_dir_all(...)` で削除失敗を握り潰していたため、
+/// 消せなかったディレクトリをそのまま再利用していた。`temp_dir()` が共有の
+/// `/tmp` になる環境（Linux。macOS は `TMPDIR` がユーザーごと）では、
+/// 他ユーザーが先に `/tmp/token-burn` を作っておくと sticky bit により削除が
+/// 失敗する一方 `create_dir_all` は成功するため、他人の所有ディレクトリへ
+/// ワーカースクリプトやプロンプトを書き込んでしまう。削除失敗は
+/// （存在しない場合を除き）エラーとして扱い、作成後は所有者のみアクセス可にする。
+fn prepare_run_tmp_dir(tmp_dir: &std::path::Path) -> Result<()> {
+    match std::fs::remove_dir_all(tmp_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "failed to clear the temporary run directory {}",
+                tmp_dir.display()
+            )));
+        }
+    }
+    std::fs::create_dir_all(tmp_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 pub fn execute_plan_tmux(
     plan: ExecutionPlan,
     parallelism: usize,
@@ -219,8 +248,7 @@ pub fn execute_plan_tmux(
         .output();
 
     let tmp_dir = std::env::temp_dir().join("token-burn");
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    std::fs::create_dir_all(&tmp_dir)?;
+    prepare_run_tmp_dir(&tmp_dir)?;
 
     // 今回の実行用レポートディレクトリを作成
     let now = chrono::Local::now();
@@ -658,5 +686,86 @@ mod tests {
                 .map(String::as_str),
             Some("0")
         );
+    }
+
+    #[test]
+    fn prepare_run_tmp_dir_creates_missing_directory() {
+        // 存在しない場合の削除失敗（NotFound）は正常系として無視し、作成まで到達すること。
+        let parent = tempfile::TempDir::new().expect("temp dir should be created");
+        let target = parent.path().join("run");
+        assert!(!target.exists());
+
+        prepare_run_tmp_dir(&target).expect("missing directory should be created");
+
+        assert!(target.is_dir(), "実行用一時ディレクトリが作られるべき");
+    }
+
+    #[test]
+    fn prepare_run_tmp_dir_clears_existing_contents() {
+        // 旧実装は `let _ = remove_dir_all(...)` で削除失敗を握り潰し、消せなかった
+        // ディレクトリをそのまま再利用していた。前回実行の残骸（キュー・タスク
+        // スクリプト・マーカー）が残ると、完了済みタスクの誤検出につながる。
+        let parent = tempfile::TempDir::new().expect("temp dir should be created");
+        let target = parent.path().join("run");
+        std::fs::create_dir_all(target.join("markers")).expect("nested dir should be created");
+        std::fs::write(target.join("stale.sh"), b"old").expect("stale file should be written");
+        std::fs::write(target.join("markers/done-1"), b"").expect("stale marker should be written");
+
+        prepare_run_tmp_dir(&target).expect("existing directory should be recreated");
+
+        assert!(target.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&target)
+                .expect("read_dir should succeed")
+                .count(),
+            0,
+            "前回実行の残骸が残ってはいけない"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_run_tmp_dir_restricts_permissions_to_owner_only() {
+        // 共有 /tmp を temp_dir に持つ環境で他ユーザーにワーカースクリプトや
+        // プロンプトを読み書きされないよう、作成後は必ず 0o700 にする。
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::TempDir::new().expect("temp dir should be created");
+        let target = parent.path().join("run");
+        // 事前に緩い権限のディレクトリがあっても、作り直して 0o700 になること
+        std::fs::create_dir_all(&target).expect("dir should be created");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod should succeed");
+
+        prepare_run_tmp_dir(&target).expect("directory should be prepared");
+
+        let mode = std::fs::metadata(&target)
+            .expect("metadata should be readable")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "所有者のみアクセス可にすべき: {mode:o}"
+        );
+    }
+
+    #[test]
+    fn prepare_run_tmp_dir_errors_when_path_is_not_a_directory() {
+        // 削除できないパスをそのまま再利用しないこと（旧実装は握り潰していた）。
+        // 通常ファイルを渡すと remove_dir_all が ENOTDIR で失敗するため、root 権限も
+        // 特殊なファイルシステムも要らずに「削除失敗」を再現できる。
+        let parent = tempfile::TempDir::new().expect("temp dir should be created");
+        let target = parent.path().join("run");
+        std::fs::write(&target, b"not a directory").expect("file should be written");
+
+        let err = prepare_run_tmp_dir(&target).expect_err("削除失敗はエラーにすべき");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to clear the temporary run directory"),
+            "エラーは一時ディレクトリの掃除失敗だと分かる文言にすべき: {msg}"
+        );
+        // 既存パスを黙って上書き・再利用しない
+        assert!(target.is_file(), "既存ファイルは触らないべき");
     }
 }

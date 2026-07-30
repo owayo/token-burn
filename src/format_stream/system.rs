@@ -5,12 +5,15 @@
 use anyhow::Result;
 use std::io::Write;
 
-use crate::format_stream::util::{first_string, format_number, truncate_inline, truncate_str};
+use crate::format_stream::util::{
+    first_non_empty_string, format_number, truncate_inline, truncate_str,
+};
 
 /// system イベントのうち、サブエージェント進捗・通知・完了通知を表示する。
 pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
     let subtype = v["subtype"].as_str().unwrap_or("");
     match subtype {
+        "init" => write_session_init(v, out)?,
         "task_started" => write_task_started(v, out)?,
         "task_progress" => write_task_progress(v, out)?,
         "task_notification" => write_task_notification(v, out)?,
@@ -34,7 +37,47 @@ pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -
             // task_started / task_notification で既に表示しており、重複表示は
             // ノイズになるため明示的に無視する。
         }
-        _ => {} // init, hook_started 等は無視
+        _ => {} // hook_started 等は無視
+    }
+    Ok(())
+}
+
+/// `init`: セッション開始時のモデル・CLI バージョン・権限モードを 1 行で表示する。
+///
+/// これらはログ中の他のどのイベントにも現れない。`result.modelUsage` からは
+/// 実際に課金されたモデルしか分からず、CLI のバージョンと権限モード
+/// （`bypassPermissions` で走ったのか）は完全に失われていた。セッションにつき
+/// 1 行だけなのでノイズにならない。
+fn write_session_init(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    let model = v["model"].as_str().unwrap_or("");
+    let mut attrs = Vec::new();
+    if let Some(version) = v["claude_code_version"]
+        .as_str()
+        .filter(|version| !version.is_empty())
+    {
+        attrs.push(format!("v{}", truncate_inline(version, 20)));
+    }
+    if let Some(mode) = v["permissionMode"].as_str().filter(|mode| !mode.is_empty()) {
+        attrs.push(truncate_inline(mode, 24));
+    }
+    if model.is_empty() && attrs.is_empty() {
+        return Ok(());
+    }
+
+    let model = if model.is_empty() {
+        "?".to_string()
+    } else {
+        truncate_inline(model, 40)
+    };
+    if attrs.is_empty() {
+        writeln!(out, "\x1b[2m  \u{2139} Session {}\x1b[0m", model)?;
+    } else {
+        writeln!(
+            out,
+            "\x1b[2m  \u{2139} Session {} ({})\x1b[0m",
+            model,
+            attrs.join(", ")
+        )?;
     }
     Ok(())
 }
@@ -246,8 +289,12 @@ fn task_notification_usage_attrs(usage: &serde_json::Value) -> Vec<String> {
 
 /// フックの stderr/output がある場合だけ表示する。
 /// 成功して何も出力していない通常フックはノイズになるため表示しない。
+///
+/// 実データの `hook_response` は `output` / `stdout` / `stderr` を常に持ち、
+/// 失敗時は stderr にだけ内容が入る。空文字を飛ばして次の候補へ進まないと
+/// フック失敗の診断が最も欲しい場面で "no output" にしかならない。
 fn handle_hook_output(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
-    let detail = first_string(v, &["output", "stderr", "stdout"]);
+    let detail = first_non_empty_string(v, &["output", "stderr", "stdout"]);
     let outcome = v["outcome"].as_str().unwrap_or("");
     let exit_code = v["exit_code"].as_i64();
     let has_failure =
@@ -257,7 +304,7 @@ fn handle_hook_output(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
         return Ok(());
     }
 
-    let hook = first_string(v, &["hook_name", "hook_event"]);
+    let hook = first_non_empty_string(v, &["hook_name", "hook_event"]);
     let hook = if hook.is_empty() { "hook" } else { hook };
     let mut attrs = Vec::new();
     if !outcome.is_empty() {

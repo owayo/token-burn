@@ -90,28 +90,57 @@ pub fn classify_content(content: &str) -> ResultClass {
 /// `"Claude AI usage limit reached|<timestamp>"` のようなレート制限メッセージを検出する。
 fn is_rate_limit_message(msg: &str) -> bool {
     let lower = msg.to_lowercase();
-    // format_stream 側と同様のヒューリスティック: "resets <digit><am|pm>" もしくは "usage limit reached" を含む
     if lower.contains("usage limit reached") {
         return true;
     }
-    // "resets <数字>[<数字>...]<am|pm>" のパターンに厳密にマッチする。
+    // 実ログで観測される上限到達メッセージ群:
+    //   "You've hit your session limit · resets 3am (Asia/Tokyo)"
+    //   "You've hit your org's monthly spend limit · run /usage-credits to raise it, ..."
+    // いずれも再試行では回復せず、api_error_status=429 のため Retryable へ落ちると
+    // 残りのターゲット全件にエラー行が出続ける。上限到達として扱う。
+    if let Some(idx) = lower.find("hit your")
+        && lower[idx..].contains("limit")
+    {
+        return true;
+    }
+    // "resets <時刻><am|pm>" のパターンに厳密にマッチする。
     // `after.contains("am")` のような緩い判定だと、数字と "am"/"pm" が離れた位置にある
     // 一般のエラーメッセージを誤って RateLimited 扱いして state.json への記録を欠落させる。
     if let Some(idx) = lower.find("resets ") {
-        let after = &lower[idx + "resets ".len()..];
-        let digit_end = after
-            .as_bytes()
-            .iter()
-            .position(|b| !b.is_ascii_digit())
-            .unwrap_or(after.len());
-        if digit_end > 0 {
-            let tail = &after[digit_end..];
-            if tail.starts_with("am") || tail.starts_with("pm") {
-                return true;
-            }
-        }
+        return starts_with_clock_time(&lower[idx + "resets ".len()..]);
     }
     false
+}
+
+/// `"3am"` / `"12pm"` / `"2:30am"` のような時刻表記で始まるか判定する。
+///
+/// 分を含む `"resets 2:30am (Asia/Tokyo)"` は実ログで観測される表記だが、`":"` を
+/// 単純な非数字として打ち切ると `":30am"` が残って am/pm 判定に失敗し、上限到達を
+/// 取りこぼしていた。任意の `":<分>"` を明示的に読み飛ばす。
+fn starts_with_clock_time(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let digits_from = |start: usize| {
+        let mut i = start;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        i
+    };
+
+    // 時（1 桁以上の数字）
+    let mut pos = digits_from(0);
+    if pos == 0 {
+        return false;
+    }
+    // 任意の ":<分>"。":" の後に数字が無ければ時刻表記ではない。
+    if bytes.get(pos) == Some(&b':') {
+        let minutes_end = digits_from(pos + 1);
+        if minutes_end == pos + 1 {
+            return false;
+        }
+        pos = minutes_end;
+    }
+    s[pos..].starts_with("am") || s[pos..].starts_with("pm")
 }
 
 /// リトライ可能な HTTP ステータス（5xx および 408/429）か判定する。
@@ -343,6 +372,78 @@ mod tests {
         // "resets 12pm" / "resets 09am" のような複数桁の時刻表記を検出する
         assert!(is_rate_limit_message("resets 12pm"));
         assert!(is_rate_limit_message("resets 09am tomorrow"));
+    }
+
+    /// 実ログに 6 件存在した `resets 2:30am` 表記。`":"` を単なる非数字として
+    /// 打ち切ると `":30am"` が残って am/pm 判定に失敗し、api_error_status=429 の
+    /// Retryable へ落ちて残りのターゲット全件にエラー行が出続けていた。
+    #[test]
+    fn classify_session_limit_with_minutes_is_rate_limited() {
+        let input = r#"{"type":"result","is_error":true,"api_error_status":429,"result":"You've hit your session limit · resets 2:30am (Asia/Tokyo)"}"#;
+        assert_eq!(classify_content(input), ResultClass::RateLimited);
+    }
+
+    /// 実ログの `resets 3am` / `resets 12pm` 表記（分なし）も従来どおり検出する。
+    #[test]
+    fn classify_session_limit_without_minutes_is_rate_limited() {
+        for msg in [
+            "You've hit your session limit \u{b7} resets 3am (Asia/Tokyo)",
+            "You've hit your session limit \u{b7} resets 12pm (Asia/Tokyo)",
+        ] {
+            assert!(is_rate_limit_message(msg), "should detect: {msg}");
+        }
+    }
+
+    /// 月次の支出上限。リセット時刻表記が無いため `resets` 判定では拾えないが、
+    /// リトライしても回復しないので Retryable にしてはいけない。
+    #[test]
+    fn classify_monthly_spend_limit_is_rate_limited() {
+        let input = r#"{"type":"result","is_error":true,"api_error_status":429,"result":"You've hit your org's monthly spend limit · run /usage-credits to raise it, or visit claude.ai/admin-settings/usage"}"#;
+        assert_eq!(classify_content(input), ResultClass::RateLimited);
+    }
+
+    #[test]
+    fn is_rate_limit_message_matches_clock_with_minutes() {
+        assert!(is_rate_limit_message("resets 2:30am"));
+        assert!(is_rate_limit_message("resets 11:05pm tomorrow"));
+        assert!(is_rate_limit_message("resets 09:00AM"));
+    }
+
+    /// `":"` の後に数字が無い表記は時刻ではないので拾わない。
+    #[test]
+    fn is_rate_limit_message_rejects_colon_without_minutes() {
+        assert!(!is_rate_limit_message("resets 2:am"));
+        assert!(!is_rate_limit_message("resets 3: pm"));
+        assert!(!is_rate_limit_message("resets 5:"));
+    }
+
+    /// 「上限に達した」系の文言でも、`hit your` と `limit` が揃わなければ拾わない。
+    #[test]
+    fn is_rate_limit_message_requires_both_hit_your_and_limit() {
+        assert!(!is_rate_limit_message("could not hit your endpoint"));
+        assert!(!is_rate_limit_message("limit exceeded for this request"));
+        assert!(is_rate_limit_message("You've hit your weekly limit"));
+    }
+
+    /// 「上限」系の文言を追加しても、既存の誤検知ガードは崩れていない。
+    #[test]
+    fn is_rate_limit_message_still_rejects_unrelated_errors() {
+        assert!(!is_rate_limit_message(
+            "API error: resets 5 times max. Please retry tomorrow at 8am"
+        ));
+        assert!(!is_rate_limit_message("API Error: 529 Overloaded"));
+        assert!(!is_rate_limit_message(""));
+    }
+
+    #[test]
+    fn starts_with_clock_time_boundaries() {
+        assert!(starts_with_clock_time("1am"));
+        assert!(starts_with_clock_time("0:00pm rest"));
+        // 数字で始まらない / am・pm が続かない / 空文字はいずれも時刻ではない
+        assert!(!starts_with_clock_time("am"));
+        assert!(!starts_with_clock_time("12"));
+        assert!(!starts_with_clock_time("12 am"));
+        assert!(!starts_with_clock_time(""));
     }
 
     #[test]

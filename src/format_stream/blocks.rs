@@ -131,6 +131,35 @@ pub(crate) fn finalize_block(out: &mut impl Write, block: ContentBlockState) -> 
     Ok(())
 }
 
+/// 未確定のブロックが行を開いたままなら、その行を閉じる。
+///
+/// 思考ブロックは `\x1b[2m💭 ` を改行なしで書き、以後ドットを追記していく。
+/// `--include-partial-messages` では同一メッセージの `assistant` イベントが
+/// 思考の途中で届くため、通知行をそのまま書くと思考行の途中に連結され、
+/// 通知末尾の `\x1b[0m` が思考ブロックの dim を打ち消してしまう。
+/// 通知を出す直前にこれを呼んで、独立した行から書き始められるようにする。
+pub(crate) fn break_open_line(
+    out: &mut impl Write,
+    blocks: &mut HashMap<usize, ContentBlockState>,
+) -> Result<()> {
+    for block in blocks.values_mut() {
+        match block.kind {
+            BlockKind::Thinking if block.thinking_started => {
+                writeln!(out, "\x1b[0m")?;
+                // 次の thinking_delta で 💭 プレフィックスから描き直させる。
+                block.thinking_started = false;
+            }
+            BlockKind::Text if !block.text.is_empty() && !block.text.ends_with('\n') => {
+                writeln!(out)?;
+                // finalize_block が改行を二重に足さないよう、書き出した分を記録する。
+                block.text.push('\n');
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn finalize_open_blocks(
     out: &mut impl Write,
     blocks: &mut HashMap<usize, ContentBlockState>,

@@ -47,7 +47,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Multi-agent**: Supports Claude Code, Codex CLI, and custom agents
 - **ai-usage integration**: Derives reset times from real usage data via `ai-usage --json` (with the configured fixed-schedule calculation kept as a fallback)
 - **Usage-rate gate**: When ai-usage integration is enabled, re-checks each agent's real utilization (`weekly` / `five_hour`) after every task and stops starting new tasks once `rate_limit_threshold` is reached — extending threshold-based auto-stop to `codex`, not just Claude Code's in-task `rate_limit_event`
-- **Monitor usage panel**: When ai-usage integration is enabled, the tmux monitor pane shows `ai-usage --statusline --logos` (each account's 5h / weekly utilization bars) refreshed every 10 seconds, rendered from a cached `--input` snapshot alongside the per-second progress bar
+- **Monitor usage panel**: When ai-usage integration is enabled, the tmux monitor pane shows `ai-usage --statusline --logos` (each account's 5h / weekly utilization bars) refreshed every 10 seconds, rendered from a cached `--input` snapshot alongside the per-second progress bar. The refresh returns as soon as `ai-usage` does, so it never freezes the pane and the progress bar keeps its per-second update
 - **Multi-account expansion**: Expands a single agent across multiple accounts (e.g. `claude` → `claude-work` / `claude-home`), each launched with its own environment and tracked separately in `state.json`
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
 - **Deadline-aware stop**: Stops starting new tasks when the reset time arrives and waits for current tasks to finish
@@ -63,15 +63,17 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Sub-agent stop visibility**: `task_notification` events with `status="stopped"` (e.g. forced via `TaskStop`) are now surfaced in the live monitor; missing usage metrics are omitted instead of being shown as zero
 - **Tool error summary**: When a `tool_result` is `is_error:true`, the live monitor appends a short, single-line summary (truncated to 120 characters, with single-line or multi-line `<tool_use_error>` wrappers stripped) so the cause of a failed tool call is visible without opening the jsonl
 - **Tool result metadata**: Surfaces important top-level `tool_use_result` metadata such as truncated output, applied limits, stale-read hints, `user-modified` markers when Edit/Write detect a concurrent user edit, `stale-recovered` when Edit recovers from stale read state, failure details (`error:` / `message:`), Bash stdout/stderr summaries (`stdout:` / `stderr:`), structured MCP/Codex summaries (`structured:`), Edit result file paths and structured patch size (`file:<path>`, `patch:<hunks> ... +added/-removed`, `replace_all`), auto-backgrounding, clamped wakeups, persisted output size, return-code interpretation, Agent duration/token/tool counts, sub-agent type (`agent:`), resolved model (`model:`), and sub-agent edited line counts (`edits:+added/-removed`), Grep/ToolSearch result counts and mode, WebSearch result counts/search count/duration, WebFetch HTTP status code and response size (`http:200 OK`, `bytes:120.2KB`), Read partial-read line ratios (`lines:<n>/<total>`) and token-cap truncation (`truncated:token-cap`), git commit operations (sha/kind), task counts/task IDs/task types, TaskOutput retrieval status, readable Agent output files, Monitor timeout/persistent state, TaskUpdate status transitions and changed fields beyond status (`updated:<field1>,<field2>`), async Agent launches (`async` when `run_in_background=true`), ScheduleWakeup scheduled time, Skill command names with allowed-tool counts (`allowed-tools:<n>`), and launched workflow names (`workflow:<name>`)
+- **Session header**: Prints one line per session from the `init` event — model, Claude Code version, and permission mode (`ℹ Session <model> (v<version>, <permissionMode>)`). None of these appear anywhere else in the stream: `result.modelUsage` only reveals the models that were billed, so the CLI version and whether the run used `bypassPermissions` were otherwise lost
 - **Observed background metadata**: Shows a background handoff's wait ceiling as `wait-timeout:<duration>`, its working-directory note as `cwd-hint:<summary>`, and permission-rule non-execution as `not-executed:permission-rule`
 - **Observed stream-json edge cases**: Shows assistant-level model fallbacks (`from.model` → `to.model`) and cache-miss diagnostics with affected input-token counts, deduplicating repeated partial messages by message ID; suppresses high-frequency `background_tasks_changed` snapshots already represented by task events, shows optional Agent `model` / `isolation` launch settings, marks `isImage:true` tool results as `image`, and counts every `structuredPatch[].lines` entry beginning with `+` or `-` (including added/removed content that itself begins with `++` / `--`)
-- **Logging pipeline safety**: Marks a task failed if `format-stream`, `tee`, or raw jsonl capture fails instead of recording it as completed
+- **Logging pipeline safety**: Marks a task failed if `format-stream`, `tee`, or raw jsonl capture fails instead of recording it as completed. A target directory deleted or renamed between scan and execution is reported accurately as `target directory is unavailable` instead of an unrelated logging pipeline failure
 - **Per-model usage**: Displays token usage, cost, cache read/creation tokens, web search counts, and the model's context window / max output limits (e.g. `ctx:1M`, `max_out:64K`) per model in the result summary
 - **API timing**: Shows API response time, time to first token (`ttft`), time to first stream token (`stream:`, the pure streaming latency excluding queue/retry waits), and time-to-request (`req:<n>ms`) alongside wall-clock duration
 - **Fast mode indicator**: Shows fast mode state when active and reports `fast_mode_disabled_reason` when the provider explains why it is unavailable
 - **Terminal reason & permission denials**: Surfaces non-`completed` `terminal_reason` and denied tool call count/tool names in the result summary
 - **Result metadata**: Displays `usage.service_tier`, `usage.speed`, non-empty inference geo, iteration count, and result origin kind when present
 - **Rate limit alerts**: Displays utilization warnings, rejected request notifications, allowed-event reset/overage reset details when present, and the server-side warning threshold that was crossed (e.g. `warning at 90%`) for `allowed_warning` events; auto-stops when the configured threshold is exceeded (if the stop file cannot be created due to ENOSPC/permissions, the failure is surfaced instead of being silently swallowed)
+- **Limit-aware result classification**: Treats limit-reached results — clock times including minutes such as `resets 2:30am`, and messages such as `You've hit your session limit` or `You've hit your org's monthly spend limit` — as rate limits rather than retryable provider errors, since retrying cannot clear them
 - **API retry visibility**: Shows retry attempts with error details during transient failures
 - **Collision-safe logs**: Per-task logs are numbered to avoid overwrite when display names collide
 - **Prompt files**: Prompts can be `.md` files or inline strings
@@ -202,7 +204,7 @@ skip_within = "7d"    # optional
 
 `rate_limit_threshold` is enforced on two paths. During a task, Claude Code's stream-json `rate_limit_event` is monitored in real time and execution stops once the threshold is exceeded. In addition, when [ai-usage integration](#ai-usage-integration-optional) is enabled, after each task completes the agent's real utilization is re-checked against this threshold using the higher of the matching `(profile, provider)` pair's `weekly` and `five_hour` `used_percent` values; this applies to both `claude` and `codex` agents (the latter previously had no real-time monitoring).
 
-State is stored in `<config-dir>/state.json` (same directory as the active config file). Updates are written to a same-directory temporary file and atomically swapped into place with `rename`, while a stable sidecar lock file such as `.state.json.lock` serializes parallel workers. If the existing file contains malformed JSON, the update fails without replacing it, preserving the original data for recovery instead of silently discarding processed-target history. With the default config path, this is `~/.config/token-burn/state.json`.
+State is stored in `<config-dir>/state.json` (same directory as the active config file). Updates are written to a same-directory temporary file and atomically swapped into place with `rename`, while a stable sidecar lock file such as `.state.json.lock` serializes parallel workers. If the existing file contains malformed JSON, the update fails without replacing it, preserving the original data for recovery instead of silently discarding processed-target history. Within each agent, entries are written most-recently-processed first (ties broken by ascending path), so the newest activity stays at the top of the file. With the default config path, this is `~/.config/token-burn/state.json`.
 
 ### Agents
 
@@ -347,7 +349,7 @@ public_first = false
 |-------|-------------|---------|
 | `base_dirs` | Directories to scan for git repositories | (required) |
 | `username` | Filter repos whose remote URL owner matches this username | (none — all repos included) |
-| `public_first` | Sort public repositories before private ones so they are processed first | `true` |
+| `public_first` | Group public repositories ahead of private ones in the processing order. Applied when **any** `[[scan]]` enables it; if every scan sets `false` (or the config has no `[[scan]]`), visibility does not affect the order | `true` |
 | `recursive` | Recurse into subdirectories to find nested git repositories | `false` |
 | `exclude` | Directory names to skip during scan | `[]` |
 
@@ -358,6 +360,8 @@ Owner and repository names are extracted from the last two segments of the remot
 When `username` is not set, repositories are included even if they do not have an `origin` remote. In that case visibility remains `Unknown`.
 
 Symlinks are skipped during directory scanning to prevent infinite recursion from circular links.
+
+Directories that cannot be read — for example a subdirectory without read permission — are skipped with a warning and the scan continues, matching how missing `base_dirs` and symlinks are handled. A single unreadable subdirectory no longer aborts `run` / `list` before any repository is processed.
 
 If multiple `[[scan]]` entries discover the same repository directory, scan results are deduplicated by directory path so the same repository is not executed twice in a single run.
 
@@ -391,7 +395,9 @@ If a target's `directory` matches a scan result, the explicit target takes prece
 
 ### Processing order
 
-Targets are processed **least-recently-modified first**: the repository whose newest file change is the oldest goes first. `defer` and visibility (`public_first`) keep their priority — the reordering happens within those groups, and it is a stable sort, so targets sharing a modification time keep their original order. Repositories whose modification time cannot be determined go last within their group. `token-burn run PATH...` keeps the order given on the command line.
+Targets are processed **least-recently-modified first**: the repository whose newest file change is the oldest goes first. `defer` keeps its priority, and visibility groups public repositories ahead of private ones **only when at least one `[[scan]]` sets `public_first = true`**. The reordering happens within those groups, and it is a stable sort, so targets sharing a modification time keep their original order. Repositories whose modification time cannot be determined go last within their group. `token-burn run PATH...` keeps the order given on the command line.
+
+When every `[[scan]]` sets `public_first = false` (or the config has no `[[scan]]` at all), visibility is left out of the sort key entirely, so the order depends only on `defer` and modification time. This matters together with `limit`: while visibility grouping is active, private repositories are never reached as long as at least `limit` public repositories remain queued.
 
 Without this, the processing order was fixed, so every run took the first `limit` targets from the same list head. The already-processed cutoff (`skip_within`, or the previous reset) is an absolute time window, so once a run falls outside it the whole history is invalidated at once and the same head repositories are picked again — while the tail is never reached.
 

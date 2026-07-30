@@ -7,6 +7,19 @@ pub(crate) fn first_string<'a>(value: &'a serde_json::Value, keys: &[&str]) -> &
         .unwrap_or("")
 }
 
+/// キー順に走査し、最初に見つかった「空でない」文字列を返す。
+///
+/// `first_string` は値が文字列でありさえすれば空文字でも確定するため、
+/// 実データのように候補キーが全て常設されている payload では 2 番目以降の
+/// フォールバックへ到達できない。例えば hook イベントは `output` / `stdout` /
+/// `stderr` を常に持ち、失敗時は stderr にだけ内容が入るが、`output: ""` が
+/// 先に採用されて診断が丸ごと落ちていた。
+pub(crate) fn first_non_empty_string<'a>(value: &'a serde_json::Value, keys: &[&str]) -> &'a str {
+    keys.iter()
+        .find_map(|key| value[*key].as_str().filter(|s| !s.trim().is_empty()))
+        .unwrap_or("")
+}
+
 pub(crate) fn truncate_inline(s: &str, max: usize) -> String {
     let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_str(&normalized, max)

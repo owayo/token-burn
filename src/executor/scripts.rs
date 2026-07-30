@@ -70,14 +70,20 @@ STATUS_MSG=""
 restore_terminal() {{ tput cnorm 2>/dev/null; printf '\033[?7h'; }}
 
 # ai-usage サブプロセスがハングしても monitor ループを止めないための timeout ラッパー。
-# `$1` 秒で子プロセスを SIGTERM → 1 秒後 SIGKILL する。stdout はそのまま親に伝搬するため
-# `$(run_with_timeout N bash -c "$CMD")` の形で捕捉できる。
+# `$1` 秒で子プロセスを SIGTERM → 1 秒後 SIGKILL する。コマンド自身の stdout はそのまま
+# 親に伝搬するため `$(run_with_timeout N bash -c "$CMD")` の形で捕捉できる。
+#
+# 監視サブシェルの stdout は必ず捨てる。継承したままだと、コマンドが即座に終わっても
+# サブシェルの子 `sleep $secs` がコマンド置換のパイプ書き込み端を握ったまま孤児化し
+# （`kill -TERM $wpid` はサブシェル本体しか殺せない）、`$( )` が EOF を待って
+# timeout 秒まるごとブロックする。結果として monitor の再描画が 10 秒ごとに
+# AI_USAGE_TIMEOUT 秒固まっていた（ハング対策のはずが逆に固まる）。
 run_with_timeout() {{
     local secs=$1
     shift
     "$@" &
     local cpid=$!
-    ( sleep "$secs"; kill -TERM $cpid 2>/dev/null; sleep 1; kill -KILL $cpid 2>/dev/null ) 2>/dev/null &
+    ( sleep "$secs"; kill -TERM $cpid 2>/dev/null; sleep 1; kill -KILL $cpid 2>/dev/null ) >/dev/null 2>&1 &
     local wpid=$!
     wait $cpid 2>/dev/null
     local rc=$?
@@ -341,12 +347,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
     );
     let error_prefix = shell_escape(&format!("[{}] ", ctx.task.display_name));
     let stop_file_escaped = shell_escape(&ctx.stop_file.to_string_lossy());
-    let cmd_str = build_shell_command(
-        &ctx.agent.command,
-        &ctx.agent.env,
-        ctx.prompt_file,
-        &ctx.task.directory,
-    );
+    let cmd_str = build_shell_command(&ctx.agent.command, &ctx.agent.env, ctx.prompt_file);
     let mark_cmd = format!(
         "{} mark {} {} {}",
         shell_escape(&ctx.exe_path.to_string_lossy()),
@@ -359,6 +360,28 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
     // 現在処理中のタスクをシグナルハンドラから参照できるようにする
     script += &format!("CURRENT_FAILED_MARKER={failed_marker}\n");
     script += &build_task_header_script(ctx.idx, ctx.total, &ctx.task.display_name);
+    // 対象ディレクトリへの移動はパイプラインと分けて明示的に扱う。
+    // `cd X && cmd | fmt | tee` と書くと bash は `cd X && (3 要素パイプライン)` と解釈し、
+    // cd 失敗時はパイプラインが実行されず PIPESTATUS が cd の 1 要素だけになる。
+    // すると FORMAT_EXIT / TEE_EXIT が空文字に展開されて `[ "" -ne 0 ]` が
+    // "integer expression expected" を吐き（ワーカーペインに漏れる）、記録される
+    // エラーも「logging pipeline failed」という真因と無関係な文言になっていた。
+    // スキャンから実行までの間に対象リポジトリが削除・リネームされると発生する。
+    script += &format!(
+        concat!(
+            "cd {dir} || {{\n",
+            "  printf '%starget directory is unavailable\\n' {prefix} > {error}\n",
+            "  touch {failed}\n",
+            "  echo '━━━ Error - target directory is unavailable ━━━'\n",
+            "  echo ''\n",
+            "  return 0\n",
+            "}}\n",
+        ),
+        dir = shell_escape(&ctx.task.directory.to_string_lossy()),
+        prefix = error_prefix,
+        error = error_file,
+        failed = failed_marker,
+    );
 
     if ctx.is_claude {
         let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
@@ -602,13 +625,16 @@ fn build_task_header_script(idx: usize, total: usize, display_name: &str) -> Str
     )
 }
 
+/// 対象ディレクトリでエージェントを起動するコマンド文字列を組み立てる。
+///
+/// `cd` は含めない。呼び出し側（`build_task_script`）がパイプラインの手前で
+/// 明示的に `cd ... || { ... }` を発行する。`cd X && cmd | fmt | tee` の形にすると
+/// cd 失敗時に PIPESTATUS の要素数が変わってしまうため。
 fn build_shell_command(
     cmd_parts: &[String],
     env: &std::collections::BTreeMap<String, String>,
     prompt_file: &std::path::Path,
-    directory: &std::path::Path,
 ) -> String {
-    let mut parts: Vec<String> = vec![format!("cd {}", shell_escape(&directory.to_string_lossy()))];
     // 環境変数を `KEY='val' cmd ...` の形で前置する。key は設定読み込み時に
     // [A-Za-z_][A-Za-z0-9_]* へ制限済みなのでエスケープ不要、値のみ shell_escape する。
     let env_prefix = env_prefix_parts(env).join(" ");
@@ -624,12 +650,11 @@ fn build_shell_command(
     };
     // プロンプトをコマンド置換 $(cat file) で引数として渡す
     // stdin パイプは claude -p で確実に動作しないため
-    parts.push(format!(
+    format!(
         "{} \"$(cat {})\"",
         run,
         shell_escape(&prompt_file.to_string_lossy())
-    ));
-    parts.join(" && ")
+    )
 }
 
 pub(super) fn shell_escape(s: &str) -> String {
@@ -1406,9 +1431,7 @@ mod tests {
         let cmd = vec!["claude".to_string(), "-p".to_string()];
         let env = std::collections::BTreeMap::new();
         let prompt = std::path::Path::new("/tmp/prompt.txt");
-        let dir = std::path::Path::new("/home/user/my project");
-        let result = build_shell_command(&cmd, &env, prompt, dir);
-        assert!(result.contains("cd '/home/user/my project'"));
+        let result = build_shell_command(&cmd, &env, prompt);
         assert!(result.contains("'claude' '-p'"));
         assert!(result.contains("$(cat '/tmp/prompt.txt')"));
     }
@@ -1422,8 +1445,7 @@ mod tests {
             "/home/user/.config/work".to_string(),
         );
         let prompt = std::path::Path::new("/tmp/prompt.txt");
-        let dir = std::path::Path::new("/repo");
-        let result = build_shell_command(&cmd, &env, prompt, dir);
+        let result = build_shell_command(&cmd, &env, prompt);
         // env は cmd の直前に KEY='val' 形式で前置される
         assert!(
             result.contains("CLAUDE_CONFIG_DIR='/home/user/.config/work' 'claude' '-p'"),
@@ -1436,9 +1458,8 @@ mod tests {
         let cmd = vec!["codex".to_string()];
         let env = std::collections::BTreeMap::new();
         let prompt = std::path::Path::new("/tmp/p.txt");
-        let dir = std::path::Path::new("/repo");
-        let result = build_shell_command(&cmd, &env, prompt, dir);
-        assert!(result.contains("&& 'codex' \"$(cat"));
+        let result = build_shell_command(&cmd, &env, prompt);
+        assert!(result.starts_with("'codex' \"$(cat"));
     }
 
     #[test]
@@ -1452,8 +1473,7 @@ mod tests {
         env.insert("CLAUDE_CONFIG_DIR".to_string(), String::new());
         env.insert("CODEX_HOME".to_string(), "/home/u/.codex".to_string());
         let prompt = std::path::Path::new("/tmp/prompt.txt");
-        let dir = std::path::Path::new("/repo");
-        let result = build_shell_command(&cmd, &env, prompt, dir);
+        let result = build_shell_command(&cmd, &env, prompt);
         assert!(
             result.contains("env -u CLAUDE_CONFIG_DIR CODEX_HOME='/home/u/.codex' 'claude' '-p'"),
             "got: {result}"
@@ -1468,8 +1488,7 @@ mod tests {
         env.insert("CLAUDE_CONFIG_DIR".to_string(), String::new());
         env.insert("CODEX_HOME".to_string(), String::new());
         let prompt = std::path::Path::new("/tmp/prompt.txt");
-        let dir = std::path::Path::new("/repo");
-        let result = build_shell_command(&cmd, &env, prompt, dir);
+        let result = build_shell_command(&cmd, &env, prompt);
         assert!(
             result.contains("env -u CLAUDE_CONFIG_DIR -u CODEX_HOME 'claude' '-p'"),
             "got: {result}"
@@ -1477,15 +1496,339 @@ mod tests {
     }
 
     #[test]
-    fn build_shell_command_includes_cd_and_prompt() {
+    fn build_shell_command_has_no_cd_prefix() {
+        // cd は build_task_script 側で `cd ... || {{ ... }}` として別行に出す。
+        // パイプラインと && で繋ぐと cd 失敗時に PIPESTATUS の要素数が変わるため。
         let cmd = build_shell_command(
             &["claude".to_string(), "-p".to_string()],
             &std::collections::BTreeMap::new(),
             std::path::Path::new("/tmp/prompt.txt"),
-            std::path::Path::new("/home/user/repo"),
         );
-        assert!(cmd.contains("cd '/home/user/repo'"));
+        assert!(!cmd.contains("cd "), "got: {cmd}");
         assert!(cmd.contains("$(cat '/tmp/prompt.txt')"));
         assert!(cmd.contains("'claude' '-p'"));
+    }
+
+    // ───────────────────────── 回帰テスト用ヘルパー ─────────────────────────
+
+    /// bash が無い環境ではスクリプト実行系テストをスキップするための判定。
+    fn bash_available() -> bool {
+        std::process::Command::new("bash")
+            .args(["-c", "exit 0"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// テスト用の monitor スクリプト（ai-usage 連携あり）を生成する。
+    fn monitor_script_for_test() -> String {
+        generate_monitor_script(
+            "claude",
+            "claude -p",
+            "2026/02/24 09:00",
+            1,
+            60,
+            std::path::Path::new("/tmp/markers"),
+            "token-burn",
+            1,
+            std::path::Path::new("/tmp/stop"),
+            std::path::Path::new("/tmp/report"),
+            Some("'ai-usage' --statusline --logos --input '/tmp/cache.json'"),
+            Some("'ai-usage' '--json'"),
+            Some(std::path::Path::new("/tmp/cache.json")),
+        )
+    }
+
+    /// 生成済み monitor スクリプトから `run_with_timeout` の関数定義だけを切り出す。
+    /// monitor 本体は無限ループなのでそのままは source できないため、実際に生成された
+    /// 定義を実行して挙動を実測できるようにする。
+    fn extract_run_with_timeout(script: &str) -> String {
+        let start = script
+            .find("run_with_timeout() {")
+            .expect("run_with_timeout definition missing");
+        let rest = &script[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("run_with_timeout definition must be closed");
+        rest[..end + 3].to_string()
+    }
+
+    fn target_for_test(directory: &str) -> ResolvedTarget {
+        ResolvedTarget {
+            directory: std::path::PathBuf::from(directory),
+            display_name: "repo".to_string(),
+            prompt: "review".to_string(),
+            visibility: Visibility::Public,
+            defer: false,
+        }
+    }
+
+    fn agent_for_test(name: &str, command: &[&str]) -> RuntimeAgent {
+        RuntimeAgent {
+            name: name.to_string(),
+            command: command.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// bash -n で構文チェックする（`bash` が無い環境では何もしない）。
+    fn assert_valid_bash(script: &str, label: &str) {
+        if !bash_available() {
+            return;
+        }
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let path = dir.path().join("script.sh");
+        std::fs::write(&path, script).expect("script should be written");
+        let status = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .expect("bash -n should run");
+        assert!(status.success(), "{label} must be valid bash:\n{script}");
+    }
+
+    // ─────────── バグ1: watchdog サブシェルが stdout を継承して固まる ───────────
+
+    #[test]
+    fn generate_monitor_script_redirects_watchdog_subshell_output() {
+        // watchdog サブシェルが呼び出し側の stdout を継承していると、コマンドが即座に
+        // 終わってもサブシェルの子 `sleep $secs` がコマンド置換 `$( )` のパイプ書き込み端を
+        // 握ったまま孤児化し（`kill -TERM $wpid` はサブシェル本体しか殺せない）、
+        // EOF 待ちで timeout 秒まるごとブロックする。monitor の再描画が 10 秒ごとに
+        // AI_USAGE_TIMEOUT 秒固まる回帰を止める。
+        let script = monitor_script_for_test();
+        assert!(
+            script.contains("kill -KILL $cpid 2>/dev/null ) >/dev/null 2>&1 &"),
+            "watchdog subshell must discard inherited stdout/stderr: {script}"
+        );
+        // リダイレクト無しの旧形（`) &` で終わる）が残っていないこと
+        assert!(
+            !script.contains("kill -KILL $cpid 2>/dev/null ) &"),
+            "watchdog subshell must not inherit caller stdout: {script}"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_returns_immediately_for_fast_command() {
+        // 生成された `run_with_timeout` を実際に source し、実運用と同じ
+        // `new=$(run_with_timeout N bash -c "$CMD")` の形で即座に終わるコマンドを
+        // 包んでも待たされないことを実測する。watchdog が stdout を継承していた頃は
+        // ここで指定秒（下記なら 6 秒）まるごとブロックしていた。
+        if !bash_available() {
+            return;
+        }
+        let fragment = extract_run_with_timeout(&monitor_script_for_test());
+        let harness = format!(
+            "{fragment}\nout=$(run_with_timeout 6 bash -c 'printf ready')\nprintf '%s' \"$out\"\n"
+        );
+
+        let start = std::time::Instant::now();
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&harness)
+            .output()
+            .expect("bash should run");
+        let elapsed = start.elapsed();
+
+        assert!(
+            output.status.success(),
+            "harness must succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ready");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "fast command must not wait for the timeout (took {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_kills_hanging_command_at_deadline() {
+        // ハング側の契約も維持されていること（stdout を捨てても timeout は効く）。
+        // 2 秒指定でハングするコマンドを打ち切り、出力は空で返る。
+        if !bash_available() {
+            return;
+        }
+        let fragment = extract_run_with_timeout(&monitor_script_for_test());
+        let harness =
+            format!("{fragment}\nout=$(run_with_timeout 2 sleep 30)\nprintf '%s' \"$out\"\n");
+
+        let start = std::time::Instant::now();
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&harness)
+            .output()
+            .expect("bash should run");
+        let elapsed = start.elapsed();
+
+        assert!(
+            output.stdout.is_empty(),
+            "killed command must produce no output: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_secs(1),
+            "timeout must actually wait for the deadline (took {elapsed:?})"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "hanging command must be killed at the deadline (took {elapsed:?})"
+        );
+    }
+
+    // ─────────── バグ2: cd 失敗で PIPESTATUS の要素数が変わる ───────────
+
+    #[test]
+    fn build_task_script_guards_cd_failure_for_claude() {
+        // `cd X && cmd | fmt | tee` は bash が `cd && (3要素パイプライン)` と解釈するため、
+        // cd 失敗時に PIPESTATUS が cd の 1 要素だけになり、FORMAT_EXIT / TEE_EXIT が
+        // 空文字へ展開されて `[ "" -ne 0 ]` が "integer expression expected" を吐き、
+        // 記録されるエラーも真因と無関係な「logging pipeline failed」になっていた。
+        // cd は必ずパイプラインと分離し、失敗時は専用メッセージで failed 扱いにする。
+        let agent = agent_for_test("claude", &["claude", "-p"]);
+        let task = target_for_test("/tmp/repo");
+        let tmp = std::path::PathBuf::from("/tmp");
+        let ctx = task_ctx_for_test(3, &agent, &task, &tmp, true);
+        let script = build_task_script(&ctx);
+
+        assert!(
+            script.contains("cd '/tmp/repo' || {"),
+            "cd はガード付きの独立文であるべき: {script}"
+        );
+        assert!(
+            !script.contains("cd '/tmp/repo' &&"),
+            "cd をパイプラインへ && で連結してはいけない: {script}"
+        );
+        assert!(script.contains("target directory is unavailable"));
+        // ガードは失敗マーカーを作り、ワーカーは次タスクへ進む
+        assert!(script.contains("touch '/tmp/failed-3'"));
+        assert!(
+            script.contains(
+                "printf '%starget directory is unavailable\\n' '[repo] ' > '/tmp/error-3'"
+            )
+        );
+        // ガードはパイプラインより前に出る
+        let cd_idx = script
+            .find("cd '/tmp/repo' || {")
+            .expect("cd guard missing");
+        let pipe_idx = script.find("| tee ").expect("pipeline missing");
+        assert!(cd_idx < pipe_idx, "cd ガードはパイプラインの手前に出すべき");
+    }
+
+    #[test]
+    fn build_task_script_guards_cd_failure_for_non_claude() {
+        // 非 claude（codex 等）の 2 要素パイプラインでも同じガードが必要。
+        let agent = agent_for_test("codex", &["codex", "exec"]);
+        let task = target_for_test("/tmp/repo");
+        let tmp = std::path::PathBuf::from("/tmp");
+        let ctx = task_ctx_for_test(4, &agent, &task, &tmp, false);
+        let script = build_task_script(&ctx);
+
+        assert!(
+            script.contains("cd '/tmp/repo' || {"),
+            "cd はガード付きの独立文であるべき: {script}"
+        );
+        assert!(
+            !script.contains("cd '/tmp/repo' &&"),
+            "cd をパイプラインへ && で連結してはいけない: {script}"
+        );
+        assert!(script.contains("target directory is unavailable"));
+        assert!(script.contains("touch '/tmp/failed-4'"));
+        let cd_idx = script
+            .find("cd '/tmp/repo' || {")
+            .expect("cd guard missing");
+        let pipe_idx = script.find("| tee ").expect("pipeline missing");
+        assert!(cd_idx < pipe_idx, "cd ガードはパイプラインの手前に出すべき");
+    }
+
+    #[test]
+    fn build_task_script_cd_guard_escapes_special_characters_in_directory() {
+        // ディレクトリ名に空白やシングルクォートが混ざっても cd ガードが壊れないこと。
+        // エスケープが崩れると cd 行が構文エラーになり、ガード自体が機能しなくなる。
+        let agent = agent_for_test("claude", &["claude", "-p"]);
+        let task = target_for_test("/tmp/re po's dir");
+        let tmp = std::path::PathBuf::from("/tmp");
+        let ctx = task_ctx_for_test(5, &agent, &task, &tmp, true);
+        let script = build_task_script(&ctx);
+
+        assert!(
+            script.contains("cd '/tmp/re po'\\''s dir' || {"),
+            "cd の引数はシェルエスケープされるべき: {script}"
+        );
+        assert_valid_bash(&script, "task script with quoted directory");
+    }
+
+    #[test]
+    fn build_task_script_is_valid_bash() {
+        // cd ガードを差し込んだ後も、claude / 非 claude 双方のタスクスクリプトが
+        // bash 構文として妥当であること（ワーカーは source して実行する）。
+        let claude = agent_for_test("claude", &["claude", "-p"]);
+        let codex = agent_for_test("codex", &["codex", "exec"]);
+        let task = target_for_test("/tmp/repo");
+        let tmp = std::path::PathBuf::from("/tmp");
+
+        for (agent, is_claude, label) in [(&claude, true, "claude"), (&codex, false, "non-claude")]
+        {
+            let ctx = task_ctx_for_test(1, agent, &task, &tmp, is_claude);
+            let script = build_task_script(&ctx);
+            assert_valid_bash(&script, label);
+        }
+    }
+
+    #[test]
+    fn build_worker_script_is_valid_bash() {
+        // usage-gate の有無どちらでもワーカースクリプトが bash 構文として妥当であること。
+        let tmp = std::path::PathBuf::from("/tmp/burn");
+        for gate in [None, Some("tb usage-gate --profile P --provider claude")] {
+            let script = build_worker_script(&WorkerCtx {
+                worker_id: 0,
+                queue_dir: &tmp.join("queue"),
+                task_dir: &tmp.join("tasks"),
+                marker_dir: &tmp.join("markers"),
+                stop_file: &tmp.join("stop"),
+                usage_gate_cmd: gate,
+            });
+            assert_valid_bash(&script, "worker script");
+        }
+    }
+
+    #[test]
+    fn build_shell_command_never_prefixes_cd_regardless_of_env() {
+        // env の有無・空文字 unset のいずれの経路でも cd が混ざらないこと。
+        // cd が戻ると PIPESTATUS の要素数が変わる回帰が再発する。
+        let cmd = vec!["claude".to_string(), "-p".to_string()];
+        let prompt = std::path::Path::new("/tmp/prompt.txt");
+
+        let mut set_env = std::collections::BTreeMap::new();
+        set_env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/home/u/.claude".to_string(),
+        );
+        let mut unset_env = std::collections::BTreeMap::new();
+        unset_env.insert("CLAUDE_CONFIG_DIR".to_string(), String::new());
+
+        for env in [
+            std::collections::BTreeMap::new(),
+            set_env.clone(),
+            unset_env.clone(),
+        ] {
+            let result = build_shell_command(&cmd, &env, prompt);
+            assert!(!result.contains("cd "), "got: {result}");
+            assert!(!result.contains("&&"), "got: {result}");
+        }
+
+        // env 前置きの形自体は従来どおり保たれる
+        assert_eq!(
+            build_shell_command(&cmd, &std::collections::BTreeMap::new(), prompt),
+            "'claude' '-p' \"$(cat '/tmp/prompt.txt')\""
+        );
+        assert_eq!(
+            build_shell_command(&cmd, &set_env, prompt),
+            "CLAUDE_CONFIG_DIR='/home/u/.claude' 'claude' '-p' \"$(cat '/tmp/prompt.txt')\""
+        );
+        assert_eq!(
+            build_shell_command(&cmd, &unset_env, prompt),
+            "env -u CLAUDE_CONFIG_DIR 'claude' '-p' \"$(cat '/tmp/prompt.txt')\""
+        );
     }
 }

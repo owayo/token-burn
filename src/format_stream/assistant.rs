@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
+use crate::format_stream::blocks::{ContentBlockState, break_open_line};
 use crate::format_stream::util::{format_number, truncate_inline};
 
 /// ツール ID の対応表を更新し、stream_event に現れないモデル切替と
@@ -13,9 +14,15 @@ pub(crate) fn handle_assistant_event(
     out: &mut impl Write,
     tool_id_map: &mut HashMap<String, String>,
     shown_notices: &mut HashSet<String>,
+    blocks: &mut HashMap<usize, ContentBlockState>,
 ) -> Result<()> {
     let message = &value["message"];
     let message_id = message["id"].as_str().unwrap_or("");
+
+    // 通知はいったんバッファへ書く。assistant イベントは 1 セッションで数千件届くが
+    // 大半は通知を伴わないため、実際に出力がある場合だけ開きっぱなしの
+    // 思考/テキスト行を閉じる（毎回閉じると思考の進捗ドット表示が壊れる）。
+    let mut notices: Vec<u8> = Vec::new();
 
     if let Some(content) = message["content"].as_array() {
         for item in content {
@@ -26,12 +33,18 @@ pub(crate) fn handle_assistant_event(
             }
 
             if item["type"].as_str() == Some("fallback") {
-                write_model_fallback(item, message_id, out, shown_notices)?;
+                write_model_fallback(item, message_id, &mut notices, shown_notices)?;
             }
         }
     }
 
-    write_cache_miss(message, message_id, out, shown_notices)
+    write_cache_miss(message, message_id, &mut notices, shown_notices)?;
+
+    if !notices.is_empty() {
+        break_open_line(out, blocks)?;
+        out.write_all(&notices)?;
+    }
+    Ok(())
 }
 
 fn write_model_fallback(

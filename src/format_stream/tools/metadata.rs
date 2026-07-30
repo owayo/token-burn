@@ -183,6 +183,17 @@ fn append_file_metadata(obj: &serde_json::Map<String, serde_json::Value>, attrs:
     {
         attrs.push("replace_all".to_string());
     }
+    // 結果種別。実データでは "text"（通常の読み取り）/"update"（書き込み）に加えて
+    // "file_unchanged" が現れる。前回読み取りから内容が変わっていないため本文が返らな
+    // かったケースで、表示しないと通常の読み取り成功と区別できない（ポーリング中の
+    // Read が実は何も取得していない、という判断材料を失う）。
+    if obj
+        .get("type")
+        .and_then(|value| value.as_str())
+        .is_some_and(|kind| kind == "file_unchanged")
+    {
+        attrs.push("file-unchanged".to_string());
+    }
     // Read は読み取り結果を file オブジェクトに格納する。部分読み取り（limit 指定や
     // ファイル途中までの読み取り）では numLines < totalLines となり、切り詰めの判断材料になる。
     if let Some(file) = obj.get("file").and_then(|value| value.as_object()) {

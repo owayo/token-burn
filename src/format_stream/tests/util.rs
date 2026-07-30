@@ -3,8 +3,8 @@
 //! `process` 経由では踏みにくい端数・オーバーフロー境界を直接検証する。
 
 use crate::format_stream::util::{
-    first_string, format_byte_size, format_epoch_millis_clock, format_millis_as_seconds,
-    truncate_inline,
+    first_non_empty_string, first_string, format_byte_size, format_epoch_millis_clock,
+    format_millis_as_seconds, truncate_inline,
 };
 
 // --- format_byte_size: B / KB / MB の境界 ---
@@ -133,6 +133,73 @@ fn first_string_returns_empty_string_value_when_key_present() {
     // 値が空文字でも as_str() は Some を返すため、その空文字を採用する
     let v = serde_json::json!({"a": "", "b": "beta"});
     assert_eq!(first_string(&v, &["a", "b"]), "");
+}
+
+// --- first_non_empty_string: 空文字をスキップして次の候補へ進む ---
+// first_string との差分（空文字を確定しない）が本体。hook イベントのように
+// 候補キーが全て常設される payload で、内容のあるキーまで辿れることを固定する。
+
+#[test]
+fn first_non_empty_string_skips_empty_value_and_takes_next() {
+    // これが効かないと hook_response の output:"" が採用され、stderr の
+    // 失敗診断が丸ごと落ちる（旧実装の実バグ）。
+    let v = serde_json::json!({"output": "", "stderr": "boom", "stdout": ""});
+    assert_eq!(
+        first_non_empty_string(&v, &["output", "stderr", "stdout"]),
+        "boom"
+    );
+}
+
+#[test]
+fn first_non_empty_string_all_empty_returns_empty() {
+    let v = serde_json::json!({"output": "", "stderr": "", "stdout": ""});
+    assert_eq!(
+        first_non_empty_string(&v, &["output", "stderr", "stdout"]),
+        ""
+    );
+}
+
+#[test]
+fn first_non_empty_string_takes_middle_key_only() {
+    // 前後が空でも中間の非空キーだけを拾う
+    let v = serde_json::json!({"a": "", "b": "found", "c": ""});
+    assert_eq!(first_non_empty_string(&v, &["a", "b", "c"]), "found");
+}
+
+#[test]
+fn first_non_empty_string_skips_whitespace_only_values() {
+    // 空白・改行のみの値も「内容なし」として次の候補へ進む
+    let v = serde_json::json!({"a": "   ", "b": "\n\t", "c": "real"});
+    assert_eq!(first_non_empty_string(&v, &["a", "b", "c"]), "real");
+}
+
+#[test]
+fn first_non_empty_string_returns_value_verbatim_without_trimming() {
+    // 空判定にのみ trim を使い、返す値自体は加工しない
+    let v = serde_json::json!({"a": "  padded  "});
+    assert_eq!(first_non_empty_string(&v, &["a"]), "  padded  ");
+}
+
+#[test]
+fn first_non_empty_string_returns_empty_when_keys_absent() {
+    let v = serde_json::json!({"x": "y"});
+    assert_eq!(first_non_empty_string(&v, &["a", "b"]), "");
+    assert_eq!(first_non_empty_string(&v, &[]), "");
+}
+
+#[test]
+fn first_non_empty_string_skips_non_string_values() {
+    // 数値・真偽値・null は文字列ではないのでスキップする
+    let v = serde_json::json!({"a": 42, "b": null, "c": "found"});
+    assert_eq!(first_non_empty_string(&v, &["a", "b", "c"]), "found");
+}
+
+#[test]
+fn first_non_empty_string_respects_key_order_when_both_non_empty() {
+    // 空文字スキップを入れてもキー配列の優先順は変わらない
+    let v = serde_json::json!({"a": "alpha", "b": "beta"});
+    assert_eq!(first_non_empty_string(&v, &["a", "b"]), "alpha");
+    assert_eq!(first_non_empty_string(&v, &["b", "a"]), "beta");
 }
 
 // --- truncate_inline: 空白正規化 + 切り詰め ---

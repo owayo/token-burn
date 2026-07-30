@@ -386,7 +386,7 @@ async fn list(opts: ListOptions) -> Result<()> {
     let modified = if force_paths.is_empty() {
         let dirs: Vec<_> = targets.iter().map(|t| t.directory.clone()).collect();
         let modified = scanner::repo_last_modified_map(&dirs).await;
-        sort_by_least_recent(&mut targets, &modified);
+        sort_by_least_recent(&mut targets, &modified, public_first_enabled(&config));
         modified
     } else {
         HashMap::new()
@@ -502,7 +502,7 @@ async fn run(opts: RunOptions) -> Result<()> {
     let modified = if force_paths.is_empty() {
         let dirs: Vec<_> = targets.iter().map(|t| t.directory.clone()).collect();
         let modified = scanner::repo_last_modified_map(&dirs).await;
-        sort_by_least_recent(&mut targets, &modified);
+        sort_by_least_recent(&mut targets, &modified, public_first_enabled(&config));
         modified
     } else {
         HashMap::new()
@@ -693,22 +693,31 @@ fn resolve_force_paths(
 /// (`scanner::repo_last_modified`)。実際に変更が入ったかどうかを見るため、レート制限で
 /// 中断されて何も変更できなかった実行を「処理済み」と数えてしまうことがない。
 ///
-/// `defer` と `visibility` (`public_first`) の優先度は従来どおり維持し、その内側だけを
-/// 並べ替える。安定ソートなので、変更日時が同じターゲット同士の順序も変わらない。
+/// `defer` の優先度は従来どおり維持し、その内側だけを並べ替える。安定ソートなので、
+/// 変更日時が同じターゲット同士の順序も変わらない。
 /// 変更日時を取得できなかったリポジトリは、判断材料が無いので各グループの末尾に置く。
+///
+/// 可視性 (`public_first`) でグループ化するかどうかは `public_first` 引数で切り替える。
+/// 無条件に `visibility` をソートキーへ入れると、`public_first = false` を指定しても
+/// 公開リポジトリが必ず先頭に寄り、設定が黙って無視される（`limit` と併用すると
+/// 公開リポジトリが limit 件以上ある限り非公開リポジトリに永久に到達しない）。
 fn sort_by_least_recent(
     targets: &mut [scanner::ResolvedTarget],
     modified: &HashMap<PathBuf, DateTime<Utc>>,
+    public_first: bool,
 ) {
     targets.sort_by_cached_key(|t| {
         let last_modified = modified.get(&t.directory).copied();
-        (
-            t.defer,
-            t.visibility.clone(),
-            last_modified.is_none(),
-            last_modified,
-        )
+        // public_first = false のときは全要素が None になり、可視性はキーとして効かない。
+        let visibility = public_first.then(|| t.visibility.clone());
+        (t.defer, visibility, last_modified.is_none(), last_modified)
     });
+}
+
+/// いずれかの `[[scan]]` が `public_first` を有効にしているか。
+/// 有効な scan が 1 つでもあれば、最終的な実行順も可視性でグループ化する。
+fn public_first_enabled(config: &config::Config) -> bool {
+    config.scan.iter().any(|scan| scan.public_first)
 }
 
 fn filter_by_state(
@@ -952,7 +961,7 @@ mod tests {
         ];
         let modified = modified_at(&[("fresh", 1), ("stale", 60), ("middle", 10)]);
 
-        sort_by_least_recent(&mut targets, &modified);
+        sort_by_least_recent(&mut targets, &modified, true);
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(order, vec!["stale", "middle", "fresh"]);
@@ -973,7 +982,7 @@ mod tests {
             ("public-fresh", 1),
         ]);
 
-        sort_by_least_recent(&mut targets, &modified);
+        sort_by_least_recent(&mut targets, &modified, true);
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(
@@ -1007,7 +1016,7 @@ mod tests {
             ("public-middle", 30),
         ]);
 
-        sort_by_least_recent(&mut targets, &modified);
+        sort_by_least_recent(&mut targets, &modified, true);
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(
@@ -1034,7 +1043,7 @@ mod tests {
         ];
         let modified = modified_at(&[("known-fresh", 1)]);
 
-        sort_by_least_recent(&mut targets, &modified);
+        sort_by_least_recent(&mut targets, &modified, true);
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(order, vec!["known-fresh", "unknown"]);
@@ -1055,10 +1064,121 @@ mod tests {
             .map(|t| (t.directory.clone(), same))
             .collect();
 
-        sort_by_least_recent(&mut targets, &modified);
+        sort_by_least_recent(&mut targets, &modified, true);
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(order, vec!["first", "second", "third"]);
+    }
+
+    /// `public_first = false` を指定したら可視性でグループ化しない。
+    ///
+    /// 以前は `sort_by_least_recent` が無条件に `visibility` をソートキーへ入れていたため、
+    /// `public_first` を読むのは scanner の 1 箇所だけなのに最終順序が必ず
+    /// public 優先になり、設定が黙って無視されていた。`limit` と併用すると
+    /// 公開リポジトリが limit 件以上ある限り非公開リポジトリへ永久に到達しない。
+    #[test]
+    fn sort_by_least_recent_ignores_visibility_when_public_first_disabled() {
+        use scanner::Visibility;
+        let mut targets = vec![
+            target_at("public-fresh", Visibility::Public, false),
+            target_at("private-stale", Visibility::Private, false),
+            target_at("unknown-middle", Visibility::Unknown, false),
+        ];
+        let modified = modified_at(&[
+            ("public-fresh", 1),
+            ("private-stale", 90),
+            ("unknown-middle", 30),
+        ]);
+
+        sort_by_least_recent(&mut targets, &modified, false);
+
+        // 可視性は無視され、純粋に最終更新の古い順になる
+        let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["private-stale", "unknown-middle", "public-fresh"]
+        );
+    }
+
+    /// `public_first = false` でも `defer` の優先度は維持される。
+    #[test]
+    fn sort_by_least_recent_keeps_defer_when_public_first_disabled() {
+        use scanner::Visibility;
+        let mut targets = vec![
+            target_at("deferred-stale", Visibility::Public, true),
+            target_at("normal-fresh", Visibility::Private, false),
+        ];
+        let modified = modified_at(&[("deferred-stale", 300), ("normal-fresh", 1)]);
+
+        sort_by_least_recent(&mut targets, &modified, false);
+
+        let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
+        assert_eq!(order, vec!["normal-fresh", "deferred-stale"]);
+    }
+
+    /// `public_first = false` でも変更日時不明は末尾、同時刻は元順序で安定。
+    #[test]
+    fn sort_by_least_recent_without_public_first_keeps_unknown_last_and_is_stable() {
+        use scanner::Visibility;
+        let mut targets = vec![
+            target_at("no-mtime-a", Visibility::Public, false),
+            target_at("known", Visibility::Private, false),
+            target_at("no-mtime-b", Visibility::Public, false),
+        ];
+        let modified = modified_at(&[("known", 5)]);
+
+        sort_by_least_recent(&mut targets, &modified, false);
+
+        let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
+        assert_eq!(order, vec!["known", "no-mtime-a", "no-mtime-b"]);
+    }
+
+    fn scan_with(public_first: bool) -> config::Scan {
+        config::Scan {
+            base_dirs: vec!["/tmp".to_string()],
+            recursive: false,
+            username: None,
+            public_first,
+            exclude: vec![],
+        }
+    }
+
+    fn config_with_scans(scans: Vec<config::Scan>) -> config::Config {
+        config::Config {
+            config_dir: std::path::PathBuf::from("/tmp"),
+            settings: config::Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+                rate_limit_threshold: 95,
+            },
+            prompts: config::Prompts {
+                default: "review".to_string(),
+            },
+            agents: vec![],
+            scan: scans,
+            targets: vec![],
+            ai_usage: None,
+        }
+    }
+
+    #[test]
+    fn public_first_enabled_reflects_scan_settings() {
+        // scan が無い構成（[[targets]] のみ）は可視性でグループ化しない
+        assert!(!public_first_enabled(&config_with_scans(vec![])));
+        assert!(!public_first_enabled(&config_with_scans(vec![scan_with(
+            false
+        )])));
+        assert!(public_first_enabled(&config_with_scans(vec![scan_with(
+            true
+        )])));
+        // 1 つでも有効な scan があればグループ化する
+        assert!(public_first_enabled(&config_with_scans(vec![
+            scan_with(false),
+            scan_with(true),
+        ])));
     }
 
     #[test]
