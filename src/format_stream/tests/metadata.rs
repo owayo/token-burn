@@ -606,6 +606,31 @@ fn tool_result_metadata_auto_backgrounded_and_background_task_id() {
 }
 
 #[test]
+fn tool_result_metadata_shows_actual_agent_identifiers() {
+    // 実ログの非同期 Agent 起動結果と SendMessage 再開結果に現れる識別子。
+    // 両者を表示すると、起動した Agent と後続の送信・再開を対応付けられる。
+    let value = serde_json::json!({
+        "agentId": "a0ba96398b3dbd878",
+        "resumedAgentId": "ac33a76d38596530e"
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(
+        metadata.contains("agent-id:a0ba96398b3dbd878"),
+        "{metadata}"
+    );
+    assert!(
+        metadata.contains("resumed-agent:ac33a76d38596530e"),
+        "{metadata}"
+    );
+}
+
+#[test]
+fn tool_result_metadata_omits_empty_agent_identifiers() {
+    let value = serde_json::json!({"agentId": "", "resumedAgentId": ""});
+    assert_eq!(tool_result_metadata(&value), "");
+}
+
+#[test]
 fn tool_result_metadata_shows_actual_background_timeout_fields() {
     let result = serde_json::json!({
         "backgroundTaskId": "task-123",
@@ -879,8 +904,8 @@ fn tool_result_metadata_read_missing_total_lines_omits_ratio() {
 }
 
 #[test]
-fn tool_result_metadata_async_agent_is_marked() {
-    // Agent を run_in_background=true で起動した際の応答は async と表示される
+fn tool_result_metadata_async_agent_is_marked_with_id() {
+    // Agent を run_in_background=true で起動した際の応答は async と識別子を表示する。
     let value = serde_json::json!({
         "isAsync": true,
         "status": "async_launched",
@@ -890,8 +915,10 @@ fn tool_result_metadata_async_agent_is_marked() {
     });
     let metadata = tool_result_metadata(&value);
     assert!(metadata.contains("async"), "{metadata}");
-    // agentId は識別子としてのみ用いられ、表示はしない
-    assert!(!metadata.contains("a32bc162"), "{metadata}");
+    assert!(
+        metadata.contains("agent-id:a32bc162897eb706d"),
+        "{metadata}"
+    );
     // 既存の output-file:readable と共存する
     assert!(metadata.contains("output-file:readable"), "{metadata}");
 }

@@ -347,13 +347,29 @@ fn append_agent_metadata(
 ) {
     // Agent を `run_in_background:true` で起動したときの async-launched 応答。
     // 同期実行の Agent 結果には isAsync が無いため、フィールド存在で判定する。
-    // agentId はユーザがアクションに使える識別子ではないため表示しない（ノイズ回避）。
     if obj
         .get("isAsync")
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
     {
         attrs.push("async".to_string());
+    }
+    // 非同期 Agent の起動結果で返る識別子。後続の SendMessage の recipient や
+    // resumedAgentId と同じ値なので、起動と再開・送信をログ上で対応付けられる。
+    if let Some(agent_id) = obj
+        .get("agentId")
+        .and_then(|value| value.as_str())
+        .filter(|agent_id| !agent_id.is_empty())
+    {
+        attrs.push(format!("agent-id:{}", truncate_inline(agent_id, 40)));
+    }
+    // SendMessage が停止中の Agent を再開した場合に返る識別子。
+    if let Some(agent_id) = obj
+        .get("resumedAgentId")
+        .and_then(|value| value.as_str())
+        .filter(|agent_id| !agent_id.is_empty())
+    {
+        attrs.push(format!("resumed-agent:{}", truncate_inline(agent_id, 40)));
     }
     // Agent: 起動したサブエージェント種別（どのエージェントが実行したかの文脈）。
     if let Some(agent_type) = obj

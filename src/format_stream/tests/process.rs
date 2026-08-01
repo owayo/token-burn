@@ -702,6 +702,42 @@ fn process_task_progress_shows_subagent_progress() {
 }
 
 #[test]
+fn process_task_progress_breaks_open_thinking_line() {
+    // 実ログでは思考 delta の途中に system/task_progress が到着する。開いている思考行を
+    // 閉じずに直接表示すると、進捗が「💭 」の直後へ連結され、後続 delta の表示も崩れる。
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"検討中"}}}"#,
+        r#"{"type":"system","subtype":"task_progress","task_id":"abc","tool_use_id":"tu1","description":"Running checks","last_tool_name":"Bash"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"続行"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+    assert!(
+        clean.contains("💭 \n  🔄 Running checks (Bash)\n💭 "),
+        "system 通知の前後で思考行が独立しているべき: {clean:?}"
+    );
+}
+
+#[test]
+fn process_ignored_system_event_keeps_open_text_line() {
+    // thinking_tokens など表示しない system イベントでは、バッファが空のままなので
+    // 開いている本文行を閉じず、前後の text delta を連続して表示する。
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"前半"}}}"#,
+        r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":100}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"後半"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    assert_eq!(strip_ansi(&run_process(&input)), "前半後半\n");
+}
+
+#[test]
 fn process_task_notification_completed() {
     let input = [
             r#"{"type":"system","subtype":"task_notification","task_id":"abc","tool_use_id":"tu1","status":"completed","summary":"コードベースの徹底レビュー","usage":{"total_tokens":141902,"tool_uses":47,"duration_ms":158066}}"#,
@@ -1062,9 +1098,9 @@ fn process_stream_event_ping_is_silent() {
 }
 
 #[test]
-fn process_async_agent_launch_shows_async_marker() {
+fn process_async_agent_launch_shows_async_marker_and_agent_id() {
     // Agent を run_in_background=true で起動した async-launched 応答が
-    // tool 完了行で [async, output-file:readable] として表示されることを確認。
+    // tool 完了行で [async, agent-id:..., output-file:readable] として表示されることを確認。
     let input = [
             r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_async","name":"Agent","input":{}}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"description\":\"bg task\",\"run_in_background\":true}"}}}"#,
@@ -1077,8 +1113,8 @@ fn process_async_agent_launch_shows_async_marker() {
     assert!(clean.contains("\u{2713} Agent"), "{clean}");
     assert!(clean.contains("async"), "{clean}");
     assert!(clean.contains("output-file:readable"), "{clean}");
-    // agentId そのものは表示しない
-    assert!(!clean.contains("a32bc162"), "{clean}");
+    // 後続の SendMessage と対応付けるため、実ログの agentId も表示する。
+    assert!(clean.contains("agent-id:a32bc162897eb706d"), "{clean}");
 }
 
 #[test]

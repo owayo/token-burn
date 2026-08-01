@@ -86,6 +86,45 @@ fn process_rate_limit_allowed_with_details_is_shown() {
 }
 
 #[test]
+fn process_rate_limit_event_breaks_open_text_line() {
+    // 実ログではテキスト delta の単語途中に rate_limit_event が到着する。通知を直接
+    // 書くと `I<通知>'ll` のように本文と同じ行へ混入するため、独立した行へ分離する。
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I"}}}"#,
+        r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":1776009600}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"'ll continue"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+    assert!(
+        clean.contains("I\n  ℹ Rate limit status: allowed (five_hour)"),
+        "rate-limit 通知は本文と独立した行へ出るべき: {clean:?}"
+    );
+    assert!(
+        clean.contains("\n'll continue\n"),
+        "通知後の text delta も独立した本文行へ続くべき: {clean:?}"
+    );
+}
+
+#[test]
+fn process_silent_rate_limit_event_keeps_open_text_line() {
+    // 詳細の無い allowed は表示しないため、前後の本文 delta に改行を挟まない。
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"前半"}}}"#,
+        r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"後半"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    assert_eq!(strip_ansi(&run_process(&input)), "前半後半\n");
+}
+
+#[test]
 fn process_rate_limit_auto_stop_touches_stop_file() {
     let tmp = tempfile::TempDir::new().unwrap();
     let stop_file = tmp.path().join("stop");

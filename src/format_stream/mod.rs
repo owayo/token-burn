@@ -17,7 +17,7 @@ mod tools;
 mod util;
 
 use assistant::handle_assistant_event;
-use blocks::{ContentBlockState, finalize_open_blocks};
+use blocks::{ContentBlockState, break_open_line, finalize_open_blocks};
 use rate_limit::handle_rate_limit_event;
 use result::handle_result;
 use state::{StreamState, StreamSummary};
@@ -75,7 +75,9 @@ fn process(
         match msg_type {
             "system" => {
                 summary.update_from_system(&v);
-                handle_system_event(&v, &mut out)?;
+                render_out_of_band_event(&mut out, &mut blocks, |pending| {
+                    handle_system_event(&v, pending)
+                })?;
             }
             "stream_event" => {
                 handle_stream_event(
@@ -107,7 +109,9 @@ fn process(
                 handle_result(&v, &summary, &mut out)?;
             }
             "rate_limit_event" => {
-                handle_rate_limit_event(&v, &mut out, stop_file, threshold)?;
+                render_out_of_band_event(&mut out, &mut blocks, |pending| {
+                    handle_rate_limit_event(&v, pending, stop_file, threshold)
+                })?;
             }
             "tool_progress" => {
                 handle_tool_progress(&v, &mut out)?;
@@ -122,6 +126,25 @@ fn process(
         writer.flush()?;
     }
 
+    Ok(())
+}
+
+/// stream の本文・思考とは独立した通知を、開いている行へ連結せずに出力する。
+///
+/// 無視対象のイベントでは余計な改行を増やさないよう、先にバッファへ描画し、実際に
+/// 表示内容がある場合だけ現在の行を閉じる。system のタスク進捗や rate-limit 通知は
+/// テキスト delta の途中にも到着するため、直接書くと本文の単語中へ通知が混入する。
+fn render_out_of_band_event(
+    out: &mut impl Write,
+    blocks: &mut HashMap<usize, ContentBlockState>,
+    render: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    let mut pending = Vec::new();
+    render(&mut pending)?;
+    if !pending.is_empty() {
+        break_open_line(out, blocks)?;
+        out.write_all(&pending)?;
+    }
     Ok(())
 }
 
