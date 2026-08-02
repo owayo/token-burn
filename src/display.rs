@@ -8,6 +8,60 @@ use crate::config::RuntimeAgent;
 use crate::scanner::{ResolvedTarget, Visibility};
 use crate::usage::ScheduleResolver;
 
+const REDACTED_COMMAND_VALUE: &str = "<redacted>";
+
+/// ログや実行計画へ表示するコマンドから、秘密値になり得る引数を伏せる。
+pub fn format_command(command: &[String]) -> String {
+    let mut rendered = Vec::with_capacity(command.len());
+    let mut redact_next = false;
+
+    for (index, arg) in command.iter().enumerate() {
+        if index == 0 {
+            rendered.push(arg.clone());
+            continue;
+        }
+        if redact_next {
+            rendered.push(REDACTED_COMMAND_VALUE.to_string());
+            redact_next = false;
+            continue;
+        }
+
+        if let Some((key, _)) = arg.split_once('=')
+            && (is_env_key(key) || is_sensitive_option(key))
+        {
+            rendered.push(format!("{key}={REDACTED_COMMAND_VALUE}"));
+            continue;
+        }
+
+        rendered.push(arg.clone());
+        redact_next = is_sensitive_option(arg);
+    }
+
+    rendered.join(" ")
+}
+
+fn is_env_key(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some('A'..='Z' | 'a'..='z' | '_'))
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_sensitive_option(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().replace('_', "-").as_str(),
+        "--api-key"
+            | "--apikey"
+            | "--token"
+            | "--access-token"
+            | "--auth-token"
+            | "--password"
+            | "--secret"
+            | "--client-secret"
+            | "--credential"
+            | "--credentials"
+    )
+}
+
 pub fn print_status(agents: &[RuntimeAgent], resolver: &ScheduleResolver) -> anyhow::Result<()> {
     println!("{}", "=== Agent Status ===".bold());
     println!();
@@ -93,6 +147,53 @@ pub fn format_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_command_redacts_environment_assignments() {
+        let command = vec![
+            "env".to_string(),
+            "API_TOKEN=top-secret".to_string(),
+            "ai-usage".to_string(),
+            "--json".to_string(),
+        ];
+
+        assert_eq!(
+            format_command(&command),
+            "env API_TOKEN=<redacted> ai-usage --json"
+        );
+    }
+
+    #[test]
+    fn format_command_redacts_sensitive_option_values() {
+        let command = vec![
+            "client".to_string(),
+            "--api-key".to_string(),
+            "top-secret".to_string(),
+            "--auth_token=another-secret".to_string(),
+            "--verbose".to_string(),
+        ];
+
+        assert_eq!(
+            format_command(&command),
+            "client --api-key <redacted> --auth_token=<redacted> --verbose"
+        );
+    }
+
+    #[test]
+    fn format_command_keeps_non_sensitive_arguments() {
+        let command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+        ];
+
+        assert_eq!(
+            format_command(&command),
+            "codex exec --sandbox workspace-write"
+        );
+        assert_eq!(format_command(&[]), "");
+    }
 
     #[test]
     fn format_duration_days() {

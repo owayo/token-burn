@@ -91,6 +91,8 @@ make release  # リリースビルド
 
 リセット時刻は `DateTime<FixedOffset>` で保持します。ai-usage の `resets_at`（RFC3339、オフセット付き）は瞬間を保ったまま実行環境のローカル固定オフセットへ変換し、固定計算（タイムゾーンのオフセット）と同じ型で統一します。UTC で返る ai-usage 出力も `status` / `run` ではユーザーのローカル時刻として表示されます。`status` と `run` は各エージェントのスケジュールの導出元（`ai-usage (weekly)` / `fixed` / `fixed fallback: <理由>`）を表示し、ai-usage が静かに固定計算へ戻ることはありません。
 
+ドライランの実行計画、および ai-usage コマンドの起動失敗・タイムアウトエラーにコマンド列を表示するときは、環境変数代入と一般的な認証オプションの値を `<redacted>` に置き換えます。実際の子プロセスには元の引数を渡し、表示のために実行内容を変更しません。
+
 ### 使用率ゲート（usage-gate）
 
 ai-usage 連携が有効なとき、`rate_limit_threshold`（%）は 2 経路で後続タスクを止めます。1 つは既存の `claude` stream-json `rate_limit_event` によるリアルタイム監視（タスク実行中の `utilization` が閾値超過で stop file 作成）。もう 1 つが **usage-gate** で、各タスク完了後（ワーカーが次の pending を claim する前）に内部サブコマンド `token-burn usage-gate` が `ai-usage --json` を実行し、その agent の `(profile, provider)` の weekly / five_hour `used_percent` のうち**いずれかが `rate_limit_threshold` 以上なら stop file を作成**して後続を停止します。`claude` / `codex` 両方に効きます（codex は従来リアルタイム監視が無かったため特に有効）。

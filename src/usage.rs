@@ -289,13 +289,16 @@ async fn spawn_ai_usage_with_timeout(command: &[String]) -> Result<std::process:
     let mut cmd = tokio::process::Command::new(&command[0]);
     cmd.args(&command[1..]).kill_on_drop(true);
     match tokio::time::timeout(AI_USAGE_TIMEOUT, cmd.output()).await {
-        Ok(res) => {
-            res.with_context(|| format!("failed to run ai-usage command: {}", command.join(" ")))
-        }
+        Ok(res) => res.with_context(|| {
+            format!(
+                "failed to run ai-usage command: {}",
+                crate::display::format_command(command)
+            )
+        }),
         Err(_) => anyhow::bail!(
             "ai-usage timed out after {}s: {}",
             AI_USAGE_TIMEOUT.as_secs(),
-            command.join(" ")
+            crate::display::format_command(command)
         ),
     }
 }
@@ -465,6 +468,24 @@ fn write_stop_file(stop_file: &Path, reason: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn spawn_ai_usage_redacts_secret_on_spawn_failure() {
+        let secret = "actual-secret-value";
+        let command = vec![
+            "token-burn-command-that-does-not-exist".to_string(),
+            "--api-key".to_string(),
+            secret.to_string(),
+        ];
+
+        let error = spawn_ai_usage_with_timeout(&command)
+            .await
+            .expect_err("存在しないコマンドの起動は失敗するべき");
+        let message = error.to_string();
+
+        assert!(message.contains("--api-key <redacted>"));
+        assert!(!message.contains(secret));
+    }
 
     fn window_data(resets_at: Option<&str>) -> UsageWindowData {
         UsageWindowData {

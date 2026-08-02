@@ -94,7 +94,12 @@ fn spawn_ai_usage_sync_with_timeout(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .with_context(|| format!("failed to spawn ai-usage command: {}", command.join(" ")))?;
+        .with_context(|| {
+            format!(
+                "failed to spawn ai-usage command: {}",
+                crate::display::format_command(command)
+            )
+        })?;
 
     // stdout/stderr は必ず別スレッドで並行に drain する。子の終了を待ってから読むと、
     // 出力がパイプバッファ（macOS では 16KB 程度）を超えたとき子の write(2) がブロックして
@@ -142,7 +147,7 @@ fn spawn_ai_usage_sync_with_timeout(
                     anyhow::bail!(
                         "ai-usage timed out after {}s: {}",
                         timeout.as_secs(),
-                        command.join(" ")
+                        crate::display::format_command(command)
                     );
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -169,7 +174,10 @@ fn ensure_executable(path: &Path) -> Result<()> {
 pub fn print_plan(plan: &ExecutionPlan) {
     println!("{}", "=== Execution Plan ===".bold());
     println!("Agent: {}", plan.agent.name.cyan());
-    println!("Command: {}", plan.agent.command.join(" ").dimmed());
+    println!(
+        "Command: {}",
+        crate::display::format_command(&plan.agent.command).dimmed()
+    );
     println!("Tasks: {}", plan.tasks.len());
     println!();
     for (i, task) in plan.tasks.iter().enumerate() {
@@ -565,6 +573,61 @@ pub fn execute_plan_tmux(
 mod tests {
     use super::flags::CLAUDE_PRINT_BG_WAIT_ENV;
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_executable_adds_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().expect("一時ディレクトリを作成できるべき");
+        let path = tmp.path().join("script.sh");
+        std::fs::write(&path, "#!/bin/sh\n").expect("テスト用スクリプトを書き込めるべき");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("テスト用スクリプトのメタデータを取得できるべき")
+            .permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&path, permissions).expect("実行前の権限を設定できるべき");
+
+        ensure_executable(&path).expect("実行権限を付与できるべき");
+
+        let mode = std::fs::metadata(&path)
+            .expect("実行後のメタデータを取得できるべき")
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_executable_reports_missing_path() {
+        let tmp = tempfile::TempDir::new().expect("一時ディレクトリを作成できるべき");
+        let missing = tmp.path().join("missing-script.sh");
+
+        let error = ensure_executable(&missing).expect_err("存在しないパスは失敗するべき");
+
+        assert!(error.to_string().contains("chmod +x"));
+    }
+
+    #[test]
+    fn spawn_ai_usage_sync_redacts_secret_on_spawn_failure() {
+        let secret = "actual-secret-value";
+        let command = vec![
+            "token-burn-command-that-does-not-exist".to_string(),
+            "--api-key".to_string(),
+            secret.to_string(),
+        ];
+
+        let error = spawn_ai_usage_sync_with_timeout(
+            &command,
+            &std::collections::BTreeMap::new(),
+            Duration::from_secs(1),
+        )
+        .expect_err("存在しないコマンドの起動は失敗するべき");
+        let message = error.to_string();
+
+        assert!(message.contains("--api-key <redacted>"));
+        assert!(!message.contains(secret));
+    }
 
     #[test]
     fn spawn_ai_usage_sync_kills_hanging_child_within_timeout() {
