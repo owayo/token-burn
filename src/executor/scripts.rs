@@ -69,6 +69,22 @@ STATUS_MSG=""
 
 restore_terminal() {{ tput cnorm 2>/dev/null; printf '\033[?7h'; }}
 
+# 完了・停止後の待機。待機を exec で sleep に置き換えると、その時点で INT/TERM の trap が
+# SIG_DFL へ戻る（POSIX: catch 済みシグナルは exec 後にデフォルト動作へ戻る）。すると
+# 画面に出した "Press Ctrl-C to close session." が機能せず、Ctrl-C はモニターペインの
+# sleep を殺すだけになる。ワーカーペインは生き残るので tmux セッションは閉じず、
+# attach したままのユーザーは手動で kill する羽目になっていた。trap を保ったまま
+# 待機し、Ctrl-C でセッションごと閉じられるようにする。
+wait_for_close() {{
+    local sleep_pid=""
+    trap 'restore_terminal; [ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null; tmux kill-session -t "$SESSION" 2>/dev/null; exit 0' INT TERM
+    while true; do
+        sleep 3600 &
+        sleep_pid=$!
+        wait "$sleep_pid"
+    done
+}}
+
 # ai-usage サブプロセスがハングしても monitor ループを止めないための timeout ラッパー。
 # `$1` 秒で子プロセスを SIGTERM → 1 秒後 SIGKILL する。コマンド自身の stdout はそのまま
 # 親に伝搬するため `$(run_with_timeout N bash -c "$CMD")` の形で捕捉できる。
@@ -162,11 +178,19 @@ tput civis 2>/dev/null
 END=$(($(date +%s) + DEADLINE))
 
 fetch_usage
+LAST_USAGE=$(date +%s)
 render
 
 while true; do
     NOW=$(date +%s)
     REMAINING=$((END - NOW))
+    # worker-done は各ワーカーが自分の done-*/failed-*/retry-* を書き切った後に作る。
+    # 先に worker-done を読んでからタスクマーカーを読めば「worker-done が見えている
+    # のにそのワーカーのタスクマーカーが見えていない」状態は起こらない。逆順（タスク
+    # マーカーを読む → fetch_usage で最大 AI_USAGE_TIMEOUT 秒ブロック → worker-done を
+    # 読む）だと、その待ち時間に最後のワーカーが完走した場合に古い PROCESSED と新しい
+    # WORKERS_DONE が組み合わさり、全件成功でも「⏹ Stopped: 9/10 processed」と誤報告する。
+    WORKERS_DONE=$(find "$MARKER_DIR" -name 'worker-done-*' 2>/dev/null | wc -l | tr -d ' ')
     DONE=$(find "$MARKER_DIR" -name 'done-*' 2>/dev/null | wc -l | tr -d ' ')
     FAILED=$(find "$MARKER_DIR" -name 'failed-*' 2>/dev/null | wc -l | tr -d ' ')
     RETRY=$(find "$MARKER_DIR" -name 'retry-*' 2>/dev/null | wc -l | tr -d ' ')
@@ -177,7 +201,10 @@ while true; do
     # ai-usage statusline は 10 秒ごとに再取得・再描画する
     if [ -n "$AI_USAGE_CMD" ] && [ $((NOW - LAST_USAGE)) -ge 10 ]; then
         fetch_usage
-        LAST_USAGE=$NOW
+        # fetch 開始時刻（$NOW）ではなく完了時刻を記録する。fetch_usage は
+        # run_with_timeout を 2 回呼ぶため最長 2*AI_USAGE_TIMEOUT 秒かかり、開始時刻を
+        # 基準にすると次の周回で即座に条件が成立して間隔を空けずに再取得し続ける。
+        LAST_USAGE=$(date +%s)
         NEED_RENDER=1
     fi
     # 新規エラー検出時も全体を再描画する
@@ -218,7 +245,7 @@ while true; do
         echo ""
         echo " Press Ctrl-C to close session."
         restore_terminal
-        exec sleep infinity
+        wait_for_close
     fi
 
     # 全ワーカーが終了していれば、STOPPED かどうかに関わらず停止と判定する。
@@ -227,7 +254,6 @@ while true; do
     # の fail-closed による break、タスクスクリプト欠落など）。STOPPED の内側に閉じ込めると、
     # usage-gate が stop file を作れずに fail-closed した場合にモニターがデッドラインまで
     # ハングするため、ワーカー全滅は独立した終了条件として扱う。
-    WORKERS_DONE=$(find "$MARKER_DIR" -name 'worker-done-*' 2>/dev/null | wc -l | tr -d ' ')
     if [ "$WORKERS_DONE" -ge "$WORKER_COUNT" ]; then
         render
         printf " ⏹ Stopped: %d/%d processed (fail:%d retry:%d)\n" "$PROCESSED" "$TOTAL" "$FAILED" "$RETRY"
@@ -236,7 +262,7 @@ while true; do
         echo ""
         echo " Press Ctrl-C to close session."
         restore_terminal
-        exec sleep infinity
+        wait_for_close
     fi
 
     # 進捗バー（画面最下部、毎秒 \r 上書き）
@@ -604,7 +630,10 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "printf '\\033]2;Worker {w} done\\033\\\\'\n",
             "echo '━━━ All tasks completed ━━━'\n",
             "touch {worker_done}\n",
-            "exec sleep infinity\n",
+            // macOS の BSD sleep は `infinity` を受け付けず、usage エラーで即座に
+            // 終了する（`sleep infinity` → exit 1）。ワーカーペインが完了直後に
+            // 閉じてしまい、直前のログを読み返せなくなるため有限秒のループで待つ。
+            "while true; do sleep 3600; done\n",
         ),
         queue_dir = queue_dir,
         task_dir = task_dir,
@@ -1084,19 +1113,97 @@ mod tests {
         assert!(script.contains("while [ $i -lt $FILLED ]"));
         assert!(script.contains("while [ $i -lt $EMPTY ]"));
         assert!(!script.contains("seq 1 $FILLED"));
-        // 完了/停止後も端末状態（カーソル/autowrap）を復元する。EXIT trap は exec で発火しないため
-        // exec sleep infinity の直前でも復元する。
+        // 完了/停止後も端末状態（カーソル/autowrap）を復元する。
         assert!(script.contains("restore_terminal() {"));
         assert!(script.contains("trap restore_terminal EXIT"));
-        // 完了時ブロック・停止時ブロックのいずれも 8 スペースインデントで、exec sleep infinity の
-        // 直前に端末状態を復元する。EXIT trap は exec で発火しないため復元呼び出しが必須。
-        // （ワーカー全滅判定を STOPPED の内側から出したため、停止時ブロックも 8 スペースになった）
+        // 完了時ブロック・停止時ブロックのいずれも、待機前に端末状態を復元してから
+        // wait_for_close へ入る（どちらも 8 スペースインデント）。
         assert_eq!(
             script
-                .matches("restore_terminal\n        exec sleep infinity")
+                .matches("restore_terminal\n        wait_for_close")
                 .count(),
             2,
-            "both completion and stopped blocks must restore terminal before exec: {script}"
+            "both completion and stopped blocks must restore terminal before waiting: {script}"
+        );
+        // 待機は exec せずに行う。exec すると catch 済みの INT/TERM が SIG_DFL に戻り、
+        // 画面に出す "Press Ctrl-C to close session." が機能しなくなる。
+        // また macOS の BSD sleep は `infinity` を受け付けず即座に usage エラーで
+        // 終了するため、待機自体が成立しない（ペインが完了直後に閉じる）。
+        assert!(
+            !script.contains("sleep infinity"),
+            "monitor must not rely on `sleep infinity` (unsupported by BSD sleep): {script}"
+        );
+        assert!(script.contains("wait_for_close() {"));
+        assert!(
+            script.contains(r#"tmux kill-session -t "$SESSION" 2>/dev/null; exit 0' INT TERM"#),
+            "wait_for_close must close the tmux session on Ctrl-C: {script}"
+        );
+        assert!(
+            script.contains("sleep 3600 &"),
+            "wait_for_close must sleep in finite chunks so the trap stays reachable: {script}"
+        );
+    }
+
+    #[test]
+    fn build_worker_script_waits_without_sleep_infinity() {
+        // macOS の BSD sleep は `infinity` を受け付けず exit 1 で即座に終了する。
+        // ワーカーペインが完了直後に閉じて直前のログを読み返せなくなるのを防ぐ。
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 1,
+            queue_dir: std::path::Path::new("/tmp/queue"),
+            task_dir: std::path::Path::new("/tmp/tasks"),
+            marker_dir: std::path::Path::new("/tmp/markers"),
+            stop_file: std::path::Path::new("/tmp/stop"),
+            usage_gate_cmd: None,
+        });
+        assert!(
+            !script.contains("sleep infinity"),
+            "worker must not rely on `sleep infinity`: {script}"
+        );
+        assert!(
+            script.contains("while true; do sleep 3600; done"),
+            "worker must wait in finite sleep chunks: {script}"
+        );
+        assert_valid_bash(&script, "worker script waiting loop");
+    }
+
+    #[test]
+    fn generate_monitor_script_reads_worker_done_before_task_markers() {
+        // worker-done はワーカーが自分のタスクマーカーを書き切った後に作られる。
+        // 先に worker-done を読むことで「worker 全滅は見えているがタスクマーカーが
+        // 古い」状態を防ぎ、全件成功を「⏹ Stopped: 9/10」と誤報告しないようにする。
+        let script = monitor_script_for_test();
+        let workers_done = script
+            .find("WORKERS_DONE=$(find")
+            .expect("WORKERS_DONE の取得が必要");
+        let done = script
+            .find("DONE=$(find \"$MARKER_DIR\" -name 'done-*'")
+            .expect("DONE の取得が必要");
+        assert!(
+            workers_done < done,
+            "WORKERS_DONE はタスクマーカーより先に読むべき: {script}"
+        );
+        // 再取得は残さない（古い値と新しい値の混在を避ける）。
+        assert_eq!(
+            script.matches("WORKERS_DONE=$(find").count(),
+            1,
+            "WORKERS_DONE の取得は 1 箇所のみ: {script}"
+        );
+    }
+
+    #[test]
+    fn generate_monitor_script_records_fetch_completion_time() {
+        // スロットルは fetch 開始時刻ではなく完了時刻を基準にする。開始時刻だと
+        // fetch が 10 秒以上かかったとき次の周回で即座に再取得してしまう。
+        let script = monitor_script_for_test();
+        assert!(
+            !script.contains("LAST_USAGE=$NOW"),
+            "fetch 開始時刻を記録してはいけない: {script}"
+        );
+        assert_eq!(
+            script.matches("LAST_USAGE=$(date +%s)").count(),
+            2,
+            "初回 fetch 直後とループ内 fetch 直後の 2 箇所で完了時刻を記録する: {script}"
         );
     }
 

@@ -185,3 +185,77 @@ fn init_without_display_fields_writes_nothing() {
     let out = render(r#"{"type":"system","subtype":"init","session_id":"s1","cwd":"/repo"}"#);
     assert!(out.is_empty(), "{out:?}");
 }
+
+// --- task_updated: 失敗理由とバックグラウンド移行 ---
+
+/// 失敗 patch の error（実データの主要な失敗原因）を表示する。
+#[test]
+fn task_updated_failed_shows_patch_error() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"status":"failed","end_time":1785433765926,"error":"Agent terminated early due to an API error: API Error: Connection closed mid-response."}}"#,
+    );
+    assert!(out.contains("Task failed"), "{out:?}");
+    assert!(
+        out.contains("Connection closed mid-response"),
+        "失敗理由を表示すべき: {out:?}"
+    );
+}
+
+/// killed も失敗系として error を併記する。
+#[test]
+fn task_updated_killed_shows_patch_error() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"status":"killed","error":"stopped by user"}}"#,
+    );
+    assert!(out.contains("Task killed"), "{out:?}");
+    assert!(out.contains("stopped by user"), "{out:?}");
+}
+
+/// error が無い失敗 patch は従来どおり状態のみを表示する。
+#[test]
+fn task_updated_failed_without_error_keeps_short_form() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"status":"failed","end_time":1785433765926}}"#,
+    );
+    assert!(out.contains("Task failed"), "{out:?}");
+    assert!(!out.contains(':'), "余計な区切りを付けないべき: {out:?}");
+}
+
+/// 空文字の error は付けない。
+#[test]
+fn task_updated_failed_with_empty_error_keeps_short_form() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"status":"failed","error":""}}"#,
+    );
+    assert!(out.contains("Task failed"), "{out:?}");
+    assert!(!out.contains(':'), "{out:?}");
+}
+
+/// status を伴わない is_backgrounded patch は「バックグラウンド移行」として表示する。
+/// これ以降タスクの出力がインラインに出なくなる理由そのものになる。
+#[test]
+fn task_updated_backgrounded_is_reported() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"is_backgrounded":true}}"#,
+    );
+    assert!(out.contains("Task backgrounded"), "{out:?}");
+}
+
+/// is_backgrounded:false や未知フィールドのみの patch は何も出さない。
+#[test]
+fn task_updated_unknown_patch_writes_nothing() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"is_backgrounded":false,"end_time":1785433765926}}"#,
+    );
+    assert!(out.is_empty(), "{out:?}");
+}
+
+/// status がある場合は is_backgrounded より status を優先する。
+#[test]
+fn task_updated_status_takes_precedence_over_backgrounded() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"status":"completed","is_backgrounded":true}}"#,
+    );
+    assert!(out.contains("Task completed"), "{out:?}");
+    assert!(!out.contains("backgrounded"), "{out:?}");
+}

@@ -36,9 +36,30 @@ struct AiUsageAccount {
 /// 各枠（weekly / five_hour）のリセット情報。
 #[derive(Debug, Deserialize, Clone)]
 struct UsageWindowData {
+    /// ai-usage が返す実際の枠種別（`five_hour` / `daily` / `weekly` / `monthly` 等）。
+    ///
+    /// スロット名（`weekly` / `five_hour`）と一致しないことがある。実データでは
+    /// antigravity が `five_hour` スロットに `kind:"daily"`（24 時間枠）を、pixellab が
+    /// `weekly` スロットに `kind:"monthly"`（月次枠）を返す。周期の導出はスロット名では
+    /// なくこちらを優先しないと `state_cutoff` が実際の枠開始点からずれる。
+    #[serde(default)]
+    kind: Option<String>,
     resets_at: Option<String>,
     /// 使用率（%）。usage-gate の閾値判定に使う。
     used_percent: Option<f64>,
+}
+
+impl UsageWindowData {
+    /// この枠の 1 周期の長さ。`kind` が未知・欠損ならスロット名の既定値へ落とす。
+    fn period(&self, slot: UsageWindow) -> chrono::Duration {
+        match self.kind.as_deref() {
+            Some("five_hour") => chrono::Duration::hours(5),
+            Some("daily") => chrono::Duration::days(1),
+            Some("weekly") => chrono::Duration::days(7),
+            Some("monthly") => chrono::Duration::days(30),
+            _ => slot.period(),
+        }
+    }
 }
 
 /// ai-usage --json の取得結果スナップショット。
@@ -213,16 +234,20 @@ impl ScheduleResolver {
         // state_cutoff の枠を決める。state_window=weekly なら weekly 基準を優先し、
         // weekly が無い場合だけ選択枠に落とす。deadline が five_hour 由来でも、
         // 処理済みカットオフは週次基準を保つのが安全。
-        let (cutoff_anchor, cutoff_window) = match self.state_window {
+        let (cutoff_anchor, cutoff_period) = match self.state_window {
             StateWindowPolicy::Weekly => acc
                 .weekly
                 .as_ref()
-                .and_then(parse_resets_at)
-                .map(|w| (w, UsageWindow::Weekly))
-                .unwrap_or((next_reset, window)),
-            StateWindowPolicy::Selected => (next_reset, window),
+                .and_then(|w| parse_resets_at(w).map(|at| (at, w.period(UsageWindow::Weekly))))
+                .unwrap_or((next_reset, data.period(window))),
+            StateWindowPolicy::Selected => (next_reset, data.period(window)),
         };
-        let state_cutoff = cutoff_anchor - cutoff_window.period();
+        // 周期は枠データの `kind` から求める。スロット名で決め打ちすると、実データの
+        // `five_hour` スロットに入る 24 時間枠（`kind:"daily"`）を 5 時間として扱い、
+        // カットオフ（= 直前の枠の開始点）が未来へ飛ぶ。すると `filter_by_state` の
+        // `last >= cutoff` が恒偽になって処理済みフィルタが黙って無効化され、毎回同じ
+        // 先頭ターゲットだけを再処理し続ける。
+        let state_cutoff = cutoff_anchor - cutoff_period;
 
         let time_until_reset = (next_reset.with_timezone(&Utc) - Utc::now())
             .to_std()
@@ -489,6 +514,16 @@ mod tests {
 
     fn window_data(resets_at: Option<&str>) -> UsageWindowData {
         UsageWindowData {
+            kind: None,
+            resets_at: resets_at.map(String::from),
+            used_percent: None,
+        }
+    }
+
+    /// `kind` を明示した枠データ（実データの `daily` / `monthly` 再現用）。
+    fn window_data_with_kind(kind: &str, resets_at: Option<&str>) -> UsageWindowData {
+        UsageWindowData {
+            kind: Some(kind.to_string()),
             resets_at: resets_at.map(String::from),
             used_percent: None,
         }
@@ -619,6 +654,100 @@ mod tests {
         let sched = r.schedule_for(&agent).unwrap().expect("should resolve");
         assert_eq!(sched.source, ScheduleSource::AiUsage(UsageWindow::Weekly));
         // 状態カットオフは次回リセットの 7 日前
+        let diff = sched.next_reset - sched.state_cutoff;
+        assert_eq!(diff.num_days(), 7);
+    }
+
+    #[test]
+    fn schedule_for_uses_daily_period_for_daily_kind() {
+        // 実データの antigravity は `five_hour` スロットに 24 時間枠（kind:"daily"）を返す。
+        // スロット名どおり 5 時間として扱うと state_cutoff が未来へ飛び、処理済み
+        // フィルタが恒久的に無効化される（毎回同じ先頭ターゲットを再処理し続ける）。
+        let snapshot = AiUsageSnapshot {
+            accounts: vec![account(
+                "Antigravity",
+                "antigravity",
+                true,
+                None,
+                Some(window_data_with_kind(
+                    "daily",
+                    Some("2099-01-02T00:00:00+00:00"),
+                )),
+                None,
+            )],
+        };
+        let r = resolver(UsageState::Loaded(snapshot));
+        let agent = rt_agent(
+            "Antigravity",
+            "antigravity",
+            UsageWindowPolicy::FiveHour,
+            UsageFallback::Fixed,
+        );
+        let sched = r.schedule_for(&agent).unwrap().expect("should resolve");
+        let diff = sched.next_reset - sched.state_cutoff;
+        assert_eq!(
+            diff.num_hours(),
+            24,
+            "daily 枠のカットオフは 24 時間前であるべき"
+        );
+    }
+
+    #[test]
+    fn schedule_for_uses_monthly_period_for_monthly_kind() {
+        // 実データの pixellab は `weekly` スロットに月次枠（kind:"monthly"）を返す。
+        let snapshot = AiUsageSnapshot {
+            accounts: vec![account(
+                "Yohei",
+                "pixellab",
+                true,
+                Some(window_data_with_kind(
+                    "monthly",
+                    Some("2099-02-01T00:00:00+00:00"),
+                )),
+                None,
+                None,
+            )],
+        };
+        let r = resolver(UsageState::Loaded(snapshot));
+        let agent = rt_agent(
+            "Yohei",
+            "pixellab",
+            UsageWindowPolicy::Weekly,
+            UsageFallback::Fixed,
+        );
+        let sched = r.schedule_for(&agent).unwrap().expect("should resolve");
+        let diff = sched.next_reset - sched.state_cutoff;
+        assert_eq!(
+            diff.num_days(),
+            30,
+            "monthly 枠のカットオフは 30 日前であるべき"
+        );
+    }
+
+    #[test]
+    fn schedule_for_unknown_kind_falls_back_to_slot_period() {
+        // 未知の kind はスロット名の既定周期へ落とす（従来動作を維持）。
+        let snapshot = AiUsageSnapshot {
+            accounts: vec![account(
+                "Work",
+                "claude",
+                true,
+                Some(window_data_with_kind(
+                    "fortnightly",
+                    Some("2099-01-01T00:00:00+00:00"),
+                )),
+                None,
+                None,
+            )],
+        };
+        let r = resolver(UsageState::Loaded(snapshot));
+        let agent = rt_agent(
+            "Work",
+            "claude",
+            UsageWindowPolicy::Weekly,
+            UsageFallback::Fixed,
+        );
+        let sched = r.schedule_for(&agent).unwrap().expect("should resolve");
         let diff = sched.next_reset - sched.state_cutoff;
         assert_eq!(diff.num_days(), 7);
     }

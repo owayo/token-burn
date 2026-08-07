@@ -427,3 +427,108 @@ fn format_resets_at_null_value() {
     let result = format_resets_at(&info);
     assert_eq!(result, "", "resetsAt が null の場合は空文字列を返すべき");
 }
+
+// --- overage（超過枠）補足と日付付きリセット時刻のテスト ---
+// いずれも ~/Documents/token-burn の実 jsonl に現れた rate_limit_info を再現する。
+
+#[test]
+fn rejected_shows_overage_details() {
+    // 実データの rejected は overageStatus / overageResetsAt / isUsingOverage を伴う。
+    // これらを落とすと 5 時間枠の resets だけが残り、実際は超過枠まで使い切っていて
+    // 復旧が数週間先でも「その時刻まで待てば再開できる」と誤読される。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1785772200,"rateLimitType":"five_hour","overageStatus":"allowed","overageResetsAt":1788220800,"isUsingOverage":true,"overageInUse":true}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("rejected"), "{clean}");
+    assert!(clean.contains("five_hour"), "{clean}");
+    assert!(
+        clean.contains("overage:allowed"),
+        "overage の可否が表示されるべき: {clean}"
+    );
+    assert!(
+        clean.contains("using_overage"),
+        "超過枠を消費中である旨が表示されるべき: {clean}"
+    );
+    assert!(
+        clean.contains("overage_resets:"),
+        "超過枠のリセット時刻が表示されるべき: {clean}"
+    );
+}
+
+#[test]
+fn rejected_without_overage_keeps_previous_format() {
+    // overage 情報が無い rejected は従来どおり括弧を増やさない。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.trim_end().ends_with("rejected (five_hour)"),
+        "余計な括弧を付けないべき: {clean}"
+    );
+}
+
+#[test]
+fn warning_shows_using_overage() {
+    // 警告イベントは実データで isUsingOverage を常に持つ。通常枠の警告か
+    // 超過枠の警告かを区別できないと停止判断を誤る。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.79,"isUsingOverage":true}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("79%"), "{clean}");
+    assert!(
+        clean.contains("using_overage"),
+        "超過枠の消費中表示が必要: {clean}"
+    );
+}
+
+#[test]
+fn warning_without_overage_has_no_overage_suffix() {
+    // isUsingOverage:false のときは補足を付けない（過剰表示の防止）。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.79,"isUsingOverage":false}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(!clean.contains("using_overage"), "{clean}");
+}
+
+#[test]
+fn overage_in_use_alias_is_recognized() {
+    // isUsingOverage が無く overageInUse だけの形でも超過枠消費として扱う。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","overageInUse":true}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("using_overage"), "{clean}");
+}
+
+#[test]
+fn auto_stop_line_includes_overage_flag() {
+    // 閾値超過で停止する行にも超過枠の消費有無を残す。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"overage","utilization":1.03,"surpassedThreshold":1,"isUsingOverage":true}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("auto-stop"), "{clean}");
+    assert!(clean.contains("using_overage"), "{clean}");
+}
+
+#[test]
+fn resets_today_shows_time_only() {
+    // 当日中のリセットは従来どおり HH:MM のみ（日付でノイズを増やさない）。
+    let today_noon = chrono::Local::now()
+        .date_naive()
+        .and_hms_opt(12, 0, 0)
+        .expect("valid time");
+    let ts = today_noon
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .expect("resolvable local time")
+        .timestamp();
+    let info: serde_json::Value = serde_json::json!({ "resetsAt": ts });
+    let result = format_resets_at(&info);
+    assert_eq!(result, " resets 12:00", "当日は時刻のみのはず: {result}");
+}
+
+#[test]
+fn resets_on_another_day_includes_date() {
+    // seven_day 枠や overage 枠のリセットは最大 1 か月先になる。時刻だけだと
+    // 「今日のその時刻に回復する」と誤読されるため日付を添える。
+    let ts = (chrono::Local::now() + chrono::Duration::days(28)).timestamp();
+    let info: serde_json::Value = serde_json::json!({ "resetsAt": ts });
+    let result = format_resets_at(&info);
+    assert!(
+        result.starts_with(" resets ") && result.contains('/'),
+        "翌日以降は日付付きで表示すべき: {result}"
+    );
+}

@@ -78,9 +78,23 @@ pub fn classify_content(content: &str) -> ResultClass {
         return ResultClass::RateLimited;
     }
 
-    if let Some(status) = v.get("api_error_status").and_then(|s| s.as_u64())
+    let status = v.get("api_error_status").and_then(|s| s.as_u64());
+    if let Some(status) = status
         && is_retryable_status(status)
     {
+        return ResultClass::Retryable(message);
+    }
+
+    // HTTP ステータスが無い（`api_error_status` が null）まま `terminal_reason` が
+    // `api_error` で終わったケースは、HTTP 応答そのものが返っていない = 接続断や名前
+    // 解決失敗といったトランスポート層の一時障害を意味する。実ログでは
+    //   "API Error: Connection closed mid-response. The response above may be incomplete."
+    //   "API Error: Unable to connect to API (ENOTFOUND)"
+    // が該当し、13 セッション中 5 セッションで発生していた。恒久エラー（Failed）に
+    // 落とすとワーカーごと停止して以降のターゲットが 1 件も処理されないため、次回実行で
+    // 再処理できる Retryable として扱う。認証エラーや不正リクエストは HTTP ステータスを
+    // 伴うため、この分岐には入らず従来どおり Failed のままになる。
+    if status.is_none() && v.get("terminal_reason").and_then(|r| r.as_str()) == Some("api_error") {
         return ResultClass::Retryable(message);
     }
 
@@ -452,5 +466,66 @@ mod tests {
         assert!(!is_retryable_status(400));
         assert!(!is_retryable_status(401));
         assert!(!is_retryable_status(404));
+    }
+
+    /// 実ログで最も多く観測された接続断。HTTP ステータスを伴わないため、
+    /// 恒久エラーではなく再試行可能として扱う（ワーカーを止めない）。
+    #[test]
+    fn connection_closed_mid_response_is_retryable() {
+        let content = r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":null,"terminal_reason":"api_error","result":"API Error: Connection closed mid-response. The response above may be incomplete."}"#;
+        assert_eq!(
+            classify_content(content),
+            ResultClass::Retryable(
+                "API Error: Connection closed mid-response. The response above may be incomplete."
+                    .to_string()
+            )
+        );
+    }
+
+    /// 名前解決失敗も同じくトランスポート層の一時障害。
+    #[test]
+    fn enotfound_is_retryable() {
+        let content = r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":null,"terminal_reason":"api_error","result":"API Error: Unable to connect to API (ENOTFOUND)"}"#;
+        assert!(matches!(
+            classify_content(content),
+            ResultClass::Retryable(_)
+        ));
+    }
+
+    /// `api_error_status` キー自体が無い形でも同じ扱いにする。
+    #[test]
+    fn missing_api_error_status_key_is_retryable() {
+        let content = r#"{"type":"result","is_error":true,"terminal_reason":"api_error","result":"API Error: socket hang up"}"#;
+        assert!(matches!(
+            classify_content(content),
+            ResultClass::Retryable(_)
+        ));
+    }
+
+    /// HTTP ステータスを伴う恒久エラー（認証失敗など）は従来どおり Failed のまま。
+    #[test]
+    fn http_status_error_stays_failed() {
+        let content = r#"{"type":"result","is_error":true,"api_error_status":401,"terminal_reason":"api_error","result":"authentication_failed"}"#;
+        assert_eq!(
+            classify_content(content),
+            ResultClass::Failed("authentication_failed".to_string())
+        );
+    }
+
+    /// `terminal_reason` が api_error でない失敗は Failed のまま（過剰な再試行を防ぐ）。
+    #[test]
+    fn non_api_terminal_reason_stays_failed() {
+        let content = r#"{"type":"result","is_error":true,"terminal_reason":"error_during_execution","result":"tool loop aborted"}"#;
+        assert_eq!(
+            classify_content(content),
+            ResultClass::Failed("tool loop aborted".to_string())
+        );
+    }
+
+    /// レート制限メッセージはトランスポート判定より前に確定する。
+    #[test]
+    fn rate_limit_wins_over_transport_branch() {
+        let content = r#"{"type":"result","is_error":true,"terminal_reason":"api_error","result":"You've hit your org's monthly spend limit"}"#;
+        assert_eq!(classify_content(content), ResultClass::RateLimited);
     }
 }

@@ -215,16 +215,54 @@ fn find_repos(
     Ok(())
 }
 
+/// `git -C <dir> <args...>` を実行して出力を返す。パスは `OsStr` のまま渡す。
+///
+/// 起動自体に失敗した場合（`git` が PATH に無い等）は、1 プロセスにつき 1 回だけ警告を
+/// 出す。ここを黙って `None` にすると、`[[scan]]` に `username` がある構成では全リポジトリ
+/// が対象から外れて「No targets found」だけが表示され、`repo_last_modified_map` も空になって
+/// 「最終更新の古い順」が黙って入力順に劣化する。launchd/cron のような PATH の細い環境から
+/// 起動したときに原因の手掛かりがゼロになるのを防ぐ。
+fn run_git_capture(dir: &Path, args: &[&str]) -> Option<std::process::Output> {
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+    {
+        Ok(output) => Some(output),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                warn_git_missing_once();
+            }
+            None
+        }
+    }
+}
+
+/// `git` が見つからない旨の警告を 1 プロセスにつき 1 回だけ出す。
+/// リポジトリごとに出すと数百行のノイズになるため抑制する。
+fn warn_git_missing_once() {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "{}: git が PATH に見つかりません。可視性の判定と最終更新日時の取得をスキップします",
+            "Warning".yellow()
+        );
+    });
+}
+
 fn check_repo(
     path: &Path,
     dir_name: &str,
     scan: &Scan,
     visibility_map: &HashMap<String, Visibility>,
 ) -> Option<ResolvedTarget> {
-    let remote_url = std::process::Command::new("git")
-        .args(["-C", &path.to_string_lossy(), "remote", "get-url", "origin"])
-        .output()
-        .ok()
+    // パスは `OsStr` のまま渡す。`to_string_lossy()` は不正な UTF-8 バイトを U+FFFD へ
+    // 置換するため、非 UTF-8 のディレクトリ名では存在しないパスを git に渡すことになり、
+    // `username` 指定時はそのリポジトリが黙って対象から消える。`repo_last_modified` は
+    // すでに `.arg(dir)` で正しく渡しており、ここだけ振る舞いが食い違っていた。
+    let remote_url = run_git_capture(path, &["remote", "get-url", "origin"])
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
 
@@ -348,12 +386,7 @@ async fn fetch_visibility_map(username: &str) -> Result<HashMap<String, Visibili
 ///
 /// git が使えない・追跡ファイルが無い・全ファイルの stat に失敗した場合は `None`。
 pub fn repo_last_modified(dir: &Path) -> Option<DateTime<Utc>> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["ls-files", "-z"])
-        .output()
-        .ok()?;
+    let output = run_git_capture(dir, &["ls-files", "-z"])?;
     if !output.status.success() {
         return None;
     }

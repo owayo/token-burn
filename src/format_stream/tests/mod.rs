@@ -48,6 +48,14 @@ fn run_process(input: &str) -> String {
     run_process_with_opts(input, None, None, 95)
 }
 
+/// 非 UTF-8 バイトを含む入力を扱えるよう、生バイト列で `process` を回す。
+fn run_process_bytes(input: &[u8], raw_output: Option<&std::path::Path>) -> (String, bool) {
+    let reader = Cursor::new(input.to_vec());
+    let mut output = Vec::new();
+    let ok = process(reader, &mut output, raw_output, None, 95).is_ok();
+    (String::from_utf8_lossy(&output).into_owned(), ok)
+}
+
 fn run_process_with_raw_log(input: &str, raw_output: Option<&std::path::Path>) -> String {
     run_process_with_opts(input, raw_output, None, 95)
 }

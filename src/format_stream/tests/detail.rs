@@ -866,3 +866,32 @@ fn workflow_empty_falls_back() {
     let detail = extract_tool_detail("Workflow", r#"{"description":"fallback desc"}"#);
     assert_eq!(detail, "fallback desc");
 }
+
+/// Tavily 検索の topic / days は検索対象そのものを変えるため表示する。
+/// 実データ: {"query":"CodeRabbit code review","topic":"news","days":8,"max_results":10}
+#[test]
+fn tavily_search_shows_topic_and_days() {
+    let input = r#"{"query":"CodeRabbit code review","topic":"news","days":8,"max_results":10}"#;
+    let detail = extract_tool_detail("mcp__tavily__tavily-search", input);
+    assert!(detail.contains("topic=news"), "got: {detail}");
+    assert!(detail.contains("days=8"), "got: {detail}");
+    assert!(detail.contains("max=10"), "got: {detail}");
+}
+
+/// topic / days が無い通常検索では属性を増やさない。
+#[test]
+fn tavily_search_without_topic_omits_attrs() {
+    let input = r#"{"query":"rust async","max_results":5}"#;
+    let detail = extract_tool_detail("mcp__tavily__tavily-search", input);
+    assert!(!detail.contains("topic="), "got: {detail}");
+    assert!(!detail.contains("days="), "got: {detail}");
+}
+
+/// アンダースコア版のツール名でも同じ属性を表示する。
+#[test]
+fn tavily_search_underscore_variant_shows_topic() {
+    let input = r#"{"query":"q","topic":"general","days":3}"#;
+    let detail = extract_tool_detail("mcp__tavily__tavily_search", input);
+    assert!(detail.contains("topic=general"), "got: {detail}");
+    assert!(detail.contains("days=3"), "got: {detail}");
+}

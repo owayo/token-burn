@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
+use colored::Colorize;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use std::collections::HashMap;
@@ -56,10 +57,36 @@ impl Serialize for State {
 }
 
 impl State {
-    pub fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
+    /// 状態ファイルを読み込む。
+    ///
+    /// 存在しない場合のみ空状態として扱う。権限エラーや I/O エラーはエラーとして返す。
+    /// これらを空状態へ潰すと `filter_by_state` が全ターゲットを未処理と判断し、今週すでに
+    /// 消化したリポジトリを再実行してクォータを二重消費する。しかも各タスクの
+    /// `token-burn mark` は `mark_completed_atomic` 側で正しくエラーになるため
+    /// `state.json` は更新されず、次回以降も同じ状態が再現して延々と同じターゲットを
+    /// 処理し続ける。書き込み側が fail-closed なのに読み取り側だけ fail-open だった。
+    ///
+    /// JSON 破損時は従来どおり空状態へ落とす（壊れたファイルで実行自体を止めない）が、
+    /// 処理済み履歴が失われる旨は警告として明示する。
+    pub fn load(path: &Path) -> Result<Self> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => {
+                anyhow::bail!("Failed to read state {}: {}", path.display(), e);
+            }
+        };
+        match serde_json::from_str(&content) {
+            Ok(state) => Ok(state),
+            Err(e) => {
+                eprintln!(
+                    "{}: 状態ファイル {} を解析できませんでした ({})。処理済み履歴なしとして続行します",
+                    "Warning".yellow(),
+                    path.display(),
+                    e
+                );
+                Ok(Self::default())
+            }
         }
     }
 
@@ -320,7 +347,7 @@ mod tests {
             handle.join().expect("worker thread should join");
         }
 
-        let state = State::load(&state_file);
+        let state = State::load(&state_file).expect("状態ファイルは読めるはず");
         let map = state
             .agents
             .get("claude")
@@ -374,14 +401,33 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir should be created");
         let state_file = tmp.path().join("state.json");
         std::fs::write(&state_file, "not valid json").expect("ファイル書き込み成功");
-        let state = State::load(&state_file);
+        let state = State::load(&state_file).expect("破損 JSON は空状態へ落とす");
         assert!(state.agents.is_empty());
     }
 
     #[test]
     fn state_load_nonexistent_file_returns_default() {
-        let state = State::load(Path::new("/nonexistent/state.json"));
+        let state =
+            State::load(Path::new("/nonexistent/state.json")).expect("存在しないファイルは空状態");
         assert!(state.agents.is_empty());
+    }
+
+    #[test]
+    fn state_load_unreadable_file_is_error() {
+        // 権限・I/O エラーを空状態へ潰すと、処理済み履歴が消えて消化済みリポジトリを
+        // 再実行しクォータを二重消費する。書き込み側 (mark_completed_atomic) が
+        // fail-closed なのに読み取り側だけ fail-open になっていた。
+        // ディレクトリを state.json の位置に置いて read_to_string を失敗させる
+        // （NotFound 以外の I/O エラーを root 権限なしで再現できる）。
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let state_file = tmp.path().join("state.json");
+        std::fs::create_dir(&state_file).expect("ディレクトリ作成成功");
+
+        let result = State::load(&state_file);
+        assert!(
+            result.is_err(),
+            "読み取り不能な状態ファイルはエラーにすべき（空状態で続行しない）"
+        );
     }
 
     #[test]
@@ -624,7 +670,7 @@ mod tests {
             .expect("書き込み成功");
 
         // 読み込み
-        let state = State::load(&state_file);
+        let state = State::load(&state_file).expect("状態ファイルは読めるはず");
         assert!(
             state
                 .last_processed("claude", Path::new("/tmp/repo-a"))

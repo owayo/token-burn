@@ -51,7 +51,7 @@ fn process(
         None => None,
     };
 
-    for line in reader.lines() {
+    for line in read_lines_lossy(reader) {
         let line = line?;
         if let Some(writer) = raw_writer.as_mut() {
             writeln!(writer, "{}", line)?;
@@ -100,8 +100,13 @@ fn process(
                 )?;
             }
             "user" => {
-                // ツール結果 — 完了したツール名を表示
-                handle_tool_result_event(&v, &mut out, &tool_id_map)?;
+                // ツール結果 — 完了したツール名を表示。
+                // バックグラウンド/非同期ツールの完了は次ターンのテキスト・思考 delta の
+                // 途中にも到着するため、直接書くと開きっぱなしの行へ連結される
+                // （実ログで `💭   ✓ WebFetch` の形が 38 件）。
+                render_out_of_band_event(&mut out, &mut blocks, |pending| {
+                    handle_tool_result_event(&v, pending, &tool_id_map)
+                })?;
             }
             "result" => {
                 summary.update_from_result(v.as_object());
@@ -114,7 +119,11 @@ fn process(
                 })?;
             }
             "tool_progress" => {
-                handle_tool_progress(&v, &mut out)?;
+                // 長時間ツールのハートビートも本文ストリームと非同期に届くため、
+                // system / rate_limit と同じく行を閉じてから書く。
+                render_out_of_band_event(&mut out, &mut blocks, |pending| {
+                    handle_tool_progress(&v, pending)
+                })?;
             }
             _ => {} // message_stop 等
         }
@@ -127,6 +136,37 @@ fn process(
     }
 
     Ok(())
+}
+
+/// 入力を 1 行ずつ読み、不正な UTF-8 バイトは U+FFFD へ置換して返す。
+///
+/// `BufRead::lines()` は非 UTF-8 バイトを 1 つでも含む行に対して `Err(InvalidData)` を
+/// 返す。そこで `?` すると `process` がその場で中断し、以降の**正常な JSON も含めて**
+/// 標準出力と `--raw-output` の両方から失われる。タスクスクリプトのパイプラインは
+/// `claude ... 2>&1 | token-burn format-stream ... | tee log` で stderr を同じパイプへ
+/// 合流させており、しかも stream-json の 1 行は macOS の `PIPE_BUF`（512 バイト）を
+/// 常に超えるため、stdout の途中に stderr の書き込みが割り込んでマルチバイト文字が
+/// 分断されるだけで不正な UTF-8 が生じ得る。中断すると `FORMAT_EXIT != 0` で
+/// `failed-N` になるうえ、パイプが閉じて `claude` 本体が SIGPIPE で落ちるため、
+/// 表示整形の都合で数時間の実行を巻き添えにしてしまう。整形器が UTF-8 を要求する
+/// 必然性は無いので、該当行だけ置換文字にして読み進める。
+fn read_lines_lossy(mut reader: impl BufRead) -> impl Iterator<Item = io::Result<String>> {
+    std::iter::from_fn(move || {
+        let mut buf = Vec::new();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => None,
+            Ok(_) => {
+                if buf.last() == Some(&b'\n') {
+                    buf.pop();
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                }
+                Some(Ok(String::from_utf8_lossy(&buf).into_owned()))
+            }
+            Err(e) => Some(Err(e)),
+        }
+    })
 }
 
 /// stream の本文・思考とは独立した通知を、開いている行へ連結せずに出力する。

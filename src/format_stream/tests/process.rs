@@ -1198,3 +1198,116 @@ fn usage_summary_merge_overrides_with_latest() {
     assert_eq!(usage.input_tokens, 100, "最終値で上書きされるべき");
     assert_eq!(usage.output_tokens, 50);
 }
+
+// --- 非 UTF-8 入力と、割り込みイベントの行分離 ---
+
+#[test]
+fn invalid_utf8_line_does_not_abort_the_stream() {
+    // `BufRead::lines()` は非 UTF-8 バイトを含む行で Err(InvalidData) を返す。
+    // そこで中断すると以降の正常な JSON も失われ、format-stream が非ゼロ終了して
+    // タスクが failed 扱いになるうえ、パイプ切断で claude 本体まで巻き添えになる。
+    // 該当行だけ置換文字にして読み進める。
+    let mut input = Vec::new();
+    input.extend_from_slice(br#"{"type":"system","subtype":"init","model":"before"}"#);
+    input.push(b'\n');
+    input.extend_from_slice(&[0xff, 0xfe]);
+    input.extend_from_slice(b" junk\n");
+    input.extend_from_slice(br#"{"type":"system","subtype":"init","model":"after"}"#);
+    input.push(b'\n');
+    input.extend_from_slice(br#"{"type":"result","total_cost_usd":1.5}"#);
+    input.push(b'\n');
+
+    let (output, ok) = run_process_bytes(&input, None);
+    assert!(ok, "非 UTF-8 バイトで中断してはいけない");
+    let clean = strip_ansi(&output);
+    assert!(clean.contains("Session before"), "{clean}");
+    assert!(
+        clean.contains("Session after"),
+        "不正バイトの後続イベントも処理されるべき: {clean}"
+    );
+    assert!(
+        clean.contains("$1.5000"),
+        "result も処理されるべき: {clean}"
+    );
+}
+
+#[test]
+fn invalid_utf8_line_is_preserved_in_raw_log() {
+    // --raw-output は生ログの保全が目的なので、行が失われないことを確認する。
+    let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+    let raw = tmp.path().join("raw.jsonl");
+    let mut input = Vec::new();
+    input.extend_from_slice(br#"{"type":"system","subtype":"init","model":"a"}"#);
+    input.push(b'\n');
+    input.extend_from_slice(&[0xff]);
+    input.push(b'\n');
+    input.extend_from_slice(br#"{"type":"result","total_cost_usd":2.0}"#);
+    input.push(b'\n');
+
+    let (_, ok) = run_process_bytes(&input, Some(&raw));
+    assert!(ok);
+    let saved = std::fs::read_to_string(&raw).expect("raw log should be readable");
+    assert_eq!(saved.lines().count(), 3, "全行が保存されるべき: {saved:?}");
+}
+
+#[test]
+fn tool_result_does_not_glue_onto_open_thinking_line() {
+    // 思考ブロックは改行なしで書き進めるため、非同期に届くツール完了行を直接書くと
+    // `💭   ✓ WebFetch` のように同じ行へ連結される（実ログで 38 件観測）。
+    let input = concat!(
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}"#,
+        "\n",
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"considering"}}}"#,
+        "\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#,
+        "\n"
+    );
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        !clean
+            .lines()
+            .any(|line| line.contains('💭') && line.contains('✓')),
+        "思考行とツール完了行は別行になるべき: {clean:?}"
+    );
+}
+
+#[test]
+fn tool_progress_does_not_glue_onto_open_thinking_line() {
+    // 長時間ツールのハートビートも本文ストリームと非同期に届く。
+    let input = concat!(
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}"#,
+        "\n",
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"considering"}}}"#,
+        "\n",
+        r#"{"type":"tool_progress","tool_name":"Bash","elapsed_time_seconds":30}"#,
+        "\n"
+    );
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("Bash running (30s)"), "{clean}");
+    assert!(
+        !clean
+            .lines()
+            .any(|line| line.contains('💭') && line.contains('⏱')),
+        "思考行と進捗行は別行になるべき: {clean:?}"
+    );
+}
+
+#[test]
+fn ignored_tool_progress_keeps_open_line_intact() {
+    // 表示対象外（tool_name 欠落）のときは余計な改行を増やさない。
+    let input = concat!(
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}"#,
+        "\n",
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I"}}}"#,
+        "\n",
+        r#"{"type":"tool_progress","elapsed_time_seconds":30}"#,
+        "\n",
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"'ll go"}}}"#,
+        "\n"
+    );
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.contains("I'll go"),
+        "無視イベントで本文を分断してはいけない: {clean:?}"
+    );
+}

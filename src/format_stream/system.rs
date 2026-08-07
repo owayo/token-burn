@@ -210,18 +210,32 @@ fn write_task_notification(v: &serde_json::Value, out: &mut impl Write) -> Resul
     Ok(())
 }
 
-/// `task_updated`: patch.status の状態遷移を表示する。
+/// `task_updated`: patch.status の状態遷移と、失敗時は patch.error を表示する。
 fn write_task_updated(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
-    let status = v["patch"]["status"].as_str().unwrap_or("");
+    let patch = &v["patch"];
+    let status = patch["status"].as_str().unwrap_or("");
     match status {
         "completed" => {
             writeln!(out, "\x1b[32m  \u{2705} Task completed\x1b[0m")?;
         }
         "failed" | "cancelled" | "killed" => {
-            writeln!(out, "\x1b[31m  \u{274c} Task {}\x1b[0m", status)?;
+            // 実データの失敗 patch は原因を error に持つ（例: "Agent terminated early
+            // due to an API error: ..."）。これを落とすと "Task failed" だけが残り、
+            // 無人実行でサブエージェントが死んだ理由を後から追えなくなる。
+            let reason = patch["error"]
+                .as_str()
+                .filter(|reason| !reason.is_empty())
+                .map(|reason| format!(": {}", truncate_inline(reason, 100)))
+                .unwrap_or_default();
+            writeln!(out, "\x1b[31m  \u{274c} Task {}{}\x1b[0m", status, reason)?;
         }
         status if !status.is_empty() => {
             writeln!(out, "\x1b[2m  \u{2139} Task {}\x1b[0m", status)?;
+        }
+        // status を伴わない patch もある。バックグラウンド移行はタスクの出力が
+        // インラインに出なくなる理由そのものなので、状態変化として表示する。
+        _ if patch["is_backgrounded"].as_bool() == Some(true) => {
+            writeln!(out, "\x1b[2m  \u{2139} Task backgrounded\x1b[0m")?;
         }
         _ => {}
     }

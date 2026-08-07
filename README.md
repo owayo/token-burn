@@ -73,8 +73,11 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Fast mode indicator**: Shows fast mode state when active and reports `fast_mode_disabled_reason` when the provider explains why it is unavailable
 - **Terminal reason & permission denials**: Surfaces non-`completed` `terminal_reason` and denied tool call count/tool names in the result summary
 - **Result metadata**: Displays `usage.service_tier`, `usage.speed`, non-empty inference geo, iteration count, and result origin kind when present
-- **Rate limit alerts**: Displays utilization warnings, rejected request notifications, allowed-event reset/overage reset details when present, and the server-side warning threshold that was crossed (e.g. `warning at 90%`) for `allowed_warning` events; auto-stops when the configured threshold is exceeded (if the stop file cannot be created due to ENOSPC/permissions, the failure is surfaced instead of being silently swallowed)
+- **Rate limit alerts**: Displays utilization warnings, rejected request notifications, overage status and overage reset time (shown on warning and rejection events too), and the server-side warning threshold that was crossed (e.g. `warning at 90%`) for `allowed_warning` events; auto-stops when the configured threshold is exceeded (if the stop file cannot be created due to ENOSPC/permissions, the failure is surfaced instead of being silently swallowed)
 - **Limit-aware result classification**: Treats limit-reached results — clock times including minutes such as `resets 2:30am`, and messages such as `You've hit your session limit` or `You've hit your org's monthly spend limit` — as rate limits rather than retryable provider errors, since retrying cannot clear them
+- **Dated reset times**: Reset times that fall on a later day are shown as `MM/DD HH:MM`, since `seven_day` and overage windows can reset up to a month out and a bare clock time reads as "later today"
+- **Transient connection errors retried**: Connection-level failures without an HTTP status (e.g. `API Error: Connection closed mid-response`) are classified as retryable rather than permanent, so the worker moves on to the next target instead of stopping (the target is reprocessed on the next run)
+- **Subagent failure reasons**: When a subagent fails or is killed, the underlying cause (API error, etc.) is shown alongside the notification
 - **API retry visibility**: Shows retry attempts with error details during transient failures
 - **Collision-safe logs**: Per-task logs are numbered to avoid overwrite when display names collide
 - **Prompt files**: Prompts can be `.md` files or inline strings
@@ -197,7 +200,7 @@ skip_within = "7d"    # optional
 | `parallelism` | Number of concurrent tasks | `3` |
 | `skip_within` | Skip directories processed within this duration | `"7d"`, `"24h"`, `"1d12h"` |
 | `cleanup_after` | Auto-delete report directories older than this duration | `"7d"` (default) |
-| `report_dir` | Directory to save execution logs | `~/Documents/token-burn` (default) |
+| `report_dir` | Directory to save execution logs (relative paths are resolved against the current working directory) | `~/Documents/token-burn` (default) |
 | `limit` | Maximum number of targets to process per run (`>= 1`) | `10` (default) |
 | `rate_limit_threshold` | Auto-stop when rate limit utilization exceeds this percentage (`1-100`) | `95` (default) |
 

@@ -718,6 +718,17 @@ fn detail_tavily_search(v: &serde_json::Value) -> DetailResult {
         {
             attrs.push(format!("depth={search_depth}"));
         }
+        // topic=news はニュース索引への切り替え、days はその遡及日数で、いずれも
+        // 検索対象そのものを変える。実データの `topic:news days:8` は time_range を
+        // 伴わないため、これらを落とすと通常の Web 検索と区別できなくなる。
+        if let Some(topic) = v["topic"].as_str()
+            && !topic.is_empty()
+        {
+            attrs.push(format!("topic={topic}"));
+        }
+        if let Some(days) = v["days"].as_u64() {
+            attrs.push(format!("days={days}"));
+        }
         if attrs.is_empty() {
             return DetailResult::Handled(truncate_inline(query, 100));
         }

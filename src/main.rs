@@ -375,7 +375,7 @@ async fn list(opts: ListOptions) -> Result<()> {
     };
 
     let state_file = state::state_path(&config_path);
-    let run_state = state::State::load(&state_file);
+    let run_state = state::State::load(&state_file)?;
     let (mut targets, skipped) = if fresh || !force_paths.is_empty() {
         (targets, 0usize)
     } else {
@@ -489,7 +489,7 @@ async fn run(opts: RunOptions) -> Result<()> {
     // 保存済み状態でフィルタリング（処理済みディレクトリをスキップ）
     // force_paths 指定時は状態フィルタリングをスキップ
     let state_file = state::state_path(&config_path);
-    let run_state = state::State::load(&state_file);
+    let run_state = state::State::load(&state_file)?;
     let (mut targets, skipped) = if fresh || !force_paths.is_empty() {
         (targets, 0usize)
     } else {
@@ -606,16 +606,28 @@ fn run_clean(config: &config::Config, older_than: Option<String>) -> Result<()> 
     Ok(())
 }
 
+/// レポート出力先を解決する。設定値は必ず絶対パスへ正規化する。
+///
+/// 相対パスのまま返すと、レポートディレクトリの作成（`executor` 側。プロセスの cwd で
+/// 解決される）と、そこへ書き込むタスクスクリプトの `tee` / `--raw-output`
+/// （対象リポジトリへ `cd` した後で解決される）が別ディレクトリを指す。結果として
+/// ログのパイプラインが `No such file or directory` で失敗し、全ターゲットが
+/// `failed-N` になって `state.json` に 1 件も記録されない。`cleanup` も別の場所を
+/// 見に行くことになる。`report_dir = "reports"` のような素直な設定で踏むため、
+/// 読み込み時点で絶対パスへ寄せる。
 fn resolve_report_dir(settings: &config::Settings) -> PathBuf {
     if let Some(ref dir) = settings.report_dir {
-        let expanded = shellexpand::tilde(dir);
-        PathBuf::from(expanded.as_ref())
-    } else {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("~"))
-            .join("Documents")
-            .join("token-burn")
+        // current_dir() の取得に失敗する環境（cwd が削除済み等）では、
+        // 展開だけした従来の値へフォールバックする。
+        return config::resolve_directory(dir).unwrap_or_else(|_| {
+            let expanded = shellexpand::tilde(dir);
+            PathBuf::from(expanded.as_ref())
+        });
     }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join("Documents")
+        .join("token-burn")
 }
 
 fn resolve_force_paths(
@@ -807,6 +819,59 @@ mod tests {
         // チルダが展開されていることを確認
         assert!(!dir.to_string_lossy().contains('~'));
         assert!(dir.to_string_lossy().ends_with("custom-reports"));
+    }
+
+    #[test]
+    fn resolve_report_dir_absolutizes_relative_path() {
+        // 相対パスのまま返すと、レポートディレクトリの作成（プロセスの cwd 基準）と
+        // タスクスクリプトの tee / --raw-output（対象リポジトリへ cd した後の基準）が
+        // 別の場所を指し、ログのパイプラインが必ず失敗して全ターゲットが failed になる。
+        let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+        let _cwd_guard = crate::test_support::CwdGuard::switch_to(tmp.path());
+
+        let settings = config::Settings {
+            parallelism: 1,
+            skip_within: None,
+            report_dir: Some("reports".to_string()),
+            cleanup_after: None,
+            limit: 10,
+            rate_limit_threshold: 95,
+        };
+        let dir = resolve_report_dir(&settings);
+        assert!(
+            dir.is_absolute(),
+            "相対パスは絶対パスへ正規化されるべき: {dir:?}"
+        );
+        assert!(dir.ends_with("reports"), "{dir:?}");
+        assert_eq!(
+            dir,
+            std::env::current_dir()
+                .expect("cwd should be available")
+                .join("reports")
+        );
+    }
+
+    #[test]
+    fn resolve_report_dir_normalizes_relative_segments() {
+        // `./` や `..` を含む設定値も 1 つの絶対パスへ畳み込む。
+        let tmp = tempfile::TempDir::new().expect("temp dir should be created");
+        let _cwd_guard = crate::test_support::CwdGuard::switch_to(tmp.path());
+
+        let settings = config::Settings {
+            parallelism: 1,
+            skip_within: None,
+            report_dir: Some("./nested/../logs".to_string()),
+            cleanup_after: None,
+            limit: 10,
+            rate_limit_threshold: 95,
+        };
+        let dir = resolve_report_dir(&settings);
+        assert_eq!(
+            dir,
+            std::env::current_dir()
+                .expect("cwd should be available")
+                .join("logs")
+        );
     }
 
     #[test]
