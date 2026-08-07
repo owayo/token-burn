@@ -630,6 +630,12 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "printf '\\033]2;Worker {w} done\\033\\\\'\n",
             "echo '━━━ All tasks completed ━━━'\n",
             "touch {worker_done}\n",
+            // 全タスク完了後はキャンセル trap を外す。待機を exec で置き換えていた頃は
+            // exec が catch 済みシグナルを SIG_DFL へ戻していたため、待機中の Ctrl-C は
+            // 既定動作（ペインを閉じる）だった。有限 sleep のループへ変えた分、trap を
+            // 明示的に解除して同じ挙動を保つ（残すと Ctrl-C が握り潰され、もう処理する
+            // タスクが無いのに handle_cancel だけが走る）。
+            "trap - INT TERM\n",
             // macOS の BSD sleep は `infinity` を受け付けず、usage エラーで即座に
             // 終了する（`sleep infinity` → exit 1）。ワーカーペインが完了直後に
             // 閉じてしまい、直前のログを読み返せなくなるため有限秒のループで待つ。
@@ -1163,6 +1169,12 @@ mod tests {
         assert!(
             script.contains("while true; do sleep 3600; done"),
             "worker must wait in finite sleep chunks: {script}"
+        );
+        // 完了後はキャンセル trap を外し、待機中の Ctrl-C を既定動作へ戻す。
+        // 残すと処理するタスクが無いのに handle_cancel だけが走り、ペインも閉じない。
+        assert!(
+            script.contains("trap - INT TERM\nwhile true; do sleep 3600; done"),
+            "worker must clear the cancel trap before waiting: {script}"
         );
         assert_valid_bash(&script, "worker script waiting loop");
     }

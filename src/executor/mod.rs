@@ -211,6 +211,19 @@ pub fn print_plan(plan: &ExecutionPlan) {
 /// 失敗する一方 `create_dir_all` は成功するため、他人の所有ディレクトリへ
 /// ワーカースクリプトやプロンプトを書き込んでしまう。削除失敗は
 /// （存在しない場合を除き）エラーとして扱い、作成後は所有者のみアクセス可にする。
+/// tmux の shell-command 引数として渡すスクリプトパスを組み立てる。
+///
+/// tmux は `new-session` / `split-window` の shell-command を **`sh -c` 経由**で実行する
+/// ため、パスは必ずクォートする。`std::env::temp_dir()`（= `TMPDIR`）に空白が含まれる
+/// 環境では、未クォートだと `/tmp/tb` を `space` `test/monitor.sh` を引数に起動しようと
+/// してペインが即死する。しかも **tmux 自身は exit 0 を返す**ため呼び出し側の
+/// `ensure!(status.success())` では検知できず、後続の split-window が
+/// 「no such session」で失敗して真因と無関係なエラーになる。生成するシェルスクリプトの
+/// 内側は `shell_escape` 済みで、この tmux 呼び出しだけが取りこぼしだった。
+fn tmux_script_arg(path: &std::path::Path) -> String {
+    shell_escape(&path.to_string_lossy())
+}
+
 fn prepare_run_tmp_dir(tmp_dir: &std::path::Path) -> Result<()> {
     match std::fs::remove_dir_all(tmp_dir) {
         Ok(()) => {}
@@ -415,7 +428,7 @@ pub fn execute_plan_tmux(
                 "-d",
                 "-s",
                 session,
-                &monitor_path.to_string_lossy(),
+                &tmux_script_arg(&monitor_path),
             ])
             .status()
             .context("Failed to create tmux session")?;
@@ -433,7 +446,7 @@ pub fn execute_plan_tmux(
                 "-h",
                 "-t",
                 session,
-                &script_paths[0].to_string_lossy(),
+                &tmux_script_arg(&script_paths[0]),
             ])
             .status()
             .context("Failed to split tmux window for worker")?;
@@ -452,7 +465,7 @@ pub fn execute_plan_tmux(
                     "-v",
                     "-t",
                     &format!("{}:.right", session),
-                    &script.to_string_lossy(),
+                    &tmux_script_arg(script),
                 ])
                 .status()
                 .context("Failed to split tmux window for worker")?;
@@ -571,6 +584,30 @@ pub fn execute_plan_tmux(
 
 #[cfg(test)]
 mod tests {
+    /// tmux は shell-command を `sh -c` で解釈するため、空白入りパスはクォートが要る。
+    /// 未クォートだとペインが即死するのに tmux は exit 0 を返し、呼び出し側の
+    /// `ensure!(status.success())` をすり抜ける。
+    #[test]
+    fn tmux_script_arg_quotes_paths_with_spaces() {
+        let arg = tmux_script_arg(std::path::Path::new("/tmp/my tmp/token-burn/monitor.sh"));
+        assert_eq!(arg, "'/tmp/my tmp/token-burn/monitor.sh'");
+    }
+
+    /// シェルメタ文字を含むパスもコマンドとして解釈させない。
+    #[test]
+    fn tmux_script_arg_neutralizes_shell_metacharacters() {
+        let arg = tmux_script_arg(std::path::Path::new("/tmp/a;touch evil/monitor.sh"));
+        assert_eq!(arg, "'/tmp/a;touch evil/monitor.sh'");
+        assert!(!arg.starts_with('/'), "生パスのまま渡してはいけない: {arg}");
+    }
+
+    /// 単一引用符を含むパスも壊れない。
+    #[test]
+    fn tmux_script_arg_escapes_single_quotes() {
+        let arg = tmux_script_arg(std::path::Path::new("/tmp/it's/monitor.sh"));
+        assert_eq!(arg, r"'/tmp/it'\''s/monitor.sh'");
+    }
+
     use super::flags::CLAUDE_PRINT_BG_WAIT_ENV;
     use super::*;
 
