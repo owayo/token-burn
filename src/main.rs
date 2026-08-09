@@ -91,6 +91,16 @@ struct Cli {
     #[arg(long, global = true, conflicts_with = "limit")]
     no_limit: bool,
 
+    /// 並列実行するワーカー数（デフォルト: 設定値の parallelism）
+    #[arg(
+        short = 'w',
+        long,
+        global = true,
+        value_name = "N",
+        value_parser = parse_positive_workers
+    )]
+    workers: Option<usize>,
+
     /// 公開リポジトリのみ処理する
     #[arg(long, global = true)]
     public_only: bool,
@@ -177,14 +187,22 @@ enum Commands {
     },
 }
 
-fn parse_positive_limit(value: &str) -> Result<usize, String> {
+fn parse_positive_usize(value: &str, option: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
         .map_err(|_| format!("無効な数値です: {value}"))?;
     if parsed == 0 {
-        return Err("limit には 1 以上を指定してください".to_string());
+        return Err(format!("{option} には 1 以上を指定してください"));
     }
     Ok(parsed)
+}
+
+fn parse_positive_limit(value: &str) -> Result<usize, String> {
+    parse_positive_usize(value, "limit")
+}
+
+fn parse_positive_workers(value: &str) -> Result<usize, String> {
+    parse_positive_usize(value, "workers")
 }
 
 #[tokio::main]
@@ -253,6 +271,7 @@ async fn main() -> Result<()> {
         cli.limit
     };
     let public_only = cli.public_only;
+    let workers = cli.workers;
 
     match command {
         Commands::Status => {
@@ -268,6 +287,7 @@ async fn main() -> Result<()> {
                 dry_run,
                 fresh,
                 limit_override: limit,
+                workers_override: workers,
                 public_only,
                 force_paths: paths,
             })
@@ -304,6 +324,7 @@ struct RunOptions {
     dry_run: bool,
     fresh: bool,
     limit_override: Option<usize>,
+    workers_override: Option<usize>,
     public_only: bool,
     force_paths: Vec<PathBuf>,
 }
@@ -425,6 +446,7 @@ async fn run(opts: RunOptions) -> Result<()> {
         dry_run,
         fresh,
         limit_override,
+        workers_override,
         public_only,
         force_paths,
     } = opts;
@@ -561,8 +583,10 @@ async fn run(opts: RunOptions) -> Result<()> {
         .as_ref()
         .filter(|g| g.enabled)
         .map(|g| g.command.clone());
+    // ワーカー数: CLI オプションが設定値を上書き
+    let parallelism = workers_override.unwrap_or(config.settings.parallelism);
     let plan = executor::build_plan(agent, targets, ai_usage_command);
-    executor::print_plan(&plan);
+    executor::print_plan(&plan, parallelism);
 
     if dry_run {
         println!(
@@ -576,7 +600,7 @@ async fn run(opts: RunOptions) -> Result<()> {
     let report_dir = resolve_report_dir(&config.settings);
     executor::execute_plan_tmux(
         plan,
-        config.settings.parallelism,
+        parallelism,
         sched.time_until_reset,
         &state_file,
         &reset_info,
@@ -1250,6 +1274,27 @@ mod tests {
     fn cli_limit_rejects_zero() {
         let result = Cli::try_parse_from(["token-burn", "--limit", "0"]);
         assert!(result.is_err(), "limit=0 は CLI で拒否されるべき");
+    }
+
+    #[test]
+    fn cli_workers_rejects_zero() {
+        let result = Cli::try_parse_from(["token-burn", "--workers", "0"]);
+        assert!(result.is_err(), "workers=0 は CLI で拒否されるべき");
+    }
+
+    #[test]
+    fn cli_workers_parses_long_and_short_forms() {
+        let long = Cli::try_parse_from(["token-burn", "run", "--workers", "5"])
+            .expect("--workers は run で受け付けられるべき");
+        assert_eq!(long.workers, Some(5));
+
+        // サブコマンド省略時（デフォルト run）でも global オプションとして解釈される
+        let short = Cli::try_parse_from(["token-burn", "-w", "2"])
+            .expect("-w はサブコマンド省略時も受け付けられるべき");
+        assert_eq!(short.workers, Some(2));
+
+        let absent = Cli::try_parse_from(["token-burn", "run"]).expect("run は解釈できるべき");
+        assert_eq!(absent.workers, None, "未指定なら設定値を使うため None");
     }
 
     #[test]

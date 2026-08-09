@@ -46,6 +46,12 @@ pub struct UsageGateConfig {
     pub env: std::collections::BTreeMap<String, String>,
 }
 
+/// 実際に起動するワーカー数。タスク数を超えるワーカーは claim できる pending が
+/// 無いまま終了するだけなので、指定値をタスク数で頭打ちにする。
+fn worker_count(parallelism: usize, total: usize) -> usize {
+    parallelism.min(total)
+}
+
 pub fn build_plan(
     agent: &RuntimeAgent,
     targets: Vec<ResolvedTarget>,
@@ -171,7 +177,7 @@ fn ensure_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn print_plan(plan: &ExecutionPlan) {
+pub fn print_plan(plan: &ExecutionPlan, parallelism: usize) {
     println!("{}", "=== Execution Plan ===".bold());
     println!("Agent: {}", plan.agent.name.cyan());
     println!(
@@ -179,6 +185,18 @@ pub fn print_plan(plan: &ExecutionPlan) {
         crate::display::format_command(&plan.agent.command).dimmed()
     );
     println!("Tasks: {}", plan.tasks.len());
+    // 実際に起動するワーカー数は execute_plan_tmux と同じ算出（タスク数で頭打ち）。
+    // 指定値がそのまま使われないケースをドライランの時点で見えるようにする。
+    let workers = worker_count(parallelism, plan.tasks.len());
+    if workers < parallelism {
+        println!(
+            "Workers: {} {}",
+            workers,
+            format!("(requested {parallelism}, capped by task count)").dimmed()
+        );
+    } else {
+        println!("Workers: {workers}");
+    }
     println!();
     for (i, task) in plan.tasks.iter().enumerate() {
         let vis = format!("[{}]", task.visibility);
@@ -282,7 +300,7 @@ pub fn execute_plan_tmux(
     std::fs::create_dir_all(&run_dir)?;
 
     let total = plan.tasks.len();
-    let worker_count = parallelism.min(total);
+    let worker_count = worker_count(parallelism, total);
 
     // ワーカー間で共有するタスクキュー
     let marker_dir = tmp_dir.join("markers");

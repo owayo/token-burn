@@ -171,9 +171,12 @@ token-burn run
 | `--fresh` | | Ignore saved state and process all targets |
 | `--limit <N>` | `-l` | Maximum number of targets to process (`N >= 1`) |
 | `--no-limit` | | Process all targets without limit |
+| `--workers <N>` | `-w` | Number of concurrent workers (`N >= 1`, overrides `parallelism`) |
 | `--public-only` | | Process only repositories detected as public |
 | `--help` | `-h` | Show help |
 | `--version` | `-V` | Show version |
+
+`--workers` overrides the configured `parallelism` for a single run. The number of workers that actually start is capped by the number of tasks, and the effective value is shown as `Workers:` in the execution plan (visible with `--dry-run`).
 
 `init` also accepts `--force` (`-f`) to overwrite existing files without confirmation.
 
@@ -197,7 +200,7 @@ skip_within = "7d"    # optional
 
 | Field | Description | Example |
 |-------|-------------|---------|
-| `parallelism` | Number of concurrent tasks | `3` |
+| `parallelism` | Number of concurrent tasks (`>= 1`, overridable per run with `--workers`) | `3` |
 | `skip_within` | Skip directories processed within this duration | `"7d"`, `"24h"`, `"1d12h"` |
 | `cleanup_after` | Auto-delete report directories older than this duration | `"7d"` (default) |
 | `report_dir` | Directory to save execution logs (relative paths are resolved against the current working directory) | `~/Documents/token-burn` (default) |

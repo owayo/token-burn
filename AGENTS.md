@@ -160,6 +160,8 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 
 結果として、`parallelism` で指定した並列数はタスクが尽きるまで維持されます（一部タスクが失敗しても他ワーカーは止まらない）。エラーは `marker_dir/error-<idx>` にタスク単位で記録されるため、同一ワーカーで複数エラーが起きてもモニターに全て表示されます。
 
+並列数は CLI の `--workers` / `-w`（1 以上。0 は clap の `value_parser` で拒否）で実行ごとに上書きでき、未指定なら `[settings].parallelism` を使います。実際に起動するワーカー数は `worker_count`（= `parallelism.min(タスク数)`）で頭打ちになり、`print_plan` が同じ関数で算出した実効値を実行計画に `Workers:` として表示します（頭打ちのときは要求値も併記）。表示と `execute_plan_tmux` の起動数が食い違わないよう、両者は必ずこの関数を経由します。
+
 `format-stream` は以下の stream-json イベントを処理します:
 - テキスト応答のストリーミング表示
 - セッション開始（`system` / `init`）のモデル・CLI バージョン・権限モードを 1 行表示（`ℹ Session <model> (v<version>, <permissionMode>)`）。これらは他のどのイベントにも現れず、`result.modelUsage` からは実際に課金されたモデルしか分からないため、CLI バージョンと `bypassPermissions` で走ったかどうかが完全に失われていた。セッションにつき 1 行のみ
@@ -199,6 +201,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 処理済み状態は有効な設定ファイルと同じディレクトリの `state.json` に保存されます（デフォルト: `~/.config/token-burn/state.json`）。エージェント名は昇順、各エージェント内のエントリは処理時刻の降順（同時刻はパス昇順で安定化）で書き出します。内側のマップを `serde_json::Map` へ `collect()` してはいけません。`preserve_order` feature を有効にしていない serde_json の `Map` は `BTreeMap` であり、collect した時点でキー（パス）昇順へ再ソートされ、並べ替えが丸ごと捨てられます（実際の `state.json` も全エージェントがパスのアルファベット順になっていました）。順序を保つために `OrderedEntries` ラッパーで `serialize_map` を直接使います。
 
 `[settings]` の `limit` は 1 以上である必要があります。
+`[settings]` の `parallelism` は 1 以上である必要があります（CLI の `--workers` / `-w` で実行ごとに上書き可能）。
 `[settings]` の `rate_limit_threshold` は 1〜100 の範囲で指定する必要があります（デフォルト: 95）。レート制限使用率がこの閾値を超えると、現在のタスク完了後に後続タスクの実行を停止します。`rejected` イベント受信時も同様に停止します。ai-usage 連携が有効な場合は、各タスク完了後に該当 agent の実使用率（weekly / five_hour の最大）でも `usage-gate` が判定し、閾値以上なら停止します。
 `[settings]` の `skip_within` と `cleanup_after` には `d` / `h` / `m` / `s` を使った有効な期間文字列を指定する必要があり、不正または `chrono::Duration` で表現できない値は設定読み込み時にエラーになります。期間自体は表現できても日時の減算範囲を超える場合、`skip_within` は警告後に前回リセット時刻へフォールバックし、レポートクリーンアップはエラーを返します。
 
