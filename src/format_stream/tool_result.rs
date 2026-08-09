@@ -64,7 +64,8 @@ fn build_metadata(value: &serde_json::Value, tool_use_id: &str, is_error: bool) 
         }
         metadata.push_str(&result_meta);
     }
-    // tool_use_result が文字列の応答（MCP ツール等）には object メタデータが無い。
+    // tool_use_result が文字列や text ブロック配列の応答（MCP ツール等）には
+    // object メタデータが無い。
     // エラー時は content 側のサマリーと同文になるため、成功時のみ result: として
     // 先頭行を補足する。
     if metadata.is_empty()

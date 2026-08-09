@@ -493,6 +493,39 @@ fn write_stop_file(stop_file: &Path, reason: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AiUsageConfig, Prompts, Settings};
+
+    fn config_for_resolver(ai_usage: Option<AiUsageConfig>) -> Config {
+        Config {
+            config_dir: Default::default(),
+            settings: Settings {
+                parallelism: 1,
+                skip_within: None,
+                report_dir: None,
+                cleanup_after: None,
+                limit: 1,
+                rate_limit_threshold: 95,
+            },
+            prompts: Prompts {
+                default: String::new(),
+            },
+            agents: Vec::new(),
+            scan: Vec::new(),
+            targets: Vec::new(),
+            ai_usage,
+        }
+    }
+
+    fn ai_usage_config(enabled: bool, command: Vec<String>) -> AiUsageConfig {
+        AiUsageConfig {
+            enabled,
+            command,
+            window: UsageWindowPolicy::Weekly,
+            fallback: UsageFallback::Fixed,
+            state_window: StateWindowPolicy::Selected,
+            profiles: Vec::new(),
+        }
+    }
 
     #[tokio::test]
     async fn spawn_ai_usage_redacts_secret_on_spawn_failure() {
@@ -510,6 +543,61 @@ mod tests {
 
         assert!(message.contains("--api-key <redacted>"));
         assert!(!message.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn schedule_resolver_load_skips_command_when_integration_is_disabled() {
+        let config = config_for_resolver(Some(ai_usage_config(
+            false,
+            vec!["token-burn-command-that-must-not-run".to_string()],
+        )));
+
+        let resolver = ScheduleResolver::load(&config).await;
+
+        assert!(matches!(resolver.usage, UsageState::Disabled));
+        assert!(matches!(resolver.state_window, StateWindowPolicy::Selected));
+        assert_eq!(resolver.failure(), None);
+    }
+
+    #[tokio::test]
+    async fn schedule_resolver_load_parses_successful_command_output() {
+        let output = r#"{"accounts":[{"profile":"P","provider":"claude","ok":true,"weekly":{"resets_at":"2099-01-01T00:00:00+00:00","used_percent":42.0}}]}"#;
+        let config = config_for_resolver(Some(ai_usage_config(
+            true,
+            vec!["printf".to_string(), output.to_string()],
+        )));
+
+        let resolver = ScheduleResolver::load(&config).await;
+
+        assert!(matches!(
+            &resolver.usage,
+            UsageState::Loaded(snapshot) if snapshot.accounts.len() == 1
+        ));
+        assert_eq!(resolver.failure(), None);
+        let schedule = resolver
+            .schedule_for(&rt_agent(
+                "P",
+                "claude",
+                UsageWindowPolicy::Weekly,
+                UsageFallback::Error,
+            ))
+            .expect("読み込んだ使用状況からスケジュールを解決できるべき")
+            .expect("weekly 枠があるためスケジュールを返すべき");
+        assert!(matches!(schedule.source, ScheduleSource::AiUsage { .. }));
+    }
+
+    #[tokio::test]
+    async fn schedule_resolver_load_records_command_failure() {
+        let config = config_for_resolver(Some(ai_usage_config(
+            true,
+            vec!["token-burn-command-that-does-not-exist".to_string()],
+        )));
+
+        let resolver = ScheduleResolver::load(&config).await;
+
+        assert!(matches!(resolver.usage, UsageState::Failed(_)));
+        let failure = resolver.failure().expect("起動失敗理由を保持するべき");
+        assert!(failure.contains("token-burn-command-that-does-not-exist"));
     }
 
     fn window_data(resets_at: Option<&str>) -> UsageWindowData {

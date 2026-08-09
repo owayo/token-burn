@@ -991,6 +991,19 @@ fn tool_result_metadata_shows_workflow_name() {
 }
 
 #[test]
+fn tool_result_metadata_shows_memdir_stamped_flag() {
+    // 実 jsonl ではメモリ用ディレクトリへの Edit/Write 成功時に true で現れる。
+    assert_eq!(
+        tool_result_metadata(&serde_json::json!({"memdirStamped": true})),
+        "memdir-stamped"
+    );
+    assert_eq!(
+        tool_result_metadata(&serde_json::json!({"memdirStamped": false})),
+        ""
+    );
+}
+
+#[test]
 fn tool_result_string_summary_returns_first_meaningful_line() {
     // 実データ例: MCP ツール応答が文字列で入るケース
     let value = serde_json::json!("initialize OK, protocol: 2025-06-18");
@@ -1010,6 +1023,27 @@ fn tool_result_string_summary_returns_first_meaningful_line() {
         tool_result_string_summary(&serde_json::json!({"stdout":"x"})),
         None
     );
+}
+
+#[test]
+fn tool_result_string_summary_supports_text_block_array() {
+    // 実 jsonl の Context7 応答は tool_use_result 自体が text ブロック配列になる。
+    let value = serde_json::json!([
+        {"type": "text", "text": "\n  first Context7 result\nrest"}
+    ]);
+    assert_eq!(
+        tool_result_string_summary(&value).as_deref(),
+        Some("result:first Context7 result")
+    );
+
+    // text 以外のブロックや空配列を結果本文として誤表示しない。
+    assert_eq!(
+        tool_result_string_summary(&serde_json::json!([
+            {"type": "image", "text": "not a text result"}
+        ])),
+        None
+    );
+    assert_eq!(tool_result_string_summary(&serde_json::json!([])), None);
 }
 
 #[test]
@@ -1038,4 +1072,15 @@ fn process_string_tool_use_result_shown_on_success_only() {
         "{clean}"
     );
     assert!(!clean.contains("[result:"), "{clean}");
+}
+
+#[test]
+fn process_text_block_array_tool_use_result_is_shown() {
+    let input = [
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t_context7","name":"mcp__context7__query-docs","input":{}}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t_context7","type":"tool_result","content":[{"type":"text","text":"Context7 result body"}]}]},"tool_use_result":[{"type":"text","text":"Context7 result body"}]}"#,
+    ]
+    .join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert!(clean.contains("[result:Context7 result body]"), "{clean}");
 }

@@ -6,14 +6,30 @@ use crate::format_stream::util::{
     format_number, truncate_inline,
 };
 
-/// `tool_use_result` が object でなく文字列だった場合の要約（先頭の有意な 1 行、80 文字まで）。
-/// 実データでは MCP ツール応答等が文字列で入る（例: "initialize OK, protocol: 2025-06-18"）。
+/// `tool_use_result` が object でなく文字列または text ブロック配列だった場合の要約。
+/// 実データでは MCP ツール応答等が文字列、Context7 応答が
+/// `[{"type":"text","text":"..."}]` の形で入る。
 /// エラー文字列は content 側のサマリー（extract_tool_result_summary）と同文になり
 /// 重複するため、呼び出し側は成功時に限って使う。
 pub(crate) fn tool_result_string_summary(result: &serde_json::Value) -> Option<String> {
-    let text = result.as_str()?;
-    let first_line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let first_line = match result {
+        serde_json::Value::String(text) => first_meaningful_result_line(text),
+        serde_json::Value::Array(blocks) => blocks.iter().find_map(|block| {
+            (block["type"].as_str() == Some("text"))
+                .then(|| {
+                    block["text"]
+                        .as_str()
+                        .and_then(first_meaningful_result_line)
+                })
+                .flatten()
+        }),
+        _ => None,
+    }?;
     Some(format!("result:{}", truncate_inline(first_line, 80)))
+}
+
+fn first_meaningful_result_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 /// `tool_result_meta` から、対象ツールが実行されなかった理由を抽出する。
@@ -182,6 +198,15 @@ fn append_file_metadata(obj: &serde_json::Map<String, serde_json::Value>, attrs:
         .unwrap_or(false)
     {
         attrs.push("replace_all".to_string());
+    }
+    // Claude Code がメモリ用ディレクトリの印を付けた Edit/Write 結果を区別する。
+    // 実データでは false が常設されず true のときだけ現れるため、その場合のみ表示する。
+    if obj
+        .get("memdirStamped")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        attrs.push("memdir-stamped".to_string());
     }
     // 結果種別。実データでは "text"（通常の読み取り）/"update"（書き込み）に加えて
     // "file_unchanged" が現れる。前回読み取りから内容が変わっていないため本文が返らな
