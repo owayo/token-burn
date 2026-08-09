@@ -52,6 +52,72 @@ fn worker_count(parallelism: usize, total: usize) -> usize {
     parallelism.min(total)
 }
 
+/// tmux セッション終了後に呼び出し元の端末へ出す最終集計。
+///
+/// モニターペインに出した完了表示はセッションを閉じた時点で画面から消えるため、
+/// 同じ内容をマーカーファイルから読み直して stdout に残す。
+#[derive(Default, Debug, PartialEq, Eq)]
+struct RunSummary {
+    done: usize,
+    failed: usize,
+    retry: usize,
+}
+
+impl RunSummary {
+    fn processed(&self) -> usize {
+        self.done + self.failed + self.retry
+    }
+
+    /// 集計に問題（失敗・リトライ・未処理）が含まれるか。表示色の判定に使う。
+    fn has_issues(&self, total: usize) -> bool {
+        self.failed > 0 || self.retry > 0 || self.processed() < total
+    }
+
+    /// モニターペインの完了行と同じ文言を組み立てる。
+    fn describe(&self, total: usize) -> String {
+        if self.processed() < total {
+            return format!(
+                "⏹ Stopped: {}/{} processed (fail:{} retry:{})",
+                self.processed(),
+                total,
+                self.failed,
+                self.retry
+            );
+        }
+        if self.failed > 0 || self.retry > 0 {
+            return format!(
+                "⚠ Completed: {} succeeded / {} failed / {} retry",
+                self.done, self.failed, self.retry
+            );
+        }
+        format!("✅ All {}/{} tasks completed", self.done, total)
+    }
+}
+
+/// マーカーディレクトリから done / failed / retry を数える。
+///
+/// 読めない場合は 0 件として扱う。これは表示のための集計であり、実行結果の記録自体は
+/// `state.json` が持つため、ここで失敗しても実行の成否には影響しない。
+fn collect_run_summary(marker_dir: &Path) -> RunSummary {
+    let mut summary = RunSummary::default();
+    let Ok(entries) = std::fs::read_dir(marker_dir) else {
+        return summary;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // ワーカー完了マーカーは `worker-done-*` で "done-" 始まりではないため混ざらない。
+        if name.starts_with("done-") {
+            summary.done += 1;
+        } else if name.starts_with("failed-") {
+            summary.failed += 1;
+        } else if name.starts_with("retry-") {
+            summary.retry += 1;
+        }
+    }
+    summary
+}
+
 pub fn build_plan(
     agent: &RuntimeAgent,
     targets: Vec<ResolvedTarget>,
@@ -457,6 +523,14 @@ pub fn execute_plan_tmux(
         );
         session_created = true;
 
+        // ワーカーはタスクを消化し切ると自分で終了してペインを閉じる。ユーザーの tmux 設定が
+        // remain-on-exit を on にしていると終了済みペインが "Pane is dead" のまま画面に残り、
+        // ペインを閉じる意味が無くなるため、このセッションに限って off を明示する。最初の
+        // タスクが終わる前に設定しておきたいので、ワーカー用のペイン分割より先に置く。
+        let _ = std::process::Command::new("tmux")
+            .args(["set-option", "-t", session, "remain-on-exit", "off"])
+            .status();
+
         // 最初のワーカー用に右ペインを分割
         let split_status = std::process::Command::new("tmux")
             .args([
@@ -584,6 +658,11 @@ pub fn execute_plan_tmux(
         return Ok(());
     }
 
+    // モニターは完了・停止を検知するとセッションごと閉じるため、画面に出した集計は
+    // tmux から抜けた時点で消える。同じ内容を呼び出し元の端末へ出し直す。マーカーは
+    // tmp_dir 配下にあるので、クリーンアップより先に読む。
+    let summary = collect_run_summary(&marker_dir);
+
     // クリーンアップ
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
@@ -592,6 +671,12 @@ pub fn execute_plan_tmux(
 
     println!();
     println!("{}", "tmux session ended.".bold());
+    let summary_line = summary.describe(total);
+    if summary.has_issues(total) {
+        println!("  {}", summary_line.yellow());
+    } else {
+        println!("  {}", summary_line.green());
+    }
     println!(
         "  {} {}",
         "Logs:".dimmed(),
@@ -628,6 +713,83 @@ mod tests {
 
     use super::flags::CLAUDE_PRINT_BG_WAIT_ENV;
     use super::*;
+
+    /// モニターがセッションを自動で閉じた後、呼び出し元の端末へ出す集計はマーカーから
+    /// 数え直す。ワーカー完了マーカー（`worker-done-*`）やエラー詳細（`error-*`）を
+    /// タスク件数に混ぜてはいけない。
+    #[test]
+    fn collect_run_summary_counts_task_markers_only() {
+        let tmp = tempfile::TempDir::new().expect("一時ディレクトリを作成できるべき");
+        let dir = tmp.path();
+        for name in [
+            "done-1",
+            "done-2",
+            "failed-3",
+            "retry-4",
+            "worker-done-0",
+            "worker-done-1",
+            "error-3",
+            "pending-9",
+        ] {
+            std::fs::write(dir.join(name), "").expect("マーカーを作成できるべき");
+        }
+
+        let summary = collect_run_summary(dir);
+
+        assert_eq!(
+            summary,
+            RunSummary {
+                done: 2,
+                failed: 1,
+                retry: 1,
+            }
+        );
+        assert_eq!(summary.processed(), 4);
+    }
+
+    /// マーカーディレクトリが読めない場合も表示だけの集計なので 0 件で続行する。
+    #[test]
+    fn collect_run_summary_is_empty_for_unreadable_dir() {
+        let tmp = tempfile::TempDir::new().expect("一時ディレクトリを作成できるべき");
+
+        let summary = collect_run_summary(&tmp.path().join("missing"));
+
+        assert_eq!(summary, RunSummary::default());
+    }
+
+    /// stdout の集計はモニターペインの完了行と同じ文言・同じ分岐にする。
+    #[test]
+    fn run_summary_describe_matches_monitor_wording() {
+        let all_done = RunSummary {
+            done: 10,
+            failed: 0,
+            retry: 0,
+        };
+        assert_eq!(all_done.describe(10), "✅ All 10/10 tasks completed");
+        assert!(!all_done.has_issues(10));
+
+        let mixed = RunSummary {
+            done: 8,
+            failed: 1,
+            retry: 1,
+        };
+        assert_eq!(
+            mixed.describe(10),
+            "⚠ Completed: 8 succeeded / 1 failed / 1 retry"
+        );
+        assert!(mixed.has_issues(10));
+
+        let stopped = RunSummary {
+            done: 4,
+            failed: 1,
+            retry: 0,
+        };
+        assert_eq!(
+            stopped.describe(10),
+            "⏹ Stopped: 5/10 processed (fail:1 retry:0)"
+        );
+        assert!(stopped.has_issues(10));
+    }
 
     #[cfg(unix)]
     #[test]

@@ -69,20 +69,19 @@ STATUS_MSG=""
 
 restore_terminal() {{ tput cnorm 2>/dev/null; printf '\033[?7h'; }}
 
-# 完了・停止後の待機。待機を exec で sleep に置き換えると、その時点で INT/TERM の trap が
-# SIG_DFL へ戻る（POSIX: catch 済みシグナルは exec 後にデフォルト動作へ戻る）。すると
-# 画面に出した "Press Ctrl-C to close session." が機能せず、Ctrl-C はモニターペインの
-# sleep を殺すだけになる。ワーカーペインは生き残るので tmux セッションは閉じず、
-# attach したままのユーザーは手動で kill する羽目になっていた。trap を保ったまま
-# 待機し、Ctrl-C でセッションごと閉じられるようにする。
-wait_for_close() {{
-    local sleep_pid=""
-    trap 'restore_terminal; [ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null; tmux kill-session -t "$SESSION" 2>/dev/null; exit 0' INT TERM
-    while true; do
-        sleep 3600 &
-        sleep_pid=$!
-        wait "$sleep_pid"
-    done
+# 完了・停止時はセッションごと閉じて token-burn を終了する。Ctrl-C 待ちはしない。
+# ワーカーはタスクを消化し切った時点で自分のペインを閉じるため、ここまで来た時点で
+# 生きているのはモニターだけ（早期停止時は走行中タスクのペインも残るが、その完了を
+# 待ってからこの関数に入る）。画面に出した集計とログパスは Rust 側（execute_plan_tmux）が
+# attach から戻った直後に stdout へ出し直すので、読み返すために tmux を開いたままに
+# する必要はない。
+# kill-session はモニター自身のペインも道連れに殺すため、後続行には基本到達しない。
+# セッション名の解決失敗などで kill-session が空振りした場合に取り残されないよう、
+# 明示的に exit する（モニターが最後のペインならこの exit でもセッションは閉じる）。
+finish_session() {{
+    restore_terminal
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    exit 0
 }}
 
 # ai-usage サブプロセスがハングしても monitor ループを止めないための timeout ラッパー。
@@ -170,6 +169,10 @@ handle_signal() {{
 }}
 trap handle_signal INT TERM
 trap restore_terminal EXIT
+# ワーカーはタスクを消化し切るたびに自分のペインを閉じ、そのぶん tmux がモニターペインを
+# 広げるため SIGWINCH が届く。通常の全体再描画は ai-usage の 10 秒間隔取得・エラー件数の
+# 変化・状態遷移でしか走らないので、ここで描き直さないと旧い幅で折り返した行が残る。
+trap render WINCH
 
 printf '\033]2;token-burn\033\\'
 printf '\033[?7l'
@@ -243,9 +246,7 @@ while true; do
         echo ""
         echo " 📁 Logs: $REPORT_DIR"
         echo ""
-        echo " Press Ctrl-C to close session."
-        restore_terminal
-        wait_for_close
+        finish_session
     fi
 
     # 全ワーカーが終了していれば、STOPPED かどうかに関わらず停止と判定する。
@@ -260,9 +261,7 @@ while true; do
         echo ""
         echo " 📁 Logs: $REPORT_DIR"
         echo ""
-        echo " Press Ctrl-C to close session."
-        restore_terminal
-        wait_for_close
+        finish_session
     fi
 
     # 進捗バー（画面最下部、毎秒 \r 上書き）
@@ -630,16 +629,17 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "printf '\\033]2;Worker {w} done\\033\\\\'\n",
             "echo '━━━ All tasks completed ━━━'\n",
             "touch {worker_done}\n",
-            // 全タスク完了後はキャンセル trap を外す。待機を exec で置き換えていた頃は
-            // exec が catch 済みシグナルを SIG_DFL へ戻していたため、待機中の Ctrl-C は
-            // 既定動作（ペインを閉じる）だった。有限 sleep のループへ変えた分、trap を
-            // 明示的に解除して同じ挙動を保つ（残すと Ctrl-C が握り潰され、もう処理する
-            // タスクが無いのに handle_cancel だけが走る）。
+            // 全タスク完了後はキャンセル trap を外してから抜ける。残したまま exit すると、
+            // 終了間際に届いた INT/TERM で handle_cancel だけが走り、処理するタスクが無いのに
+            // 直前タスクの failed マーカーを立て直してしまう。
             "trap - INT TERM\n",
-            // macOS の BSD sleep は `infinity` を受け付けず、usage エラーで即座に
-            // 終了する（`sleep infinity` → exit 1）。ワーカーペインが完了直後に
-            // 閉じてしまい、直前のログを読み返せなくなるため有限秒のループで待つ。
-            "while true; do sleep 3600; done\n",
+            // 消化し切ったワーカーはそのまま終了し、tmux ペインを閉じる（remain-on-exit は
+            // Rust 側でセッション単位に off を明示している）。以前は
+            // `while true; do sleep 3600; done` でペインを開いたままログを読み返せるように
+            // していたが、同じ出力は run_dir 配下の `.log` / `.jsonl` に残るため、画面に
+            // 貼り付けておく必要はない。空のペインが残らない分、走っているワーカーだけが
+            // 画面に出る。
+            "exit 0\n",
         ),
         queue_dir = queue_dir,
         task_dir = task_dir,
@@ -1122,38 +1122,45 @@ mod tests {
         // 完了/停止後も端末状態（カーソル/autowrap）を復元する。
         assert!(script.contains("restore_terminal() {"));
         assert!(script.contains("trap restore_terminal EXIT"));
-        // 完了時ブロック・停止時ブロックのいずれも、待機前に端末状態を復元してから
-        // wait_for_close へ入る（どちらも 8 スペースインデント）。
+        // 完了時ブロック・停止時ブロックのいずれも Ctrl-C 待ちせず、finish_session で
+        // セッションごと閉じて token-burn を終了する（どちらも 8 スペースインデント）。
         assert_eq!(
-            script
-                .matches("restore_terminal\n        wait_for_close")
-                .count(),
+            script.matches("\n        finish_session\n").count(),
             2,
-            "both completion and stopped blocks must restore terminal before waiting: {script}"
+            "both completion and stopped blocks must close the session: {script}"
         );
-        // 待機は exec せずに行う。exec すると catch 済みの INT/TERM が SIG_DFL に戻り、
-        // 画面に出す "Press Ctrl-C to close session." が機能しなくなる。
-        // また macOS の BSD sleep は `infinity` を受け付けず即座に usage エラーで
-        // 終了するため、待機自体が成立しない（ペインが完了直後に閉じる）。
+        assert!(script.contains("finish_session() {"));
+        assert!(
+            script.contains("    restore_terminal\n    tmux kill-session -t \"$SESSION\" 2>/dev/null\n    exit 0"),
+            "finish_session must restore the terminal, kill the session, then exit: {script}"
+        );
+        // Ctrl-C 待ちの案内と無限待機は残さない。残っていると自動終了しなくなる。
+        assert!(
+            !script.contains("Press Ctrl-C to close session"),
+            "monitor must not wait for Ctrl-C after finishing: {script}"
+        );
+        assert!(
+            !script.contains("sleep 3600"),
+            "monitor must not park in a sleep loop after finishing: {script}"
+        );
+        // macOS の BSD sleep は `infinity` を受け付けず usage エラーで即終了するため、
+        // 待機に使うと成立しない（過去の回帰を検知するための残置）。
         assert!(
             !script.contains("sleep infinity"),
             "monitor must not rely on `sleep infinity` (unsupported by BSD sleep): {script}"
         );
-        assert!(script.contains("wait_for_close() {"));
+        // ワーカーがタスクを消化し切るたびペインが閉じ、モニターペインが広がる。
+        // SIGWINCH で描き直さないと旧い幅で折り返した行が残る。
         assert!(
-            script.contains(r#"tmux kill-session -t "$SESSION" 2>/dev/null; exit 0' INT TERM"#),
-            "wait_for_close must close the tmux session on Ctrl-C: {script}"
-        );
-        assert!(
-            script.contains("sleep 3600 &"),
-            "wait_for_close must sleep in finite chunks so the trap stays reachable: {script}"
+            script.contains("trap render WINCH"),
+            "monitor must redraw the whole pane on resize: {script}"
         );
     }
 
     #[test]
-    fn build_worker_script_waits_without_sleep_infinity() {
-        // macOS の BSD sleep は `infinity` を受け付けず exit 1 で即座に終了する。
-        // ワーカーペインが完了直後に閉じて直前のログを読み返せなくなるのを防ぐ。
+    fn build_worker_script_exits_after_consuming_queue() {
+        // タスクを消化し切ったワーカーはそのまま終了してペインを閉じる。待機ループを
+        // 残すと空のペインが画面を占め続ける（ログは run_dir 側に残るので読み返せる）。
         let script = build_worker_script(&WorkerCtx {
             worker_id: 1,
             queue_dir: std::path::Path::new("/tmp/queue"),
@@ -1167,16 +1174,21 @@ mod tests {
             "worker must not rely on `sleep infinity`: {script}"
         );
         assert!(
-            script.contains("while true; do sleep 3600; done"),
-            "worker must wait in finite sleep chunks: {script}"
+            !script.contains("sleep 3600"),
+            "worker must not park in a sleep loop after finishing: {script}"
         );
-        // 完了後はキャンセル trap を外し、待機中の Ctrl-C を既定動作へ戻す。
-        // 残すと処理するタスクが無いのに handle_cancel だけが走り、ペインも閉じない。
+        // worker-done マーカーは終了前に必ず作る（モニターの停止判定がこれを見る）。
         assert!(
-            script.contains("trap - INT TERM\nwhile true; do sleep 3600; done"),
-            "worker must clear the cancel trap before waiting: {script}"
+            script.contains("touch '/tmp/markers/worker-done-1'\n"),
+            "worker must create its done marker before exiting: {script}"
         );
-        assert_valid_bash(&script, "worker script waiting loop");
+        // 終了直前にキャンセル trap を外す。残すと終了間際に届いた INT/TERM で
+        // handle_cancel だけが走り、処理するタスクが無いのに failed マーカーが立つ。
+        assert!(
+            script.contains("trap - INT TERM\nexit 0\n"),
+            "worker must clear the cancel trap before exiting: {script}"
+        );
+        assert_valid_bash(&script, "worker script exit path");
     }
 
     #[test]
