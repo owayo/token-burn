@@ -53,6 +53,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Credential-safe command display**: Redacts environment assignments and common credential option values as `<redacted>` in dry-run plans and ai-usage startup errors while executing the original values unchanged
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
 - **Deadline-aware stop**: Stops starting new tasks when the reset time arrives and waits for current tasks to finish
+- **Interactive target picker** (`-i` / `--interactive`): Opens a TUI before the run where you choose which repositories to process and in what order — workers claim the queue in exactly that order. All candidates are listed (not just the first `limit`), with the first `limit` pre-selected so pressing Enter reproduces the non-interactive run
 - **Parallel execution**: Runs multiple prompts concurrently in tmux split panes with progress monitor
 - **Self-closing run**: Workers close their own pane as soon as they run out of tasks, and the monitor tears down the tmux session once everything is processed — no Ctrl-C needed. The final tally and log path are reprinted on the terminal you started from
 - **Detach-safe tmux runtime**: Keeps worker scripts and queues when you detach, so background tasks continue safely until the tmux session ends
@@ -174,6 +175,7 @@ token-burn run
 | `--limit <N>` | `-l` | Maximum number of targets to process (`N >= 1`) |
 | `--no-limit` | | Process all targets without limit |
 | `--workers <N>` | `-w` | Number of concurrent workers (`N >= 1`, overrides `parallelism`) |
+| `--interactive` | `-i` | Pick the targets and their execution order in a TUI before running (`run` only, requires a TTY) |
 | `--public-only` | | Process only repositories detected as public |
 | `--dedup-scope <SCOPE>` | | How widely processed-target history is shared: `global` / `provider` / `agent` (overrides `dedup_scope`) |
 | `--help` | `-h` | Show help |
@@ -182,6 +184,8 @@ token-burn run
 `--dedup-scope` overrides the configured [`dedup_scope`](#sharing-processed-target-history-across-agents) for a single run. Use `--dedup-scope agent` to opt out of sharing and let this account re-visit repositories another account already processed.
 
 `--workers` overrides the configured `parallelism` for a single run. The number of workers that actually start is capped by the number of tasks, and the effective value is shown as `Workers:` in the execution plan (visible with `--dry-run`).
+
+`--interactive` opens a picker before the run. Every candidate is listed — not only the first `limit` — with the first `limit` rows pre-selected, so pressing Enter runs exactly what a non-interactive run would. Keys: `↑↓` / `j` `k` to move, `Space` to toggle, `J` / `K` (or `Shift+↑↓`) to move a row and change the order, `a` / `n` to select all or none, `g` / `G` for top and bottom, `Enter` to run, `q` / `Esc` to cancel. The number shown on each selected row is the order workers will process it in. It needs a real terminal, so it errors out when stdin or stdout is redirected; combine it with `--dry-run` to review the plan without executing.
 
 `init` also accepts `--force` (`-f`) to overwrite existing files without confirmation.
 

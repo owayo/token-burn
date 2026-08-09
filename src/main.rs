@@ -8,6 +8,7 @@ mod init;
 mod scanner;
 mod schedule;
 mod state;
+mod tui;
 mod usage;
 
 #[cfg(test)]
@@ -100,6 +101,10 @@ struct Cli {
         value_parser = parse_positive_workers
     )]
     workers: Option<usize>,
+
+    /// 実行対象と実行順を TUI で選んでから実行する（run のみ）
+    #[arg(short = 'i', long, global = true)]
+    interactive: bool,
 
     /// 公開リポジトリのみ処理する
     #[arg(long, global = true)]
@@ -276,6 +281,7 @@ async fn main() -> Result<()> {
         cli.limit
     };
     let public_only = cli.public_only;
+    let interactive = cli.interactive;
     let workers = cli.workers;
     let dedup_scope = resolve_dedup_scope(&config, cli.dedup_scope)?;
 
@@ -295,6 +301,7 @@ async fn main() -> Result<()> {
                 limit_override: limit,
                 workers_override: workers,
                 public_only,
+                interactive,
                 dedup_scope,
                 force_paths: paths,
             })
@@ -334,6 +341,8 @@ struct RunOptions {
     limit_override: Option<usize>,
     workers_override: Option<usize>,
     public_only: bool,
+    /// 実行対象と実行順を TUI で確定してから実行する。
+    interactive: bool,
     dedup_scope: config::DedupScope,
     force_paths: Vec<PathBuf>,
 }
@@ -480,6 +489,7 @@ async fn run(opts: RunOptions) -> Result<()> {
         limit_override,
         workers_override,
         public_only,
+        interactive,
         dedup_scope,
         force_paths,
     } = opts;
@@ -573,12 +583,31 @@ async fn run(opts: RunOptions) -> Result<()> {
 
     // 制限適用: CLIオプションが設定値を上書き
     let limit = limit_override.unwrap_or(config.settings.limit);
-    let truncated = if targets.len() > limit {
-        targets.len() - limit
+    // ワーカー数: CLI オプションが設定値を上書き（TUI のヘッダーにも出す）
+    let parallelism = workers_override.unwrap_or(config.settings.parallelism);
+
+    let (targets, truncated) = if interactive && !targets.is_empty() {
+        // TUI では候補を limit で切らず、先頭 limit 件を初期選択にして全候補を見せる。
+        // そのまま決定すれば非対話実行と同じ対象になり、必要なら limit の外側
+        // （11 件目以降）も選べる。確定後に limit を再適用すると、選んだのに実行
+        // されないターゲットが黙って落ちるため、選択結果をそのまま実行対象にする。
+        let ctx = tui::RunContext {
+            agent_name: sched.agent_name.clone(),
+            reset_in: display::format_duration(sched.time_until_reset),
+            schedule_source: sched.source.label().to_string(),
+            workers: parallelism,
+        };
+        match tui::select_targets(targets, &modified, limit, &ctx)? {
+            tui::Outcome::Confirmed(selected) => (selected, 0),
+            tui::Outcome::Cancelled => {
+                println!("{}", "Cancelled - nothing was executed.".yellow());
+                return Ok(());
+            }
+        }
     } else {
-        0
+        let truncated = targets.len().saturating_sub(limit);
+        (targets.into_iter().take(limit).collect(), truncated)
     };
-    let targets: Vec<_> = targets.into_iter().take(limit).collect();
 
     display::print_targets(&targets, &modified);
 
@@ -618,8 +647,6 @@ async fn run(opts: RunOptions) -> Result<()> {
         .as_ref()
         .filter(|g| g.enabled)
         .map(|g| g.command.clone());
-    // ワーカー数: CLI オプションが設定値を上書き
-    let parallelism = workers_override.unwrap_or(config.settings.parallelism);
     let plan = executor::build_plan(agent, targets, ai_usage_command);
     executor::print_plan(&plan, parallelism);
 
@@ -632,11 +659,16 @@ async fn run(opts: RunOptions) -> Result<()> {
     }
 
     let reset_info = sched.next_reset.format("%Y/%m/%d %H:%M").to_string();
+    // デッドラインは起動時の残り時間ではなく、実行直前の現在時刻から引き直す。
+    // TUI での選択は人手なので分単位で止まり、スキャン（gh CLI / git ls-files）にも
+    // 時間がかかる。起動時の値をそのまま渡すと、そこに費やした分だけモニターの
+    // デッドラインが後ろへずれ、実際のリセット後まで新規タスクを開始してしまう。
+    let time_until_reset = remaining_until(sched.next_reset);
     let report_dir = resolve_report_dir(&config.settings);
     executor::execute_plan_tmux(
         plan,
         parallelism,
-        sched.time_until_reset,
+        time_until_reset,
         &state_file,
         &reset_info,
         &report_dir,
@@ -757,6 +789,16 @@ fn resolve_force_paths(
 /// 処理済みカットオフ (`skip_within` / 前回リセット) は絶対時刻の窓なので、窓をまたいだ
 /// 時点で処理済み履歴が一斉に無効化される。ターゲット順が固定のままだと、そのたびに
 /// リストの先頭 `limit` 件だけが再処理され、末尾のリポジトリには永遠に到達しない。
+/// 指定時刻までの残り時間。すでに過ぎている場合は 0（デッドライン到達扱い）。
+///
+/// `AgentSchedule::time_until_reset` は起動時のスナップショットなので、スキャンや TUI 操作に
+/// かかった時間の分だけ実際より長くなる。実行直前にここで引き直す。
+fn remaining_until(reset: DateTime<chrono::FixedOffset>) -> std::time::Duration {
+    (reset - chrono::Local::now().fixed_offset())
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO)
+}
+
 /// 最終ファイル変更日時が古い順に並べ替えることで、カットオフが切れても前回処理した分は
 /// 後ろへ回り、放置されているリポジトリから消化される。
 ///
