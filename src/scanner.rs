@@ -713,6 +713,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: Prompts {
                 default: "review".to_string(),
@@ -780,6 +781,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: Prompts {
                 default: "default prompt".to_string(),
@@ -854,6 +856,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: Prompts {
                 default: "default".to_string(),
@@ -942,6 +945,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: Prompts {
                 default: "default prompt".to_string(),
@@ -1020,6 +1024,7 @@ mod tests {
                     cleanup_after: None,
                     limit: 10,
                     rate_limit_threshold: 95,
+                    dedup_scope: crate::config::DedupScope::Agent,
                 },
                 prompts: Prompts {
                     default: "default prompt".to_string(),
@@ -1104,6 +1109,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: Prompts {
                 default: "test".to_string(),
@@ -1164,6 +1170,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: Prompts {
                 default: "default".to_string(),
@@ -1257,6 +1264,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: Prompts {
                 default: "default".to_string(),
@@ -1337,6 +1345,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: Prompts {
                 default: "default".to_string(),

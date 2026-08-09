@@ -14,6 +14,16 @@ pub struct State {
     pub agents: HashMap<String, HashMap<String, DateTime<Utc>>>,
 }
 
+/// `last_processed_in_scope` の照合結果。「いつ」に加えて「どのエージェントが」を返す。
+/// 共有 scope ではスキップ理由が自分以外のエージェントになり得るため、
+/// 表示側がそれを提示できるようにエージェント名を持つ。
+#[derive(Debug, Clone)]
+pub struct LastProcessed {
+    /// 記録を持っていたエージェントの展開名。
+    pub agent_name: String,
+    pub at: DateTime<Utc>,
+}
+
 /// エージェント 1 件分の「パス → 処理時刻」を、与えられた Vec の順序のまま
 /// JSON オブジェクトへ書き出すラッパー。
 ///
@@ -90,11 +100,41 @@ impl State {
         }
     }
 
-    pub fn last_processed(&self, agent_name: &str, directory: &Path) -> Option<DateTime<Utc>> {
+    /// 指定したエージェント 1 件の記録だけを引く。
+    ///
+    /// 本番の判定は `last_processed_in_scope` に一本化しているため、これはテスト専用。
+    /// `pub` のまま残すと clippy の dead_code で落ちるので `#[cfg(test)]` へ降格している。
+    #[cfg(test)]
+    fn last_processed(&self, agent_name: &str, directory: &Path) -> Option<DateTime<Utc>> {
         self.agents
             .get(agent_name)
             .and_then(|m| m.get(&directory.to_string_lossy().to_string()))
             .copied()
+    }
+
+    /// `in_scope` が true を返すエージェントの記録だけを見て、最も新しい処理記録を返す。
+    ///
+    /// 記録側（`mark_completed`）は常に実行したエージェント名のキーへ書くため、
+    /// 「どのアカウントが処理したか」の履歴を保ったまま、参照範囲だけを広げられる。
+    /// 同時刻の記録が複数あるときはエージェント名の昇順で先頭を採り、
+    /// 実行のたびに表示するエージェント名が揺れないようにする。
+    pub fn last_processed_in_scope(
+        &self,
+        directory: &Path,
+        in_scope: impl Fn(&str) -> bool,
+    ) -> Option<LastProcessed> {
+        let key = directory.to_string_lossy().to_string();
+        self.agents
+            .iter()
+            .filter(|(name, _)| in_scope(name))
+            .filter_map(|(name, entries)| entries.get(&key).map(|ts| (name, ts)))
+            .max_by(|(a_name, a_ts), (b_name, b_ts)| {
+                a_ts.cmp(b_ts).then_with(|| b_name.cmp(a_name))
+            })
+            .map(|(name, at)| LastProcessed {
+                agent_name: name.clone(),
+                at: *at,
+            })
     }
 
     pub fn mark_completed(&mut self, agent_name: &str, directory: &Path) {
@@ -438,6 +478,88 @@ mod tests {
 
         let ts = state.last_processed("claude", dir);
         assert!(ts.is_some(), "処理済みタイムスタンプが記録されるべき");
+    }
+
+    /// scope 内で最も新しい記録と、そのエージェント名を返す。
+    #[test]
+    fn last_processed_in_scope_returns_newest_across_agents() {
+        let mut state = State::default();
+        let older = DateTime::parse_from_rfc3339("2026-08-02T11:47:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let newer = DateTime::parse_from_rfc3339("2026-08-09T10:42:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        state
+            .agents
+            .entry("codex-alt".to_string())
+            .or_default()
+            .insert("/repo".to_string(), older);
+        state
+            .agents
+            .entry("codex".to_string())
+            .or_default()
+            .insert("/repo".to_string(), newer);
+
+        let found = state
+            .last_processed_in_scope(Path::new("/repo"), |_| true)
+            .expect("記録が見つかるべき");
+        assert_eq!(found.at, newer);
+        assert_eq!(found.agent_name, "codex");
+    }
+
+    /// scope 外のエージェントの記録は無視する。
+    #[test]
+    fn last_processed_in_scope_skips_agents_outside_scope() {
+        let mut state = State::default();
+        state
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .insert("/repo".to_string(), Utc::now());
+
+        assert!(
+            state
+                .last_processed_in_scope(Path::new("/repo"), |name| name == "codex")
+                .is_none(),
+            "scope 外の記録で判定してはならない"
+        );
+    }
+
+    /// 同時刻の記録が複数あるときはエージェント名昇順で安定させる
+    /// （HashMap の走査順に引きずられて、実行のたびに表示名が変わらないようにする）。
+    #[test]
+    fn last_processed_in_scope_breaks_ties_by_agent_name() {
+        let ts = DateTime::parse_from_rfc3339("2026-08-09T10:42:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut state = State::default();
+        for agent in ["zeta", "alpha", "codex"] {
+            state
+                .agents
+                .entry(agent.to_string())
+                .or_default()
+                .insert("/repo".to_string(), ts);
+        }
+
+        for _ in 0..8 {
+            let found = state
+                .last_processed_in_scope(Path::new("/repo"), |_| true)
+                .expect("記録が見つかるべき");
+            assert_eq!(found.agent_name, "alpha");
+        }
+    }
+
+    #[test]
+    fn last_processed_in_scope_returns_none_for_unknown_directory() {
+        let mut state = State::default();
+        state.mark_completed("codex", Path::new("/repo-a"));
+
+        assert!(
+            state
+                .last_processed_in_scope(Path::new("/repo-b"), |_| true)
+                .is_none()
+        );
     }
 
     #[test]

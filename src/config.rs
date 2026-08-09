@@ -36,6 +36,43 @@ pub struct Settings {
     /// レート制限使用率がこの閾値（%）を超えたら自動停止する（デフォルト: 95）。
     #[serde(default = "default_rate_limit_threshold")]
     pub rate_limit_threshold: u8,
+    /// 処理済み判定を共有する範囲（デフォルト: agent = エージェントごとに分離）。
+    #[serde(default)]
+    pub dedup_scope: DedupScope,
+}
+
+/// 処理済み判定（`state.json` の照会）を共有する範囲。
+///
+/// 記録側は常に実行したエージェント名のキーへ書くため、この設定を変えても
+/// `state.json` のスキーマと「どのエージェントが処理したか」の履歴は変わらない。
+/// 変わるのは「スキップ対象かどうかを判定するときに、どのエージェントの履歴まで見るか」だけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum DedupScope {
+    /// 全エージェント横断。どのアカウント・どの CLI で処理しても他へ引き継ぐ。
+    Global,
+    /// 同じ provider（CLI 種別）のエージェント同士で共有する。
+    /// provider 未設定のエージェントは自分自身のみを見る。
+    Provider,
+    /// エージェントごとに完全分離（従来の挙動）。
+    #[default]
+    Agent,
+}
+
+impl DedupScope {
+    /// 他エージェントの履歴まで参照する範囲かどうか。
+    pub fn is_shared(self) -> bool {
+        !matches!(self, DedupScope::Agent)
+    }
+
+    /// 表示用のラベル。
+    pub fn label(self) -> &'static str {
+        match self {
+            DedupScope::Global => "global",
+            DedupScope::Provider => "provider",
+            DedupScope::Agent => "agent",
+        }
+    }
 }
 
 fn default_limit() -> usize {
@@ -269,6 +306,19 @@ impl Config {
         }
         validate_optional_duration("skip_within", self.settings.skip_within.as_deref())?;
         validate_optional_duration("cleanup_after", self.settings.cleanup_after.as_deref())?;
+
+        // 共有 scope では skip_within を必須にする。
+        // skip_within 省略時のカットオフは「実行中のエージェントの前回リセット時刻」であり、
+        // エージェント固有の周期に依存する。他エージェントの履歴まで参照する共有 scope で
+        // これを使うと、リセット周期の異なるアカウントの履歴へ別アカウントの周期を
+        // 当てはめることになり、スキップ範囲が実行するエージェント次第で揺れる。
+        // 共有するなら窓は全エージェント共通の絶対時間で決めるべきなので、明示を求める。
+        if self.settings.dedup_scope.is_shared() && self.settings.skip_within.is_none() {
+            anyhow::bail!(
+                "dedup_scope = \"{}\" requires settings.skip_within (the per-agent reset cutoff cannot be shared across agents)",
+                self.settings.dedup_scope.label()
+            );
+        }
 
         if let Some(global) = &self.ai_usage {
             if global.command.is_empty() {
@@ -627,6 +677,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: Prompts {
                 default: "review".to_string(),
@@ -647,6 +698,74 @@ mod tests {
             }],
             ai_usage: None,
         }
+    }
+
+    /// 共有 scope は skip_within を必須にする。
+    ///
+    /// skip_within 省略時のカットオフは実行エージェントの前回リセット時刻であり、
+    /// エージェント固有の周期に依存する。共有 scope でこれを使うと、スキップ範囲が
+    /// 「どのエージェントで走らせたか」で揺れるため、設定読み込みの時点で弾く。
+    #[test]
+    fn validate_rejects_shared_dedup_scope_without_skip_within() {
+        for scope in [DedupScope::Global, DedupScope::Provider] {
+            let mut config = base_config();
+            config.settings.dedup_scope = scope;
+            config.settings.skip_within = None;
+
+            let err = config
+                .validate()
+                .expect_err("共有 scope で skip_within 無しは拒否されるべき");
+            assert!(err.to_string().contains("skip_within"), "{scope:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_shared_dedup_scope_with_skip_within() {
+        let mut config = base_config();
+        config.settings.dedup_scope = DedupScope::Global;
+        config.settings.skip_within = Some("2d".to_string());
+
+        config
+            .validate()
+            .expect("skip_within があれば共有 scope は許可されるべき");
+    }
+
+    /// 既定（dedup_scope 省略）は agent = 従来どおり分離。skip_within 無しでも通る。
+    #[test]
+    fn validate_accepts_default_agent_scope_without_skip_within() {
+        let config = base_config();
+        assert_eq!(config.settings.dedup_scope, DedupScope::Agent);
+        config.validate().expect("既定は skip_within 不要");
+    }
+
+    /// dedup_scope は TOML の小文字表記でパースでき、省略時は agent になる。
+    #[test]
+    fn dedup_scope_parses_from_toml() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            dedup_scope: DedupScope,
+        }
+
+        let parsed: Wrapper = toml::from_str("dedup_scope = \"global\"").expect("parse");
+        assert_eq!(parsed.dedup_scope, DedupScope::Global);
+
+        let parsed: Wrapper = toml::from_str("dedup_scope = \"provider\"").expect("parse");
+        assert_eq!(parsed.dedup_scope, DedupScope::Provider);
+
+        let parsed: Wrapper = toml::from_str("").expect("parse");
+        assert_eq!(
+            parsed.dedup_scope,
+            DedupScope::Agent,
+            "省略時は従来の挙動（分離）"
+        );
+    }
+
+    #[test]
+    fn dedup_scope_is_shared_only_for_cross_agent_scopes() {
+        assert!(DedupScope::Global.is_shared());
+        assert!(DedupScope::Provider.is_shared());
+        assert!(!DedupScope::Agent.is_shared());
     }
 
     #[test]

@@ -48,7 +48,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -104,6 +104,11 @@ struct Cli {
     /// 公開リポジトリのみ処理する
     #[arg(long, global = true)]
     public_only: bool,
+
+    /// 処理済み判定を共有する範囲（デフォルト: 設定値の dedup_scope）。
+    /// agent を指定すると他アカウントの処理済み履歴を引き継がない
+    #[arg(long, global = true, value_name = "SCOPE")]
+    dedup_scope: Option<config::DedupScope>,
 }
 
 #[derive(Subcommand)]
@@ -272,6 +277,7 @@ async fn main() -> Result<()> {
     };
     let public_only = cli.public_only;
     let workers = cli.workers;
+    let dedup_scope = resolve_dedup_scope(&config, cli.dedup_scope)?;
 
     match command {
         Commands::Status => {
@@ -289,6 +295,7 @@ async fn main() -> Result<()> {
                 limit_override: limit,
                 workers_override: workers,
                 public_only,
+                dedup_scope,
                 force_paths: paths,
             })
             .await?;
@@ -300,6 +307,7 @@ async fn main() -> Result<()> {
                 agent_name,
                 fresh,
                 public_only,
+                dedup_scope,
                 force_paths: paths,
             })
             .await?;
@@ -326,6 +334,7 @@ struct RunOptions {
     limit_override: Option<usize>,
     workers_override: Option<usize>,
     public_only: bool,
+    dedup_scope: config::DedupScope,
     force_paths: Vec<PathBuf>,
 }
 
@@ -335,7 +344,27 @@ struct ListOptions {
     agent_name: Option<String>,
     fresh: bool,
     public_only: bool,
+    dedup_scope: config::DedupScope,
     force_paths: Vec<PathBuf>,
+}
+
+/// 実行時に適用する dedup scope を決める。CLI 指定（`--dedup-scope`）は設定値より優先。
+///
+/// 共有 scope は「実行中のエージェントの前回リセット時刻」をカットオフに使えないため、
+/// `skip_within` が無ければここで弾く。設定側は `Config::validate` が同じ検査をするが、
+/// CLI で `agent` から `global` へ引き上げた場合はそこを通らないので二重に置く。
+fn resolve_dedup_scope(
+    config: &config::Config,
+    override_scope: Option<config::DedupScope>,
+) -> Result<config::DedupScope> {
+    let scope = override_scope.unwrap_or(config.settings.dedup_scope);
+    if scope.is_shared() && config.settings.skip_within.is_none() {
+        anyhow::bail!(
+            "--dedup-scope {} requires settings.skip_within in the config (the per-agent reset cutoff cannot be shared across agents)",
+            scope.label()
+        );
+    }
+    Ok(scope)
 }
 
 async fn list(opts: ListOptions) -> Result<()> {
@@ -345,6 +374,7 @@ async fn list(opts: ListOptions) -> Result<()> {
         agent_name,
         fresh,
         public_only,
+        dedup_scope,
         force_paths,
     } = opts;
     let runtime_agents = config.expand_runtime_agents()?;
@@ -398,9 +428,17 @@ async fn list(opts: ListOptions) -> Result<()> {
     let state_file = state::state_path(&config_path);
     let run_state = state::State::load(&state_file)?;
     let (mut targets, skipped) = if fresh || !force_paths.is_empty() {
-        (targets, 0usize)
+        (targets, SkipSummary::default())
     } else {
-        filter_by_state(targets, &run_state, agent, &config, &sched)
+        filter_by_state(
+            targets,
+            &run_state,
+            agent,
+            &runtime_agents,
+            &config,
+            &sched,
+            dedup_scope,
+        )
     };
 
     // 最終ファイル変更日時が古い順に並べ替える（force_paths 指定時は CLI 指定順を尊重）
@@ -423,15 +461,9 @@ async fn list(opts: ListOptions) -> Result<()> {
         );
     }
 
-    if skipped > 0 {
-        println!(
-            "  {} {} targets (already processed)",
-            "Skipped:".dimmed(),
-            skipped
-        );
-    }
+    print_skip_summary(&skipped, dedup_scope, &config);
 
-    if public_filtered > 0 || skipped > 0 {
+    if public_filtered > 0 || skipped.total > 0 {
         println!();
     }
 
@@ -448,6 +480,7 @@ async fn run(opts: RunOptions) -> Result<()> {
         limit_override,
         workers_override,
         public_only,
+        dedup_scope,
         force_paths,
     } = opts;
     let runtime_agents = config.expand_runtime_agents()?;
@@ -513,9 +546,17 @@ async fn run(opts: RunOptions) -> Result<()> {
     let state_file = state::state_path(&config_path);
     let run_state = state::State::load(&state_file)?;
     let (mut targets, skipped) = if fresh || !force_paths.is_empty() {
-        (targets, 0usize)
+        (targets, SkipSummary::default())
     } else {
-        filter_by_state(targets, &run_state, agent, &config, &sched)
+        filter_by_state(
+            targets,
+            &run_state,
+            agent,
+            &runtime_agents,
+            &config,
+            &sched,
+            dedup_scope,
+        )
     };
 
     // 最終ファイル変更日時が古い順に並べ替えてから limit を適用する。
@@ -558,15 +599,9 @@ async fn run(opts: RunOptions) -> Result<()> {
         );
     }
 
-    if skipped > 0 {
-        println!(
-            "  {} {} targets (already processed)",
-            "Skipped:".dimmed(),
-            skipped
-        );
-    }
+    print_skip_summary(&skipped, dedup_scope, &config);
 
-    if public_filtered > 0 || skipped > 0 {
+    if public_filtered > 0 || skipped.total > 0 {
         println!();
     }
 
@@ -756,13 +791,124 @@ fn public_first_enabled(config: &config::Config) -> bool {
     config.scan.iter().any(|scan| scan.public_first)
 }
 
+/// 処理済みスキップの内訳。
+///
+/// 共有 scope では自分以外のエージェントの履歴が理由になり得るため、件数だけでなく
+/// 「どのエージェントの記録で弾かれたか」を持つ。件数しか出さないと、統合が効いた結果
+/// スキップされたのか、ターゲット探索そのものが壊れているのか区別できない。
+#[derive(Debug, Default)]
+struct SkipSummary {
+    total: usize,
+    /// スキップ理由になったエージェント展開名 → 件数。
+    by_agent: BTreeMap<String, usize>,
+}
+
+impl SkipSummary {
+    fn record(&mut self, agent_name: &str) {
+        self.total += 1;
+        *self.by_agent.entry(agent_name.to_string()).or_default() += 1;
+    }
+
+    /// `codex=5, codex-alt=2` 形式の内訳。件数降順、同数はエージェント名昇順。
+    fn breakdown(&self) -> String {
+        let mut entries: Vec<_> = self.by_agent.iter().collect();
+        entries.sort_by(|(a_name, a_count), (b_name, b_count)| {
+            b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
+        });
+        entries
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// 処理済みスキップの内訳を表示する。
+///
+/// scope と窓を必ず併記する。件数だけでは「統合が効いてスキップされた」のか
+/// 「ターゲット探索が壊れて候補が消えた」のかを実行ログから切り分けられない。
+fn print_skip_summary(skipped: &SkipSummary, scope: config::DedupScope, config: &config::Config) {
+    if skipped.total == 0 {
+        return;
+    }
+    let window = config
+        .settings
+        .skip_within
+        .as_deref()
+        .unwrap_or("since last reset");
+    println!(
+        "  {} {} targets (already processed; scope: {}, window: {})",
+        "Skipped:".dimmed(),
+        skipped.total,
+        scope.label(),
+        window
+    );
+    // 自分の履歴しか見ない agent scope では内訳が自明なので出さない。
+    if scope.is_shared() {
+        println!("    {} {}", "by agent:".dimmed(), skipped.breakdown());
+    }
+}
+
+/// dedup scope に応じた「処理済み履歴を共有するエージェント」の判定。
+enum DedupPeers {
+    /// 全エージェント。`state.json` にあって現在の設定に無いもの（削除・改名済み）も含む。
+    All,
+    /// 列挙した展開名のみ。
+    Named(HashSet<String>),
+}
+
+impl DedupPeers {
+    fn contains(&self, agent_name: &str) -> bool {
+        match self {
+            DedupPeers::All => true,
+            DedupPeers::Named(names) => names.contains(agent_name),
+        }
+    }
+}
+
+/// 実行中のエージェントと同じ処理済み履歴を共有する相手を決める。
+///
+/// `provider` scope では現在の `RuntimeAgent` 一覧からしか provider を復元できない。
+/// `state.json` は provider を持たないため、設定から消えた・改名されたエージェントの記録は
+/// provider 不明として対象外になる。別 provider の履歴を誤って引き当てて実行を握り潰すより、
+/// 取りこぼして再処理する方が安全なため、この向きに倒している。
+fn dedup_peers(
+    scope: config::DedupScope,
+    agent: &config::RuntimeAgent,
+    runtime_agents: &[config::RuntimeAgent],
+) -> DedupPeers {
+    match scope {
+        config::DedupScope::Global => DedupPeers::All,
+        config::DedupScope::Agent => DedupPeers::Named(HashSet::from([agent.name.clone()])),
+        config::DedupScope::Provider => {
+            // provider 未設定のエージェントはグルーピングの手掛かりが無いので自分自身のみ。
+            let Some(provider) = agent.provider.as_deref() else {
+                return DedupPeers::Named(HashSet::from([agent.name.clone()]));
+            };
+            let names = runtime_agents
+                .iter()
+                .filter(|candidate| {
+                    candidate
+                        .provider
+                        .as_deref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(provider))
+                })
+                .map(|candidate| candidate.name.clone())
+                .collect();
+            DedupPeers::Named(names)
+        }
+    }
+}
+
 fn filter_by_state(
     targets: Vec<scanner::ResolvedTarget>,
     run_state: &state::State,
     agent: &config::RuntimeAgent,
+    runtime_agents: &[config::RuntimeAgent],
     config: &config::Config,
     sched: &schedule::AgentSchedule,
-) -> (Vec<scanner::ResolvedTarget>, usize) {
+    scope: config::DedupScope,
+) -> (Vec<scanner::ResolvedTarget>, SkipSummary) {
     use chrono::Utc;
 
     // カットオフ時刻を決定: この時刻以降に処理済みのディレクトリをスキップ
@@ -795,13 +941,16 @@ fn filter_by_state(
         sched.state_cutoff.with_timezone(&Utc)
     };
 
+    let peers = dedup_peers(scope, agent, runtime_agents);
+
     let mut kept = Vec::new();
-    let mut skipped = 0usize;
+    let mut skipped = SkipSummary::default();
     for target in targets {
-        if let Some(last) = run_state.last_processed(&agent.name, &target.directory)
-            && last >= cutoff
+        if let Some(last) =
+            run_state.last_processed_in_scope(&target.directory, |name| peers.contains(name))
+            && last.at >= cutoff
         {
-            skipped += 1;
+            skipped.record(&last.agent_name);
             continue;
         }
         kept.push(target);
@@ -824,6 +973,7 @@ mod tests {
             cleanup_after: None,
             limit: 10,
             rate_limit_threshold: 95,
+            dedup_scope: crate::config::DedupScope::Agent,
         };
         let dir = resolve_report_dir(&settings);
         assert!(dir.ends_with("Documents/token-burn"));
@@ -838,6 +988,7 @@ mod tests {
             cleanup_after: None,
             limit: 10,
             rate_limit_threshold: 95,
+            dedup_scope: crate::config::DedupScope::Agent,
         };
         let dir = resolve_report_dir(&settings);
         // チルダが展開されていることを確認
@@ -860,6 +1011,7 @@ mod tests {
             cleanup_after: None,
             limit: 10,
             rate_limit_threshold: 95,
+            dedup_scope: crate::config::DedupScope::Agent,
         };
         let dir = resolve_report_dir(&settings);
         assert!(
@@ -888,6 +1040,7 @@ mod tests {
             cleanup_after: None,
             limit: 10,
             rate_limit_threshold: 95,
+            dedup_scope: crate::config::DedupScope::Agent,
         };
         let dir = resolve_report_dir(&settings);
         assert_eq!(
@@ -919,6 +1072,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
@@ -957,8 +1111,16 @@ mod tests {
             .or_default()
             .insert("/tmp/processed-repo".to_string(), Utc::now());
 
-        let (kept, skipped) = filter_by_state(targets, &run_state, runtime_agent, &conf, &sched);
-        assert_eq!(skipped, 1);
+        let (kept, skipped) = filter_by_state(
+            targets,
+            &run_state,
+            runtime_agent,
+            &runtime,
+            &conf,
+            &sched,
+            config::DedupScope::Agent,
+        );
+        assert_eq!(skipped.total, 1);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].display_name, "new-repo");
     }
@@ -993,6 +1155,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
@@ -1007,8 +1170,16 @@ mod tests {
         let sched = schedule::calculate_fixed_reset(runtime_agent).unwrap();
         let empty_state = state::State::default();
 
-        let (kept, skipped) = filter_by_state(targets, &empty_state, runtime_agent, &conf, &sched);
-        assert_eq!(skipped, 0);
+        let (kept, skipped) = filter_by_state(
+            targets,
+            &empty_state,
+            runtime_agent,
+            &runtime,
+            &conf,
+            &sched,
+            config::DedupScope::Agent,
+        );
+        assert_eq!(skipped.total, 0);
         assert_eq!(kept.len(), original_len);
     }
 
@@ -1242,6 +1413,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
@@ -1319,6 +1491,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
@@ -1369,9 +1542,17 @@ mod tests {
                 Utc::now() - chrono::Duration::hours(2),
             );
 
-        let (kept, skipped) = filter_by_state(targets, &run_state, runtime_agent, &conf, &sched);
+        let (kept, skipped) = filter_by_state(
+            targets,
+            &run_state,
+            runtime_agent,
+            &runtime,
+            &conf,
+            &sched,
+            config::DedupScope::Agent,
+        );
         assert_eq!(
-            skipped, 1,
+            skipped.total, 1,
             "1時間以内に処理済みのターゲットはスキップされるべき"
         );
         assert_eq!(kept.len(), 1);
@@ -1400,6 +1581,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
@@ -1426,10 +1608,380 @@ mod tests {
             .or_default()
             .insert("/tmp/processed-repo".to_string(), Utc::now());
 
-        let (kept, skipped) = filter_by_state(targets, &run_state, runtime_agent, &conf, &sched);
+        let (kept, skipped) = filter_by_state(
+            targets,
+            &run_state,
+            runtime_agent,
+            &runtime,
+            &conf,
+            &sched,
+            config::DedupScope::Agent,
+        );
 
-        assert_eq!(skipped, 1, "スケジュールのカットオフへ戻るべき");
+        assert_eq!(skipped.total, 1, "スケジュールのカットオフへ戻るべき");
         assert!(kept.is_empty());
+    }
+
+    /// dedup scope 検証用の設定。`agents` は (エージェント名, provider) の並び。
+    fn dedup_test_config(
+        agents: &[(&str, Option<&str>)],
+        skip_within: Option<&str>,
+    ) -> config::Config {
+        config::Config {
+            config_dir: std::path::PathBuf::from("."),
+            settings: config::Settings {
+                parallelism: 1,
+                skip_within: skip_within.map(|s| s.to_string()),
+                report_dir: None,
+                cleanup_after: None,
+                limit: 10,
+                rate_limit_threshold: 95,
+                dedup_scope: config::DedupScope::Agent,
+            },
+            prompts: config::Prompts {
+                default: "review".to_string(),
+            },
+            agents: agents
+                .iter()
+                .map(|(name, provider)| config::Agent {
+                    name: (*name).to_string(),
+                    provider: provider.map(|p| p.to_string()),
+                    command: vec!["echo".to_string()],
+                    reset_weekday: Some("monday".to_string()),
+                    reset_time: Some("09:00".to_string()),
+                    timezone: Some("UTC".to_string()),
+                    ..Default::default()
+                })
+                .collect(),
+            scan: vec![],
+            targets: vec![],
+            ai_usage: None,
+        }
+    }
+
+    /// (エージェント名, ディレクトリ) を「たった今処理した」状態にする。
+    fn state_with(entries: &[(&str, &str)]) -> state::State {
+        let mut run_state = state::State::default();
+        for (agent, dir) in entries {
+            run_state
+                .agents
+                .entry((*agent).to_string())
+                .or_default()
+                .insert((*dir).to_string(), chrono::Utc::now());
+        }
+        run_state
+    }
+
+    /// テスト対象のエージェントを展開名で取り出し、固定スケジュールとともに返す。
+    fn dedup_runtime(
+        conf: &config::Config,
+        agent_name: &str,
+    ) -> (Vec<config::RuntimeAgent>, schedule::AgentSchedule) {
+        let runtime = conf.expand_runtime_agents().expect("expand");
+        let agent = runtime
+            .iter()
+            .find(|a| a.name == agent_name)
+            .unwrap_or_else(|| panic!("agent {agent_name} が展開されるべき"));
+        let sched = schedule::calculate_fixed_reset(agent).expect("schedule");
+        (runtime, sched)
+    }
+
+    /// dedup_scope = global では、別アカウント（別エージェント）の処理済み記録でもスキップする。
+    /// アカウント A の codex で一巡したリポジトリを、アカウント B の codex が拾い直さないための挙動。
+    #[test]
+    fn filter_by_state_global_scope_shares_history_across_agents() {
+        let conf = dedup_test_config(
+            &[("codex", Some("codex")), ("codex-alt", Some("codex"))],
+            Some("2d"),
+        );
+        let (runtime, sched) = dedup_runtime(&conf, "codex-alt");
+        let agent = runtime.iter().find(|a| a.name == "codex-alt").unwrap();
+
+        // 記録があるのは別エージェント (codex) の側だけ
+        let run_state = state_with(&[("codex", "/tmp/repo-a")]);
+        let targets = vec![target_at("repo-a", scanner::Visibility::Unknown, false)];
+
+        let (kept, skipped) = filter_by_state(
+            targets,
+            &run_state,
+            agent,
+            &runtime,
+            &conf,
+            &sched,
+            config::DedupScope::Global,
+        );
+
+        assert!(
+            kept.is_empty(),
+            "他エージェントの処理済み記録でもスキップされるべき"
+        );
+        assert_eq!(skipped.total, 1);
+        assert_eq!(
+            skipped.by_agent.get("codex"),
+            Some(&1),
+            "どのエージェントの記録で弾いたかを残すべき"
+        );
+    }
+
+    /// dedup_scope = agent（既定）は他エージェントの記録を一切見ない。
+    #[test]
+    fn filter_by_state_agent_scope_ignores_other_agents() {
+        let conf = dedup_test_config(
+            &[("codex", Some("codex")), ("codex-alt", Some("codex"))],
+            Some("2d"),
+        );
+        let (runtime, sched) = dedup_runtime(&conf, "codex-alt");
+        let agent = runtime.iter().find(|a| a.name == "codex-alt").unwrap();
+
+        let run_state = state_with(&[("codex", "/tmp/repo-a")]);
+        let targets = vec![target_at("repo-a", scanner::Visibility::Unknown, false)];
+
+        let (kept, skipped) = filter_by_state(
+            targets,
+            &run_state,
+            agent,
+            &runtime,
+            &conf,
+            &sched,
+            config::DedupScope::Agent,
+        );
+
+        assert_eq!(kept.len(), 1, "自分の履歴に無いなら処理対象のまま残すべき");
+        assert_eq!(skipped.total, 0);
+    }
+
+    /// dedup_scope = global でも窓（skip_within）は効く。窓の外の記録では弾かない。
+    /// 「統合したのに再処理される」ときの切り分けに必要な境界。
+    #[test]
+    fn filter_by_state_global_scope_respects_skip_within_window() {
+        let conf = dedup_test_config(
+            &[("codex", Some("codex")), ("codex-alt", Some("codex"))],
+            Some("2d"),
+        );
+        let (runtime, sched) = dedup_runtime(&conf, "codex-alt");
+        let agent = runtime.iter().find(|a| a.name == "codex-alt").unwrap();
+
+        // 別エージェントの記録はあるが 3 日前 = skip_within("2d") の外
+        let mut run_state = state::State::default();
+        run_state
+            .agents
+            .entry("codex".to_string())
+            .or_default()
+            .insert(
+                "/tmp/repo-a".to_string(),
+                chrono::Utc::now() - chrono::Duration::days(3),
+            );
+        let targets = vec![target_at("repo-a", scanner::Visibility::Unknown, false)];
+
+        let (kept, skipped) = filter_by_state(
+            targets,
+            &run_state,
+            agent,
+            &runtime,
+            &conf,
+            &sched,
+            config::DedupScope::Global,
+        );
+
+        assert_eq!(kept.len(), 1, "窓の外の記録では弾かないべき");
+        assert_eq!(skipped.total, 0);
+    }
+
+    /// dedup_scope = provider は同じ provider 同士でだけ共有する。
+    #[test]
+    fn filter_by_state_provider_scope_shares_within_same_provider() {
+        let conf = dedup_test_config(
+            &[
+                ("codex", Some("codex")),
+                ("codex-alt", Some("codex")),
+                ("claude", Some("claude")),
+            ],
+            Some("2d"),
+        );
+        let (runtime, sched) = dedup_runtime(&conf, "codex-alt");
+        let agent = runtime.iter().find(|a| a.name == "codex-alt").unwrap();
+
+        // repo-a は同 provider の codex が、repo-b は別 provider の claude が処理済み
+        let run_state = state_with(&[("codex", "/tmp/repo-a"), ("claude", "/tmp/repo-b")]);
+        let targets = vec![
+            target_at("repo-a", scanner::Visibility::Unknown, false),
+            target_at("repo-b", scanner::Visibility::Unknown, false),
+        ];
+
+        let (kept, skipped) = filter_by_state(
+            targets,
+            &run_state,
+            agent,
+            &runtime,
+            &conf,
+            &sched,
+            config::DedupScope::Provider,
+        );
+
+        assert_eq!(skipped.total, 1);
+        assert_eq!(skipped.by_agent.get("codex"), Some(&1));
+        assert_eq!(
+            kept.iter()
+                .map(|t| t.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["repo-b"],
+            "別 provider の履歴では弾かないべき"
+        );
+    }
+
+    /// provider 未設定のエージェントは、provider scope でも自分の記録だけを見る。
+    /// 手掛かりが無いのに他エージェントと同一視すると、無関係な履歴で実行を握り潰す。
+    #[test]
+    fn filter_by_state_provider_scope_without_provider_falls_back_to_self() {
+        let conf = dedup_test_config(&[("codex", Some("codex")), ("legacy", None)], Some("2d"));
+        let (runtime, sched) = dedup_runtime(&conf, "legacy");
+        let agent = runtime.iter().find(|a| a.name == "legacy").unwrap();
+
+        let run_state = state_with(&[("codex", "/tmp/repo-a")]);
+        let targets = vec![target_at("repo-a", scanner::Visibility::Unknown, false)];
+
+        let (kept, skipped) = filter_by_state(
+            targets,
+            &run_state,
+            agent,
+            &runtime,
+            &conf,
+            &sched,
+            config::DedupScope::Provider,
+        );
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(skipped.total, 0);
+    }
+
+    /// global scope は state.json にしか残っていないエージェント名（削除・改名済み）も参照する。
+    #[test]
+    fn filter_by_state_global_scope_includes_agents_absent_from_config() {
+        let conf = dedup_test_config(&[("codex", Some("codex"))], Some("2d"));
+        let (runtime, sched) = dedup_runtime(&conf, "codex");
+        let agent = &runtime[0];
+
+        let run_state = state_with(&[("retired-agent", "/tmp/repo-a")]);
+        let targets = vec![target_at("repo-a", scanner::Visibility::Unknown, false)];
+
+        let (kept, skipped) = filter_by_state(
+            targets,
+            &run_state,
+            agent,
+            &runtime,
+            &conf,
+            &sched,
+            config::DedupScope::Global,
+        );
+
+        assert!(kept.is_empty());
+        assert_eq!(skipped.by_agent.get("retired-agent"), Some(&1));
+    }
+
+    /// provider scope は provider を復元できないエージェント名（設定に無い）を対象外にする。
+    #[test]
+    fn filter_by_state_provider_scope_excludes_agents_absent_from_config() {
+        let conf = dedup_test_config(&[("codex", Some("codex"))], Some("2d"));
+        let (runtime, sched) = dedup_runtime(&conf, "codex");
+        let agent = &runtime[0];
+
+        let run_state = state_with(&[("retired-agent", "/tmp/repo-a")]);
+        let targets = vec![target_at("repo-a", scanner::Visibility::Unknown, false)];
+
+        let (kept, skipped) = filter_by_state(
+            targets,
+            &run_state,
+            agent,
+            &runtime,
+            &conf,
+            &sched,
+            config::DedupScope::Provider,
+        );
+
+        assert_eq!(
+            kept.len(),
+            1,
+            "provider を復元できない記録で弾くより取りこぼす方に倒すべき"
+        );
+        assert_eq!(skipped.total, 0);
+    }
+
+    /// provider の照合は大文字小文字を無視する（"Codex" と "codex" を別グループにしない）。
+    #[test]
+    fn dedup_peers_matches_provider_case_insensitively() {
+        let conf = dedup_test_config(
+            &[("codex", Some("codex")), ("codex-alt", Some("Codex"))],
+            Some("2d"),
+        );
+        let runtime = conf.expand_runtime_agents().expect("expand");
+        let agent = runtime.iter().find(|a| a.name == "codex").unwrap();
+
+        let peers = dedup_peers(config::DedupScope::Provider, agent, &runtime);
+        assert!(peers.contains("codex-alt"));
+    }
+
+    /// スキップ内訳は件数降順・同数はエージェント名昇順で安定して並ぶ。
+    #[test]
+    fn skip_summary_breakdown_orders_by_count_then_name() {
+        let mut summary = SkipSummary::default();
+        for _ in 0..2 {
+            summary.record("zeta");
+        }
+        for _ in 0..2 {
+            summary.record("alpha");
+        }
+        for _ in 0..5 {
+            summary.record("codex");
+        }
+
+        assert_eq!(summary.total, 9);
+        assert_eq!(summary.breakdown(), "codex=5, alpha=2, zeta=2");
+    }
+
+    /// --dedup-scope は設定値を上書きする（「今回は引き継がない」を実行ごとに選べる）。
+    #[test]
+    fn resolve_dedup_scope_cli_overrides_config() {
+        let mut conf = dedup_test_config(&[("codex", Some("codex"))], Some("2d"));
+        conf.settings.dedup_scope = config::DedupScope::Global;
+
+        assert_eq!(
+            resolve_dedup_scope(&conf, Some(config::DedupScope::Agent))
+                .expect("CLI 指定は通るべき"),
+            config::DedupScope::Agent
+        );
+        assert_eq!(
+            resolve_dedup_scope(&conf, None).expect("未指定なら設定値"),
+            config::DedupScope::Global
+        );
+    }
+
+    /// 共有 scope を CLI で指定しても skip_within が無ければエラーにする。
+    /// エージェント固有のリセット時刻を他エージェントの履歴へ当てはめないため。
+    #[test]
+    fn resolve_dedup_scope_shared_requires_skip_within() {
+        let conf = dedup_test_config(&[("codex", Some("codex"))], None);
+
+        let err = resolve_dedup_scope(&conf, Some(config::DedupScope::Global))
+            .expect_err("skip_within 無しの共有 scope は拒否されるべき");
+        assert!(err.to_string().contains("skip_within"), "{err}");
+
+        assert!(
+            resolve_dedup_scope(&conf, Some(config::DedupScope::Agent)).is_ok(),
+            "agent scope は skip_within 無しでも従来どおり動くべき"
+        );
+    }
+
+    /// CLI の --dedup-scope をパースできる。
+    #[test]
+    fn cli_parses_dedup_scope_override() {
+        let cli = Cli::parse_from(["token-burn", "run", "--dedup-scope", "agent"]);
+        assert_eq!(cli.dedup_scope, Some(config::DedupScope::Agent));
+
+        let cli = Cli::parse_from(["token-burn", "run", "--dedup-scope", "global"]);
+        assert_eq!(cli.dedup_scope, Some(config::DedupScope::Global));
+
+        let cli = Cli::parse_from(["token-burn", "run"]);
+        assert_eq!(cli.dedup_scope, None, "未指定なら設定値を使う");
     }
 
     #[test]
@@ -1443,6 +1995,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: config::Prompts {
                 default: "default".to_string(),
@@ -1491,6 +2044,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: config::Prompts {
                 default: "default".to_string(),
@@ -1528,6 +2082,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: config::Prompts {
                 default: "default".to_string(),
@@ -1576,6 +2131,7 @@ mod tests {
                     cleanup_after: None,
                     limit: 10,
                     rate_limit_threshold: 95,
+                    dedup_scope: crate::config::DedupScope::Agent,
                 },
                 prompts: config::Prompts {
                     default: "default prompt".to_string(),
@@ -1627,6 +2183,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: config::Prompts {
                 default: "default prompt".to_string(),
@@ -1674,6 +2231,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 10,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: config::Prompts {
                 default: "default prompt".to_string(),

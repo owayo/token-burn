@@ -49,6 +49,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Usage-rate gate**: When ai-usage integration is enabled, re-checks each agent's real utilization (`weekly` / `five_hour`) after every task and stops starting new tasks once `rate_limit_threshold` is reached — extending threshold-based auto-stop to `codex`, not just Claude Code's in-task `rate_limit_event`
 - **Monitor usage panel**: When ai-usage integration is enabled, the tmux monitor pane shows `ai-usage --statusline --logos` (each account's 5h / weekly utilization bars) refreshed every 10 seconds, rendered from a cached `--input` snapshot alongside the per-second progress bar. The refresh returns as soon as `ai-usage` does, so it never freezes the pane and the progress bar keeps its per-second update
 - **Multi-account expansion**: Expands a single agent across multiple accounts (e.g. `claude` → `claude-work` / `claude-home`), each launched with its own environment and tracked separately in `state.json`
+- **Cross-account continuation**: `dedup_scope` lets one account resume where another stopped instead of re-visiting the same repositories, while still recording which account did the work — opt out per run with `--dedup-scope agent`
 - **Credential-safe command display**: Redacts environment assignments and common credential option values as `<redacted>` in dry-run plans and ai-usage startup errors while executing the original values unchanged
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
 - **Deadline-aware stop**: Stops starting new tasks when the reset time arrives and waits for current tasks to finish
@@ -173,8 +174,11 @@ token-burn run
 | `--no-limit` | | Process all targets without limit |
 | `--workers <N>` | `-w` | Number of concurrent workers (`N >= 1`, overrides `parallelism`) |
 | `--public-only` | | Process only repositories detected as public |
+| `--dedup-scope <SCOPE>` | | How widely processed-target history is shared: `global` / `provider` / `agent` (overrides `dedup_scope`) |
 | `--help` | `-h` | Show help |
 | `--version` | `-V` | Show version |
+
+`--dedup-scope` overrides the configured [`dedup_scope`](#sharing-processed-target-history-across-agents) for a single run. Use `--dedup-scope agent` to opt out of sharing and let this account re-visit repositories another account already processed.
 
 `--workers` overrides the configured `parallelism` for a single run. The number of workers that actually start is capped by the number of tasks, and the effective value is shown as `Workers:` in the execution plan (visible with `--dry-run`).
 
@@ -206,12 +210,34 @@ skip_within = "7d"    # optional
 | `report_dir` | Directory to save execution logs (relative paths are resolved against the current working directory) | `~/Documents/token-burn` (default) |
 | `limit` | Maximum number of targets to process per run (`>= 1`) | `10` (default) |
 | `rate_limit_threshold` | Auto-stop when rate limit utilization exceeds this percentage (`1-100`) | `95` (default) |
+| `dedup_scope` | How widely processed-target history is shared (`global` / `provider` / `agent`) | `agent` (default) |
 
 `skip_within` and `cleanup_after` accept duration strings using `d` (days), `h` (hours), `m` (minutes), and `s` (seconds). Invalid or unrepresentable values are rejected when the config file is loaded. If `skip_within` is omitted, directories processed since the previous reset are skipped. A representable duration that still exceeds the date-time range cannot panic: `skip_within` falls back to the previous-reset cutoff with a warning, while cleanup returns an error. Use `--fresh` to ignore saved state entirely.
 
 `rate_limit_threshold` is enforced on two paths. During a task, Claude Code's stream-json `rate_limit_event` is monitored in real time and execution stops once the threshold is exceeded. In addition, when [ai-usage integration](#ai-usage-integration-optional) is enabled, after each task completes the agent's real utilization is re-checked against this threshold using the higher of the matching `(profile, provider)` pair's `weekly` and `five_hour` `used_percent` values; this applies to both `claude` and `codex` agents (the latter previously had no real-time monitoring).
 
 State is stored in `<config-dir>/state.json` (same directory as the active config file). Updates are written to a same-directory temporary file and atomically swapped into place with `rename`, while a stable sidecar lock file such as `.state.json.lock` serializes parallel workers. If the existing file contains malformed JSON, the update fails without replacing it, preserving the original data for recovery instead of silently discarding processed-target history. Within each agent, entries are written most-recently-processed first (ties broken by ascending path), so the newest activity stays at the top of the file. With the default config path, this is `~/.config/token-burn/state.json`.
+
+#### Sharing processed-target history across agents
+
+`state.json` records history under the expanded agent name, so by default a repository processed by one account is still pending for every other account. When you run the same CLI under two accounts, the second run starts over from the same repositories instead of continuing where the first left off. `dedup_scope` controls how widely that history is consulted:
+
+| Value | Which history is consulted when deciding to skip |
+|-------|--------------------------------------------------|
+| `global` | Every agent, including names that only exist in `state.json` (renamed or removed agents). One account continues where another stopped |
+| `provider` | Agents sharing the same `provider` (e.g. `codex` accounts share with each other, but not with `claude`). Agents without a `provider`, and names absent from the config, consult only their own history |
+| `agent` | Only the running agent (default; previous behavior) |
+
+Writes are unaffected: completion is always recorded under the agent that actually ran it, so `state.json` keeps the full per-account history and its schema is unchanged. Only the *read* side widens.
+
+`global` and `provider` require `skip_within`. The cutoff used when `skip_within` is omitted is the running agent's own previous reset time, which is agent-specific — applying it to another agent's history would make the skip window depend on which agent you happened to launch. Configs that ask for a shared scope without `skip_within` are rejected at load time.
+
+Pass `--dedup-scope <global|provider|agent>` to override the configured value for a single run — use `--dedup-scope agent` when you deliberately want a second account to re-visit repositories another account already covered. Skips are reported with the scope, the window, and which agents' records caused them:
+
+```
+  Skipped: 8 targets (already processed; scope: global, window: 2d)
+    by agent: codex=5, codex-alt=2, claude=1
+```
 
 ### Agents
 

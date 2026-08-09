@@ -64,7 +64,7 @@ make release  # リリースビルド
 デフォルトパス: `~/.config/token-burn/config.toml`
 
 主要セクション:
-- `[settings]` - 並列実行数、スキップ期間、レポート設定、ターゲット上限
+- `[settings]` - 並列実行数、スキップ期間、レポート設定、ターゲット上限、処理済み履歴の共有範囲
 - `[prompts]` - デフォルトプロンプト
 - `[ai_usage]` - ai-usage --json 連携設定（任意。enabled / window / fallback / state_window / `[[ai_usage.profiles]]`）
 - `[[agents]]` - エージェント定義（command, provider, env, リセットスケジュール, prompt, ai_usage 連携）
@@ -204,6 +204,20 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 `[settings]` の `parallelism` は 1 以上である必要があります（CLI の `--workers` / `-w` で実行ごとに上書き可能）。
 `[settings]` の `rate_limit_threshold` は 1〜100 の範囲で指定する必要があります（デフォルト: 95）。レート制限使用率がこの閾値を超えると、現在のタスク完了後に後続タスクの実行を停止します。`rejected` イベント受信時も同様に停止します。ai-usage 連携が有効な場合は、各タスク完了後に該当 agent の実使用率（weekly / five_hour の最大）でも `usage-gate` が判定し、閾値以上なら停止します。
 `[settings]` の `skip_within` と `cleanup_after` には `d` / `h` / `m` / `s` を使った有効な期間文字列を指定する必要があり、不正または `chrono::Duration` で表現できない値は設定読み込み時にエラーになります。期間自体は表現できても日時の減算範囲を超える場合、`skip_within` は警告後に前回リセット時刻へフォールバックし、レポートクリーンアップはエラーを返します。
+
+### 処理済み履歴の共有範囲（dedup_scope）
+
+`state.json` は展開エージェント名ごとに履歴を記録するため、既定ではアカウント A で処理したリポジトリもアカウント B からは未処理のままです。同じ CLI を 2 アカウントで回すと、B は A の続きからではなく同じ先頭ターゲットを再処理します。`[settings]` の `dedup_scope` は**スキップ判定で参照する範囲**を決めます（`global` | `provider` | `agent`、デフォルト `agent` = 従来の分離挙動）。
+
+- `global`: 全エージェント横断。`state.json` にしか無い名前（改名・削除済みエージェント）の記録も参照する
+- `provider`: 同じ `provider` のエージェント同士のみ共有。`provider` 未設定のエージェントと、現在の設定に無い名前は自分自身の記録だけを見る。`state.json` は provider を持たず現在の `RuntimeAgent` 一覧からしか復元できないため、別 provider の履歴を誤って引き当てて実行を握り潰すより取りこぼす方へ倒している
+- `agent`: 実行中のエージェントのみ（従来どおり）
+
+**書き込み側は変えません**。完了は常に実際に実行したエージェント名のキーへ記録するため、`state.json` のスキーマも「どのアカウントが処理したか」の履歴も保たれ、広がるのは参照側だけです（`State::last_processed_in_scope`）。
+
+共有 scope（`global` / `provider`）は `skip_within` を必須にします。`skip_within` 省略時のカットオフは `sched.state_cutoff` = 実行中エージェントの前回リセット時刻でエージェント固有のため、他エージェントの履歴へ適用するとスキップ範囲が「どのエージェントで起動したか」次第で揺れます。設定側は `Config::validate`、CLI 上書き側は `resolve_dedup_scope` (`main.rs`) が同じ検査をします（CLI で `agent` から `global` へ引き上げた場合は `validate` を通らないため二重に置いています）。
+
+CLI の `--dedup-scope <global|provider|agent>` で実行ごとに上書きできます。別アカウントが処理済みのリポジトリを意図的にもう一度回したいときは `--dedup-scope agent` を指定します。スキップ表示は件数だけでなく scope・窓・どのエージェントの記録で弾いたかの内訳（`SkipSummary`）を出します。件数のみだと「統合が効いてスキップされた」のか「ターゲット探索が壊れて候補が消えた」のかを実行ログから切り分けられないためです。
 
 `[[scan]]` で `username` を指定した場合、リポジトリ可視性（public/private）はローカルディレクトリ名ではなく `origin` の remote URL に含まれるリポジトリ名（大文字小文字を無視）で照合されます。`username` を指定しない通常スキャンでは `origin` remote がなくても対象に含まれ、可視性は `Unknown` になります。
 

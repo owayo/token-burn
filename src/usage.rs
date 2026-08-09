@@ -505,6 +505,7 @@ mod tests {
                 cleanup_after: None,
                 limit: 1,
                 rate_limit_threshold: 95,
+                dedup_scope: crate::config::DedupScope::Agent,
             },
             prompts: Prompts {
                 default: String::new(),

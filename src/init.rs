@@ -10,6 +10,8 @@ skip_within = "1d"                 # この期間以内に処理済みならス�
 cleanup_after = "7d"               # この期間より古いレポートディレクトリを自動削除
 limit = 10                         # 1回の実行で処理する最大ターゲット数
 rate_limit_threshold = 95          # レート制限使用率がこの閾値(%)を超えたら自動停止
+dedup_scope = "global"             # 処理済み判定の共有範囲: global(全エージェント横断) | provider(同じCLI同士) | agent(分離)
+                                   # global/provider は skip_within 必須。--dedup-scope agent で実行ごとに解除できる
 
 [prompts]
 default = "prompts/default.md"     # .md で終わる値はファイルパスとして読み込み
