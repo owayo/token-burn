@@ -54,6 +54,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
 - **Deadline-aware stop**: Stops starting new tasks when the reset time arrives and waits for current tasks to finish
 - **Parallel execution**: Runs multiple prompts concurrently in tmux split panes with progress monitor
+- **Self-closing run**: Workers close their own pane as soon as they run out of tasks, and the monitor tears down the tmux session once everything is processed — no Ctrl-C needed. The final tally and log path are reprinted on the terminal you started from
 - **Detach-safe tmux runtime**: Keeps worker scripts and queues when you detach, so background tasks continue safely until the tmux session ends
 - **Failure-safe tmux startup**: Removes the partially created session and temporary runtime directory if pane construction fails
 - **Unattended Claude execution**: Automatically disallows Claude Code's `AskUserQuestion` tool so token-burn jobs do not block waiting for interactive answers

@@ -66,15 +66,19 @@ USAGE_DISPLAY=""
 LAST_USAGE=0
 LAST_ERR_COUNT=-1
 STATUS_MSG=""
+RESIZED=0
 
 restore_terminal() {{ tput cnorm 2>/dev/null; printf '\033[?7h'; }}
 
 # 完了・停止時はセッションごと閉じて token-burn を終了する。Ctrl-C 待ちはしない。
-# ワーカーはタスクを消化し切った時点で自分のペインを閉じるため、ここまで来た時点で
-# 生きているのはモニターだけ（早期停止時は走行中タスクのペインも残るが、その完了を
-# 待ってからこの関数に入る）。画面に出した集計とログパスは Rust 側（execute_plan_tmux）が
-# attach から戻った直後に stdout へ出し直すので、読み返すために tmux を開いたままに
-# する必要はない。
+# 画面に出した集計とログパスは Rust 側（execute_plan_tmux）が attach から戻った直後に
+# stdout へ出し直すので、読み返すために tmux を開いたままにする必要はない。
+# モニターが自分で exit してペインを閉じる（＝残りペインが消えてセッションが自然終了する）
+# 方式は採らない。それだと「モニターが最後のペインである」ことが前提になり、ワーカーが
+# worker-done を作れずに死んだ場合（touch 失敗、シェルのクラッシュ、ユーザーがペインを
+# 手動で kill）にセッションが残ってデッドラインまで token-burn が終わらない。全タスク処理済み
+# 判定（PROCESSED >= TOTAL）で入ったときはワーカーが最後の usage-gate を実行中の可能性が
+# あるが、後続タスクが無いのでその結果は使われず、待たずに閉じてよい。
 # kill-session はモニター自身のペインも道連れに殺すため、後続行には基本到達しない。
 # セッション名の解決失敗などで kill-session が空振りした場合に取り残されないよう、
 # 明示的に exit する（モニターが最後のペインならこの exit でもセッションは閉じる）。
@@ -171,8 +175,10 @@ trap handle_signal INT TERM
 trap restore_terminal EXIT
 # ワーカーはタスクを消化し切るたびに自分のペインを閉じ、そのぶん tmux がモニターペインを
 # 広げるため SIGWINCH が届く。通常の全体再描画は ai-usage の 10 秒間隔取得・エラー件数の
-# 変化・状態遷移でしか走らないので、ここで描き直さないと旧い幅で折り返した行が残る。
-trap render WINCH
+# 変化・状態遷移でしか走らないので、描き直さないと旧い幅で折り返した行が残る。
+# ハンドラから直接 render を呼ぶと、進行中の render の途中に次の SIGWINCH が入って出力が
+# 混ざるため、フラグだけ立ててメインループの再描画判定に合流させる。
+trap 'RESIZED=1' WINCH
 
 printf '\033]2;token-burn\033\\'
 printf '\033[?7l'
@@ -201,6 +207,11 @@ while true; do
     ERR_COUNT=$(find "$MARKER_DIR" -name 'error-*' 2>/dev/null | wc -l | tr -d ' ')
 
     NEED_RENDER=0
+    # ワーカーペインが閉じてモニターペインの幅が変わったら全体を描き直す
+    if [ $RESIZED -eq 1 ]; then
+        RESIZED=0
+        NEED_RENDER=1
+    fi
     # ai-usage statusline は 10 秒ごとに再取得・再描画する
     if [ -n "$AI_USAGE_CMD" ] && [ $((NOW - LAST_USAGE)) -ge 10 ]; then
         fetch_usage
@@ -631,7 +642,9 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "touch {worker_done}\n",
             // 全タスク完了後はキャンセル trap を外してから抜ける。残したまま exit すると、
             // 終了間際に届いた INT/TERM で handle_cancel だけが走り、処理するタスクが無いのに
-            // 直前タスクの failed マーカーを立て直してしまう。
+            // 直前タスクの failed マーカーを立て直してしまう。trap 解除の直前に届いた分でも
+            // 立て直さないよう、参照先の変数を先に空にする。
+            "CURRENT_FAILED_MARKER=\"\"\n",
             "trap - INT TERM\n",
             // 消化し切ったワーカーはそのまま終了し、tmux ペインを閉じる（remain-on-exit は
             // Rust 側でセッション単位に off を明示している）。以前は
@@ -1150,10 +1163,16 @@ mod tests {
             "monitor must not rely on `sleep infinity` (unsupported by BSD sleep): {script}"
         );
         // ワーカーがタスクを消化し切るたびペインが閉じ、モニターペインが広がる。
-        // SIGWINCH で描き直さないと旧い幅で折り返した行が残る。
+        // SIGWINCH で描き直さないと旧い幅で折り返した行が残る。ハンドラから直接 render を
+        // 呼ぶと進行中の render に割り込んで出力が混ざるため、フラグ経由で合流させる。
         assert!(
-            script.contains("trap render WINCH"),
-            "monitor must redraw the whole pane on resize: {script}"
+            script.contains("trap 'RESIZED=1' WINCH"),
+            "monitor must flag pane resizes instead of rendering inside the handler: {script}"
+        );
+        assert!(
+            script
+                .contains("if [ $RESIZED -eq 1 ]; then\n        RESIZED=0\n        NEED_RENDER=1"),
+            "monitor must convert the resize flag into a full redraw: {script}"
         );
     }
 
@@ -1182,11 +1201,11 @@ mod tests {
             script.contains("touch '/tmp/markers/worker-done-1'\n"),
             "worker must create its done marker before exiting: {script}"
         );
-        // 終了直前にキャンセル trap を外す。残すと終了間際に届いた INT/TERM で
-        // handle_cancel だけが走り、処理するタスクが無いのに failed マーカーが立つ。
+        // 終了直前にキャンセル trap を外し、その直前に届いた INT/TERM でも直前タスクの
+        // failed マーカーを立て直さないよう参照先を空にしてから抜ける。
         assert!(
-            script.contains("trap - INT TERM\nexit 0\n"),
-            "worker must clear the cancel trap before exiting: {script}"
+            script.contains("CURRENT_FAILED_MARKER=\"\"\ntrap - INT TERM\nexit 0\n"),
+            "worker must clear the pending marker and cancel trap before exiting: {script}"
         );
         assert_valid_bash(&script, "worker script exit path");
     }

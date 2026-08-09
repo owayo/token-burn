@@ -525,11 +525,19 @@ pub fn execute_plan_tmux(
 
         // ワーカーはタスクを消化し切ると自分で終了してペインを閉じる。ユーザーの tmux 設定が
         // remain-on-exit を on にしていると終了済みペインが "Pane is dead" のまま画面に残り、
-        // ペインを閉じる意味が無くなるため、このセッションに限って off を明示する。最初の
-        // タスクが終わる前に設定しておきたいので、ワーカー用のペイン分割より先に置く。
-        let _ = std::process::Command::new("tmux")
-            .args(["set-option", "-t", session, "remain-on-exit", "off"])
+        // ペインを閉じる意味が無くなるため、このウィンドウに限って off を明示する（window
+        // option なので -w で対象を明示する）。最速のタスクが終わる前に設定しておきたいので、
+        // ワーカー用のペイン分割より先に置く。設定できなくても実行そのものは完走するため、
+        // ここは失敗しても止めず、ペインが残り得ることだけ警告する。
+        let remain_on_exit_off = std::process::Command::new("tmux")
+            .args(["set-option", "-w", "-t", session, "remain-on-exit", "off"])
             .status();
+        if !remain_on_exit_off.is_ok_and(|status| status.success()) {
+            eprintln!(
+                "{}: could not disable tmux remain-on-exit; finished worker panes may stay open",
+                "warning".yellow()
+            );
+        }
 
         // 最初のワーカー用に右ペインを分割
         let split_status = std::process::Command::new("tmux")

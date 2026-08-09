@@ -105,7 +105,17 @@ ai-usage 連携が有効なとき、`rate_limit_threshold`（%）は 2 経路で
 
 ai-usage 連携が有効なとき、tmux モニターペイン（左）には進捗に加えて `ai-usage --statusline --logos`（各アカウントの 5h / 週次の使用率バー・%・リセット残り）を表示します。**10 秒ごと**にモニター自身が `ai-usage --json` を実行してキャッシュ（`ai-usage-cache.json`）を atomic（`.tmp` に書いてから `mv` で差し替え）に更新し、その直後に `--input <cache>` 付き statusline で描画します。`--input` を介して usage-gate と同じキャッシュを共有するため、長時間タスク中でもモニター表示と並列ワーカーの使用率判定が同じ最新値で同期します（進捗バーは従来どおり毎秒 `\r` 更新）。取得失敗時は直前の表示を保持し（fail-soft）、`tput civis` でカーソルを隠してちらつきを抑えます。モニターは `\033[H\033[J` で全体を再描画する方式のため、エラーは表示済みフラグではなく `error-*` マーカーから毎回再構築して履歴を保ちます。
 
-statusline コマンドは usage-gate / 起動時キャッシュ初期化と同様に `[ai_usage].command` 全体から組み立てます（出力モードの `--json` を `--statusline --logos --input <cache>` に差し替え、無ければ末尾に追加）。先頭要素だけを使う実装ではないため、`["env", "FOO=1", "ai-usage", "--json"]` のようなラッパー前置き構成でも壊れません。完了/停止後の待機は `wait_for_close`（`sleep 3600` を回すループ）で行い、待機に入る直前に端末状態（カーソル `tput cnorm` と自動折り返し `\033[?7h`）を明示的に復元します。`exec sleep infinity` は 2 つの理由で使えません。1 つは macOS の BSD `sleep` が `infinity` を受け付けず usage エラーで即座に終了する（`exit 1`）ため、完了直後にペインが閉じて集計・ログパスを読み返せなくなること。もう 1 つは `exec` の時点で catch 済みの INT/TERM が `SIG_DFL` へ戻り（POSIX）、画面に出す `Press Ctrl-C to close session.` が機能しなくなることです。`wait_for_close` は自前の INT/TERM trap で端末を復元し、待機中の `sleep` を片付けてから `tmux kill-session` します。ワーカーペインの完了後待機も同じ理由で `while true; do sleep 3600; done` にしています。進捗バーは `seq` ではなく算術 `while` ループで描画します（BSD seq の `seq 1 0` が降順で `1 0` を返し、macOS で 0% / 100% 時にバーが 2 文字ずれるのを避けるため）。
+statusline コマンドは usage-gate / 起動時キャッシュ初期化と同様に `[ai_usage].command` 全体から組み立てます（出力モードの `--json` を `--statusline --logos --input <cache>` に差し替え、無ければ末尾に追加）。先頭要素だけを使う実装ではないため、`["env", "FOO=1", "ai-usage", "--json"]` のようなラッパー前置き構成でも壊れません。進捗バーは `seq` ではなく算術 `while` ループで描画します（BSD seq の `seq 1 0` が降順で `1 0` を返し、macOS で 0% / 100% 時にバーが 2 文字ずれるのを避けるため）。
+
+ワーカーはタスクを消化し切るとそのぶんモニターペインが広がるため、モニターは `trap render WINCH` でペインのリサイズを受けて全体を描き直します。通常の全体再描画は ai-usage の 10 秒間隔取得・`error-*` 件数の変化・状態遷移でしか走らないため、これが無いと旧い幅で折り返した行が残ります。
+
+### 完了時の自動終了
+
+モニターは全タスク完了（`PROCESSED >= TOTAL`）と早期停止（`WORKERS_DONE >= WORKER_COUNT`）のいずれでも集計とログパスを表示した後、`finish_session`（端末状態を復元 → `tmux kill-session` → `exit 0`）でセッションごと閉じて token-burn を終了します。Ctrl-C 待ちはしません。`kill-session` はモニター自身のペインも道連れに殺すため後続の `exit 0` には基本到達しませんが、セッション名の解決に失敗して空振りした場合に取り残されないよう明示的に置いています。`sleep infinity` / `sleep 3600` の待機ループはモニター・ワーカーのどちらにも残しません（回帰防止のためテストで検査しています）。
+
+ワーカーも claim できる pending が尽きたら `worker-done-<w>` を作り、キャンセル trap を外して `exit 0` します。tmux はペインのプロセス終了でペインを閉じるため、完了したワーカーのペインは順次消え、残りのワーカーだけが画面に出ます。ユーザーの `~/.tmux.conf` が `remain-on-exit on` にしていると終了済みペインが "Pane is dead" のまま残ってしまうため、`new-session` 直後（ワーカー用のペイン分割より前、= 最初のタスクが終わる前）にこのセッションに限って `remain-on-exit off` を明示します。
+
+自動終了するとモニターが最後に描いた集計は tmux ごと画面から消えるため、`execute_plan_tmux` は `attach-session` から戻った後（一時ディレクトリの削除より前）に `marker_dir` の `done-*` / `failed-*` / `retry-*` を `collect_run_summary` で数え直し、同じ文言（`✅ All N/N tasks completed` / `⚠ Completed: ...` / `⏹ Stopped: ...`）を呼び出し元の端末へ出します。`worker-done-*` は `done-` 始まりではないためタスク件数には混ざりません。集計に失敗しても 0 件として続行します（実行結果の記録自体は `state.json` が持つため）。デタッチ（`tmux has-session` が成功）時はタスクが走行中なので集計は出しません。
 
 `claude` エージェントのみ出力を `.jsonl` + `format-stream` パイプラインで処理します。`codex` 等の他エージェントは `.log` に直接出力します。
 
@@ -153,7 +163,8 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - ワーカーは `pending-<idx>` を `mv` でアトミックに `claimed-<idx>` にリネームして claim し、対応する `task-<idx>.sh` を `source` で実行する
 - 各タスクを `source` する前にワーカーループ先頭で `CANCELLED` フラグを 0 にリセットする。直前タスクの実行中に SIGINT/SIGTERM を受けて `CANCELLED=1` が立ったまま成功・早期 return しても、後続タスクの通常エラーを誤って `Cancelled` 判定しエラー記録を欠落させるのを防ぐ
 - タスクがエラー終了してもワーカーは `exec sleep infinity` せず、即座に次の `pending-*` を取りに行く
-- ワーカーは claim できる pending が尽きるまで処理を続け、尽きて初めて `worker-done-<w>` を作成して終了する
+- ワーカーは claim できる pending が尽きるまで処理を続け、尽きて初めて `worker-done-<w>` を作成して終了する。終了するとそのペインは閉じるため、画面には走行中のワーカーだけが残る
+- 全タスクの処理が済むか全ワーカーが終了すると、モニターは集計とログパスを表示してからセッションを閉じ、token-burn を終了する（Ctrl-C 待ちはしない）
 - ユーザーが tmux をデタッチした場合、tmux セッションが生存していれば `/tmp/token-burn` は削除しない。ワーカーのキュー・タスクスクリプト・プロンプトファイルを保持し、バックグラウンド実行を継続できるようにする
 - tmux セッション作成後のペイン構築に失敗した場合は、作成途中のセッションを kill して一時実行ディレクトリも削除する
 - レポートディレクトリ名に使うエージェント名は `sanitize_filename` でパス成分を無害化する
@@ -250,7 +261,7 @@ remote URL の owner / repo 抽出は末尾 2 セグメントを採用するた�
 ## 実装上の注意点
 
 - tmux へ渡すスクリプトパスは `tmux_script_arg`（= `shell_escape`）でクォートします。tmux は `new-session` / `split-window` の shell-command を `sh -c` 経由で実行するため、`std::env::temp_dir()`（= `TMPDIR`）に空白が含まれる環境では未クォートだと `/tmp/tb` を `space` `test/monitor.sh` を引数に起動しようとしてペインが即死します。しかも **tmux 自身は exit 0 を返す**ため直後の `ensure!(status.success())` では検知できず、後続の split-window が「no such session」で失敗して真因と無関係なエラーになります。生成するシェルスクリプトの内側は `shell_escape` 済みで、この tmux 呼び出しだけが取りこぼしでした。
-- ワーカーは全タスク完了後に `trap - INT TERM` でキャンセル trap を外してから待機します。待機を `exec` で置き換えていた頃は exec が catch 済みシグナルを `SIG_DFL` へ戻していたため、待機中の Ctrl-C は既定動作（ペインを閉じる）でした。有限 sleep のループへ変えた分、明示的に解除して同じ挙動を保ちます（残すと処理するタスクが無いのに `handle_cancel` だけが走り、ペインも閉じません）。
+- ワーカーは全タスク完了後、`CURRENT_FAILED_MARKER` を空にして `trap - INT TERM` でキャンセル trap を外してから `exit 0` します。trap を残したまま終了すると、解除直前に届いた INT/TERM で `handle_cancel` だけが走り、処理するタスクが無いのに直前タスクの failed マーカーを立て直してしまいます。
 
 - レポート出力先 (`resolve_report_dir` / `main.rs`) は設定値を必ず絶対パスへ正規化します（`config::resolve_directory` 経由）。相対パスのまま返すと、レポートディレクトリの作成（`executor` 側。プロセスの cwd で解決）と、そこへ書き込むタスクスクリプトの `tee` / `--raw-output`（対象リポジトリへ `cd` した後で解決）が別ディレクトリを指し、ログのパイプラインが `No such file or directory` で失敗して全ターゲットが `failed-N` になります（`state.json` に 1 件も記録されない）。`report_dir = "reports"` のような素直な設定で踏みます。
 - `format-stream` の入力読み取りは `read_lines_lossy` で行い、不正な UTF-8 バイトは U+FFFD へ置換します。`BufRead::lines()` は非 UTF-8 バイトを含む行に `Err(InvalidData)` を返し、そこで中断すると以降の**正常な JSON も含めて**標準出力と `--raw-output` の両方から失われます。タスクスクリプトは `claude ... 2>&1 | token-burn format-stream ... | tee log` で stderr を同じパイプへ合流させており、stream-json の 1 行は macOS の `PIPE_BUF`（512 バイト）を常に超えるため、stdout の途中に stderr の書き込みが割り込んでマルチバイト文字が分断されるだけで不正な UTF-8 が生じ得ます。中断すると `FORMAT_EXIT != 0` で `failed-N` になるうえ、パイプが閉じて `claude` 本体が SIGPIPE で落ち、表示整形の都合で数時間の実行を巻き添えにします。
