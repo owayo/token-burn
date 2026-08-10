@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::io::Write;
 
 use crate::format_stream::util::{
-    first_non_empty_string, format_number, truncate_inline, truncate_str,
+    first_non_empty_string, format_number, normalize_model_name, truncate_inline, truncate_str,
 };
 
 /// system イベントのうち、サブエージェント進捗・通知・完了通知を表示する。
@@ -49,7 +49,7 @@ pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -
 /// （`bypassPermissions` で走ったのか）は完全に失われていた。セッションにつき
 /// 1 行だけなのでノイズにならない。
 fn write_session_init(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
-    let model = v["model"].as_str().unwrap_or("");
+    let model = normalize_model_name(v["model"].as_str().unwrap_or(""));
     let mut attrs = Vec::new();
     if let Some(version) = v["claude_code_version"]
         .as_str()
@@ -87,8 +87,8 @@ fn write_session_init(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
 /// `content` と `api_refusal_explanation` は拒否された本文や長いポリシー説明を含むため、
 /// 出力せず、モデル名と構造化カテゴリだけを表示する。
 fn write_model_refusal_fallback(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
-    let original = v["original_model"].as_str().unwrap_or("");
-    let fallback = v["fallback_model"].as_str().unwrap_or("");
+    let original = normalize_model_name(v["original_model"].as_str().unwrap_or(""));
+    let fallback = normalize_model_name(v["fallback_model"].as_str().unwrap_or(""));
     if original.is_empty() && fallback.is_empty() {
         return Ok(());
     }

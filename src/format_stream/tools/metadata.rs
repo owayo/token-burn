@@ -3,7 +3,7 @@
 
 use crate::format_stream::util::{
     first_string, format_byte_size, format_epoch_millis_clock, format_millis_as_seconds,
-    format_number, truncate_inline,
+    format_number, normalize_model_name, truncate_inline,
 };
 
 /// `tool_use_result` が object でなく文字列または text ブロック配列だった場合の要約。
@@ -410,7 +410,10 @@ fn append_agent_metadata(
         .and_then(|value| value.as_str())
         .filter(|model| !model.is_empty())
     {
-        attrs.push(format!("model:{}", truncate_inline(model, 30)));
+        let model = normalize_model_name(model);
+        if !model.is_empty() {
+            attrs.push(format!("model:{}", truncate_inline(model, 30)));
+        }
     }
     if let Some(ms) = obj.get("totalDurationMs").and_then(|value| value.as_u64()) {
         attrs.push(format!("duration:{}", format_millis_as_seconds(ms)));

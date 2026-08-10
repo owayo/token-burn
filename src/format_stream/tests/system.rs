@@ -139,11 +139,12 @@ fn api_retry_without_error_omits_unknown_placeholder() {
 #[test]
 fn model_refusal_fallback_shows_models_and_category_without_content() {
     let out = render(
-        r#"{"type":"system","subtype":"model_refusal_fallback","original_model":"claude-fable-5","fallback_model":"claude-opus-4-8","api_refusal_category":"cyber","content":"拒否された本文","api_refusal_explanation":"長い説明"}"#,
+        r#"{"type":"system","subtype":"model_refusal_fallback","original_model":"claude-fable-5","fallback_model":"claude-opus-4-8[1m]","api_refusal_category":"cyber","content":"拒否された本文","api_refusal_explanation":"長い説明"}"#,
     );
     assert!(out.contains("Model refusal fallback"));
     assert!(out.contains("claude-fable-5"));
     assert!(out.contains("claude-opus-4-8"));
+    assert!(!out.contains("[1m]"), "{out:?}");
     assert!(out.contains("category:cyber"));
     assert!(!out.contains("拒否された本文"));
     assert!(!out.contains("長い説明"));
@@ -157,7 +158,8 @@ fn init_shows_model_version_and_permission_mode() {
     let out = render(
         r#"{"type":"system","subtype":"init","model":"claude-opus-5[1m]","claude_code_version":"2.1.220","permissionMode":"bypassPermissions","cwd":"/repo","session_id":"s1"}"#,
     );
-    assert!(out.contains("Session claude-opus-5[1m]"), "{out:?}");
+    assert!(out.contains("Session claude-opus-5"), "{out:?}");
+    assert!(!out.contains("[1m]"), "{out:?}");
     assert!(out.contains("v2.1.220"), "{out:?}");
     assert!(out.contains("bypassPermissions"), "{out:?}");
 }

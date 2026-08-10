@@ -722,6 +722,15 @@ mod tests {
     use super::flags::CLAUDE_PRINT_BG_WAIT_ENV;
     use super::*;
 
+    #[test]
+    fn worker_count_caps_parallelism_at_remaining_tasks() {
+        assert_eq!(worker_count(4, 0), 0);
+        assert_eq!(worker_count(4, 1), 1);
+        assert_eq!(worker_count(4, 3), 3);
+        assert_eq!(worker_count(4, 4), 4);
+        assert_eq!(worker_count(4, 10), 4);
+    }
+
     /// モニターがセッションを自動で閉じた後、呼び出し元の端末へ出す集計はマーカーから
     /// 数え直す。ワーカー完了マーカー（`worker-done-*`）やエラー詳細（`error-*`）を
     /// タスク件数に混ぜてはいけない。

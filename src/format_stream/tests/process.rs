@@ -390,13 +390,14 @@ fn process_subagent_tool_uses_from_assistant_message() {
 fn process_assistant_fallback_and_cache_miss_notices_are_deduplicated() {
     // 実 jsonl ではモデル切替は assistant.content の fallback にだけ現れる。
     // diagnostics は partial message ごとに同じ内容が繰り返されるため 1 回だけ表示する。
-    let fallback = r#"{"type":"assistant","message":{"id":"msg-fallback","content":[{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"}}],"diagnostics":null}}"#;
+    let fallback = r#"{"type":"assistant","message":{"id":"msg-fallback","content":[{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8[1m]"}}],"diagnostics":null}}"#;
     let diagnostic = r#"{"type":"assistant","message":{"id":"msg-cache","content":[],"diagnostics":{"cache_miss_reason":{"type":"model_changed","cache_missed_input_tokens":152448}}}}"#;
     let input = [fallback, diagnostic, diagnostic].join("\n");
 
     let clean = strip_ansi(&run_process(&input));
 
     assert!(clean.contains("Model fallback: claude-fable-5 \u{2192} claude-opus-4-8"));
+    assert!(!clean.contains("[1m]"), "{clean}");
     assert!(clean.contains("Cache miss: model_changed (152,448 input tokens)"));
     assert_eq!(clean.matches("Cache miss:").count(), 1);
 }

@@ -25,6 +25,31 @@ pub(crate) fn truncate_inline(s: &str, max: usize) -> String {
     truncate_str(&normalized, max)
 }
 
+/// Claude Code がモデル名の末尾へ混入させる壊れた SGR 断片を除去する。
+///
+/// 実際の stream-json では `claude-opus-5[1m]` のように ESC を欠いた装飾が
+/// `init.model`、`modelUsage` のキー、`resolvedModel` に現れる。モデル ID の末尾に
+/// ある数字とセミコロンだけの断片に限定し、通常の角括弧を含む名前は保持する。
+pub(crate) fn normalize_model_name(model: &str) -> &str {
+    let mut normalized = model;
+    loop {
+        let Some(prefix) = normalized.strip_suffix("m]") else {
+            return normalized;
+        };
+        let Some((name, sgr)) = prefix.rsplit_once('[') else {
+            return normalized;
+        };
+        if sgr.is_empty()
+            || !sgr
+                .split(';')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return normalized;
+        }
+        normalized = name;
+    }
+}
+
 /// tool_result の `content` からサマリー（1 行・短縮済み）を抽出する。
 ///
 /// 失敗時に診断が分かりやすくなるよう、`is_error: true` の tool_result から

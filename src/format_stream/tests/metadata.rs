@@ -594,6 +594,16 @@ fn tool_result_metadata_shows_actual_stale_recovery_flag() {
 }
 
 #[test]
+fn tool_result_metadata_normalizes_actual_resolved_model_suffix() {
+    let metadata = tool_result_metadata(&serde_json::json!({
+        "resolvedModel": "claude-opus-5[1m]"
+    }));
+
+    assert!(metadata.contains("model:claude-opus-5"), "{metadata}");
+    assert!(!metadata.contains("[1m]"), "{metadata}");
+}
+
+#[test]
 fn tool_result_metadata_auto_backgrounded_and_background_task_id() {
     // 自動バックグラウンド化フラグと backgroundTaskId の併記
     let value = serde_json::json!({

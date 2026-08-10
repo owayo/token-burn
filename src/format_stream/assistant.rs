@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 use crate::format_stream::blocks::{ContentBlockState, break_open_line};
-use crate::format_stream::util::{format_number, truncate_inline};
+use crate::format_stream::util::{format_number, normalize_model_name, truncate_inline};
 
 /// ツール ID の対応表を更新し、stream_event に現れないモデル切替と
 /// キャッシュミス診断を重複排除して表示する。
@@ -53,8 +53,8 @@ fn write_model_fallback(
     out: &mut impl Write,
     shown_notices: &mut HashSet<String>,
 ) -> Result<()> {
-    let from = model_name(&item["from"]);
-    let to = model_name(&item["to"]);
+    let from = normalize_model_name(model_name(&item["from"]));
+    let to = normalize_model_name(model_name(&item["to"]));
     if from.is_empty() && to.is_empty() {
         return Ok(());
     }

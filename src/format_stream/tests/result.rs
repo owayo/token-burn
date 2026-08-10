@@ -107,6 +107,15 @@ fn process_result_with_model_usage() {
 }
 
 #[test]
+fn process_result_normalizes_actual_broken_model_suffix() {
+    let input = r#"{"type":"result","total_cost_usd":1.0,"duration_ms":1000,"modelUsage":{"claude-opus-5[1m]":{"inputTokens":10,"outputTokens":5,"costUSD":1.0,"canonicalModel":"claude-opus-5"}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(clean.contains("claude-opus-5 $1.0000"), "got: {clean}");
+    assert!(!clean.contains("[1m]"), "got: {clean}");
+}
+
+#[test]
 fn process_result_shows_model_and_web_search_usage() {
     let input = [
             r#"{"type":"system","subtype":"init","cwd":"/tmp","session_id":"s1"}"#,
@@ -216,10 +225,11 @@ fn process_result_with_model_usage_breakdown() {
     let output = run_process(input);
     let clean = strip_ansi(&output);
     assert!(
-        clean.contains("claude-opus-4-6[1m]"),
-        "モデル名が表示されるべき: {}",
+        clean.contains("claude-opus-4-6 $1.2000"),
+        "正規化したモデル名が表示されるべき: {}",
         clean
     );
+    assert!(!clean.contains("[1m]"), "壊れた装飾は除去するべき: {clean}");
     assert!(
         clean.contains("$1.2000"),
         "モデル別コストが表示されるべき: {}",

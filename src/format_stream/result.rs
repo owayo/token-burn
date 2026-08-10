@@ -6,7 +6,9 @@ use anyhow::Result;
 use std::io::Write;
 
 use crate::format_stream::state::StreamSummary;
-use crate::format_stream::util::{format_millis_as_seconds, format_number, format_token_size};
+use crate::format_stream::util::{
+    format_millis_as_seconds, format_number, format_token_size, normalize_model_name,
+};
 
 pub(crate) fn handle_result(
     v: &serde_json::Value,
@@ -219,7 +221,7 @@ fn write_model_usage(v: &serde_json::Value, out: &mut impl Write) -> Result<()> 
                 writeln!(
                     out,
                     "\x1b[2m   {} ${:.4} (in:{} out:{}{})\x1b[0m",
-                    model_id,
+                    normalize_model_name(model_id),
                     cost,
                     format_number(input_tokens),
                     format_number(output_tokens),

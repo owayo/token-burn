@@ -4,8 +4,26 @@
 
 use crate::format_stream::util::{
     first_non_empty_string, first_string, format_byte_size, format_epoch_millis_clock,
-    format_millis_as_seconds, truncate_inline,
+    format_millis_as_seconds, normalize_model_name, truncate_inline,
 };
+
+// --- normalize_model_name: Claude Code の壊れた装飾サフィックス ---
+
+#[test]
+fn normalize_model_name_removes_actual_broken_sgr_suffix() {
+    assert_eq!(normalize_model_name("claude-opus-5[1m]"), "claude-opus-5");
+    assert_eq!(
+        normalize_model_name("claude-opus-5[1m][0m]"),
+        "claude-opus-5"
+    );
+}
+
+#[test]
+fn normalize_model_name_preserves_valid_bracketed_names() {
+    assert_eq!(normalize_model_name("claude-opus-5"), "claude-opus-5");
+    assert_eq!(normalize_model_name("model[preview]"), "model[preview]");
+    assert_eq!(normalize_model_name("model[1;x m]"), "model[1;x m]");
+}
 
 // --- format_byte_size: B / KB / MB の境界 ---
 
