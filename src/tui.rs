@@ -1,8 +1,8 @@
 //! `token-burn run --interactive` の対象選択 TUI。
 //!
 //! 実行するリポジトリと**実行順**をユーザーが確定するための画面。ワーカーは
-//! `pending-0001..N` を番号順に claim するため、ここで確定した並びがそのまま
-//! 処理順になる。
+//! `pending-0001..N` を番号順に claim するため、Space で選択した順番をそのまま
+//! 処理順として返す。
 //!
 //! 状態遷移（カーソル移動・選択・並べ替え）は [`SelectorState`] に閉じ込め、端末の
 //! 初期化・復元と描画だけを [`select_targets`] が持つ。キー処理を描画から切り離して
@@ -22,11 +22,12 @@ use std::path::{Path, PathBuf};
 
 use crate::scanner::{ResolvedTarget, Visibility};
 
-/// TUI の 1 行。ターゲットと選択状態を持つ。
+/// TUI の 1 行。ターゲットと選択順を持つ。
 #[derive(Debug, Clone)]
 pub struct SelectorItem {
     pub target: ResolvedTarget,
-    pub selected: bool,
+    /// Space で選択した順番。未選択なら `None`。
+    pub selection_order: Option<usize>,
     /// 追跡ファイルの最終更新時刻（取得できたものだけ）。
     pub last_modified: Option<DateTime<Utc>>,
 }
@@ -46,7 +47,7 @@ pub struct RunContext {
 pub enum KeyOutcome {
     /// 画面を続ける。
     Continue,
-    /// 決定。選択済みターゲットをこの並びで実行する。
+    /// 決定。選択済みターゲットを選択順で実行する。
     Confirm,
     /// キャンセル。何も実行しない。
     Cancel,
@@ -55,7 +56,7 @@ pub enum KeyOutcome {
 /// TUI 全体の結果。
 #[derive(Debug)]
 pub enum Outcome {
-    /// 実行対象（TUI 上の並び順）。
+    /// 実行対象（Space で選択した順番）。
     Confirmed(Vec<ResolvedTarget>),
     Cancelled,
 }
@@ -82,7 +83,7 @@ impl SelectorState {
             .enumerate()
             .map(|(i, target)| SelectorItem {
                 last_modified: modified.get(&target.directory).copied(),
-                selected: i < initial_selected,
+                selection_order: (i < initial_selected).then_some(i + 1),
                 target,
             })
             .collect();
@@ -102,20 +103,25 @@ impl SelectorState {
     }
 
     pub fn selected_count(&self) -> usize {
-        self.items.iter().filter(|i| i.selected).count()
+        self.items
+            .iter()
+            .filter(|item| item.selection_order.is_some())
+            .count()
     }
 
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
     }
 
-    /// 選択済みターゲットを画面の並び順で取り出す。
+    /// 選択済みターゲットを Space で選択した順番で取り出す。
     pub fn into_selected_targets(self) -> Vec<ResolvedTarget> {
-        self.items
+        let mut selected: Vec<_> = self
+            .items
             .into_iter()
-            .filter(|i| i.selected)
-            .map(|i| i.target)
-            .collect()
+            .filter_map(|item| item.selection_order.map(|order| (order, item.target)))
+            .collect();
+        selected.sort_unstable_by_key(|(order, _)| *order);
+        selected.into_iter().map(|(_, target)| target).collect()
     }
 
     /// キー入力を状態へ反映する。
@@ -167,8 +173,26 @@ impl SelectorState {
     }
 
     fn toggle(&mut self) {
-        if let Some(item) = self.items.get_mut(self.cursor) {
-            item.selected = !item.selected;
+        let Some(current_order) = self.items.get(self.cursor).map(|item| item.selection_order)
+        else {
+            return;
+        };
+
+        if let Some(removed_order) = current_order {
+            self.items[self.cursor].selection_order = None;
+            // 欠番を残すと画面の番号と pending 番号が一致しないため、後から選択した
+            // 項目を 1 つずつ前へ詰める。
+            for item in &mut self.items {
+                if item
+                    .selection_order
+                    .is_some_and(|order| order > removed_order)
+                {
+                    item.selection_order = item.selection_order.map(|order| order - 1);
+                }
+            }
+        } else {
+            let next_order = self.selected_count() + 1;
+            self.items[self.cursor].selection_order = Some(next_order);
         }
     }
 
@@ -192,6 +216,7 @@ impl SelectorState {
     }
 
     /// カーソル行を隣と入れ替え、カーソルも一緒に動かす（掴んだまま運ぶ操作）。
+    /// 選択番号は項目に付いたままなので、表示位置を変えても実行順は変わらない。
     fn reorder(&mut self, delta: isize) -> KeyOutcome {
         if self.items.is_empty() {
             return KeyOutcome::Continue;
@@ -215,8 +240,20 @@ impl SelectorState {
     }
 
     fn set_all(&mut self, selected: bool) -> KeyOutcome {
+        if !selected {
+            for item in &mut self.items {
+                item.selection_order = None;
+            }
+            return KeyOutcome::Continue;
+        }
+
+        // 既にユーザーが指定した順番は守り、未選択項目だけを画面順で末尾へ足す。
+        let mut next_order = self.selected_count() + 1;
         for item in &mut self.items {
-            item.selected = selected;
+            if item.selection_order.is_none() {
+                item.selection_order = Some(next_order);
+                next_order += 1;
+            }
         }
         KeyOutcome::Continue
     }
@@ -298,7 +335,7 @@ fn draw(frame: &mut Frame, state: &SelectorState, ctx: &RunContext, list_state: 
         .map(|(order, item)| ListItem::new(row_line(item, order, path_width)))
         .collect();
     let list = List::new(rows)
-        .block(Block::bordered().title(" Targets (execution order) "))
+        .block(Block::bordered().title(" Targets (number = execution order) "))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, list_area, list_state);
@@ -344,30 +381,20 @@ fn footer(state: &SelectorState) -> Paragraph<'static> {
             Style::default().fg(Color::Yellow),
         )),
         None => Line::from(Span::styled(
-            " [Enter] Run   [Space] Toggle   [J/K] Reorder   [j/k ↑↓] Move   [a] All   [n] None   [g/G] Top/Bottom   [Esc] Cancel",
+            " [Enter] Run   [Space] Toggle   [J/K] Move row   [j/k ↑↓] Move   [a] All   [n] None   [g/G] Top/Bottom   [Esc] Cancel",
             Style::default().add_modifier(Modifier::DIM),
         )),
     };
     Paragraph::new(text).block(Block::bordered())
 }
 
-/// 選択済みの行にだけ 1 から実行順を振る。未選択行は `None`。
+/// 各行へ Space で選択した実行順を返す。未選択行は `None`。
 ///
 /// 実行順が画面に出ていないと「並べ替えたつもりの順番でワーカーが処理する」ことを
-/// 確認できない。未選択行を飛ばして採番するので、表示された番号がそのまま
-/// `pending-<n>` の順序になる。
+/// 確認できない。表示位置から採番し直さず、項目が保持している選択順を表示するので、
+/// 表示された番号がそのまま `pending-<n>` の順序になる。
 fn order_numbers(items: &[SelectorItem]) -> Vec<Option<usize>> {
-    let mut next = 0;
-    items
-        .iter()
-        .map(|item| {
-            if !item.selected {
-                return None;
-            }
-            next += 1;
-            Some(next)
-        })
-        .collect()
+    items.iter().map(|item| item.selection_order).collect()
 }
 
 /// 表示名の列幅。これを超える名前は末尾を `…` にする。
@@ -390,8 +417,9 @@ const MIN_PATH_WIDTH: usize = 16;
 
 fn row_line(item: &SelectorItem, order: Option<usize>, path_width: usize) -> Line<'static> {
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let mark = if item.selected { "[x]" } else { "[ ]" };
-    let mark_style = if item.selected {
+    let selected = order.is_some();
+    let mark = if selected { "[x]" } else { "[ ]" };
+    let mark_style = if selected {
         Style::default().fg(Color::Green)
     } else {
         dim
@@ -644,21 +672,18 @@ mod tests {
     }
 
     #[test]
-    fn enter_confirms_in_screen_order() {
-        let mut state = state_with(3, 3);
-        // r2 を先頭へ運ぶ
+    fn enter_confirms_in_selection_order() {
+        let mut state = state_with(3, 0);
+        // 画面では下から r2 → r0 → r1 の順に選ぶ。
         state.on_key(press(KeyCode::Char('G')));
-        state.on_key(press(KeyCode::Char('K')));
-        state.on_key(press(KeyCode::Char('K')));
-        assert_eq!(names(&state), vec!["r2", "r0", "r1"]);
-
-        // 並べ替え後の 2 行目にいる r0 を対象から外す
+        state.on_key(press(KeyCode::Char(' ')));
         state.on_key(press(KeyCode::Char('g')));
+        state.on_key(press(KeyCode::Char(' ')));
         state.on_key(press(KeyCode::Char('j')));
         state.on_key(press(KeyCode::Char(' ')));
 
         assert_eq!(state.on_key(press(KeyCode::Enter)), KeyOutcome::Confirm);
-        assert_eq!(selected_names(state), vec!["r2", "r1"]);
+        assert_eq!(selected_names(state), vec!["r2", "r0", "r1"]);
     }
 
     /// 選択 0 件の Enter は実行させず、理由をフッターに出す。
@@ -706,19 +731,57 @@ mod tests {
         assert_eq!(state.selected_count(), 0);
     }
 
-    /// 実行順は選択済み行だけに 1 から振る（未選択行は飛ばす）。
+    /// 実行順は画面位置ではなく Space で選択した順番になる。
     #[test]
-    fn order_numbers_count_only_selected_rows() {
+    fn order_numbers_follow_selection_order() {
         let mut state = state_with(4, 0);
-        state.on_key(press(KeyCode::Char(' '))); // r0 を選択
+        state.on_key(press(KeyCode::Char('G')));
+        state.on_key(press(KeyCode::Char(' '))); // r3 が 1
+        state.on_key(press(KeyCode::Char('g')));
+        state.on_key(press(KeyCode::Char(' '))); // r0 が 2
         state.on_key(press(KeyCode::Down));
         state.on_key(press(KeyCode::Down));
-        state.on_key(press(KeyCode::Char(' '))); // r2 を選択
+        state.on_key(press(KeyCode::Char(' '))); // r2 が 3
 
         assert_eq!(
             order_numbers(state.items()),
-            vec![Some(1), None, Some(2), None]
+            vec![Some(2), None, Some(3), Some(1)]
         );
+    }
+
+    /// 解除した番号は詰め、同じ項目を選び直した場合は末尾へ回す。
+    #[test]
+    fn deselect_compacts_orders_and_reselect_appends() {
+        let mut state = state_with(3, 3);
+        state.on_key(press(KeyCode::Down)); // r1
+        state.on_key(press(KeyCode::Char(' ')));
+
+        assert_eq!(order_numbers(state.items()), vec![Some(1), None, Some(2)]);
+
+        state.on_key(press(KeyCode::Char(' ')));
+        assert_eq!(
+            order_numbers(state.items()),
+            vec![Some(1), Some(3), Some(2)]
+        );
+        assert_eq!(selected_names(state), vec!["r0", "r2", "r1"]);
+    }
+
+    /// 行を移動しても Space で指定した実行順は項目に付いたまま変わらない。
+    #[test]
+    fn moving_rows_preserves_selection_order() {
+        let mut state = state_with(3, 0);
+        state.on_key(press(KeyCode::Char('G')));
+        state.on_key(press(KeyCode::Char(' '))); // r2 が 1
+        state.on_key(press(KeyCode::Char('g')));
+        state.on_key(press(KeyCode::Char(' '))); // r0 が 2
+
+        state.on_key(press(KeyCode::Char('K'))); // r0 は既に先頭なので変化なし
+        state.on_key(press(KeyCode::Char('G')));
+        state.on_key(press(KeyCode::Char('K'))); // r2 を r1 より上へ
+
+        assert_eq!(names(&state), vec!["r0", "r2", "r1"]);
+        assert_eq!(order_numbers(state.items()), vec![Some(2), Some(1), None]);
+        assert_eq!(selected_names(state), vec!["r2", "r0"]);
     }
 
     /// 未知のキーは状態を変えない（誤爆でキャンセル・決定しない）。
@@ -760,7 +823,7 @@ mod tests {
     fn row_line_shows_order_and_metadata() {
         let mut item = SelectorItem {
             target: target("repo-a"),
-            selected: true,
+            selection_order: Some(3),
             last_modified: None,
         };
         let text: String = row_line(&item, Some(3), 40)
@@ -774,7 +837,7 @@ mod tests {
         assert!(text.contains("repo-a"), "表示名: {text}");
         assert!(text.contains("/repos/repo-a"), "パス: {text}");
 
-        item.selected = false;
+        item.selection_order = None;
         let text: String = row_line(&item, None, 40)
             .spans
             .iter()
