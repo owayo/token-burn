@@ -599,7 +599,7 @@ fn extract_tool_detail_task_with_name_and_type() {
     let input = r#"{"description":"implement feature","name":"worker-1","subagent_type":"general-purpose","prompt":"Do stuff","team_name":"my-team"}"#;
     assert_eq!(
         extract_tool_detail("Task", input),
-        "worker-1 (general-purpose)"
+        "worker-1 — implement feature (general-purpose)"
     );
 }
 
@@ -748,9 +748,23 @@ fn extract_tool_detail_agent_with_description() {
 }
 
 #[test]
+fn extract_tool_detail_agent_with_name_and_description() {
+    // 実ログにある subagent_type 無しの起動でも、識別子と役割の両方を残す。
+    let input =
+        r#"{"description":"Review auth module","name":"review-auth","prompt":"Inspect auth"}"#;
+    assert_eq!(
+        extract_tool_detail("Agent", input),
+        "review-auth — Review auth module"
+    );
+}
+
+#[test]
 fn extract_tool_detail_agent_with_name_and_type() {
     let input = r#"{"description":"do stuff","name":"worker-1","subagent_type":"Explore"}"#;
-    assert_eq!(extract_tool_detail("Agent", input), "worker-1 (Explore)");
+    assert_eq!(
+        extract_tool_detail("Agent", input),
+        "worker-1 — do stuff (Explore)"
+    );
 }
 
 #[test]

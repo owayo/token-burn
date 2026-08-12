@@ -244,7 +244,8 @@ pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) ->
         Ok(())
     })();
 
-    let _ = lock_file.unlock();
+    // Rust 1.89 の File::unlock ではなく、MSRV 1.88 で使える fs2 の実装を明示する。
+    let _ = fs2::FileExt::unlock(&lock_file);
     result
 }
 

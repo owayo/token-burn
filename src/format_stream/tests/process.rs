@@ -340,8 +340,8 @@ fn process_team_create_then_task_spawn() {
         clean
     );
     assert!(
-        clean.contains("worker-1 (general-purpose)"),
-        "expected agent name and type in: {}",
+        clean.contains("worker-1 — implement utils (general-purpose)"),
+        "エージェント名・説明・種別が表示されるべき: {}",
         clean
     );
     assert!(
