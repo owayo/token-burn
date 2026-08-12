@@ -31,11 +31,17 @@ pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -
             // いずれも表示するとノイズになる。思考中の進捗は thinking_delta のドット
             // 表示、正確なトークン総数は result.usage の集計表示に委ねる。
         }
+        "vcs_state_changed" => write_vcs_state_changed(v, out)?,
         "background_tasks_changed" => {
             // 実行中バックグラウンドタスク一覧のスナップショット通知。タスクの増減の
             // たびに発火する（実データで 1 セッション十数回）が、個々の開始・完了は
             // task_started / task_notification で既に表示しており、重複表示は
             // ノイズになるため明示的に無視する。
+        }
+        "commands_changed" => {
+            // 利用可能なスキル/コマンド一覧のスナップショット通知。1 件で数百 KB に
+            // 達する巨大イベント（実データで 414KB）で、一覧の中身はセッションの
+            // 実行内容と無関係なため明示的に無視する。
         }
         _ => {} // hook_started 等は無視
     }
@@ -107,6 +113,24 @@ fn write_model_refusal_fallback(v: &serde_json::Value, out: &mut impl Write) -> 
         truncate_inline(original, 40),
         truncate_inline(fallback, 40),
         category
+    )?;
+    Ok(())
+}
+
+/// `vcs_state_changed`: バージョン管理状態の変更通知を表示する。
+///
+/// 実データは git hook（git-sc 等）による自動 commit で `kind:"commit"` を持つ。
+/// 無人実行中にコミットが作られた記録はセッション後の変更追跡の手掛かりで、
+/// 落とすと「いつの間にかコミットが増えている」理由をログから追えない。
+fn write_vcs_state_changed(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    let kind = v["kind"].as_str().unwrap_or("");
+    if kind.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "\x1b[2m  \u{2387} VCS {}\x1b[0m",
+        truncate_inline(kind, 30)
     )?;
     Ok(())
 }

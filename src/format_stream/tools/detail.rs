@@ -254,7 +254,12 @@ fn detail_task_or_agent(v: &serde_json::Value) -> DetailResult {
     let name = v["name"].as_str().unwrap_or("");
     let agent_type = v["subagent_type"].as_str().unwrap_or("");
     let prompt = v["prompt"].as_str().unwrap_or("");
-    let detail = if !name.is_empty() {
+    let detail = if !name.is_empty() && !desc.is_empty() {
+        // name は SendMessage で参照する識別子（例: review-core）で、それだけでは
+        // 何をするエージェントか分からない。実データでは name 付き起動の大半が
+        // description も持つため、両方あるときは併記する。
+        format!("{} \u{2014} {}", name, truncate_str(desc, 70))
+    } else if !name.is_empty() {
         name.to_string()
     } else if !desc.is_empty() {
         truncate_str(desc, 80)

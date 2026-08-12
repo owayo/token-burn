@@ -140,6 +140,10 @@ impl SelectorState {
             // 並べ替えはカーソル移動より先に判定する（Shift+↑↓ を素の ↑↓ に落とさない）。
             KeyCode::Up if shift => self.reorder(-1),
             KeyCode::Down if shift => self.reorder(1),
+            // 端末によって Shift+K/J は大文字ではなく、小文字 + SHIFT として届く。
+            // 通常の k/j より先に拾わないと、行ではなくカーソルだけが動いてしまう。
+            KeyCode::Char('k') if shift => self.reorder(-1),
+            KeyCode::Char('j') if shift => self.reorder(1),
             KeyCode::Char('K') => self.reorder(-1),
             KeyCode::Char('J') => self.reorder(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
@@ -594,6 +598,24 @@ mod tests {
 
         state.on_key(press_with(KeyCode::Down, KeyModifiers::SHIFT));
         assert_eq!(names(&state), vec!["r0", "r1", "r2"]);
+    }
+
+    /// 端末によって Shift+K/J は `Char('K'/'J')` ではなく
+    /// `Char('k'/'j') + SHIFT` として報告される。この場合もカーソル移動ではなく
+    /// 行の並べ替えとして扱う。
+    #[test]
+    fn shifted_lowercase_letter_keys_reorder_rows() {
+        let mut state = state_with(3, 3);
+        state.on_key(press(KeyCode::Char('G'))); // r2 へ
+
+        state.on_key(press_with(KeyCode::Char('k'), KeyModifiers::SHIFT));
+        state.on_key(press_with(KeyCode::Char('k'), KeyModifiers::SHIFT));
+        assert_eq!(names(&state), vec!["r2", "r0", "r1"]);
+        assert_eq!(state.cursor(), 0, "動かした r2 にカーソルが付いてくる");
+
+        state.on_key(press_with(KeyCode::Char('j'), KeyModifiers::SHIFT));
+        assert_eq!(names(&state), vec!["r0", "r2", "r1"]);
+        assert_eq!(state.cursor(), 1);
     }
 
     #[test]
