@@ -878,6 +878,28 @@ fn tool_result_metadata_read_partial_shows_line_ratio() {
 }
 
 #[test]
+fn tool_result_metadata_read_partial_from_offset_shows_line_range() {
+    // 実ログの offset 付き Read は startLine から読み取った範囲を表示する。
+    let value = serde_json::json!({
+        "type": "text",
+        "file": {"filePath": "/src/big.rs", "numLines": 60, "startLine": 995, "totalLines": 1221}
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(metadata.contains("lines:995-1054/1221"), "{metadata}");
+}
+
+#[test]
+fn tool_result_metadata_read_invalid_range_falls_back_to_line_ratio() {
+    // 壊れた範囲や加算オーバーフローでも panic せず、従来の件数表示へ戻す。
+    for start_line in [200, u64::MAX] {
+        let value = serde_json::json!({
+            "file": {"numLines": 50, "startLine": start_line, "totalLines": 100}
+        });
+        assert_eq!(tool_result_metadata(&value), "lines:50/100");
+    }
+}
+
+#[test]
 fn tool_result_metadata_read_token_cap_truncation_is_shown() {
     // 実データの Read 結果では token cap による切り詰めが file 配下に入る。
     let value = serde_json::json!({

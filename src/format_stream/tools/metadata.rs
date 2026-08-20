@@ -221,12 +221,24 @@ fn append_file_metadata(obj: &serde_json::Map<String, serde_json::Value>, attrs:
     }
     // Read は読み取り結果を file オブジェクトに格納する。部分読み取り（limit 指定や
     // ファイル途中までの読み取り）では numLines < totalLines となり、切り詰めの判断材料になる。
+    // startLine が 2 行目以降なら件数だけでは実際の読み取り位置を失うため、範囲も表示する。
     if let Some(file) = obj.get("file").and_then(|value| value.as_object()) {
         if let Some(num_lines) = file.get("numLines").and_then(|value| value.as_u64())
             && let Some(total_lines) = file.get("totalLines").and_then(|value| value.as_u64())
             && total_lines > num_lines
         {
-            attrs.push(format!("lines:{num_lines}/{total_lines}"));
+            let line_summary = file
+                .get("startLine")
+                .and_then(|value| value.as_u64())
+                .filter(|start_line| *start_line > 1 && num_lines > 0)
+                .and_then(|start_line| {
+                    start_line
+                        .checked_add(num_lines - 1)
+                        .filter(|end_line| *end_line <= total_lines)
+                        .map(|end_line| format!("{start_line}-{end_line}"))
+                })
+                .unwrap_or_else(|| num_lines.to_string());
+            attrs.push(format!("lines:{line_summary}/{total_lines}"));
         }
         if file
             .get("truncatedByTokenCap")
