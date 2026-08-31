@@ -17,7 +17,9 @@ pub(crate) fn handle_result(
 ) -> Result<()> {
     write_cost(v, out)?;
     write_duration(v, out)?;
+    write_subagent_summary(v, out)?;
     write_token_summary(summary, out)?;
+    write_session_total(v, summary, out)?;
     write_cache_summary(summary, out)?;
     write_model_stop(summary, out)?;
     write_web_summary(summary, out)?;
@@ -25,6 +27,90 @@ pub(crate) fn handle_result(
     write_model_usage(v, out)?;
     write_terminal_info(v, out)?;
     Ok(())
+}
+
+/// サブエージェントの完了内訳を表示する。
+///
+/// top-level result が成功でも、配下のサブエージェントだけが全件失敗する実データがある。
+/// この内訳を隠すとセッション全体が正常完了したように見えるため、失敗・強制終了・
+/// 起動拒否が 1 件でもあれば警告色で表示する。
+fn write_subagent_summary(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    let Some(stats) = v["subagent_stats"].as_object() else {
+        return Ok(());
+    };
+
+    let spawned = stats
+        .get("spawned")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let completed = stats
+        .get("completed")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let failed = stats
+        .get("failed")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let killed = sum_counter_object(stats.get("killed"));
+    let refused = sum_counter_object(stats.get("refused"));
+
+    if spawned == 0 && completed == 0 && failed == 0 && killed == 0 && refused == 0 {
+        return Ok(());
+    }
+
+    let mut parts = vec![
+        format!("spawned:{}", format_number(spawned)),
+        format!("completed:{}", format_number(completed)),
+        format!("failed:{}", format_number(failed)),
+    ];
+    if killed > 0 {
+        parts.push(format!("killed:{}", format_number(killed)));
+    }
+    if refused > 0 {
+        parts.push(format!("refused:{}", format_number(refused)));
+    }
+    if let Some(background) = stats
+        .get("started_in_background")
+        .and_then(|value| value.as_u64())
+        .filter(|count| *count > 0)
+    {
+        parts.push(format!("bg:{}", format_number(background)));
+    }
+    if let Some(nested) = stats
+        .get("spawned_by_subagents")
+        .and_then(|value| value.as_u64())
+        .filter(|count| *count > 0)
+    {
+        parts.push(format!("nested:{}", format_number(nested)));
+    }
+    if let Some(depth) = stats
+        .get("max_depth")
+        .and_then(|value| value.as_u64())
+        .filter(|depth| *depth > 0)
+    {
+        parts.push(format!("max-depth:{depth}"));
+    }
+
+    let detail = parts.join(" ");
+    if failed > 0 || killed > 0 || refused > 0 {
+        writeln!(out, "\x1b[33m\u{26a0}  subagents {detail}\x1b[0m")?;
+    } else {
+        writeln!(out, "\x1b[2m   subagents {detail}\x1b[0m")?;
+    }
+    Ok(())
+}
+
+/// killed / refused の理由別カウンタを飽和加算し、壊れた巨大値でも panic させない。
+fn sum_counter_object(value: Option<&serde_json::Value>) -> u64 {
+    value
+        .and_then(|value| value.as_object())
+        .map(|counts| {
+            counts
+                .values()
+                .filter_map(|value| value.as_u64())
+                .fold(0, u64::saturating_add)
+        })
+        .unwrap_or(0)
 }
 
 /// 総コスト（USD）を表示する。
@@ -81,13 +167,70 @@ fn write_token_summary(summary: &StreamSummary, out: &mut impl Write) -> Result<
     let input = summary.usage.total_input_tokens();
     let output = summary.usage.output_tokens;
     if output > 0 {
+        // 思考トークンは出力トークンの内訳（実ログで 10〜52%）なので、出力へ加算せず
+        // 括弧で内訳として添える。0 のときは省略してノイズを増やさない。
+        let thinking = if summary.usage.thinking_tokens > 0 {
+            format!(
+                " (thinking:{})",
+                format_number(summary.usage.thinking_tokens)
+            )
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            "\x1b[33m\u{1f4ca} in:{} out:{}\x1b[0m",
+            "\x1b[33m\u{1f4ca} in:{} out:{}{}\x1b[0m",
             format_number(input),
-            format_number(output)
+            format_number(output),
+            thinking
         )?;
     }
+    Ok(())
+}
+
+/// サブエージェント込みのセッション総消費量を表示する。
+///
+/// `result.usage` はメインループの消費しか含まない。実ログで検証したところ、
+/// `subagent_stats.spawned` が 0 のセッションでは `usage` と `modelUsage` の合計が
+/// 完全に一致し、サブエージェントを起動したセッションでは `modelUsage` 側が
+/// 最大 100 倍大きくなる（cache_read で 2,110,690 → 220,321,325 の実例）。
+/// トークン消費量そのものを目的とするツールで、見出しの `in/out` が実消費の
+/// 1/100 になり得るのは致命的なため、乖離があるときだけ総計を併記する。
+fn write_session_total(
+    v: &serde_json::Value,
+    summary: &StreamSummary,
+    out: &mut impl Write,
+) -> Result<()> {
+    let Some(model_usage) = v["modelUsage"].as_object() else {
+        return Ok(());
+    };
+
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    for usage in model_usage.values() {
+        for key in [
+            "inputTokens",
+            "cacheReadInputTokens",
+            "cacheCreationInputTokens",
+        ] {
+            total_input = total_input.saturating_add(usage[key].as_u64().unwrap_or(0));
+        }
+        total_output = total_output.saturating_add(usage["outputTokens"].as_u64().unwrap_or(0));
+    }
+
+    // メインループ分と一致する（＝サブエージェントを使っていない）場合は重複表示になる。
+    if total_output <= summary.usage.output_tokens
+        && total_input <= summary.usage.total_input_tokens()
+    {
+        return Ok(());
+    }
+
+    writeln!(
+        out,
+        "\x1b[33m\u{1f4ca} total in:{} out:{} (incl. subagents)\x1b[0m",
+        format_number(total_input),
+        format_number(total_output)
+    )?;
     Ok(())
 }
 

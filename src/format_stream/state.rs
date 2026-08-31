@@ -69,6 +69,10 @@ impl StreamSummary {
 pub(crate) struct UsageSummary {
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
+    /// `output_tokens` の内訳のうち思考（extended thinking）に使われた分。
+    /// 実ログでは出力トークンの 10〜52% を占めるため、これを表示しないと
+    /// 「何にトークンを使ったのか」の最大の内訳が丸ごと失われる。
+    pub(crate) thinking_tokens: u64,
     pub(crate) cache_read_input_tokens: u64,
     pub(crate) cache_creation_input_tokens: u64,
     pub(crate) cache_creation_5m_input_tokens: u64,
@@ -94,6 +98,9 @@ impl UsageSummary {
         if let Some(v) = value["output_tokens"].as_u64() {
             self.output_tokens = v;
         }
+        if let Some(v) = value["output_tokens_details"]["thinking_tokens"].as_u64() {
+            self.thinking_tokens = v;
+        }
         if let Some(v) = value["cache_read_input_tokens"].as_u64() {
             self.cache_read_input_tokens = v;
         }
@@ -114,8 +121,16 @@ impl UsageSummary {
         }
     }
 
+    /// 入力側トークンの合計。壊れた巨大値でも panic させないため飽和加算する。
+    ///
+    /// `format-stream` はパイプの中段に置かれ、`claude ... 2>&1 | format-stream | tee` で
+    /// stderr が同じパイプへ合流するため、行が破損した jsonl を読む可能性がある。
+    /// debug build ではオーバーフローが panic になり、パイプが閉じて `claude` 本体が
+    /// SIGPIPE で落ちるため、表示の都合で数時間の実行を巻き添えにしてしまう。
     pub(crate) fn total_input_tokens(&self) -> u64 {
-        self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+        self.input_tokens
+            .saturating_add(self.cache_read_input_tokens)
+            .saturating_add(self.cache_creation_input_tokens)
     }
 
     pub(crate) fn cache_write_5m_tokens(&self) -> u64 {

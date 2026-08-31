@@ -382,6 +382,21 @@ fn append_agent_metadata(
     obj: &serde_json::Map<String, serde_json::Value>,
     attrs: &mut Vec<String>,
 ) {
+    // ListAgents の listing は「見出し + 2 空白で始まるエージェント行」の文字列。
+    // 実データでは結果本文と完全に重複するため本文は再表示せず、行数だけを補足する。
+    if let Some(listing) = obj
+        .get("listing")
+        .and_then(|value| value.as_str())
+        .filter(|listing| !listing.is_empty())
+    {
+        let agent_count = listing
+            .lines()
+            .filter(|line| line.starts_with("  ") && !line.trim().is_empty())
+            .count();
+        if agent_count > 0 {
+            attrs.push(format!("agents:{agent_count}"));
+        }
+    }
     // Agent を `run_in_background:true` で起動したときの async-launched 応答。
     // 同期実行の Agent 結果には isAsync が無いため、フィールド存在で判定する。
     if obj

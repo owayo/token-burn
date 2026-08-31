@@ -40,6 +40,140 @@ fn process_result_hides_permission_denials_when_empty() {
 }
 
 #[test]
+fn process_result_shows_actual_subagent_stats_and_failures() {
+    // 実 jsonl では top-level success でも配下の Agent が全件失敗するため、警告表示する。
+    let input = r#"{"type":"result","subtype":"success","subagent_stats":{"spawned":6,"completed":0,"failed":6,"killed":{"user":0,"system":0,"parent":0},"refused":{"budget":0,"concurrency_limit":0,"depth_limit":0},"started_in_background":6,"spawned_by_subagents":1,"max_depth":2}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(clean.contains("⚠  subagents"), "got: {clean}");
+    assert!(
+        clean.contains("spawned:6 completed:0 failed:6"),
+        "got: {clean}"
+    );
+    assert!(clean.contains("bg:6 nested:1 max-depth:2"), "got: {clean}");
+}
+
+#[test]
+fn process_result_hides_empty_subagent_stats() {
+    let input = r#"{"type":"result","subtype":"success","subagent_stats":{"spawned":0,"completed":0,"failed":0,"killed":{},"refused":{}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(!clean.contains("subagents"), "got: {clean}");
+}
+
+#[test]
+fn process_result_saturates_subagent_counter_totals() {
+    // 理由別カウンタの合計が u64 を超えても debug build で panic しない。
+    let input = r#"{"type":"result","subtype":"success","subagent_stats":{"spawned":1,"completed":0,"failed":0,"killed":{"user":18446744073709551615,"system":1},"refused":{"budget":18446744073709551615,"depth_limit":1}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(
+        clean.contains("killed:18,446,744,073,709,551,615"),
+        "got: {clean}"
+    );
+    assert!(
+        clean.contains("refused:18,446,744,073,709,551,615"),
+        "got: {clean}"
+    );
+}
+
+#[test]
+fn process_result_shows_actual_thinking_token_breakdown() {
+    // 実 jsonl の result.usage.output_tokens_details.thinking_tokens。
+    // 出力トークンの内訳なので加算せず括弧で添える。
+    let input = r#"{"type":"result","subtype":"success","usage":{"input_tokens":100,"output_tokens":44892,"output_tokens_details":{"thinking_tokens":20705}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(
+        clean.contains("in:100 out:44,892 (thinking:20,705)"),
+        "{clean}"
+    );
+}
+
+#[test]
+fn process_result_hides_zero_thinking_tokens() {
+    // 実 jsonl では thinking_tokens:0 が常設されるため、0 のときは表示しない。
+    let input = r#"{"type":"result","subtype":"success","usage":{"input_tokens":100,"output_tokens":50,"output_tokens_details":{"thinking_tokens":0}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(clean.contains("in:100 out:50"), "{clean}");
+    assert!(!clean.contains("thinking:"), "{clean}");
+}
+
+#[test]
+fn process_result_prefers_result_thinking_tokens_over_stream_delta() {
+    // message_delta は API 呼び出し単独の値、result が最終累計。
+    // 既存の usage と同じく result 側を最終値として優先する。
+    let input = concat!(
+        r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":10,"output_tokens_details":{"thinking_tokens":4}}}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":100,"output_tokens":44892,"output_tokens_details":{"thinking_tokens":20705}}}"#
+    );
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(clean.contains("(thinking:20,705)"), "{clean}");
+    assert!(!clean.contains("thinking:4"), "{clean}");
+}
+
+#[test]
+fn process_result_shows_session_total_when_subagents_consumed_tokens() {
+    // 実 jsonl 20260828_004503/0003_astro-sight より。result.usage はメインループ分だけで、
+    // modelUsage はサブエージェント込みの総計になる（cache_read で 5 倍の乖離）。
+    let input = r#"{"type":"result","subtype":"success","subagent_stats":{"spawned":19,"completed":19,"failed":0},"usage":{"input_tokens":312,"output_tokens":78447,"cache_read_input_tokens":68069506,"cache_creation_input_tokens":148317},"modelUsage":{"claude-opus-5":{"costUSD":237.47,"inputTokens":2876,"outputTokens":1336407,"cacheReadInputTokens":335838930,"cacheCreationInputTokens":5489856}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(clean.contains("in:68,218,135 out:78,447"), "{clean}");
+    assert!(
+        clean.contains("total in:341,331,662 out:1,336,407 (incl. subagents)"),
+        "{clean}"
+    );
+}
+
+#[test]
+fn process_result_hides_session_total_without_subagents() {
+    // spawned:0 のセッションでは usage と modelUsage が一致するため、総計行は重複ノイズ。
+    let input = r#"{"type":"result","subtype":"success","subagent_stats":{"spawned":0},"usage":{"input_tokens":100,"output_tokens":67798,"cache_read_input_tokens":14640463},"modelUsage":{"claude-opus-5":{"costUSD":1.0,"inputTokens":100,"outputTokens":67798,"cacheReadInputTokens":14640463}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(clean.contains("in:14,640,563 out:67,798"), "{clean}");
+    assert!(!clean.contains("incl. subagents"), "{clean}");
+}
+
+#[test]
+fn process_result_sums_session_total_across_models() {
+    // modelUsage が複数モデルを含む場合も総計を合算する。
+    let input = r#"{"type":"result","subtype":"success","usage":{"input_tokens":10,"output_tokens":20},"modelUsage":{"claude-opus-5":{"costUSD":1.0,"inputTokens":100,"outputTokens":200,"cacheReadInputTokens":1000},"claude-haiku-4-5":{"costUSD":0.1,"inputTokens":50,"outputTokens":30,"cacheCreationInputTokens":500}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(clean.contains("total in:1,650 out:230"), "{clean}");
+}
+
+#[test]
+fn process_result_saturates_session_total_on_broken_values() {
+    // 壊れた巨大値でも debug build でオーバーフローさせない。
+    let input = r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1},"modelUsage":{"a":{"costUSD":1.0,"inputTokens":18446744073709551615,"outputTokens":18446744073709551615,"cacheReadInputTokens":18446744073709551615},"b":{"costUSD":1.0,"inputTokens":10,"outputTokens":10}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(
+        clean.contains("total in:18,446,744,073,709,551,615"),
+        "{clean}"
+    );
+}
+
+#[test]
+fn process_result_saturates_total_input_tokens_on_broken_values() {
+    // 破損した jsonl で入力側トークンが u64 を超えても panic しない。
+    // format-stream はパイプの中段にあり、panic すると claude 本体が SIGPIPE で落ちる。
+    let input = r#"{"type":"result","subtype":"success","usage":{"input_tokens":18446744073709551615,"cache_read_input_tokens":1,"cache_creation_input_tokens":1,"output_tokens":5}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(
+        clean.contains("in:18,446,744,073,709,551,615 out:5"),
+        "{clean}"
+    );
+}
+
+#[test]
 fn format_number_with_commas() {
     assert_eq!(format_number(1234567), "1,234,567");
     assert_eq!(format_number(999), "999");

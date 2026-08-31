@@ -261,3 +261,49 @@ fn task_updated_status_takes_precedence_over_backgrounded() {
     assert!(out.contains("Task completed"), "{out:?}");
     assert!(!out.contains("backgrounded"), "{out:?}");
 }
+
+/// 実 jsonl の `vcs_state_changed`（git hook による自動 push）。
+/// main への push か作業ブランチへの push かで影響範囲が違うため branch も併記する。
+#[test]
+fn vcs_state_changed_shows_kind_and_branch() {
+    let out = render(
+        r#"{"type":"system","subtype":"vcs_state_changed","kind":"push","branch":"main","cwd":"/repo"}"#,
+    );
+    assert!(out.contains("VCS push (main)"), "{out:?}");
+    // cwd は対象リポジトリと重複するため表示しない。
+    assert!(!out.contains("/repo"), "{out:?}");
+}
+
+/// branch が無い（commit 等）場合は kind だけを表示する。
+#[test]
+fn vcs_state_changed_without_branch_shows_kind_only() {
+    let out = render(r#"{"type":"system","subtype":"vcs_state_changed","kind":"commit"}"#);
+    assert!(out.contains("VCS commit"), "{out:?}");
+    assert!(!out.contains('('), "{out:?}");
+}
+
+/// kind が無い通知は表示しない。
+#[test]
+fn vcs_state_changed_without_kind_writes_nothing() {
+    let out = render(r#"{"type":"system","subtype":"vcs_state_changed","branch":"main"}"#);
+    assert!(out.is_empty(), "{out:?}");
+}
+
+/// 空文字の branch は括弧ごと省略する。
+#[test]
+fn vcs_state_changed_ignores_empty_branch() {
+    let out = render(
+        r#"{"type":"system","subtype":"vcs_state_changed","kind":"push","branch":""}"#,
+    );
+    assert!(out.contains("VCS push"), "{out:?}");
+    assert!(!out.contains('('), "{out:?}");
+}
+
+/// 巨大な commands_changed スナップショットは明示的に無視する（1 件で数百 KB）。
+#[test]
+fn commands_changed_writes_nothing() {
+    let out = render(
+        r#"{"type":"system","subtype":"commands_changed","commands":[{"name":"a","description":"x"}]}"#,
+    );
+    assert!(out.is_empty(), "{out:?}");
+}

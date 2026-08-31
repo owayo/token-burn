@@ -119,18 +119,27 @@ fn write_model_refusal_fallback(v: &serde_json::Value, out: &mut impl Write) -> 
 
 /// `vcs_state_changed`: バージョン管理状態の変更通知を表示する。
 ///
-/// 実データは git hook（git-sc 等）による自動 commit で `kind:"commit"` を持つ。
-/// 無人実行中にコミットが作られた記録はセッション後の変更追跡の手掛かりで、
-/// 落とすと「いつの間にかコミットが増えている」理由をログから追えない。
+/// 実データは git hook（git-sc 等）による自動 commit で `kind:"commit"` を、
+/// 自動 push で `kind:"push"` を持つ。無人実行中にコミットや push が作られた記録は
+/// セッション後の変更追跡の手掛かりで、落とすと「いつの間にかコミットが増えている」
+/// 理由をログから追えない。`branch` も併記する（実データで `push` に付随）。
+/// main へ push したのか作業ブランチへ push したのかは影響範囲が全く違うため、
+/// kind だけでは無人実行の結果として何が起きたのか判断できない。
+/// `cwd` は対象リポジトリと重複するので表示しない。
 fn write_vcs_state_changed(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
     let kind = v["kind"].as_str().unwrap_or("");
     if kind.is_empty() {
         return Ok(());
     }
+    let branch = match v["branch"].as_str().filter(|branch| !branch.is_empty()) {
+        Some(branch) => format!(" ({})", truncate_inline(branch, 40)),
+        None => String::new(),
+    };
     writeln!(
         out,
-        "\x1b[2m  \u{2387} VCS {}\x1b[0m",
-        truncate_inline(kind, 30)
+        "\x1b[2m  \u{2387} VCS {}{}\x1b[0m",
+        truncate_inline(kind, 30),
+        branch
     )?;
     Ok(())
 }

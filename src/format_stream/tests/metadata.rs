@@ -431,6 +431,25 @@ fn tool_result_metadata_shows_actual_jsonl_agent_usage() {
 }
 
 #[test]
+fn tool_result_metadata_shows_list_agents_count() {
+    // 実 jsonl の listing は active / inactive の見出しと、2 空白で始まる各 Agent 行を持つ。
+    let value = serde_json::json!({
+        "listing": "Active agents:\n  lead active\n  worker-1 active\nInactive agents:\n  worker-2 stopped\n"
+    });
+
+    assert_eq!(tool_result_metadata(&value), "agents:3");
+}
+
+#[test]
+fn tool_result_metadata_omits_empty_list_agents_sections() {
+    let value = serde_json::json!({
+        "listing": "Active agents:\nInactive agents:\n"
+    });
+
+    assert_eq!(tool_result_metadata(&value), "");
+}
+
+#[test]
 fn tool_result_metadata_shows_agent_type_and_tool_stats() {
     // 実 jsonl で確認した Agent 結果の agentType / resolvedModel / toolStats(編集行数)。
     let value = serde_json::json!({

@@ -339,3 +339,65 @@ fn format_epoch_millis_clock_out_of_range_returns_none() {
     // i64 最大値を秒として渡すと chrono の表現可能範囲外で None
     assert_eq!(format_epoch_millis_clock(i64::MAX), None);
 }
+
+// ===== TEMPORARY AUDIT PROBES 2 =====
+use crate::format_stream::tests::{run_process, strip_ansi};
+
+#[test]
+fn probe_interleave() {
+    let input = concat!(
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#, "\n",
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I"}}}"#, "\n",
+        r#"{"type":"tool_progress","tool_name":"Bash","elapsed_time_seconds":90}"#, "\n",
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"'ll do it"}}}"#, "\n",
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#, "\n",
+    );
+    println!("PROBE_A >>>\n{}<<<", strip_ansi(&run_process(input)));
+}
+
+#[test]
+fn probe_multi_tool_result_same_user_event() {
+    let input = concat!(
+        r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Read"},{"type":"tool_use","id":"t2","name":"Grep"}]}}"#, "\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"},{"type":"tool_result","tool_use_id":"t2"}]},"tool_use_result":{"filePath":"/only/for/t1","numLines":3}}"#, "\n",
+    );
+    println!("PROBE_B >>>\n{}<<<", strip_ansi(&run_process(input)));
+}
+
+#[test]
+fn probe_model_normalization_paths() {
+    let input = concat!(
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1","model":"claude-opus-5[1m]"}}}"#, "\n",
+        r#"{"type":"result","subtype":"success","model":"claude-opus-5[1m]","usage":{"input_tokens":1,"output_tokens":2},"modelUsage":{"claude-opus-5[1m]":{"costUSD":0.1,"outputTokens":2}}}"#, "\n",
+    );
+    println!("PROBE_C >>>\n{}<<<", strip_ansi(&run_process(input)));
+}
+
+#[test]
+fn probe_thinking_interleave() {
+    let mut input = String::new();
+    input.push_str(r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}"#);
+    input.push('\n');
+    input.push_str(&format!(r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{}"}}}}}}"#, "x".repeat(250)));
+    input.push('\n');
+    input.push_str(r#"{"type":"system","subtype":"task_progress","description":"working","last_tool_name":"Bash"}"#);
+    input.push('\n');
+    input.push_str(&format!(r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{}"}}}}}}"#, "y".repeat(250)));
+    input.push('\n');
+    input.push_str(r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#);
+    input.push('\n');
+    println!("PROBE_D >>>\n{:?}<<<", run_process(&input));
+}
+
+#[test]
+fn probe_valid_json_scalar_line_dropped() {
+    let input = "42\n\"plain text line\"\nnot json at all\ntrue\n";
+    println!("PROBE_E >>>\n{:?}<<<", run_process(input));
+}
+
+#[test]
+fn probe_rate_limit_allowed_high_utilization() {
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"seven_day","utilization":0.99}}"#;
+    let out = run_process(input);
+    println!("PROBE_F >>> {:?}", strip_ansi(&out));
+}
