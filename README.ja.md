@@ -79,6 +79,7 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **terminal_reason / permission_denials**: 異常終了時の `terminal_reason`（`completed` 以外）と権限拒否されたツール呼び出しの件数/ツール名を結果サマリーに表示
 - **結果メタデータ**: `usage.service_tier`、`usage.speed`、空でない推論リージョン、iteration 数、result origin 種別を表示
 - **レート制限通知**: 使用率の警告、リクエスト拒否、overage（超過枠）の状態・リセット時刻（警告時と拒否時にも表示）、および `allowed_warning` でサーバー側が通過した警告閾値（例: `warning at 90%`）を表示し、ローカル閾値超過時に後続タスクを自動停止（stop file の作成が ENOSPC・権限不足等で失敗した場合は握り潰さず、停止シグナルが生成されない旨を出力に明示）
+- **自動停止は実行を止める枠だけで判定**: 停止判定に使うのは `unifiedWindows` の 5 時間枠 / 7 日枠の使用率で、月次の追加課金枠（`overage`）の使用率では停止しません。実データでは 5 時間枠が 13% でも `rateLimitType:"overage"` / `utilization:1.03` の警告が届き、これを閾値と比べて全タスクが止まっていました。停止行には判定した枠の名前・使用率・**その枠自身の**リセット時刻を出し、`[5h 13% / 7d 54%]` の形で実測値を併記します。追加課金枠の警告は `(overage, no auto-stop)` として表示のみ行います
 - **ai-usage 使用率ゲート**: ai-usage 連携時、各タスク完了後に該当 agent の実使用率（weekly / five_hour の最大）を確認し、`rate_limit_threshold` 以上なら後続タスクを停止。stream-json のリアルタイム監視が無い codex でも実使用率で確実に停止でき、取得失敗時は fail-closed で安全側に倒す
 - **モニター使用量パネル**: ai-usage 連携時、tmux モニターペインに `ai-usage --statusline --logos`（各アカウントの 5h / 週次使用率バー）を 10 秒ごとに表示（`--input` でキャッシュから高速描画、進捗バーは毎秒更新）。取得は `ai-usage` の終了と同時に返るため、更新処理でペインが固まることはなく、進捗バーは毎秒更新を維持
 - **上限到達の判定**: `resets 2:30am` のような分を含む時刻表記や、`You've hit your session limit` / `You've hit your org's monthly spend limit` といった上限到達メッセージを、リトライ可能なプロバイダエラーではなくレート制限として扱う（リトライしても回復しないため）
@@ -218,7 +219,7 @@ skip_within = "7d"    # 任意
 | `cleanup_after` | この期間より古いレポートディレクトリを自動削除 | `"7d"`（デフォルト） |
 | `report_dir` | 実行ログの保存先ディレクトリ（相対パスは実行時のカレントディレクトリ基準で絶対パスへ解決） | `~/Documents/token-burn`（デフォルト） |
 | `limit` | 1回の実行で処理する最大ターゲット数（`>= 1`） | `10`（デフォルト） |
-| `rate_limit_threshold` | レート制限使用率がこの閾値（%）以上で自動停止（`1-100`）。Claude の stream-json リアルタイム監視に加え、ai-usage 連携時は各タスク完了後にも該当 agent の実使用率（weekly / five_hour の最大）でチェックされる | `95`（デフォルト） |
+| `rate_limit_threshold` | 5 時間枠 / 7 日枠の使用率がこの閾値（%）以上で自動停止（`1-100`）。月次の追加課金枠（overage）の使用率では停止しない。Claude の stream-json リアルタイム監視に加え、ai-usage 連携時は各タスク完了後にも該当 agent の実使用率（weekly / five_hour の最大）でチェックされる | `95`（デフォルト） |
 | `dedup_scope` | 処理済み履歴を共有する範囲（`global` / `provider` / `agent`） | `agent`（デフォルト） |
 
 `skip_within` と `cleanup_after` には、`d`（日）、`h`（時間）、`m`（分）、`s`（秒）を使った期間文字列を指定します。不正な値や期間として表現できない値は設定ファイルの読み込み時点でエラーになります。`skip_within` を省略した場合は前回リセット以降に処理済みのターゲットをスキップします。期間として表現できても日時の計算範囲を超える値ではパニックせず、`skip_within` は警告後に前回リセット時刻へフォールバックし、クリーンアップはエラーを返します。`--fresh` を指定すると保存済み状態を無視して全ターゲットを処理します。

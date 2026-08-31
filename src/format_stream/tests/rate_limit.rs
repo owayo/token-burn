@@ -155,7 +155,7 @@ fn process_rate_limit_below_threshold_no_stop_file() {
         clean
     );
     assert!(
-        !clean.contains("auto-stop"),
+        !clean.contains("Rate limit auto-stop"),
         "auto-stop は表示されるべきでない: {}",
         clean
     );
@@ -497,10 +497,183 @@ fn overage_in_use_alias_is_recognized() {
 #[test]
 fn auto_stop_line_includes_overage_flag() {
     // 閾値超過で停止する行にも超過枠の消費有無を残す。
-    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"overage","utilization":1.03,"surpassedThreshold":1,"isUsingOverage":true}}"#;
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","utilization":0.96,"surpassedThreshold":0.95,"isUsingOverage":true}}"#;
     let clean = strip_ansi(&run_process(input));
     assert!(clean.contains("auto-stop"), "{clean}");
     assert!(clean.contains("using_overage"), "{clean}");
+}
+
+// --- 停止判定の基準枠（unifiedWindows）のテスト ---
+// 実データ（~/Documents/token-burn の jsonl）では、月次の追加課金枠が 103% に
+// なると `rateLimitType:"overage"` / `utilization:1.03` の警告が繰り返し届く
+// （13 セッションで 188 件）。同じイベントの `unifiedWindows.five_hour` は 0.13 で
+// リクエストは通っており、この % で全タスクを止めてはいけない。
+
+#[test]
+fn overage_warning_does_not_stop_when_gating_windows_are_low() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    // 実ログそのままの overage 警告。5 時間枠 13% / 7 日枠 54% で余裕がある。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"overage","utilization":1.03,"isUsingOverage":false,"surpassedThreshold":1,"unifiedWindows":{"five_hour":{"utilization":0.13},"seven_day":{"utilization":0.54},"seven_day_overage_included":{"utilization":0.02}}}}"#;
+    let clean = strip_ansi(&run_process_with_opts(input, None, Some(&stop_file), 90));
+    assert!(
+        !clean.contains("Rate limit auto-stop"),
+        "追加課金枠の使用率で停止してはいけない: {clean}"
+    );
+    assert!(
+        !stop_file.exists(),
+        "5 時間枠 13% で stop file が作られてはいけない"
+    );
+    assert!(clean.contains("103%"), "警告自体は表示する: {clean}");
+    assert!(
+        clean.contains("no auto-stop"),
+        "停止判定に使わない枠であることを明示すべき: {clean}"
+    );
+    assert!(
+        clean.contains("5h 13%") && clean.contains("7d 54%"),
+        "実際に判定へ使う枠の使用率を併記すべき: {clean}"
+    );
+}
+
+#[test]
+fn overage_warning_still_stops_when_five_hour_is_exhausted() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    // overage の警告でも、同じイベントの 5 時間枠が閾値を超えていれば停止する。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"overage","utilization":1.03,"surpassedThreshold":1,"unifiedWindows":{"five_hour":{"utilization":0.95},"seven_day":{"utilization":0.54}}}}"#;
+    let clean = strip_ansi(&run_process_with_opts(input, None, Some(&stop_file), 90));
+    assert!(clean.contains("auto-stop"), "{clean}");
+    assert!(
+        clean.contains("95% used (five_hour)"),
+        "停止理由は追加課金枠でなく 5 時間枠であるべき: {clean}"
+    );
+    assert!(
+        !clean.contains("warning at"),
+        "追加課金枠に対する警告閾値を 5 時間枠の停止行へ持ち込まない: {clean}"
+    );
+    assert!(stop_file.exists(), "stop file が作成されるべき");
+}
+
+#[test]
+fn stop_uses_worst_gating_window_and_shows_both() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    // 5 時間枠と 7 日枠の両方が閾値超過なら、高い方を主理由にして両方を残す。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","utilization":0.92,"unifiedWindows":{"five_hour":{"utilization":0.92},"seven_day":{"utilization":0.97}}}}"#;
+    let clean = strip_ansi(&run_process_with_opts(input, None, Some(&stop_file), 90));
+    assert!(
+        clean.contains("97% used (seven_day)"),
+        "使用率が高い枠を主理由にすべき: {clean}"
+    );
+    assert!(
+        clean.contains("5h 92%") && clean.contains("7d 97%"),
+        "両方の枠を併記すべき: {clean}"
+    );
+    assert!(stop_file.exists());
+}
+
+#[test]
+fn stop_shows_reset_of_the_triggering_window() {
+    // 停止した枠のリセット時刻を出す。top-level の `resetsAt` は `rateLimitType` が
+    // 指す枠（実データでは overage）のもので、5 時間枠の復帰時刻ではない。
+    let today_noon = chrono::Local::now()
+        .date_naive()
+        .and_hms_opt(12, 0, 0)
+        .expect("valid time")
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .expect("resolvable local time")
+        .timestamp();
+    let input = format!(
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","rateLimitType":"overage","utilization":1.03,"resetsAt":{},"unifiedWindows":{{"five_hour":{{"utilization":0.95,"resetsAt":{}}}}}}}}}"#,
+        today_noon + 7200,
+        today_noon
+    );
+    let clean = strip_ansi(&run_process_with_opts(&input, None, None, 90));
+    assert!(clean.contains("auto-stop"), "{clean}");
+    assert!(
+        clean.contains("resets 12:00"),
+        "停止した枠自身のリセット時刻を出すべき: {clean}"
+    );
+    assert!(
+        !clean.contains("14:00"),
+        "追加課金枠のリセット時刻を出してはいけない: {clean}"
+    );
+}
+
+#[test]
+fn allowed_status_stops_when_gating_window_exceeds_threshold() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    // 閾値を警告閾値より低く設定した場合、`allowed` のままでも超過し得る。
+    // ここで判定しないと停止が漏れる。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.85},"seven_day":{"utilization":0.3}}}}"#;
+    let clean = strip_ansi(&run_process_with_opts(input, None, Some(&stop_file), 80));
+    assert!(
+        clean.contains("85% used (five_hour)"),
+        "allowed でも閾値超過なら停止すべき: {clean}"
+    );
+    assert!(stop_file.exists(), "stop file が作成されるべき");
+}
+
+#[test]
+fn allowed_status_below_threshold_stays_silent() {
+    // 閾値未満の `allowed` は従来どおり黙る（480 件/13 セッションの高頻度イベント）。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.5},"seven_day":{"utilization":0.3}}}}"#;
+    assert_eq!(strip_ansi(&run_process(input)), "");
+}
+
+#[test]
+fn legacy_overage_warning_without_windows_does_not_stop() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    // `unifiedWindows` を持たない形式でも、追加課金枠の使用率では停止しない。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"overage","utilization":1.03}}"#;
+    let clean = strip_ansi(&run_process_with_opts(input, None, Some(&stop_file), 90));
+    assert!(!clean.contains("Rate limit auto-stop"), "{clean}");
+    assert!(!stop_file.exists());
+    assert!(clean.contains("103%"), "警告自体は表示する: {clean}");
+}
+
+#[test]
+fn legacy_gating_warning_without_windows_still_stops() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    // `unifiedWindows` を持たない形式の 5 時間枠警告は従来どおり停止する。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","utilization":0.95}}"#;
+    let clean = strip_ansi(&run_process_with_opts(input, None, Some(&stop_file), 90));
+    assert!(clean.contains("95% used (five_hour)"), "{clean}");
+    assert!(stop_file.exists());
+}
+
+#[test]
+fn rejected_stops_regardless_of_limit_type() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    // `rejected` はリクエストが実際に拒否された結果なので、枠の種類に依らず停止する。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"overage","unifiedWindows":{"five_hour":{"utilization":0.1}}}}"#;
+    let clean = strip_ansi(&run_process_with_opts(input, None, Some(&stop_file), 90));
+    assert!(clean.contains("rejected"), "{clean}");
+    assert!(
+        stop_file.exists(),
+        "5 時間枠が空いていても拒否されたら停止すべき"
+    );
+}
+
+#[test]
+fn malformed_window_utilization_is_ignored() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    // 使用率が読めない枠（文字列・負値）は判定に使えないので無視し、読める枠だけで
+    // 判定する。ここでは 7 日枠だけが有効で閾値未満なので停止しない。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","utilization":0.99,"unifiedWindows":{"five_hour":{"utilization":"broken"},"seven_day":{"utilization":0.2}}}}"#;
+    let clean = strip_ansi(&run_process_with_opts(input, None, Some(&stop_file), 90));
+    assert!(
+        !clean.contains("Rate limit auto-stop"),
+        "壊れた枠を理由に停止してはいけない: {clean}"
+    );
+    assert!(!stop_file.exists());
+    assert!(clean.contains("7d 20%"), "読める枠だけ併記する: {clean}");
 }
 
 #[test]

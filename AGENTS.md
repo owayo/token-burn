@@ -207,7 +207,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - fast mode 状態（`fast_mode_state` が `off` 以外の場合）と、利用できない理由（空でない `fast_mode_disabled_reason`）の表示
 - 異常終了時の `terminal_reason`（`completed` 以外の場合）と `permission_denials` の件数・ツール名表示
 - result の `usage.service_tier`、`usage.speed`、空でない `usage.inference_geo`、`usage.iterations` 件数、`origin.kind` の表示
-- レート制限警告（`rate_limit_event`）の使用率表示、リクエスト拒否通知、および overage（超過枠）の補足情報表示（`overageStatus` / `overageDisabledReason` / `overageResetsAt` / `isUsingOverage`・`overageInUse`）。補足は `allowed` だけでなく `allowed_warning` と `rejected` にも付ける。実データの `rejected` は `overageStatus` / `overageResetsAt` / `isUsingOverage` を伴い、これらを落とすと「5 時間枠の resets 時刻」だけが残って、実際は超過枠まで使い切って復旧が数週間先でも「その時刻まで待てば再開できる」と誤読される。`isUsingOverage` と `overageInUse` は実データで同義の別キーとして両方現れるため、どちらか一方でも true なら `using_overage` を表示する。`allowed_warning` 時に `surpassedThreshold` が含まれている場合は通過済み警告閾値（例: `warning at 90%`）を併記する
+- レート制限警告（`rate_limit_event`）の使用率表示、リクエスト拒否通知、および overage（超過枠）の補足情報表示（`overageStatus` / `overageDisabledReason` / `overageResetsAt` / `isUsingOverage`・`overageInUse`）。補足は `allowed` だけでなく `allowed_warning` と `rejected` にも付ける。自動停止の判定は top-level の `utilization` ではなく `unifiedWindows` の `five_hour` / `seven_day`（＝実際にリクエストを止める枠）の最大使用率で行う（後述「レート制限の自動停止判定」）。実データの `rejected` は `overageStatus` / `overageResetsAt` / `isUsingOverage` を伴い、これらを落とすと「5 時間枠の resets 時刻」だけが残って、実際は超過枠まで使い切って復旧が数週間先でも「その時刻まで待てば再開できる」と誤読される。`isUsingOverage` と `overageInUse` は実データで同義の別キーとして両方現れるため、どちらか一方でも true なら `using_overage` を表示する。`allowed_warning` 時に `surpassedThreshold` が含まれている場合は通過済み警告閾値（例: `warning at 90%`）を併記する
 - リセット時刻（`resetsAt` / `overageResetsAt`）は当日中なら `HH:MM`、翌日以降なら `MM/DD HH:MM` で表示する。時刻だけだと `seven_day` 枠（最大 7 日先）や overage 枠（実データで 28 日先）のリセットが「今日のその時刻」に見え、待てば再開できると誤読される（実ログでは復旧が 1 か月先でも `resets 09:00` としか出ていなかった）
 - レート制限使用率が `rate_limit_threshold`（デフォルト: 95%）を超えた場合、stop file を作成して後続タスクを自動停止。stop file の作成は usage-gate と同じく `create_new` で冪等（並列ワーカーから同時に呼ばれても既存内容は上書きしない）。`AlreadyExists`（別ワーカーが作成済み）は正常系として無視するが、ENOSPC・権限不足等で作成に失敗した場合は黙って握り潰さず、停止シグナル（stop file）が生成されない旨を出力に明示する（`format-stream` はパイプ中段のため exit code が観測されない）
 - APIリトライ（`api_retry`）の試行回数とエラー情報の表示。実データには `error` フィールドの無い api_retry があり、その場合は "unknown" を補わず試行回数（と `error_status` があればそれ）だけを表示する
@@ -219,11 +219,24 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 
 `usage.output_tokens_details.thinking_tokens` は `output_tokens` の内訳で、実ログでは出力トークンの 10〜52% を占めます。これを表示しないと「何にトークンを使ったのか」の最大の内訳が失われるため、非ゼロのときだけ `📊 in:<n> out:<n> (thinking:<n>)` として括弧で添えます（出力トークンへの二重加算はしません）。
 
+### レート制限の自動停止判定
+
+`rate_limit_event` による自動停止は、**実際にリクエストを止める枠だけ**を基準にします。判定に使うのは `rate_limit_info.unifiedWindows` の `five_hour` / `seven_day` の使用率で、その最大値が `rate_limit_threshold` 以上なら stop file を作成します。top-level の `utilization` は `rateLimitType` が指す枠の値でしかないため、そのまま閾値と比較してはいけません。
+
+実データ（13 セッション）には `rateLimitType:"overage"` / `utilization:1.03` の警告が 188 件あり、同じイベントの `unifiedWindows.five_hour` は 0.13、`status` は `allowed_warning`（リクエストは通っている）でした。overage は月次の追加課金枠で、このアカウントでは `overageDisabledReason:"org_level_disabled"` により組織レベルで無効化されており実行に影響しません。top-level を基準にしていた頃は、5 時間枠が 13% でも `⛔ Rate limit auto-stop: 103% used (overage) (warning at 100%) >= threshold 90% resets 09:00` を出して全タスクを止めていました。top-level の `resetsAt` も overage 枠のもの（09:00）で、5 時間枠の実際のリセット（13:10）とは別物です。
+
+- `seven_day_overage_included` は判定に使いません。overage 込みで分母が変わる派生指標で、実データでは常に `seven_day` より小さくなります（`seven_day:0.31` に対し `0.19`）。
+- 停止行には判定に使った枠の名前・使用率・**その枠自身の** `resetsAt` を出し、`[5h 13% / 7d 54%]` の形で実測値を併記します。`surpassedThreshold` は top-level の `rateLimitType` について通過を報告した閾値なので、停止理由が別の枠になったときは併記しません（overage の `warning at 100%` を 5 時間枠の停止行に持ち込むと、その枠の警告閾値だと誤読される）。
+- 停止判定に使わない枠（overage）の警告は `⚠ Rate limit warning: 103% used (overage, no auto-stop) (warning at 100%) [5h 13% / 7d 54%] resets 09:00` として表示だけ行います。判定に使う枠の実測値は主語が何であれ併記します（主語が 5 時間枠でも、警告に出ない 7 日枠の残量や、壊れて判定から外れた枠があることは、なぜ止まった/止まらなかったのかを読むのに要る）。
+- 判定は `allowed` と `allowed_warning` の両方で行います。両者の違いはサーバー側が警告閾値を跨いだかどうかだけで、`rate_limit_threshold` をサーバーの警告閾値より低く設定すると `allowed` のまま超過し得ます（実データの `allowed` は最大 5h 89% / 7d 68%）。表示は従来どおり `allowed` では補足情報があるときだけ出します（1 セッションで 480 件の高頻度イベントのため）。
+- `unifiedWindows` を持たない形式へのフォールバックでは、`rateLimitType` が `overage` のときだけ判定をスキップし、それ以外は従来どおり top-level `utilization` で判定します。使用率が読めない枠（欠損・NaN・負値）は判定から外し、読める枠だけで判定します。判定基準が無い曖昧な警告では停止しない（fail-open）方針です。本当に枯れていれば `rejected` か、実行を止める枠側の警告として届きます。usage-gate という第 2 の停止経路もあるため、ここで曖昧なイベントを理由に全体を止める必要はありません。
+- `rejected` は `rateLimitType` に依らず無条件で停止します（fail-closed）。リクエストが実際に拒否された結果であり、どの枠が原因でも走り続ける意味がありません。
+
 処理済み状態は有効な設定ファイルと同じディレクトリの `state.json` に保存されます（デフォルト: `~/.config/token-burn/state.json`）。エージェント名は昇順、各エージェント内のエントリは処理時刻の降順（同時刻はパス昇順で安定化）で書き出します。内側のマップを `serde_json::Map` へ `collect()` してはいけません。`preserve_order` feature を有効にしていない serde_json の `Map` は `BTreeMap` であり、collect した時点でキー（パス）昇順へ再ソートされ、並べ替えが丸ごと捨てられます（実際の `state.json` も全エージェントがパスのアルファベット順になっていました）。順序を保つために `OrderedEntries` ラッパーで `serialize_map` を直接使います。
 
 `[settings]` の `limit` は 1 以上である必要があります。
 `[settings]` の `parallelism` は 1 以上である必要があります（CLI の `--workers` / `-w` で実行ごとに上書き可能）。
-`[settings]` の `rate_limit_threshold` は 1〜100 の範囲で指定する必要があります（デフォルト: 95）。レート制限使用率がこの閾値を超えると、現在のタスク完了後に後続タスクの実行を停止します。`rejected` イベント受信時も同様に停止します。ai-usage 連携が有効な場合は、各タスク完了後に該当 agent の実使用率（weekly / five_hour の最大）でも `usage-gate` が判定し、閾値以上なら停止します。
+`[settings]` の `rate_limit_threshold` は 1〜100 の範囲で指定する必要があります（デフォルト: 95）。`rate_limit_event` の `unifiedWindows` が示す 5 時間枠 / 7 日枠の使用率がこの閾値以上になると、現在のタスク完了後に後続タスクの実行を停止します（月次の追加課金枠 `overage` の使用率では停止しません。前述「レート制限の自動停止判定」）。`rejected` イベント受信時も同様に停止します。ai-usage 連携が有効な場合は、各タスク完了後に該当 agent の実使用率（weekly / five_hour の最大）でも `usage-gate` が判定し、閾値以上なら停止します。
 `[settings]` の `skip_within` と `cleanup_after` には `d` / `h` / `m` / `s` を使った有効な期間文字列を指定する必要があり、不正または `chrono::Duration` で表現できない値は設定読み込み時にエラーになります。期間自体は表現できても日時の減算範囲を超える場合、`skip_within` は警告後に前回リセット時刻へフォールバックし、レポートクリーンアップはエラーを返します。
 
 ### 処理済み履歴の共有範囲（dedup_scope）
