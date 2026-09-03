@@ -340,64 +340,116 @@ fn format_epoch_millis_clock_out_of_range_returns_none() {
     assert_eq!(format_epoch_millis_clock(i64::MAX), None);
 }
 
-// ===== TEMPORARY AUDIT PROBES 2 =====
+// ===== ストリーム整形の不変条件（旧 TEMPORARY AUDIT PROBES を検証テスト化） =====
 use crate::format_stream::tests::{run_process, strip_ansi};
 
+/// 非同期に届くツールのハートビートは、開いているテキスト行へ連結しない。
+/// 実ログでは text delta の "I" と "'ll" の間に通知が割り込み、単語の途中へ
+/// 連結されていた。
 #[test]
-fn probe_interleave() {
+fn tool_progress_does_not_split_text_mid_word() {
     let input = concat!(
-        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#, "\n",
-        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I"}}}"#, "\n",
-        r#"{"type":"tool_progress","tool_name":"Bash","elapsed_time_seconds":90}"#, "\n",
-        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"'ll do it"}}}"#, "\n",
-        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#, "\n",
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+        "\n",
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I"}}}"#,
+        "\n",
+        r#"{"type":"tool_progress","tool_name":"Bash","elapsed_time_seconds":90}"#,
+        "\n",
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"'ll do it"}}}"#,
+        "\n",
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        "\n",
     );
-    println!("PROBE_A >>>\n{}<<<", strip_ansi(&run_process(input)));
+
+    let clean = strip_ansi(&run_process(input));
+    assert_eq!(
+        clean, "I\n  ⏱ Bash running (1m 30s)\n'll do it\n",
+        "{clean:?}"
+    );
 }
 
+/// 思考ブロックの途中に system 通知が届いても、通知の前後で思考行を独立させ、
+/// ドットの累積は引き継ぐ（250 バイトで 2 ドット → 通知 → さらに 250 バイトで 3 ドット目）。
 #[test]
-fn probe_multi_tool_result_same_user_event() {
+fn task_progress_between_thinking_deltas_keeps_dot_accumulation() {
+    let long = "x".repeat(250);
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}"#.to_string(),
+        format!(
+            r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{long}"}}}}}}"#
+        ),
+        r#"{"type":"system","subtype":"task_progress","description":"working","last_tool_name":"Bash"}"#.to_string(),
+        format!(
+            r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{long}"}}}}}}"#
+        ),
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#.to_string(),
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+    assert_eq!(clean, "💭 ..\n  🔄 working (Bash)\n💭 ...\n", "{clean:?}");
+}
+
+/// 壊れた末尾 SGR 断片（`claude-opus-5[1m]`）は、モデル表示のどの経路でも除去する。
+/// `modelUsage` の内訳だけ正規化してフッターの `model` 行が素通しだと、同じセッションの
+/// 中で表記が食い違う。
+#[test]
+fn model_name_sgr_fragment_is_stripped_in_every_path() {
     let input = concat!(
-        r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Read"},{"type":"tool_use","id":"t2","name":"Grep"}]}}"#, "\n",
-        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"},{"type":"tool_result","tool_use_id":"t2"}]},"tool_use_result":{"filePath":"/only/for/t1","numLines":3}}"#, "\n",
+        r#"{"type":"system","subtype":"init","model":"claude-opus-5[1m]","claude_code_version":"2.1.259"}"#,
+        "\n",
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1","model":"claude-opus-5[1m]"}}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","model":"claude-opus-5[1m]","usage":{"input_tokens":1,"output_tokens":2},"modelUsage":{"claude-opus-5[1m]":{"costUSD":0.1,"outputTokens":2}}}"#,
+        "\n",
     );
-    println!("PROBE_B >>>\n{}<<<", strip_ansi(&run_process(input)));
+
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        !clean.contains("[1m]"),
+        "壊れた SGR 断片が残っている: {clean:?}"
+    );
+    assert!(clean.contains("Session claude-opus-5 "), "{clean:?}");
+    assert!(clean.contains("   model claude-opus-5\n"), "{clean:?}");
+    assert!(clean.contains("claude-opus-5 $0.1000"), "{clean:?}");
 }
 
+/// 1 つの user イベントに複数の tool_result が入る場合、`tool_use_result` は
+/// top-level に 1 つしか無く、どの tool_use に属するか判別できない。実データでは
+/// この形は現れないが、判別できない補足を出し分けようとせず全件へ付ける現在の挙動を
+/// 固定しておく（変えるなら属性の帰属根拠を先に決める必要がある）。
 #[test]
-fn probe_model_normalization_paths() {
+fn multiple_tool_results_in_one_user_event_share_top_level_metadata() {
     let input = concat!(
-        r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1","model":"claude-opus-5[1m]"}}}"#, "\n",
-        r#"{"type":"result","subtype":"success","model":"claude-opus-5[1m]","usage":{"input_tokens":1,"output_tokens":2},"modelUsage":{"claude-opus-5[1m]":{"costUSD":0.1,"outputTokens":2}}}"#, "\n",
+        r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Read"},{"type":"tool_use","id":"t2","name":"Grep"}]}}"#,
+        "\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"},{"type":"tool_result","tool_use_id":"t2"}]},"tool_use_result":{"filePath":"/only/for/t1","numLines":3}}"#,
+        "\n",
     );
-    println!("PROBE_C >>>\n{}<<<", strip_ansi(&run_process(input)));
+
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("✓ Read ["), "{clean:?}");
+    assert!(clean.contains("✓ Grep ["), "{clean:?}");
 }
 
+/// スカラーだけの JSON 行（`42` / `true` / `"..."`）は stream-json ではないが、
+/// パースは通るため `type` 無しの未知イベントとして無視される。非 JSON 行だけが
+/// そのまま出力される、という現在の切り分けを固定する。
 #[test]
-fn probe_thinking_interleave() {
-    let mut input = String::new();
-    input.push_str(r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}"#);
-    input.push('\n');
-    input.push_str(&format!(r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{}"}}}}}}"#, "x".repeat(250)));
-    input.push('\n');
-    input.push_str(r#"{"type":"system","subtype":"task_progress","description":"working","last_tool_name":"Bash"}"#);
-    input.push('\n');
-    input.push_str(&format!(r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{}"}}}}}}"#, "y".repeat(250)));
-    input.push('\n');
-    input.push_str(r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#);
-    input.push('\n');
-    println!("PROBE_D >>>\n{:?}<<<", run_process(&input));
-}
-
-#[test]
-fn probe_valid_json_scalar_line_dropped() {
+fn scalar_json_lines_are_ignored_and_plain_lines_pass_through() {
     let input = "42\n\"plain text line\"\nnot json at all\ntrue\n";
-    println!("PROBE_E >>>\n{:?}<<<", run_process(input));
+    assert_eq!(run_process(input), "not json at all\n");
 }
 
+/// `allowed` でも判定枠の使用率が閾値以上なら停止する。`allowed` と
+/// `allowed_warning` の違いはサーバ側が警告閾値を跨いだかどうかだけで、
+/// `rate_limit_threshold` をサーバの警告閾値より低くすると `allowed` のまま超過する。
 #[test]
-fn probe_rate_limit_allowed_high_utilization() {
+fn allowed_status_still_triggers_auto_stop_over_threshold() {
     let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"seven_day","utilization":0.99}}"#;
-    let out = run_process(input);
-    println!("PROBE_F >>> {:?}", strip_ansi(&out));
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.contains("Rate limit auto-stop: 99% used (seven_day) >= threshold 95%"),
+        "{clean:?}"
+    );
 }

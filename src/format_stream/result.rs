@@ -262,9 +262,18 @@ fn write_cache_summary(summary: &StreamSummary, out: &mut impl Write) -> Result<
 }
 
 /// モデル名と stop_reason（end_turn 以外）を表示する。
+///
+/// モデル名は `normalize_model_name` を通す。`summary.model` は `message_start.model`
+/// と `result.model` から来るが、Claude Code は同じセッションのモデル ID を
+/// `init.model` や `modelUsage` のキーへ `claude-opus-5[1m]` の形（ESC を欠いた
+/// 壊れた SGR 断片付き）で載せる。セッション情報行とモデル別内訳では既に除去して
+/// いるので、ここだけ素通しすると同じセッションの中で表記が食い違う。
 fn write_model_stop(summary: &StreamSummary, out: &mut impl Write) -> Result<()> {
-    if let Some(model) = &summary.model
-        && !model.is_empty()
+    if let Some(model) = summary
+        .model
+        .as_deref()
+        .map(normalize_model_name)
+        .filter(|model| !model.is_empty())
     {
         writeln!(out, "\x1b[2m   model {}\x1b[0m", model)?;
     }

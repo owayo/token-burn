@@ -3,7 +3,7 @@
 //! 各 stream-json の type / delta type に対する分類を直接固定する。
 
 use crate::format_stream::blocks::{
-    BlockKind, ContentBlockState, block_kind, break_open_line, finalize_block,
+    BlockKind, ContentBlockState, ThinkingProgress, block_kind, break_open_line, finalize_block,
     infer_block_kind_from_delta,
 };
 use std::collections::HashMap;
@@ -187,4 +187,95 @@ fn break_open_line_ignores_tool_use_blocks() {
 fn break_open_line_on_empty_map_writes_nothing() {
     let mut blocks: HashMap<usize, ContentBlockState> = HashMap::new();
     assert_eq!(render_break(&mut blocks), "");
+}
+
+// --- 思考進捗（ThinkingProgress）の情報源とドット数 ---
+
+/// Claude Code の実データは `thinking` が空文字で、進捗は `estimated_tokens`（増分）に
+/// だけ入る。50 トークンごとに 1 ドット出す。
+#[test]
+fn thinking_progress_counts_dots_from_estimated_tokens() {
+    let mut progress = ThinkingProgress::default();
+    assert_eq!(progress.advance("", Some(50)), 1);
+    assert_eq!(progress.advance("", Some(100)), 2);
+    assert_eq!(progress.advance("", Some(150)), 3);
+}
+
+/// 50 未満の増分は端数として持ち越し、累積が 50 に届いた時点で 1 ドット出す。
+#[test]
+fn thinking_progress_carries_over_sub_dot_token_increments() {
+    let mut progress = ThinkingProgress::default();
+    assert_eq!(progress.advance("", Some(30)), 0);
+    assert_eq!(progress.advance("", Some(30)), 1, "累積 60 で 1 ドット");
+    assert_eq!(progress.advance("", Some(40)), 1, "累積 100 で 2 ドット目");
+}
+
+/// ブロック終端の `estimated_tokens: null`（実データで 1,284 件）は進捗を増やさない。
+#[test]
+fn thinking_progress_ignores_null_estimated_tokens() {
+    let mut progress = ThinkingProgress::default();
+    assert_eq!(progress.advance("", Some(100)), 2);
+    assert_eq!(progress.advance("", None), 0);
+    assert_eq!(
+        progress.advance("", Some(50)),
+        1,
+        "null の後も累積は保たれる"
+    );
+}
+
+/// 本文も推定トークンも無いデルタでは情報源を確定させない。
+/// ここで Bytes / Tokens のどちらかへ倒すと、後続の本来の情報源が使えなくなる。
+#[test]
+fn thinking_progress_stays_unknown_without_any_signal() {
+    let mut progress = ThinkingProgress::default();
+    assert_eq!(progress.advance("", None), 0);
+    assert_eq!(
+        progress.advance("", Some(100)),
+        2,
+        "空デルタの後でもトークン情報源を選べるべき"
+    );
+}
+
+/// 本文が返る形式では 100 バイトごとに 1 ドット出す。
+#[test]
+fn thinking_progress_counts_dots_from_body_bytes() {
+    let mut progress = ThinkingProgress::default();
+    assert_eq!(progress.advance(&"a".repeat(250), None), 2);
+    assert_eq!(
+        progress.advance(&"a".repeat(50), None),
+        1,
+        "累積 300 で 3 ドット目"
+    );
+}
+
+/// 情報源はブロック単位で固定する。両方を加算するとドットが二重計上される。
+#[test]
+fn thinking_progress_does_not_switch_source_midway() {
+    let mut tokens_first = ThinkingProgress::default();
+    assert_eq!(tokens_first.advance("", Some(100)), 2);
+    assert_eq!(
+        tokens_first.advance(&"a".repeat(1000), None),
+        0,
+        "トークン情報源に固定した後は本文バイトを数えない"
+    );
+
+    let mut bytes_first = ThinkingProgress::default();
+    assert_eq!(bytes_first.advance(&"a".repeat(100), None), 1);
+    assert_eq!(
+        bytes_first.advance("", Some(1000)),
+        0,
+        "バイト情報源に固定した後は推定トークンを数えない"
+    );
+}
+
+/// 壊れた巨大値でも飽和加算で panic させない（debug build のオーバーフロー回避）。
+#[test]
+fn thinking_progress_saturates_on_absurd_token_values() {
+    let mut progress = ThinkingProgress::default();
+    progress.advance("", Some(u64::MAX));
+    assert_eq!(
+        progress.advance("", Some(u64::MAX)),
+        0,
+        "飽和後は増分ゼロになるだけで panic しない"
+    );
 }

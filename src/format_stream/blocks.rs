@@ -17,13 +17,80 @@ pub(crate) enum BlockKind {
     Unknown,
 }
 
+/// 進捗ドットを 1 つ出すのに必要な思考トークン数。
+///
+/// 実データの `thinking_delta` は 50 / 100 / 150 トークン単位で飛び飛びに届き、
+/// 1 ブロックの合計は 100〜500 トークン程度。50 刻みなら 1 ブロック 2〜10 ドットに
+/// 収まり、進捗は読み取れてログはうるさくならない。
+const THINKING_TOKENS_PER_DOT: u64 = 50;
+
+/// 進捗ドットを 1 つ出すのに必要な思考本文のバイト数。
+const THINKING_BYTES_PER_DOT: usize = 100;
+
+/// 思考ブロックの進捗をどの情報源で数えているか。
+///
+/// Claude Code の `thinking_delta` は思考本文を伏せるため `thinking` が空文字で届き、
+/// 進捗は `estimated_tokens`（増分トークン数）にだけ入る。一方で本文が返る形式も
+/// 想定し得るので、ブロックごとに最初に観測できた情報源へ固定する。両方を同時に
+/// 加算するとドットが二重計上されるため、いったん決めた情報源は切り替えない。
+#[derive(Debug, Default)]
+pub(crate) enum ThinkingProgress {
+    /// まだどちらの情報源も観測していない。
+    #[default]
+    Unknown,
+    /// `estimated_tokens` の累積で数える。
+    Tokens { total: u64 },
+    /// 思考本文のバイト数の累積で数える。
+    Bytes { total: usize },
+}
+
+impl ThinkingProgress {
+    /// 1 つの `thinking_delta` を取り込み、新たに出力すべきドット数を返す。
+    pub(crate) fn advance(&mut self, text: &str, estimated_tokens: Option<u64>) -> usize {
+        match self {
+            Self::Unknown => {
+                if let Some(delta) = estimated_tokens {
+                    *self = Self::Tokens { total: delta };
+                    usize::try_from(delta / THINKING_TOKENS_PER_DOT).unwrap_or(usize::MAX)
+                } else if !text.is_empty() {
+                    let total = text.len();
+                    *self = Self::Bytes { total };
+                    total / THINKING_BYTES_PER_DOT
+                } else {
+                    // 本文も推定トークンも無いデルタ（ブロック終端の
+                    // `estimated_tokens: null` 等）では情報源を確定させない。
+                    0
+                }
+            }
+            Self::Tokens { total } => {
+                let Some(delta) = estimated_tokens else {
+                    return 0;
+                };
+                let before = *total / THINKING_TOKENS_PER_DOT;
+                *total = total.saturating_add(delta);
+                let after = *total / THINKING_TOKENS_PER_DOT;
+                usize::try_from(after - before).unwrap_or(usize::MAX)
+            }
+            Self::Bytes { total } => {
+                if text.is_empty() {
+                    return 0;
+                }
+                let before = *total / THINKING_BYTES_PER_DOT;
+                *total = total.saturating_add(text.len());
+                let after = *total / THINKING_BYTES_PER_DOT;
+                after - before
+            }
+        }
+    }
+}
+
 pub(crate) struct ContentBlockState {
     pub(crate) kind: BlockKind,
     pub(crate) tool_name: String,
     pub(crate) tool_input: String,
     pub(crate) text: String,
-    /// 思考デルタの累積バイト数。100 バイトごとに進捗ドットを 1 つ出すために使う。
-    pub(crate) thinking_bytes: usize,
+    /// 思考デルタの進捗。情報源（推定トークン / 本文バイト）はブロック単位で固定する。
+    pub(crate) thinking_progress: ThinkingProgress,
     pub(crate) thinking_started: bool,
 }
 
@@ -34,7 +101,7 @@ impl ContentBlockState {
             tool_name: String::new(),
             tool_input: String::new(),
             text: String::new(),
-            thinking_bytes: 0,
+            thinking_progress: ThinkingProgress::Unknown,
             thinking_started: false,
         }
     }

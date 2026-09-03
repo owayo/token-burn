@@ -705,7 +705,24 @@ fn detail_ask_user_question(v: &serde_json::Value) -> DetailResult {
     DetailResult::Fallback
 }
 
-/// Tavily 検索: クエリと max/range/depth 属性を表示。クエリが空なら汎用フォールバックへ。
+/// ドメイン絞り込み配列を `site=<domain>` / `site=<n> domains` の属性へ整形する。
+/// 空配列・非配列なら何も返さない（属性を増やさない）。
+fn domain_filter_attr(value: &serde_json::Value, label: &str) -> Option<String> {
+    let domains: Vec<&str> = value
+        .as_array()?
+        .iter()
+        .filter_map(|d| d.as_str())
+        .filter(|d| !d.is_empty())
+        .collect();
+    match domains.len() {
+        0 => None,
+        1 => Some(format!("{label}={}", truncate_inline(domains[0], 40))),
+        n => Some(format!("{label}={n} domains")),
+    }
+}
+
+/// Tavily 検索: クエリと max/range/depth/日付/ドメイン属性を表示。
+/// クエリが空なら汎用フォールバックへ。
 fn detail_tavily_search(v: &serde_json::Value) -> DetailResult {
     let query = v["query"].as_str().unwrap_or("");
     if !query.is_empty() {
@@ -734,6 +751,26 @@ fn detail_tavily_search(v: &serde_json::Value) -> DetailResult {
         if let Some(days) = v["days"].as_u64() {
             attrs.push(format!("days={days}"));
         }
+        // start_date / end_date は time_range / days と同じ「検索対象期間の絞り込み」で、
+        // 実データでは time_range(2 件)より start_date(13 件)の方が主流。落とすと日付で
+        // 絞った検索が期間無制限の検索と区別できない。
+        if let Some(start) = v["start_date"].as_str()
+            && !start.is_empty()
+        {
+            attrs.push(format!("start={}", truncate_inline(start, 20)));
+        }
+        if let Some(end) = v["end_date"].as_str()
+            && !end.is_empty()
+        {
+            attrs.push(format!("end={}", truncate_inline(end, 20)));
+        }
+        // ドメイン絞り込みは検索対象そのものを置き換える強いフィルタで、実データでは
+        // `["ast-grep.github.io"]` のように単一ドメインへ限定した検索が 13 件ある。
+        // WebSearch では allowed/blocked の件数を既に出しているのに、Tavily 側だけ
+        // 落ちていた。件数だけだと「どのドメインか」が分からないので、1 件なら
+        // ドメイン名そのものを出す。
+        attrs.extend(domain_filter_attr(&v["include_domains"], "site"));
+        attrs.extend(domain_filter_attr(&v["exclude_domains"], "-site"));
         if attrs.is_empty() {
             return DetailResult::Handled(truncate_inline(query, 100));
         }

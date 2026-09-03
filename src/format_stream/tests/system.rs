@@ -292,9 +292,8 @@ fn vcs_state_changed_without_kind_writes_nothing() {
 /// 空文字の branch は括弧ごと省略する。
 #[test]
 fn vcs_state_changed_ignores_empty_branch() {
-    let out = render(
-        r#"{"type":"system","subtype":"vcs_state_changed","kind":"push","branch":""}"#,
-    );
+    let out =
+        render(r#"{"type":"system","subtype":"vcs_state_changed","kind":"push","branch":""}"#);
     assert!(out.contains("VCS push"), "{out:?}");
     assert!(!out.contains('('), "{out:?}");
 }

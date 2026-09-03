@@ -153,15 +153,29 @@ pub fn build_plan(
 /// 成功時は raw stdout を返す。stdout/stderr は別スレッドで並行に drain するため、
 /// 出力サイズがパイプバッファを超えてもデッドロックしない。非ゼロ終了・spawn 失敗・
 /// タイムアウトはエラー。呼び出し側で fail-soft（キャッシュ初期化スキップ）にする。
+///
+/// env は「空文字の値は unset」という設定側の規約（`env_prefix_parts` が `env -u KEY`
+/// へ変換するのと同じ意味）に合わせて適用する。`envs()` へ素通しすると空文字がそのまま
+/// 子プロセスへ渡り、`CLAUDE_CONFIG_DIR=""` を「既定に戻す」つもりで書いた profile で
+/// ai-usage が cwd 相対の設定ディレクトリを見に行って別アカウントの使用率を拾う。
+/// この結果は起動時キャッシュとして usage-gate と共有されるため、誤った使用率で
+/// 停止判定が走る。
 fn spawn_ai_usage_sync_with_timeout(
     command: &[String],
     env: &std::collections::BTreeMap<String, String>,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
     anyhow::ensure!(!command.is_empty(), "ai_usage.command is empty");
-    let mut child = std::process::Command::new(&command[0])
-        .args(&command[1..])
-        .envs(env)
+    let mut builder = std::process::Command::new(&command[0]);
+    builder.args(&command[1..]);
+    for (key, value) in env {
+        if value.is_empty() {
+            builder.env_remove(key);
+        } else {
+            builder.env(key, value);
+        }
+    }
+    let mut child = builder
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -901,6 +915,62 @@ mod tests {
         );
         let bytes = result.expect("should succeed");
         assert_eq!(bytes, b"hello world");
+    }
+
+    /// 設定の env は「空文字の値は unset」という規約（シェル側は `env -u KEY`）で扱う。
+    /// `envs()` へ素通しすると空文字がそのまま子へ渡り、`CLAUDE_CONFIG_DIR=""` を
+    /// 「既定に戻す」つもりで書いた profile で ai-usage が cwd 相対の設定ディレクトリを
+    /// 見に行って別アカウントの使用率を拾う。その結果は起動時キャッシュとして
+    /// usage-gate と共有されるため、誤った使用率で停止判定が走る。
+    ///
+    /// `${VAR-<unset>}` は「未設定」のときだけ既定値へ落ちるため、空文字を素通しする
+    /// 旧実装では空文字が返り、除去する現実装では `<unset>` が返る。テストプロセスの
+    /// 環境を書き換えなくても両者を区別できる（`std::env::set_var` は並列実行される
+    /// 他テストの `getenv` と競合し得るので使わない）。
+    #[test]
+    fn spawn_ai_usage_sync_unsets_env_keys_with_empty_value() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("TOKEN_BURN_ENV_UNSET_PROBE".to_string(), String::new());
+
+        let bytes = spawn_ai_usage_sync_with_timeout(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf '%s' \"${TOKEN_BURN_ENV_UNSET_PROBE-<unset>}\"".to_string(),
+            ],
+            &env,
+            Duration::from_secs(5),
+        )
+        .expect("should succeed");
+
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "<unset>",
+            "空文字の env は子プロセスへ空文字として渡さず、未設定にするべき"
+        );
+    }
+
+    /// 非空の値は従来どおり子プロセスへ渡す。
+    #[test]
+    fn spawn_ai_usage_sync_passes_non_empty_env_values() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "TOKEN_BURN_ENV_SET_PROBE".to_string(),
+            "/tmp/profile".to_string(),
+        );
+
+        let bytes = spawn_ai_usage_sync_with_timeout(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf '%s' \"$TOKEN_BURN_ENV_SET_PROBE\"".to_string(),
+            ],
+            &env,
+            Duration::from_secs(5),
+        )
+        .expect("should succeed");
+
+        assert_eq!(String::from_utf8_lossy(&bytes), "/tmp/profile");
     }
 
     #[test]

@@ -1312,3 +1312,156 @@ fn ignored_tool_progress_keeps_open_line_intact() {
         "無視イベントで本文を分断してはいけない: {clean:?}"
     );
 }
+
+// --- 非 JSON 行（`2>&1` で合流した stderr / ラッパーバナー）の割り込み ---
+
+/// タスクスクリプトは `claude ... 2>&1 | format-stream` で stderr を同じパイプへ
+/// 合流させるため、`API Error: ...` のような非 JSON 行が思考ブロックの途中に届く。
+/// 開いている行を閉じずに書くと `💭 ..API Error: ...` の形で連結され、行末のリセットが
+/// dim を打ち消して以降の進捗表示まで崩れる。
+#[test]
+fn process_non_json_line_breaks_open_thinking_line() {
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":100}}}"#,
+        "API Error: Connection closed mid-response.",
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":100}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+    assert!(
+        clean.contains("💭 ..\nAPI Error: Connection closed mid-response.\n💭 "),
+        "非 JSON 行の前後で思考行が独立しているべき: {clean:?}"
+    );
+}
+
+/// 開いているテキスト行の途中に非 JSON 行が届いた場合も、本文へ連結しない。
+#[test]
+fn process_non_json_line_breaks_open_text_line() {
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I"}}}"#,
+        "npm warn deprecated foo@1.0.0",
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"'ll do it"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+    assert!(
+        clean.contains("I\nnpm warn deprecated foo@1.0.0\n"),
+        "非 JSON 行がテキスト本文へ連結されないこと: {clean:?}"
+    );
+    assert!(clean.contains("'ll do it"), "{clean:?}");
+}
+
+/// ブロックを開いていない状態の非 JSON 行は、余計な改行を足さずそのまま出す
+/// （実データのラッパーバナーはセッション先頭に 1 行だけ届く）。
+#[test]
+fn process_non_json_line_without_open_block_is_not_padded() {
+    let output = run_process("claude-wrapper: CLAUDE_CONFIG_DIR=~/.claude\n");
+    assert_eq!(output, "claude-wrapper: CLAUDE_CONFIG_DIR=~/.claude\n");
+}
+
+// --- 思考進捗ドット（estimated_tokens 経路） ---
+
+/// 実データ形式（本文は空文字、進捗は estimated_tokens）でドットが出ること。
+/// 本文バイト数だけを見ていた頃は実データ 7,504 件すべてでドットが 0 個になり、
+/// 中身のない `💭 ` 行だけが並んでいた。
+#[test]
+fn process_thinking_dots_come_from_estimated_tokens() {
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":50}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":100}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":null}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+    assert!(clean.contains("💭 ..."), "50+100 で 3 ドット: {clean:?}");
+    assert!(!clean.contains("💭 ...."), "null で増えないこと: {clean:?}");
+}
+
+/// 進捗を何も報せないデルタ（本文なし・estimated_tokens なし）だけで終わる思考
+/// ブロックでは、中身のない `💭 ` 行を出さない。
+#[test]
+fn process_thinking_without_progress_signal_emits_nothing() {
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":null}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+    assert!(!clean.contains('\u{1f4ad}'), "{clean:?}");
+}
+
+// --- 合成 user メッセージ（hook feedback） ---
+
+/// Stop フックが exit 2 / タイムアウトで終わると、その内容が合成 user メッセージとして
+/// 差し戻される。`hook_response` にも `notification` にも現れないため、これを表示しないと
+/// 無人実行で自動コミットが走らなかった理由をログから追えない。
+#[test]
+fn process_shows_stop_hook_feedback_from_synthetic_user_message() {
+    let input = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Stop hook feedback:\n⏱ Stop hook timed out after 120s: cargo"}]},"isSynthetic":true}"#;
+
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.contains("⚠ Hook feedback (Stop): ⏱ Stop hook timed out after 120s: cargo"),
+        "{clean:?}"
+    );
+}
+
+/// `<Event> hook feedback:` は Stop 以外の hook_event でも同じ形で組み立てられる。
+#[test]
+fn process_shows_hook_feedback_for_other_hook_events() {
+    let input = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"PostToolUse:Bash hook feedback:\nblocked by policy"}]},"isSynthetic":true}"#;
+
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.contains("⚠ Hook feedback (PostToolUse:Bash): blocked by policy"),
+        "{clean:?}"
+    );
+}
+
+/// スキル本文の注入も `isSynthetic` で届くが、SKILL.md 全文を含んで巨大になり
+/// `Skill` ツール行と重複するため表示しない。
+#[test]
+fn process_ignores_synthetic_skill_body_injection() {
+    let input = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /skills/web-research\n\n# Web Research Skill\n\n本文..."}]},"isSynthetic":true}"#;
+
+    let clean = strip_ansi(&run_process(input));
+    assert_eq!(clean, "", "スキル本文は表示しない: {clean:?}");
+}
+
+/// `isSynthetic` でない通常の user メッセージ（初回プロンプト等）は表示しない。
+#[test]
+fn process_ignores_non_synthetic_user_text() {
+    let input = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Stop hook feedback:\nshould not show"}]}}"#;
+
+    let clean = strip_ansi(&run_process(input));
+    assert_eq!(clean, "", "{clean:?}");
+}
+
+/// 開いている思考行の途中に届いても、独立した行として書く。
+#[test]
+fn process_hook_feedback_breaks_open_thinking_line() {
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":50}}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Stop hook feedback:\nhook error"}]},"isSynthetic":true}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let clean = strip_ansi(&run_process(&input));
+    assert!(
+        clean.contains("💭 .\n  ⚠ Hook feedback (Stop): hook error\n"),
+        "{clean:?}"
+    );
+}

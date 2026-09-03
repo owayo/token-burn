@@ -909,3 +909,66 @@ fn tavily_search_underscore_variant_shows_topic() {
     assert!(detail.contains("topic=general"), "got: {detail}");
     assert!(detail.contains("days=3"), "got: {detail}");
 }
+
+// --- Tavily 検索の期間・ドメイン絞り込み ---
+
+/// 実データ: {"query":"ast-grep release changelog","start_date":"2026-08-01",...}
+/// start_date は time_range / days と同じ期間フィルタで、実データでは
+/// time_range(2 件)より start_date(13 件)の方が主流。
+#[test]
+fn tavily_search_shows_start_and_end_date() {
+    let input = r#"{"query":"ast-grep release changelog","start_date":"2026-08-01","end_date":"2026-08-31"}"#;
+    let detail = extract_tool_detail("mcp__tavily__tavily-search", input);
+    assert!(detail.contains("start=2026-08-01"), "got: {detail}");
+    assert!(detail.contains("end=2026-08-31"), "got: {detail}");
+}
+
+/// 実データ: {"include_domains":["ast-grep.github.io"]}
+/// 単一ドメインへ限定した検索は通常の Web 検索と別物なので、ドメイン名まで出す。
+#[test]
+fn tavily_search_shows_single_include_domain_by_name() {
+    let input = r#"{"query":"outline rule engine","include_domains":["ast-grep.github.io"]}"#;
+    let detail = extract_tool_detail("mcp__tavily__tavily_search", input);
+    assert!(detail.contains("site=ast-grep.github.io"), "got: {detail}");
+}
+
+/// 実データ: {"include_domains":["docs.coderabbit.ai","coderabbit.ai"]}
+/// 複数ドメインは 1 行に収まらないので件数で表す。
+#[test]
+fn tavily_search_shows_multiple_domains_as_count() {
+    let input = r#"{"query":"q","include_domains":["docs.coderabbit.ai","coderabbit.ai"],"exclude_domains":["a.example","b.example","c.example"]}"#;
+    let detail = extract_tool_detail("mcp__tavily__tavily-search", input);
+    assert!(detail.contains("site=2 domains"), "got: {detail}");
+    assert!(detail.contains("-site=3 domains"), "got: {detail}");
+}
+
+/// 除外ドメインのみの指定でも表示する。
+#[test]
+fn tavily_search_shows_single_exclude_domain() {
+    let input = r#"{"query":"q","exclude_domains":["spam.example"]}"#;
+    let detail = extract_tool_detail("mcp__tavily__tavily_search", input);
+    assert!(detail.contains("-site=spam.example"), "got: {detail}");
+    assert!(!detail.contains("site=spam.example ("), "got: {detail}");
+}
+
+/// 空配列・空文字・非配列は属性を増やさない（ノイズにしない）。
+#[test]
+fn tavily_search_ignores_empty_domain_filters() {
+    let input = r#"{"query":"q","include_domains":[],"exclude_domains":[""],"start_date":"","end_date":""}"#;
+    let detail = extract_tool_detail("mcp__tavily__tavily-search", input);
+    assert!(!detail.contains("site="), "got: {detail}");
+    assert!(!detail.contains("start="), "got: {detail}");
+    assert!(!detail.contains("end="), "got: {detail}");
+    assert_eq!(detail, "q", "got: {detail}");
+}
+
+/// 期間もドメインも無い通常検索の表示は変えない（回帰防止）。
+#[test]
+fn tavily_search_without_filters_keeps_previous_output() {
+    let input = r#"{"query":"rust async","max_results":5,"search_depth":"advanced"}"#;
+    let detail = extract_tool_detail("mcp__tavily__tavily-search", input);
+    assert_eq!(
+        detail, "rust async (max=5, depth=advanced)",
+        "got: {detail}"
+    );
+}

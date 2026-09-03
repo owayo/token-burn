@@ -561,6 +561,25 @@ impl Config {
         if out.is_empty() {
             anyhow::bail!("No runtime agents after expansion");
         }
+        // 展開名は state.json のキー・レポートディレクトリ名・`--agent` の指定子を兼ねる
+        // ため、全体で一意でなければならない。重複すると
+        //   - `--agent <name>` が常に先頭の 1 件しか選べず、2 件目が起動不能になる
+        //   - 別々のエージェントが同じ state.json キーへ書き、既定の dedup_scope="agent"
+        //     （エージェントごとに完全分離）が黙って破れて処理済み履歴が混ざる
+        //   - レポートディレクトリ名が衝突する
+        // という実害が出る。同一 agent 内の profile 重複参照は既にエラーにしているので、
+        // `[[agents]]` の name 重複や「profile 展開名が別 agent の名前と衝突する」経路
+        // （agent `claude` の profiles=["work","home"] → `claude-home` と、別途定義した
+        // agent `claude-home`）も同じ方針で弾く。
+        let mut seen_names = std::collections::HashSet::new();
+        for a in &out {
+            if !seen_names.insert(a.name.as_str()) {
+                anyhow::bail!(
+                    "Duplicate agent name after expansion: '{}' (agent names and `<agent>-<profile>` expansions must be unique)",
+                    a.name
+                );
+            }
+        }
         Ok(out)
     }
 }
@@ -1040,11 +1059,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_allows_duplicate_agent_names() {
-        // 同名エージェントは許容されている（重複禁止ルールなし）
+    fn validate_rejects_duplicate_agent_names() {
+        // 展開名は state.json のキー・レポート名・`--agent` の指定子を兼ねるため、
+        // 重複すると 2 件目が起動不能になり、処理済み履歴も混ざる。
         let mut config = base_config();
         config.agents.push(config.agents[0].clone());
-        assert!(config.validate().is_ok());
+
+        let err = config
+            .validate()
+            .expect_err("同名エージェントは拒否されるべき");
+        assert!(err.to_string().contains("Duplicate agent name"), "{err}");
     }
 
     #[test]
@@ -1230,6 +1254,60 @@ mod tests {
         assert_eq!(agents[1].name, "agent-home");
         assert_eq!(agents[0].ai_usage.as_ref().unwrap().profile, "Work");
         assert_eq!(agents[0].provider.as_deref(), Some("claude"));
+    }
+
+    /// profile 展開名が別 agent の名前と衝突する構成を弾く。
+    /// 展開名は `state.json` のキー・レポート名・`--agent` の指定子を兼ねるため、
+    /// 衝突すると 2 件目が起動不能になり、処理済み履歴も混ざる。
+    #[test]
+    fn expand_runtime_agents_rejects_name_collision_with_other_agent() {
+        let mut config = base_config();
+        config.agents[0].name = "claude".to_string();
+        config.agents[0].provider = Some("claude".to_string());
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["work", "home"], None));
+        // `claude` + profiles(work/home) は `claude-work` / `claude-home` へ展開される。
+        // そこへラッパー起動用の agent `claude-home` を別途定義すると名前が衝突する。
+        config.agents.push(Agent {
+            name: "claude-home".to_string(),
+            command: vec!["claude-home".to_string()],
+            reset_weekday: Some("monday".to_string()),
+            reset_time: Some("09:00".to_string()),
+            timezone: Some("UTC".to_string()),
+            ..Default::default()
+        });
+        config.ai_usage = Some(ai_usage_global(
+            true,
+            vec![("work", "Work"), ("home", "Home")],
+        ));
+
+        let err = config
+            .expand_runtime_agents()
+            .expect_err("展開名の衝突は拒否されるべき");
+        assert!(err.to_string().contains("claude-home"), "{err}");
+    }
+
+    /// 単一 profile の agent は展開名が agent 名のままなので、別 agent と衝突しない限り通る。
+    #[test]
+    fn expand_runtime_agents_allows_distinct_names_across_agents() {
+        let mut config = base_config();
+        config.agents[0].name = "claude".to_string();
+        config.agents[0].provider = Some("claude".to_string());
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["work"], None));
+        config.agents.push(Agent {
+            name: "claude-home".to_string(),
+            provider: Some("claude".to_string()),
+            command: vec!["claude-home".to_string()],
+            ai_usage: Some(agent_ai_usage(vec!["home"], None)),
+            ..Default::default()
+        });
+        config.ai_usage = Some(ai_usage_global(
+            true,
+            vec![("work", "Work"), ("home", "Home")],
+        ));
+
+        let agents = config.expand_runtime_agents().expect("展開できるべき");
+        let names: Vec<_> = agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["claude", "claude-home"]);
     }
 
     #[test]

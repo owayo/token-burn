@@ -59,9 +59,8 @@ pub(crate) fn handle_stream_event(
                 state.tool_id_map.insert(id.to_string(), name.to_string());
             }
 
-            if current.kind == BlockKind::Thinking {
-                current.ensure_thinking_started(out)?;
-            }
+            // 思考ブロックの `💭 ` は最初の進捗ドットと同時に書き出す。ブロック開始で
+            // 先に書くと、進捗が 1 ドットにも満たない思考で中身のない行だけが残る。
         }
         "content_block_delta" => {
             let delta = &event["delta"];
@@ -81,12 +80,22 @@ pub(crate) fn handle_stream_event(
 
             match dt {
                 "thinking_delta" => {
-                    if let Some(text) = delta["thinking"].as_str() {
+                    // Claude Code は思考本文を伏せるため `thinking` は空文字で届き、
+                    // 進捗は `estimated_tokens`（増分）にだけ入る。本文のバイト長だけを
+                    // 見ていた頃は実データ 7,504 件すべてでドットが 0 個になり、
+                    // 中身のない `💭 ` 行だけが並んでいた。
+                    let text = delta["thinking"].as_str().unwrap_or("");
+                    let estimated_tokens = delta["estimated_tokens"].as_u64();
+                    // ブロック終端の `estimated_tokens: null` かつ本文なしのデルタ
+                    // （実データで 1,284 件）は進捗を何も報せないので、思考行を
+                    // 開かない。ドットに満たない量でも進捗があるなら `💭 ` は出す。
+                    // 短い思考が完全に消えると、本文が伏せられる形式では
+                    // 「考えていた区間そのもの」がログから失われるため。
+                    let has_progress = !text.is_empty() || estimated_tokens.is_some();
+                    let dots = block.thinking_progress.advance(text, estimated_tokens);
+                    if has_progress {
                         block.ensure_thinking_started(out)?;
-                        let prev = block.thinking_bytes / 100;
-                        block.thinking_bytes += text.len();
-                        let curr = block.thinking_bytes / 100;
-                        for _ in prev..curr {
+                        for _ in 0..dots {
                             write!(out, ".")?;
                         }
                         out.flush()?;

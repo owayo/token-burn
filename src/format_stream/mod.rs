@@ -23,7 +23,7 @@ use result::handle_result;
 use state::{StreamState, StreamSummary};
 use stream::handle_stream_event;
 use system::handle_system_event;
-use tool_result::handle_tool_result_event;
+use tool_result::{handle_synthetic_user_event, handle_tool_result_event};
 use tools::progress::handle_tool_progress;
 
 /// `claude -p` の stream-json 出力を読みやすいテキストに変換する。
@@ -63,8 +63,20 @@ fn process(
         let v: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => {
-                // JSON以外 — そのまま出力（例: codex のプレーンテキスト出力）
-                writeln!(out, "{}", line)?;
+                // JSON 以外 — そのまま出力（例: codex のプレーンテキスト出力、
+                // claude のラッパーバナー、`2>&1` で合流した stderr）。
+                //
+                // 開きっぱなしの思考/テキスト行を閉じてから独立行へ書く。タスク
+                // スクリプトは `claude ... 2>&1 | format-stream` で stderr を同じ
+                // パイプへ合流させるため、`API Error: Connection closed mid-response.`
+                // のような stderr 行が思考ブロックの途中に到着し得る。直接書くと
+                // `💭 ..API Error: ...` の形で開いている行へ連結され、通知末尾の
+                // リセットが dim を打ち消して以降の進捗ドットまで崩れる。
+                // system / rate_limit / user / tool_progress と同じ扱いに揃える。
+                render_out_of_band_event(&mut out, &mut blocks, |pending| {
+                    writeln!(pending, "{}", line)?;
+                    Ok(())
+                })?;
                 out.flush()?;
                 continue;
             }
@@ -105,7 +117,10 @@ fn process(
                 // 途中にも到着するため、直接書くと開きっぱなしの行へ連結される
                 // （実ログで `💭   ✓ WebFetch` の形が 38 件）。
                 render_out_of_band_event(&mut out, &mut blocks, |pending| {
-                    handle_tool_result_event(&v, pending, &tool_id_map)
+                    handle_tool_result_event(&v, pending, &tool_id_map)?;
+                    // フックの差し戻し（Stop hook feedback 等）は合成 user メッセージ
+                    // として届き、tool_result を持たないため上の経路では拾えない。
+                    handle_synthetic_user_event(&v, pending)
                 })?;
             }
             "result" => {
