@@ -572,33 +572,157 @@ fn stop_uses_worst_gating_window_and_shows_both() {
     assert!(stop_file.exists());
 }
 
+/// Unix 秒を、表示と同じ規則（当日は `HH:MM`、別日は `MM/DD HH:MM`）で整形する。
+fn expected_clock(ts: i64) -> String {
+    let at = chrono::DateTime::from_timestamp(ts, 0)
+        .expect("valid timestamp")
+        .with_timezone(&chrono::Local);
+    if at.date_naive() == chrono::Local::now().date_naive() {
+        at.format("%H:%M").to_string()
+    } else {
+        at.format("%m/%d %H:%M").to_string()
+    }
+}
+
 #[test]
-fn stop_shows_reset_of_the_triggering_window() {
-    // 停止した枠のリセット時刻を出す。top-level の `resetsAt` は `rateLimitType` が
-    // 指す枠（実データでは overage）のもので、5 時間枠の復帰時刻ではない。
-    let today_noon = chrono::Local::now()
-        .date_naive()
-        .and_hms_opt(12, 0, 0)
-        .expect("valid time")
-        .and_local_timezone(chrono::Local)
-        .earliest()
-        .expect("resolvable local time")
-        .timestamp();
+fn pause_shows_reset_of_the_triggering_window() {
+    // 再開時刻は停止した枠自身のリセットから決める。top-level の `resetsAt` は
+    // `rateLimitType` が指す枠（実データでは overage）のもので、5 時間枠の復帰時刻ではない。
+    let now = chrono::Local::now().timestamp();
+    let five_hour_reset = now + 3600;
+    let overage_reset = now + 7200;
     let input = format!(
-        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","rateLimitType":"overage","utilization":1.03,"resetsAt":{},"unifiedWindows":{{"five_hour":{{"utilization":0.95,"resetsAt":{}}}}}}}}}"#,
-        today_noon + 7200,
-        today_noon
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","rateLimitType":"overage","utilization":1.03,"resetsAt":{overage_reset},"unifiedWindows":{{"five_hour":{{"utilization":0.95,"resetsAt":{five_hour_reset}}}}}}}}}"#
     );
     let clean = strip_ansi(&run_process_with_opts(&input, None, None, 90));
+    assert!(clean.contains("Rate limit pause"), "{clean}");
+    let expected =
+        expected_clock(five_hour_reset + crate::rate_control::RESET_PROPAGATION_GRACE_SECS);
+    assert!(
+        clean.contains(&expected),
+        "停止した枠自身のリセットから再開時刻を出すべき（{expected} を期待）: {clean}"
+    );
+    let forbidden = expected_clock(overage_reset);
+    assert!(
+        !clean.contains(&forbidden),
+        "追加課金枠のリセット時刻を出してはいけない（{forbidden}）: {clean}"
+    );
+}
+
+#[test]
+fn five_hour_over_threshold_pauses_instead_of_stopping() {
+    // 実際に起きた事故の再現: 5h 90%（閾値ちょうど）/ 7d 43% で、5h のリセットは 10 分後。
+    // 週次枠には余裕があり、デッドラインまでの実行余力も残っているので、恒久停止では
+    // なく 5 時間枠のリセットまでの一時停止にする。
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    let pause_file = crate::rate_control::pause_path_for(&stop_file);
+    let five_hour_reset = chrono::Local::now().timestamp() + 600;
+    let input = format!(
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed","rateLimitType":"five_hour","utilization":0.9,"unifiedWindows":{{"five_hour":{{"utilization":0.9,"resetsAt":{five_hour_reset}}},"seven_day":{{"utilization":0.43}}}}}}}}"#
+    );
+    let clean = strip_ansi(&run_process_with_opts(&input, None, Some(&stop_file), 90));
+    assert!(clean.contains("Rate limit pause"), "{clean}");
+    assert!(
+        !stop_file.exists(),
+        "5 時間枠の枯渇で恒久停止してはいけない（待てば回復する）"
+    );
+    let state = crate::rate_control::read_pause(&pause_file)
+        .unwrap()
+        .expect("pause file が作成されるべき");
+    assert_eq!(
+        state.resume_at,
+        five_hour_reset + crate::rate_control::RESET_PROPAGATION_GRACE_SECS
+    );
+    assert_eq!(state.window, "five_hour");
+}
+
+#[test]
+fn weekly_over_threshold_stops_permanently() {
+    // 週次枠は実行全体のデッドラインと同じ周期なので、待っても回復しない。
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    let seven_day_reset = chrono::Local::now().timestamp() + 3600;
+    let input = format!(
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.95,"unifiedWindows":{{"five_hour":{{"utilization":0.2,"resetsAt":{seven_day_reset}}},"seven_day":{{"utilization":0.95,"resetsAt":{seven_day_reset}}}}}}}}}"#
+    );
+    let clean = strip_ansi(&run_process_with_opts(&input, None, Some(&stop_file), 90));
     assert!(clean.contains("auto-stop"), "{clean}");
+    assert!(stop_file.exists(), "週次枠の枯渇は恒久停止すべき");
     assert!(
-        clean.contains("resets 12:00"),
-        "停止した枠自身のリセット時刻を出すべき: {clean}"
+        !crate::rate_control::pause_path_for(&stop_file).exists(),
+        "恒久停止のときに一時停止を書いてはいけない"
     );
+}
+
+#[test]
+fn five_hour_stop_explains_why_it_could_not_pause() {
+    // リセット時刻が読めない 5 時間枠は、いつ再開してよいか確定できないので恒久停止に
+    // 倒す。その理由を出さないと、なぜ待てなかったのかがログから分からない。
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","utilization":0.95,"unifiedWindows":{"five_hour":{"utilization":0.95},"seven_day":{"utilization":0.3}}}}"#;
+    let clean = strip_ansi(&run_process_with_opts(input, None, Some(&stop_file), 90));
     assert!(
-        !clean.contains("14:00"),
-        "追加課金枠のリセット時刻を出してはいけない: {clean}"
+        clean.contains("reset time unavailable"),
+        "恒久停止に倒した理由を出すべき: {clean}"
     );
+    assert!(stop_file.exists());
+}
+
+#[test]
+fn rejected_by_five_hour_window_pauses_until_it_resets() {
+    // 5 時間枠だけが原因の拒否は、その枠のリセットまで待てば再開できる。
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    let five_hour_reset = chrono::Local::now().timestamp() + 900;
+    let input = format!(
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","unifiedWindows":{{"five_hour":{{"utilization":1.0,"resetsAt":{five_hour_reset}}},"seven_day":{{"utilization":0.43}}}}}}}}"#
+    );
+    let clean = strip_ansi(&run_process_with_opts(&input, None, Some(&stop_file), 90));
+    assert!(clean.contains("rejected"), "{clean}");
+    assert!(clean.contains("Pausing until"), "{clean}");
+    assert!(
+        !stop_file.exists(),
+        "5 時間枠起因の拒否で恒久停止すべきでない"
+    );
+    let state = crate::rate_control::read_pause(&crate::rate_control::pause_path_for(&stop_file))
+        .unwrap()
+        .expect("pause file が作成されるべき");
+    assert_eq!(
+        state.resume_at,
+        five_hour_reset + crate::rate_control::RESET_PROPAGATION_GRACE_SECS
+    );
+}
+
+#[test]
+fn rejected_while_using_overage_stops_permanently() {
+    // 追加課金枠まで使い切った拒否は、5 時間枠のリセットを待っても再開できない
+    // （実データでは復旧が 28 日先）。
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    let five_hour_reset = chrono::Local::now().timestamp() + 900;
+    let input = format!(
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","isUsingOverage":true,"unifiedWindows":{{"five_hour":{{"utilization":1.0,"resetsAt":{five_hour_reset}}},"seven_day":{{"utilization":0.43}}}}}}}}"#
+    );
+    let _ = strip_ansi(&run_process_with_opts(&input, None, Some(&stop_file), 90));
+    assert!(
+        stop_file.exists(),
+        "追加課金枠を使い切った拒否は恒久停止すべき"
+    );
+}
+
+#[test]
+fn rejected_stops_when_weekly_window_is_also_exhausted() {
+    // 週次枠も閾値に触れているなら、5 時間枠のリセットを待っても再開できない。
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    let five_hour_reset = chrono::Local::now().timestamp() + 900;
+    let input = format!(
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","unifiedWindows":{{"five_hour":{{"utilization":1.0,"resetsAt":{five_hour_reset}}},"seven_day":{{"utilization":0.95}}}}}}}}"#
+    );
+    let _ = strip_ansi(&run_process_with_opts(&input, None, Some(&stop_file), 90));
+    assert!(stop_file.exists(), "週次枠も枯れているなら恒久停止すべき");
 }
 
 #[test]

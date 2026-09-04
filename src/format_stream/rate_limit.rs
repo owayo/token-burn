@@ -6,6 +6,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::format_stream::util::truncate_str;
+use crate::rate_control::{self, Basis, Decision, WindowKind, WindowObservation};
 
 /// 自動停止の判定に使う枠（実際にリクエストを止める枠）と、併記用の短縮名。
 ///
@@ -30,11 +31,18 @@ struct GatingWindow {
     resets_at: Option<i64>,
 }
 
-/// 閾値超過で停止する根拠（どの枠が何 % だったか）。
-struct StopBasis {
-    label: String,
-    pct: f64,
-    resets_at: Option<i64>,
+impl GatingWindow {
+    /// 周期で分類した観測値へ変換する。5 時間枠はリセットで回復するので一時停止、
+    /// 7 日枠はデッドラインと同周期なので恒久停止の根拠になる。
+    fn observation(&self) -> WindowObservation {
+        let kind = if self.name == "five_hour" {
+            WindowKind::FIVE_HOUR
+        } else {
+            WindowKind::Deadline
+        };
+        WindowObservation::new(kind, self.name, self.utilization * 100.0)
+            .with_reset_at(self.resets_at)
+    }
 }
 
 /// レート制限イベントを表示する。
@@ -56,24 +64,31 @@ pub(crate) fn handle_rate_limit_event(
         // 停止が漏れる。
         "allowed" | "allowed_warning" => {
             let windows = gating_windows(info);
-            if let Some(basis) = stop_basis(info, &windows, threshold) {
-                write_auto_stop(out, info, &basis, &windows, threshold)?;
-                touch_stop_file(out, stop_file)?;
-            } else if status == "allowed_warning" {
-                write_warning(out, info, &windows)?;
-            } else {
-                write_allowed(out, info)?;
+            match decide(info, &windows, threshold) {
+                Decision::Stop { basis, detail } => {
+                    write_auto_stop(out, info, &basis, detail.as_deref(), &windows, threshold)?;
+                    apply_stop(out, stop_file, &basis.reason(threshold))?;
+                }
+                Decision::Pause { resume_at, basis } => {
+                    write_auto_pause(out, info, &basis, resume_at, &windows, threshold)?;
+                    apply_pause(out, stop_file, resume_at, &basis, threshold)?;
+                }
+                Decision::Proceed => {
+                    if status == "allowed_warning" {
+                        write_warning(out, info, &windows)?;
+                    } else {
+                        write_allowed(out, info)?;
+                    }
+                }
             }
         }
         "rejected" => {
             let limit_type = info["rateLimitType"].as_str().unwrap_or("");
+            let windows = gating_windows(info);
             // 実データの rejected は overageStatus / overageResetsAt / isUsingOverage を
             // 伴う。これらを落とすと「resets <5時間枠の時刻>」だけが残り、実際には超過枠
             // まで使い切って復旧が数週間先（overageResetsAt）でも、その時刻まで待てば
             // 再開できるように読めてしまう。allowed と同じ補足を付けて誤読を防ぐ。
-            //
-            // 停止は `rateLimitType` に依らず無条件。`rejected` はリクエストが実際に
-            // 拒否されたという結果であり、どの枠が原因でも走り続ける意味が無い。
             writeln!(
                 out,
                 "\x1b[31m  \u{1f6ab} Rate limited: request rejected ({}){}{}\x1b[0m",
@@ -81,11 +96,100 @@ pub(crate) fn handle_rate_limit_event(
                 wrap_overage_details(info),
                 format_resets_at(info)
             )?;
-            touch_stop_file(out, stop_file)?;
+            // 拒否の原因が 5 時間枠だけだと確認できたときは、その枠のリセットまでの
+            // 一時停止で足りる。確認できなければ従来どおり恒久停止（fail-closed）。
+            match rejected_decision(info, &windows, threshold) {
+                Some((resume_at, basis)) => {
+                    write_rejected_pause(out, &basis, resume_at)?;
+                    apply_pause(out, stop_file, resume_at, &basis, threshold)?;
+                }
+                None => apply_stop(out, stop_file, &format!("request rejected ({limit_type})"))?,
+            }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// `allowed` / `allowed_warning` の閾値判定。
+///
+/// `unifiedWindows` があるときは枠ごとの実測値で判定する。無い古い形式では枠の種類が
+/// 分からないため、`rateLimitType` から周期を推定し、判別できなければ週次（＝恒久停止）
+/// として扱う。待てば回復すると誤って判断するより、止まる側へ倒す。
+fn decide(info: &serde_json::Value, windows: &[GatingWindow], threshold: u8) -> Decision {
+    let now = rate_control::now_epoch();
+    if !windows.is_empty() {
+        let observations: Vec<WindowObservation> =
+            windows.iter().map(GatingWindow::observation).collect();
+        return rate_control::evaluate(&observations, threshold, now);
+    }
+
+    // `unifiedWindows` を持たない形式へのフォールバック。overage は実行を止める枠では
+    // ないため、その使用率では停止しない（判定基準が無い曖昧な警告では fail-open に
+    // 倒す。本当に枯れていれば `rejected` か、実行を止める枠側の警告として届く）。
+    let limit_type = info["rateLimitType"].as_str().unwrap_or("");
+    if limit_type == OVERAGE_TYPE {
+        return Decision::Proceed;
+    }
+    let Some(utilization) = info["utilization"]
+        .as_f64()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    else {
+        return Decision::Proceed;
+    };
+    let kind = if limit_type == "five_hour" {
+        WindowKind::FIVE_HOUR
+    } else {
+        WindowKind::Deadline
+    };
+    let label = if limit_type.is_empty() {
+        "unknown"
+    } else {
+        limit_type
+    };
+    let observation = WindowObservation::new(kind, label, utilization * 100.0)
+        .with_reset_at(info["resetsAt"].as_i64());
+    rate_control::evaluate(&[observation], threshold, now)
+}
+
+/// `rejected` を 5 時間枠のリセットまでの一時停止に落とせるか判定する。
+///
+/// 落とせるのは「拒否の主語が 5 時間枠」かつ「週次枠に余裕がある」ことを実測値で
+/// 確認できたときだけ。overage が絡む拒否は、月次の追加課金枠を使い切った状態であり、
+/// 5 時間枠のリセットを待っても再開できない（実データの復旧は 28 日先）ため対象外。
+fn rejected_decision(
+    info: &serde_json::Value,
+    windows: &[GatingWindow],
+    threshold: u8,
+) -> Option<(i64, Basis)> {
+    if info["rateLimitType"].as_str()? != "five_hour" {
+        return None;
+    }
+    if info["isUsingOverage"].as_bool() == Some(true)
+        || info["overageInUse"].as_bool() == Some(true)
+    {
+        return None;
+    }
+    // 週次枠の実測値が読めない、または閾値に触れているなら一時停止にはできない。
+    let weekly = windows.iter().find(|w| w.name == "seven_day")?;
+    if weekly.utilization * 100.0 >= f64::from(threshold) {
+        return None;
+    }
+    let five_hour = windows.iter().find(|w| w.name == "five_hour")?;
+    // 使用率に関わらず「拒否された」事実で止めるため、閾値ではなく枠のリセット時刻の
+    // 妥当性だけを evaluate に確かめさせる（100% として渡す）。
+    let observation = WindowObservation::new(WindowKind::FIVE_HOUR, five_hour.name, 100.0)
+        .with_reset_at(five_hour.resets_at);
+    match rate_control::evaluate(&[observation], threshold, rate_control::now_epoch()) {
+        Decision::Pause {
+            resume_at,
+            mut basis,
+        } => {
+            basis.used_percent = five_hour.utilization * 100.0;
+            Some((resume_at, basis))
+        }
+        _ => None,
+    }
 }
 
 /// `unifiedWindows` から停止判定に使える枠を取り出す。
@@ -109,82 +213,86 @@ fn gating_windows(info: &serde_json::Value) -> Vec<GatingWindow> {
         .collect()
 }
 
-/// 閾値超過による自動停止の根拠を返す。停止不要なら `None`。
-///
-/// `unifiedWindows` があるときは、実際に実行を止める枠（5 時間 / 7 日）の最大使用率
-/// だけで判定する。top-level の `utilization` は `rateLimitType` が指す枠の値であり、
-/// 実データでは `rateLimitType:"overage"` / `utilization:1.03`（月次の追加課金枠が
-/// 103%）の警告が、同じイベントの `unifiedWindows.five_hour:0.13` と共に届く。
-/// top-level をそのまま閾値と比較すると、5 時間枠が空いていても
-/// 「103% >= threshold 90%」で全タスクを止めてしまう（実際に発生した）。
-fn stop_basis(
-    info: &serde_json::Value,
-    windows: &[GatingWindow],
-    threshold: u8,
-) -> Option<StopBasis> {
-    if let Some(worst) = windows
-        .iter()
-        .max_by(|a, b| a.utilization.total_cmp(&b.utilization))
-    {
-        let pct = worst.utilization * 100.0;
-        return (pct >= threshold as f64).then(|| StopBasis {
-            label: worst.name.to_string(),
-            pct,
-            resets_at: worst.resets_at,
-        });
-    }
-
-    // `unifiedWindows` を持たない形式へのフォールバック。overage は実行を止める枠では
-    // ないため、その使用率では停止しない（判定基準が無い曖昧な警告では fail-open に
-    // 倒す。本当に枯れていれば `rejected` か、実行を止める枠側の警告として届く）。
-    let limit_type = info["rateLimitType"].as_str().unwrap_or("");
-    if limit_type == OVERAGE_TYPE {
-        return None;
-    }
-    let pct = info["utilization"]
-        .as_f64()
-        .filter(|v| v.is_finite() && *v >= 0.0)?
-        * 100.0;
-    (pct >= threshold as f64).then(|| StopBasis {
-        label: if limit_type.is_empty() {
-            "unknown".to_string()
-        } else {
-            limit_type.to_string()
-        },
-        pct,
-        resets_at: info["resetsAt"].as_i64(),
-    })
-}
-
 /// 閾値超過で停止した行を書く。
 fn write_auto_stop(
     out: &mut impl Write,
     info: &serde_json::Value,
-    basis: &StopBasis,
+    basis: &Basis,
+    detail: Option<&str>,
     windows: &[GatingWindow],
     threshold: u8,
 ) -> Result<()> {
     // `surpassedThreshold` はサーバーが top-level の `rateLimitType` について通過を
     // 報告した閾値。停止理由が別の枠になったとき（overage の警告イベントに含まれる
     // 5 時間枠が閾値を超えた場合など）に併記すると、その枠の警告閾値だと誤読される。
-    let surpassed = if basis.label == info["rateLimitType"].as_str().unwrap_or("") {
+    let surpassed = if basis.window == info["rateLimitType"].as_str().unwrap_or("") {
+        format_surpassed_threshold(info)
+    } else {
+        String::new()
+    };
+    // 恒久停止を選んだ理由（リセット時刻が読めない等）は、なぜ一時停止で済まなかったかの
+    // 唯一の手掛かりなので落とさない。
+    let detail = detail.map(|d| format!(" ({d})")).unwrap_or_default();
+    writeln!(
+        out,
+        "\x1b[31m  \u{26d4} Rate limit auto-stop: {:.0}% used ({}){}{}{}{} >= threshold {}%{}\x1b[0m",
+        basis.used_percent,
+        basis.window,
+        surpassed,
+        detail,
+        wrap_overage_details(info),
+        // 停止した枠しか実測値が無いときは本文と同じ値の繰り返しになるので併記しない。
+        breakdown_suffix(windows, windows.len() > 1),
+        threshold,
+        format_reset_suffix(basis.reset_at),
+    )?;
+    Ok(())
+}
+
+/// 閾値超過だが、その枠のリセットで回復する（＝一時停止で済む）行を書く。
+fn write_auto_pause(
+    out: &mut impl Write,
+    info: &serde_json::Value,
+    basis: &Basis,
+    resume_at: i64,
+    windows: &[GatingWindow],
+    threshold: u8,
+) -> Result<()> {
+    let surpassed = if basis.window == info["rateLimitType"].as_str().unwrap_or("") {
         format_surpassed_threshold(info)
     } else {
         String::new()
     };
     writeln!(
         out,
-        "\x1b[31m  \u{26d4} Rate limit auto-stop: {:.0}% used ({}){}{}{} >= threshold {}%{}\x1b[0m",
-        basis.pct,
-        basis.label,
+        "\x1b[33m  \u{23f8} Rate limit pause: {:.0}% used ({}){}{}{} >= threshold {}% — resuming{}\x1b[0m",
+        basis.used_percent,
+        basis.window,
         surpassed,
         wrap_overage_details(info),
-        // 停止した枠しか実測値が無いときは本文と同じ値の繰り返しになるので併記しない。
         breakdown_suffix(windows, windows.len() > 1),
         threshold,
-        format_reset_suffix(basis.resets_at),
+        format_resume_suffix(resume_at),
     )?;
     Ok(())
+}
+
+/// 拒否されたが 5 時間枠のリセットで回復する場合の補足行を書く。
+fn write_rejected_pause(out: &mut impl Write, basis: &Basis, resume_at: i64) -> Result<()> {
+    writeln!(
+        out,
+        "\x1b[33m  \u{23f8} Pausing until the {} window resets{}\x1b[0m",
+        basis.window,
+        format_resume_suffix(resume_at),
+    )?;
+    Ok(())
+}
+
+/// ` at <時刻>` の接尾辞。時刻へ整形できなければ空文字列。
+fn format_resume_suffix(resume_at: i64) -> String {
+    format_clock(resume_at)
+        .map(|t| format!(" at {t}"))
+        .unwrap_or_default()
 }
 
 /// 閾値未満の警告行を書く。
@@ -365,24 +473,47 @@ fn format_reset_datetime(
 /// 生成されないことを意味する。`format-stream` はパイプ中段（`cmd | format-stream | tee`）で
 /// 動くため exit code も観測されず、握り潰すと安全機構が無言で失効する。よって失敗は
 /// `out` に明示してログ上で可視化する。
-fn touch_stop_file(out: &mut impl Write, stop_file: Option<&Path>) -> Result<()> {
-    if let Some(path) = stop_file {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => {
-                writeln!(
-                    out,
-                    "\x1b[31m  \u{26d4} stop file ({}) の作成に失敗しました: {}（後続タスクの自動停止が効きません）\x1b[0m",
-                    path.display(),
-                    e
-                )?;
-            }
-        }
+fn apply_stop(out: &mut impl Write, stop_file: Option<&Path>, reason: &str) -> Result<()> {
+    let Some(path) = stop_file else {
+        return Ok(());
+    };
+    if let Err(e) = rate_control::write_stop(path, reason) {
+        writeln!(
+            out,
+            "\x1b[31m  \u{26d4} stop file ({}) の作成に失敗しました: {}（後続タスクの自動停止が効きません）\x1b[0m",
+            path.display(),
+            e
+        )?;
+    }
+    Ok(())
+}
+
+/// 一時停止を pause file へ記録する（`resume_at` 以降は後続タスクを再開してよい）。
+///
+/// 恒久停止と違い、こちらは「いつまで止めるか」を持つ。書き込みに失敗した場合は
+/// `apply_stop` と同じ理由でログへ明示する。停止シグナルが生成されないと安全機構が
+/// 無言で失効するため、ここでは恒久停止へフォールバックして止める側に倒す。
+fn apply_pause(
+    out: &mut impl Write,
+    stop_file: Option<&Path>,
+    resume_at: i64,
+    basis: &Basis,
+    threshold: u8,
+) -> Result<()> {
+    let Some(path) = stop_file else {
+        return Ok(());
+    };
+    let state = rate_control::PauseState {
+        resume_at,
+        window: basis.window.clone(),
+        reason: basis.reason(threshold),
+    };
+    if let Err(e) = rate_control::write_pause(&rate_control::pause_path_for(path), &state) {
+        writeln!(
+            out,
+            "\x1b[31m  \u{26d4} pause file の書き込みに失敗しました: {e}（恒久停止へ切り替えます）\x1b[0m",
+        )?;
+        apply_stop(out, stop_file, &basis.reason(threshold))?;
     }
     Ok(())
 }

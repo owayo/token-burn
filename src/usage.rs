@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::config::{
     Config, RuntimeAgent, RuntimeAiUsage, StateWindowPolicy, UsageFallback, UsageWindowPolicy,
 };
+use crate::rate_control::{self, Decision, WindowObservation};
 use crate::schedule::{AgentSchedule, ScheduleSource, UsageWindow, calculate_fixed_reset};
 
 /// ai-usage --json のトップレベル出力。
@@ -391,31 +392,52 @@ pub async fn run_usage_gate(
         return Ok(());
     }
 
-    // weekly / five_hour のうち最大の使用率で判定する（安全側）。
-    let max_used = [acc.weekly.as_ref(), acc.five_hour.as_ref()]
-        .into_iter()
-        .flatten()
-        .filter_map(|w| w.used_percent)
-        .fold(None::<f64>, |max, p| Some(max.map_or(p, |m| m.max(p))));
-
-    if let Some(used) = max_used
-        && used >= threshold as f64
-    {
-        if write_stop_file(
-            stop_file,
-            &format!("usage {used:.0}% >= threshold {threshold}%"),
-        ) {
-            println!(
-                "\x1b[31m  \u{26d4} usage-gate: {profile}/{provider} 使用率 {used:.0}% >= {threshold}% のため後続を停止\x1b[0m"
-            );
-        } else if !stop_file.exists() {
-            // 閾値超過なのに stop_file を作成できず、既存でもない（ENOSPC・権限不足
-            // 等の作成失敗）。fail-closed パスと同様、フェイルオープンを避けるため
-            // エラーを伝搬してワーカーを止める。既存（別ワーカーが作成済み）の場合は
-            // 停止シグナルが既にあるため正常終了でよい。
-            anyhow::bail!(
-                "usage-gate: failed to write stop file (usage {used:.0}% >= {threshold}%)"
-            );
+    // 枠ごとに周期で分類して判定する。最大値へ潰すと「どの枠が閾値に触れたか」と
+    // 「その枠のリセット時刻」が失われ、5 時間枠のように待てば回復する枠でも恒久停止に
+    // なってしまう（週次デッドラインまでの実行余力を丸ごと捨てる）。
+    let observations = gate_observations(acc);
+    match rate_control::evaluate(&observations, threshold, rate_control::now_epoch()) {
+        Decision::Proceed => {}
+        Decision::Stop { basis, detail } => {
+            let reason = basis.reason(threshold);
+            let detail = detail.map(|d| format!(" ({d})")).unwrap_or_default();
+            if write_stop_file(stop_file, &format!("usage-gate: {reason}")) {
+                println!(
+                    "\x1b[31m  \u{26d4} usage-gate: {profile}/{provider} {reason}{detail} のため後続を停止\x1b[0m"
+                );
+            } else if !stop_file.exists() {
+                // 閾値超過なのに stop_file を作成できず、既存でもない（ENOSPC・権限不足
+                // 等の作成失敗）。fail-closed パスと同様、フェイルオープンを避けるため
+                // エラーを伝搬してワーカーを止める。既存（別ワーカーが作成済み）の場合は
+                // 停止シグナルが既にあるため正常終了でよい。
+                anyhow::bail!("usage-gate: failed to write stop file ({reason})");
+            }
+        }
+        Decision::Pause { resume_at, basis } => {
+            let reason = basis.reason(threshold);
+            let state = rate_control::PauseState {
+                resume_at,
+                window: basis.window.clone(),
+                reason: format!("usage-gate: {reason}"),
+            };
+            // pause を書けない場合は恒久停止へ倒す。待機の根拠を共有できない以上、
+            // 走り続けるより止める側が安全（fail-closed）。
+            if let Err(e) =
+                rate_control::write_pause(&rate_control::pause_path_for(stop_file), &state)
+            {
+                if write_stop_file(stop_file, &format!("usage-gate: {reason}")) {
+                    println!(
+                        "\x1b[31m  \u{26d4} usage-gate: pause を記録できないため停止 ({e})\x1b[0m"
+                    );
+                } else if !stop_file.exists() {
+                    anyhow::bail!("usage-gate: failed to write pause file: {e}");
+                }
+            } else {
+                println!(
+                    "\x1b[33m  \u{23f8} usage-gate: {profile}/{provider} {reason} のため {} の枠がリセットされるまで待機\x1b[0m",
+                    basis.window
+                );
+            }
         }
     }
     Ok(())
@@ -476,6 +498,29 @@ fn write_cache_atomic(cache_file: &Path, content: &[u8]) {
 }
 
 /// stop_file を冪等に作成する。新規作成できたら true、既存なら false。
+/// usage-gate の閾値判定に渡す枠ごとの観測値を組み立てる。
+///
+/// 周期はスロット名ではなく `kind`（`five_hour` / `daily` / `weekly` / `monthly`）から
+/// 導く。実データでは antigravity が `five_hour` スロットに 24 時間枠を、pixellab が
+/// `weekly` スロットに月次枠を返すため、スロット名で決め打ちすると「待てば回復するか」の
+/// 判断を取り違える。使用率が欠損している枠は判定材料にならないので落とす（該当枠が
+/// 無いときの続行は呼び出し側の従来方針どおり）。
+fn gate_observations(acc: &AiUsageAccount) -> Vec<WindowObservation> {
+    [
+        (UsageWindow::Weekly, acc.weekly.as_ref()),
+        (UsageWindow::FiveHour, acc.five_hour.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(slot, data)| {
+        let data = data?;
+        let used_percent = data.used_percent?;
+        let kind = rate_control::WindowKind::from_period_secs(data.period(slot).num_seconds());
+        let reset_at = parse_resets_at(data).map(|at| at.timestamp());
+        Some(WindowObservation::new(kind, slot.label(), used_percent).with_reset_at(reset_at))
+    })
+    .collect()
+}
+
 fn write_stop_file(stop_file: &Path, reason: &str) -> bool {
     match OpenOptions::new()
         .write(true)
@@ -1045,7 +1090,92 @@ mod tests {
         run_usage_gate("Work", "codex", 90, &stop, &cache, &["false".to_string()])
             .await
             .unwrap();
+        // リセット時刻が読めないので、いつ再開してよいか確定できず恒久停止に倒れる。
         assert!(stop.exists(), "five_hour が閾値超過なら停止すべき");
+    }
+
+    #[tokio::test]
+    async fn usage_gate_pauses_when_only_the_five_hour_window_is_over() {
+        // 5 時間枠だけが閾値を超え、その枠のリセット時刻が分かっていて、週次枠に余裕が
+        // あるケース。待てば回復するので恒久停止にはしない（実際に起きた事故の再現）。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let cache = tmp.path().join("cache.json");
+        let resets_at = (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        std::fs::write(
+            &cache,
+            format!(
+                r#"{{"accounts":[{{"profile":"Work","provider":"claude","ok":true,"weekly":{{"used_percent":43.0}},"five_hour":{{"kind":"five_hour","used_percent":90.0,"resets_at":"{resets_at}"}}}}]}}"#
+            ),
+        )
+        .unwrap();
+        run_usage_gate("Work", "claude", 90, &stop, &cache, &["false".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            !stop.exists(),
+            "5 時間枠の枯渇で恒久停止してはいけない（待てば回復する）"
+        );
+        let state = rate_control::read_pause(&rate_control::pause_path_for(&stop))
+            .unwrap()
+            .expect("pause file が作られるべき");
+        assert_eq!(state.window, "five_hour");
+        assert!(state.resume_at > rate_control::now_epoch());
+    }
+
+    #[tokio::test]
+    async fn usage_gate_stops_permanently_when_the_weekly_window_is_over() {
+        // 週次枠は実行全体のデッドラインと同じ周期なので、待っても回復しない。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let cache = tmp.path().join("cache.json");
+        let resets_at = (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        std::fs::write(
+            &cache,
+            format!(
+                r#"{{"accounts":[{{"profile":"Work","provider":"claude","ok":true,"weekly":{{"kind":"weekly","used_percent":95.0,"resets_at":"{resets_at}"}},"five_hour":{{"kind":"five_hour","used_percent":10.0,"resets_at":"{resets_at}"}}}}]}}"#
+            ),
+        )
+        .unwrap();
+        run_usage_gate("Work", "claude", 90, &stop, &cache, &["false".to_string()])
+            .await
+            .unwrap();
+        assert!(stop.exists(), "週次枠の枯渇は恒久停止すべき");
+        assert!(
+            !rate_control::pause_path_for(&stop).exists(),
+            "恒久停止のときに一時停止を書いてはいけない"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_gate_stops_when_a_daily_window_reports_a_weekly_reset() {
+        // antigravity は `five_hour` スロットに 24 時間枠を返す。スロット名で 5 時間と
+        // 決め打ちすると、週次相当のリセット時刻を短周期枠のものとして受け入れてしまう。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let cache = tmp.path().join("cache.json");
+        let resets_at = (Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+        std::fs::write(
+            &cache,
+            format!(
+                r#"{{"accounts":[{{"profile":"Work","provider":"antigravity","ok":true,"five_hour":{{"kind":"daily","used_percent":95.0,"resets_at":"{resets_at}"}}}}]}}"#
+            ),
+        )
+        .unwrap();
+        run_usage_gate(
+            "Work",
+            "antigravity",
+            90,
+            &stop,
+            &cache,
+            &["false".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            stop.exists(),
+            "24 時間枠が 3 日先のリセットを報告したら、待機の根拠にせず停止すべき"
+        );
     }
 
     #[tokio::test]

@@ -28,6 +28,10 @@ pub(super) fn generate_monitor_script(
     let marker_dir_escaped = shell_escape(&marker_dir.to_string_lossy());
     let session_escaped = shell_escape(session);
     let stop_file_escaped = shell_escape(&stop_file.to_string_lossy());
+    // 一時停止の状態はワーカー（Rust）とモニター（シェル）の両方が読む。パスは
+    // stop file から導出するので、双方が同じ規則で同じファイルを指す。
+    let pause_file_escaped =
+        shell_escape(&crate::rate_control::pause_path_for(stop_file).to_string_lossy());
     let report_dir_escaped = shell_escape(&report_dir.to_string_lossy());
     // ai-usage 連携時のみ statusline コマンド（shell_escape 済みを再度 escape し、
     // monitor 側の eval で 1 段戻して実行する）。未設定は空文字列で monitor が無効判定する。
@@ -56,12 +60,16 @@ MARKER_DIR={marker_dir}
 SESSION={session}
 WORKER_COUNT={worker_count}
 STOP_FILE={stop_file}
+PAUSE_FILE={pause_file}
 REPORT_DIR={report_dir}
 AI_USAGE_CMD={ai_usage_cmd}
 AI_USAGE_REFRESH_CMD={ai_usage_refresh_cmd}
 AI_USAGE_CACHE_FILE={ai_usage_cache_file}
 AI_USAGE_TIMEOUT={ai_usage_timeout}
 STOPPED=0
+PAUSED=0
+LAST_PAUSED=-1
+PAUSE_RESUME=""
 USAGE_DISPLAY=""
 LAST_USAGE=0
 LAST_ERR_COUNT=-1
@@ -109,6 +117,22 @@ run_with_timeout() {{
     kill -TERM $wpid 2>/dev/null
     wait $wpid 2>/dev/null
     return $rc
+}}
+
+# Unix 秒を HH:MM（当日でなければ MM/DD HH:MM）へ整形する。
+# `date -r` は BSD (macOS)、`date -d @` は GNU。どちらでも動くよう順に試す。
+format_clock() {{
+    local ts=$1
+    [ -z "$ts" ] && return
+    local today
+    today=$(date '+%Y-%m-%d')
+    local target
+    target=$(date -r "$ts" '+%Y-%m-%d' 2>/dev/null || date -d "@$ts" '+%Y-%m-%d' 2>/dev/null)
+    if [ "$target" = "$today" ]; then
+        date -r "$ts" '+%H:%M' 2>/dev/null || date -d "@$ts" '+%H:%M' 2>/dev/null
+    else
+        date -r "$ts" '+%m/%d %H:%M' 2>/dev/null || date -d "@$ts" '+%m/%d %H:%M' 2>/dev/null
+    fi
 }}
 
 fetch_usage() {{
@@ -227,6 +251,30 @@ while true; do
         NEED_RENDER=1
     fi
 
+    # 一時停止（5 時間枠のように待てば回復する枠での停止）を読む。恒久停止と違って
+    # ワーカーは生きており、再開時刻を過ぎれば自分で次のタスクへ進む。ここで STOPPED に
+    # 遷移させると、待機中のワーカーを終了扱いにして集計が食い違う。
+    PAUSED=0
+    PAUSE_RESUME=""
+    PAUSE_WINDOW=""
+    if [ -f "$PAUSE_FILE" ]; then
+        PAUSE_RESUME=$(sed -n 's/^resume_at=//p' "$PAUSE_FILE" 2>/dev/null | head -1)
+        PAUSE_WINDOW=$(sed -n 's/^window=//p' "$PAUSE_FILE" 2>/dev/null | head -1)
+        case "$PAUSE_RESUME" in
+            ''|*[!0-9]*) PAUSE_RESUME="" ;;
+            *) if [ "$PAUSE_RESUME" -gt "$NOW" ]; then PAUSED=1; fi ;;
+        esac
+    fi
+    if [ "$PAUSED" != "$LAST_PAUSED" ]; then
+        LAST_PAUSED=$PAUSED
+        NEED_RENDER=1
+        if [ $PAUSED -eq 1 ] && [ $STOPPED -eq 0 ]; then
+            STATUS_MSG=" ⏸ Paused: $PAUSE_WINDOW window over threshold — resuming at $(format_clock "$PAUSE_RESUME")"
+        elif [ $STOPPED -eq 0 ]; then
+            STATUS_MSG=""
+        fi
+    fi
+
     # デッドライン到達確認
     if [ $REMAINING -le 0 ] && [ $STOPPED -eq 0 ]; then
         STOPPED=1
@@ -291,7 +339,16 @@ while true; do
         PCT=0
     fi
 
-    if [ $STOPPED -eq 0 ]; then
+    if [ $STOPPED -eq 0 ] && [ $PAUSED -eq 1 ]; then
+        # 待機中は残りデッドラインより「あと何分で再開するか」の方が知りたい情報。
+        PR=$((PAUSE_RESUME - NOW))
+        [ $PR -lt 0 ] && PR=0
+        PH=$((PR / 3600))
+        PM=$(((PR % 3600) / 60))
+        PS=$((PR % 60))
+        printf "\r\033[2K ⏸ resuming in %02dh %02dm %02ds  [%s] %d/%d (%d%%, fail:%d retry:%d)" \
+            "$PH" "$PM" "$PS" "$BAR" "$PROCESSED" "$TOTAL" "$PCT" "$FAILED" "$RETRY"
+    elif [ $STOPPED -eq 0 ]; then
         D=$((REMAINING / 86400))
         H=$(((REMAINING % 86400) / 3600))
         M=$(((REMAINING % 3600) / 60))
@@ -315,6 +372,7 @@ done
         marker_dir = marker_dir_escaped,
         worker_count = worker_count,
         stop_file = stop_file_escaped,
+        pause_file = pause_file_escaped,
         report_dir = report_dir_escaped,
         ai_usage_cmd = ai_usage_cmd_escaped,
         ai_usage_refresh_cmd = ai_usage_refresh_escaped,
@@ -343,9 +401,11 @@ pub(super) struct WorkerCtx<'a> {
     pub(super) queue_dir: &'a Path,
     pub(super) task_dir: &'a Path,
     pub(super) marker_dir: &'a Path,
-    pub(super) stop_file: &'a Path,
     /// 各タスク完了後に実行する usage-gate コマンド（ai-usage 連携時のみ）。
     pub(super) usage_gate_cmd: Option<&'a str>,
+    /// 次のタスクを claim する前に実行するゲートコマンド。恒久停止なら非ゼロ終了し、
+    /// 一時停止中なら再開時刻まで待ってからゼロ終了する。
+    pub(super) gate_wait_cmd: &'a str,
 }
 
 /// キューから claim したワーカーが source して実行する、タスク単位のシェルスクリプトを生成する。
@@ -571,7 +631,6 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
     let w = ctx.worker_id + 1;
     let queue_dir = shell_escape(&ctx.queue_dir.to_string_lossy());
     let task_dir = shell_escape(&ctx.task_dir.to_string_lossy());
-    let stop_file = shell_escape(&ctx.stop_file.to_string_lossy());
     let worker_done = shell_escape(
         &ctx.marker_dir
             .join(format!("worker-done-{}", ctx.worker_id))
@@ -605,7 +664,19 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "TASK_DIR={task_dir}\n",
             "\n",
             "while true; do\n",
-            "  if [ -f {stop_file} ]; then\n",
+            // 残タスクが無ければゲートを通さずに終了する。一時停止中でも、取るものが
+            // 無いワーカーを待たせる意味は無い（待つと空のペインがリセットまで居座る）。
+            "  HAS_PENDING=0\n",
+            "  for pending in \"$QUEUE_DIR\"/pending-*; do\n",
+            "    if [ -e \"$pending\" ]; then HAS_PENDING=1; break; fi\n",
+            "  done\n",
+            "  if [ $HAS_PENDING -eq 0 ]; then\n",
+            "    break\n",
+            "  fi\n",
+            // 恒久停止なら非ゼロ終了、一時停止中なら再開時刻まで待ってからゼロ終了する。
+            // 停止シグナルの有無を直接見ていた頃は、5 時間枠のように待てば回復する枠で
+            // 止まっても二度と再開できなかった。
+            "  if ! {gate_wait_cmd}; then\n",
             "    printf '\\033]2;Worker {w} stopped\\033\\\\'\n",
             "    echo '━━━ Stopped ━━━'\n",
             "    break\n",
@@ -656,10 +727,10 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
         ),
         queue_dir = queue_dir,
         task_dir = task_dir,
-        stop_file = stop_file,
         w = w,
         worker_done = worker_done,
         gate_line = gate_line,
+        gate_wait_cmd = ctx.gate_wait_cmd,
     )
 }
 
@@ -975,7 +1046,7 @@ mod tests {
             queue_dir: &tmp.join("queue"),
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
-            stop_file: &tmp.join("stop"),
+            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
             usage_gate_cmd: None,
         });
 
@@ -998,7 +1069,7 @@ mod tests {
             queue_dir: &tmp.join("queue"),
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
-            stop_file: &tmp.join("stop"),
+            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
             usage_gate_cmd: Some("tb usage-gate --profile P --provider claude"),
         });
         let source_idx = script
@@ -1023,7 +1094,7 @@ mod tests {
             queue_dir: &tmp.join("queue"),
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
-            stop_file: &tmp.join("stop"),
+            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
             usage_gate_cmd: Some("tb usage-gate --profile P --provider claude"),
         });
         // 非ゼロ終了で break する分岐を持つこと
@@ -1047,7 +1118,7 @@ mod tests {
             queue_dir: &tmp.join("queue"),
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
-            stop_file: &tmp.join("stop"),
+            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
             usage_gate_cmd: None,
         });
         assert!(!script.contains("usage-gate"));
@@ -1064,7 +1135,7 @@ mod tests {
             queue_dir: &tmp.join("queue"),
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
-            stop_file: &tmp.join("stop"),
+            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
             usage_gate_cmd: None,
         });
 
@@ -1088,7 +1159,7 @@ mod tests {
             queue_dir: std::path::Path::new("/tmp/my queue"),
             task_dir: std::path::Path::new("/tmp/my tasks"),
             marker_dir: std::path::Path::new("/tmp/my markers"),
-            stop_file: std::path::Path::new("/tmp/my stop"),
+            gate_wait_cmd: "tb gate-wait --stop-file '/tmp/my stop'",
             usage_gate_cmd: None,
         });
         assert!(script.contains("QUEUE_DIR='/tmp/my queue'"));
@@ -1185,7 +1256,7 @@ mod tests {
             queue_dir: std::path::Path::new("/tmp/queue"),
             task_dir: std::path::Path::new("/tmp/tasks"),
             marker_dir: std::path::Path::new("/tmp/markers"),
-            stop_file: std::path::Path::new("/tmp/stop"),
+            gate_wait_cmd: "tb gate-wait --stop-file /tmp/stop",
             usage_gate_cmd: None,
         });
         assert!(
@@ -1693,14 +1764,82 @@ mod tests {
     /// monitor 本体は無限ループなのでそのままは source できないため、実際に生成された
     /// 定義を実行して挙動を実測できるようにする。
     fn extract_run_with_timeout(script: &str) -> String {
+        extract_shell_function(script, "run_with_timeout")
+    }
+
+    /// 生成済みスクリプトからシェル関数の定義だけを切り出す。
+    fn extract_shell_function(script: &str, name: &str) -> String {
         let start = script
-            .find("run_with_timeout() {")
-            .expect("run_with_timeout definition missing");
+            .find(&format!("{name}() {{"))
+            .unwrap_or_else(|| panic!("{name} definition missing"));
         let rest = &script[start..];
         let end = rest
             .find("\n}\n")
-            .expect("run_with_timeout definition must be closed");
+            .unwrap_or_else(|| panic!("{name} definition must be closed"));
         rest[..end + 3].to_string()
+    }
+
+    #[test]
+    fn monitor_reads_the_pause_file_written_by_rate_control() {
+        // pause file を書くのは Rust、読むのはモニターのシェル。書式が食い違うと
+        // 一時停止が画面に出ないまま（あるいは常時「一時停止中」のまま）になる。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let pause = crate::rate_control::pause_path_for(&stop);
+        crate::rate_control::write_pause(
+            &pause,
+            &crate::rate_control::PauseState {
+                resume_at: 1_788_490_232,
+                window: "five_hour".to_string(),
+                reason: "five_hour 90% >= threshold 90%".to_string(),
+            },
+        )
+        .unwrap();
+        let read = |key: &str| {
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "sed -n 's/^{key}=//p' {} | head -1",
+                    shell_escape(&pause.to_string_lossy())
+                ))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(read("resume_at"), "1788490232");
+        assert_eq!(read("window"), "five_hour");
+    }
+
+    #[test]
+    fn monitor_format_clock_renders_a_local_time() {
+        // `date -r`（BSD）と `date -d @`（GNU）のどちらの環境でも時刻を返すこと。
+        // 返せないと「resuming at 」で終わる欠けた行が出る。
+        let func = extract_shell_function(&monitor_script_for_test(), "format_clock");
+        let now = chrono::Local::now();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("{func}\nformat_clock {}", now.timestamp()))
+            .output()
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            rendered,
+            now.format("%H:%M").to_string(),
+            "当日の時刻は HH:MM で返すべき（stderr: {}）",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // 別日は日付付き。時刻だけだと、待機が翌日まで続くのか今日中に明けるのか読めない。
+        let tomorrow = now + chrono::Duration::days(1);
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("{func}\nformat_clock {}", tomorrow.timestamp()))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            tomorrow.format("%m/%d %H:%M").to_string()
+        );
     }
 
     fn target_for_test(directory: &str) -> ResolvedTarget {
@@ -1926,6 +2065,168 @@ mod tests {
     }
 
     #[test]
+    fn generate_monitor_script_reads_pause_state_without_stopping() {
+        // 一時停止はワーカーが自力で再開できる状態なので、モニターは STOPPED へ遷移
+        // させてはいけない（遷移させると待機中のワーカーを終了扱いにして集計が狂う）。
+        let script = monitor_script_for_test();
+        assert!(
+            script.contains("PAUSE_FILE='/tmp/stop-pause.json'"),
+            "stop file の隣の pause file を読むべき: {script}"
+        );
+        assert!(
+            script.contains(r"sed -n 's/^resume_at=//p'"),
+            "再開時刻を読むべき: {script}"
+        );
+        let paused_block = script.find("PAUSED=1").expect("一時停止の検出が必要");
+        let stopped_assignments: Vec<usize> =
+            script.match_indices("STOPPED=1").map(|(i, _)| i).collect();
+        assert!(
+            !stopped_assignments.is_empty(),
+            "恒久停止の遷移は残すべき: {script}"
+        );
+        // PAUSED=1 を立てる行が STOPPED=1 を伴わないこと（同じ行に無いことで確認する）。
+        let line_start = script[..paused_block].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = script[paused_block..]
+            .find('\n')
+            .map_or(script.len(), |i| paused_block + i);
+        assert!(
+            !script[line_start..line_end].contains("STOPPED=1"),
+            "一時停止で恒久停止へ遷移してはいけない: {}",
+            &script[line_start..line_end]
+        );
+    }
+
+    #[test]
+    fn build_worker_script_waits_at_the_gate_before_claiming() {
+        // ワーカーは stop file の有無を直接見るのではなく、gate を通してから claim する。
+        // 直接見ていた頃は、待てば回復する枠での停止から二度と再開できなかった。
+        let tmp = std::path::PathBuf::from("/tmp/burn");
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &tmp.join("queue"),
+            task_dir: &tmp.join("tasks"),
+            marker_dir: &tmp.join("markers"),
+            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop --deadline-epoch 123",
+            usage_gate_cmd: None,
+        });
+        assert!(
+            script.contains(
+                "if ! tb gate-wait --stop-file /tmp/burn/stop --deadline-epoch 123; then"
+            ),
+            "gate の非ゼロ終了で停止すべき: {script}"
+        );
+        let gate_idx = script.find("tb gate-wait").expect("gate missing");
+        let claim_idx = script
+            .find("mv \"$pending\" \"$QUEUE_DIR/claimed-$idx\"")
+            .expect("claim missing");
+        assert!(
+            gate_idx < claim_idx,
+            "gate は claim より前に通すべき: {script}"
+        );
+        // 残タスクが無ければ待たずに終える（空のワーカーをリセットまで居座らせない）。
+        let pending_check = script.find("HAS_PENDING=0").expect("pending check missing");
+        assert!(
+            pending_check < gate_idx,
+            "残タスクの確認は gate より前に行うべき: {script}"
+        );
+    }
+
+    /// ワーカースクリプトを実際に bash で走らせて、マーカーの生成結果を返す。
+    fn run_worker_script(gate_wait_cmd: &str, task_count: usize) -> (tempfile::TempDir, String) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let queue = tmp.path().join("queue");
+        let tasks = tmp.path().join("tasks");
+        let markers = tmp.path().join("markers");
+        for dir in [&queue, &tasks, &markers] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for idx in 1..=task_count {
+            std::fs::write(queue.join(format!("pending-{idx:04}")), "").unwrap();
+            std::fs::write(
+                tasks.join(format!("task-{idx:04}.sh")),
+                format!("touch {}\n", markers.join(format!("done-{idx}")).display()),
+            )
+            .unwrap();
+        }
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &queue,
+            task_dir: &tasks,
+            marker_dir: &markers,
+            gate_wait_cmd,
+            usage_gate_cmd: None,
+        });
+        let script_path = tmp.path().join("worker.sh");
+        std::fs::write(&script_path, &script).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg(&script_path)
+            .output()
+            .expect("bash must run the worker script");
+        let listing = std::fs::read_dir(&markers)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            out.status.success(),
+            "worker script must exit cleanly: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (tmp, listing)
+    }
+
+    #[test]
+    fn worker_script_processes_tasks_when_the_gate_allows() {
+        // ゲートが通せば従来どおり全タスクを処理する。期限切れの一時停止が残っていても
+        // ゲートは通る（それが 5 時間枠の枯渇から再開できるようになった経路）。
+        let (_tmp, markers) = run_worker_script("true", 2);
+        assert_eq!(markers, "done-1,done-2,worker-done-0");
+    }
+
+    #[test]
+    fn worker_script_stops_when_the_gate_refuses() {
+        // 恒久停止ではタスクを 1 件も処理せず、ワーカー終了マーカーだけを残す。
+        let (_tmp, markers) = run_worker_script("false", 2);
+        assert_eq!(markers, "worker-done-0");
+    }
+
+    #[test]
+    fn worker_script_skips_the_gate_when_no_tasks_remain() {
+        // 残タスクが無ければゲートを通さない。通すと、一時停止中に取るものが無い
+        // ワーカーがリセット時刻まで空のペインで待ち続ける。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let queue = tmp.path().join("queue");
+        let tasks = tmp.path().join("tasks");
+        let markers = tmp.path().join("markers");
+        for dir in [&queue, &tasks, &markers] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let probe = tmp.path().join("gate-called");
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &queue,
+            task_dir: &tasks,
+            marker_dir: &markers,
+            gate_wait_cmd: &format!("touch {}", shell_escape(&probe.to_string_lossy())),
+            usage_gate_cmd: None,
+        });
+        let script_path = tmp.path().join("worker.sh");
+        std::fs::write(&script_path, &script).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg(&script_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            !probe.exists(),
+            "残タスクが無いのにゲートで待たせてはいけない"
+        );
+        assert!(markers.join("worker-done-0").exists());
+    }
+
+    #[test]
     fn build_worker_script_is_valid_bash() {
         // usage-gate の有無どちらでもワーカースクリプトが bash 構文として妥当であること。
         let tmp = std::path::PathBuf::from("/tmp/burn");
@@ -1935,7 +2236,7 @@ mod tests {
                 queue_dir: &tmp.join("queue"),
                 task_dir: &tmp.join("tasks"),
                 marker_dir: &tmp.join("markers"),
-                stop_file: &tmp.join("stop"),
+                gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
                 usage_gate_cmd: gate,
             });
             assert_valid_bash(&script, "worker script");

@@ -5,6 +5,7 @@ mod display;
 mod executor;
 mod format_stream;
 mod init;
+mod rate_control;
 mod scanner;
 mod schedule;
 mod state;
@@ -173,6 +174,18 @@ enum Commands {
         /// 分類対象の jsonl ファイル
         jsonl: PathBuf,
     },
+    /// 次のタスクを開始してよいか判定し、一時停止中なら再開時刻まで待つ（ワーカースクリプト専用）
+    ///
+    /// 終了コード 0 は続行、それ以外は恒久停止。
+    #[command(hide = true, name = "gate-wait")]
+    GateWait {
+        /// 恒久停止シグナルのファイルパス（一時停止ファイルはこの隣に置かれる）
+        #[arg(long)]
+        stop_file: PathBuf,
+        /// 実行全体のデッドライン（Unix epoch 秒）。これを越える待機はせず停止する
+        #[arg(long)]
+        deadline_epoch: Option<i64>,
+    },
     /// ai-usage の使用率をチェックし閾値超過なら stop file を作成する（ワーカースクリプト専用）
     #[command(hide = true, name = "usage-gate")]
     UsageGate {
@@ -253,6 +266,19 @@ async fn main() -> Result<()> {
         std::process::exit(class.exit_code());
     }
 
+    if let Commands::GateWait {
+        stop_file,
+        deadline_epoch,
+    } = &command
+    {
+        let outcome = rate_control::run_gate_wait(stop_file, *deadline_epoch).await?;
+        // ワーカーはこの終了コードでループを継続するか抜けるかを決める。
+        std::process::exit(match outcome {
+            rate_control::GateOutcome::Proceed => 0,
+            rate_control::GateOutcome::Stop => 10,
+        });
+    }
+
     if let Commands::UsageGate {
         profile,
         provider,
@@ -326,7 +352,7 @@ async fn main() -> Result<()> {
         Commands::Init { .. } => unreachable!(),
         Commands::FormatStream { .. } => unreachable!(),
         Commands::ClassifyResult { .. } => unreachable!(),
-        Commands::UsageGate { .. } => unreachable!(),
+        Commands::UsageGate { .. } | Commands::GateWait { .. } => unreachable!(),
     }
 
     Ok(())

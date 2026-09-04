@@ -38,6 +38,7 @@ token-burn/
 │   │   │   └── progress.rs # tool_progress の経過時間表示
 │   │   └── tests/          # 機能別に分割した #[cfg(test)] テスト群
 │   ├── classify.rs         # 完了 jsonl の分類（success / failed / rate-limited / retryable）
+│   ├── rate_control.rs     # 枠の周期に応じた停止判定（一時停止 pause / 恒久停止 stop）・pause file・gate-wait
 │   ├── cleanup.rs          # レポートディレクトリの自動クリーンアップ
 │   ├── state.rs            # 処理済みターゲット状態の永続化
 │   ├── tui.rs              # --interactive の対象選択 TUI（ratatui。選択・並べ替え）
@@ -96,13 +97,44 @@ make release  # リリースビルド
 
 ドライランの実行計画、および ai-usage コマンドの起動失敗・タイムアウトエラーにコマンド列を表示するときは、環境変数代入と一般的な認証オプションの値を `<redacted>` に置き換えます。実際の子プロセスには元の引数を渡し、表示のために実行内容を変更しません。
 
+### 停止の 2 種類（一時停止 pause / 恒久停止 stop）
+
+停止シグナルは**枠の周期で 2 種類に分かれます**（`src/rate_control.rs`）。判定は `stream-json` の `rate_limit_event` 経路と `usage-gate` 経路で共通の `rate_control::evaluate` が行い、単位（前者は 0.0〜1.0 の `utilization`、後者は 0〜100 の `used_percent`）と枠名の違いは呼び出し側で `WindowObservation` へ正規化してから渡します。
+
+| 閾値に触れた枠 | 判定 | シグナル |
+|---|---|---|
+| 週次枠（`seven_day` / `weekly`、および周期が 7 日以上の枠） | 恒久停止 | stop file |
+| 短周期の枠（`five_hour`、`kind:"daily"` の 24 時間枠など） | その枠のリセットまで一時停止 | pause file（`<stop file>-pause.json`） |
+| 短周期だがリセット時刻が読めない / 枠 1 周期ぶんより先を指す | 恒久停止（fail-closed） | stop file |
+
+**枠の周期はスロット名ではなく `kind` から導きます。** 実データでは antigravity が `five_hour` スロットに `kind:"daily"`（24 時間枠）を、pixellab が `weekly` スロットに `kind:"monthly"` を返すため、名前で決め打ちすると「待てば回復するか」の判断を取り違えます。
+
+**なぜ分けるか。** 停止シグナルが stop file 1 個（作られたら二度と再開しない）だった頃は、5 時間枠が閾値に触れただけで週次デッドラインまでの実行余力を丸ごと捨てていました。実ログでは 5 時間枠が 90%（閾値ちょうど）に達して停止した数分後にその枠がリセットされ、以降 30 分以上リクエストが通り続けたにもかかわらず、残り 2 タスクが 1 件も実行されないまま終了しています（週次枠は 43%、デッドラインまで 4 時間 52 分残っていた）。
+
+pause file は `resume_at` / `window` / `reason` を 1 行 1 キーの平文で持ちます。JSON にしないのは、これを読むのがワーカー（Rust）だけでなく tmux モニターのシェルスクリプトでもあるためで、平文なら `sed -n 's/^resume_at=//p'` で確実に取り出せます。書き込みは sidecar ロック（`.<pause file>.lock`）の下での read-modify-write ＋ atomic rename で、**既存より再開時刻が遅い場合だけ更新**します（早い時刻での上書きは待つべき時間を縮めてしまう）。ロック対象を本体にしない理由は `state.json` と同じで、rename 後にロック対象の inode が古くなって排他が破れるためです。
+
+### ワーカーのゲート（gate-wait）
+
+ワーカーは次のタスクを claim する前に内部サブコマンド `token-burn gate-wait` を通します（終了コード 0 で続行、それ以外で恒久停止）。
+
+- stop file があれば即停止。
+- pause file の `resume_at` を**過ぎていればそのまま再開**します。これが上記の事故を防ぐ核心で、リセット済みの枠を理由に走らないままになることがなくなりました。
+- `resume_at` がまだ先なら、その時刻まで待ってから再開します。待機中も毎秒 stop file と pause の延長を確認するため、他のワーカーが恒久停止を書けばすぐ止まり、より遅い再開時刻が書かれればそちらまで待ちます。
+- 待つと実行全体のデッドラインを越える場合は、待たずに恒久停止へ倒します。デッドラインは相対秒ではなく**絶対 Unix epoch** で渡します。ワーカーは別プロセスで、しかも待機を挟むため、相対値だと基準時刻がプロセスごとにずれます。
+- pause file が壊れて読めない場合は恒久停止（fail-closed）。読めないまま走り続けると、止めるべき場面で走ってしまいます。
+- ゲートを通すのは**残 pending がある場合だけ**です。取るものが無いワーカーを待たせると、空のペインがリセット時刻まで居座ります。
+
+一時停止中のワーカーは生存しており `worker-done-*` を作りません。モニターの早期停止判定（`WORKERS_DONE >= WORKER_COUNT`）は待機中のワーカーを終了と数えないため、待機がそのまま「停止」と誤報告されることはありません。
+
 ### 使用率ゲート（usage-gate）
 
-ai-usage 連携が有効なとき、`rate_limit_threshold`（%）は 2 経路で後続タスクを止めます。1 つは既存の `claude` stream-json `rate_limit_event` によるリアルタイム監視（タスク実行中の `utilization` が閾値超過で stop file 作成）。もう 1 つが **usage-gate** で、各タスク完了後（ワーカーが次の pending を claim する前）に内部サブコマンド `token-burn usage-gate` が `ai-usage --json` を実行し、その agent の `(profile, provider)` の weekly / five_hour `used_percent` のうち**いずれかが `rate_limit_threshold` 以上なら stop file を作成**して後続を停止します。`claude` / `codex` 両方に効きます（codex は従来リアルタイム監視が無かったため特に有効）。
+ai-usage 連携が有効なとき、`rate_limit_threshold`（%）は 2 経路で後続タスクを止めます。1 つは既存の `claude` stream-json `rate_limit_event` によるリアルタイム監視（タスク実行中の `utilization` が閾値超過で stop / pause 作成）。もう 1 つが **usage-gate** で、各タスク完了後（ワーカーが次の pending を claim する前）に内部サブコマンド `token-burn usage-gate` が `ai-usage --json` を実行し、その agent の `(profile, provider)` の weekly / five_hour `used_percent` を**枠ごとに**上記の判定へかけます。`claude` / `codex` 両方に効きます（codex は従来リアルタイム監視が無かったため特に有効）。
+
+使用率を最大値へ潰してはいけません。潰すと「どの枠が閾値に触れたか」と「その枠のリセット時刻」が失われ、5 時間枠のように待てば回復する枠でも恒久停止になります。
 
 - ai-usage 出力は短 TTL（20 秒）でファイルキャッシュし、並列ワーカーからの重複取得を抑えます。キャッシュは同一ディレクトリの `.<cache>.tmp.<PID>` に書き出し → `rename` で本体に置き換える atomic rename で更新するため、別ワーカーが書き込み途中の不完全 JSON を読むことはありません。
-- 取得失敗時、および該当アカウントが `ok:false`（認証切れ等で ai-usage がエラーを報告）のときは fail-closed（使用率を確認できない以上、安全側で停止）。`ok:false` は取得成功でも「使用率を確認できない」状態であり、スケジュール解決（`ScheduleResolver`）が `ok:false` を失敗として fallback するのと一貫します（この検査が無いと `ok:false` かつ `used_percent` 欠損で `max_used=None` となり走り続ける fail-open になります）。該当エントリ無し・`used_percent` 欠損（`ok:true`）時は過剰停止を避けて続行します。`stop_file` の作成にも失敗した場合（ディスクフル等）は黙って継続せず、エラーを伝搬してワーカーを止めます。
-- stop file 作成は `create_new` で冪等（並列ワーカーから同時に呼ばれても安全）。既に走行中のタスクは止められませんが、次のタスク開始前チェックで停止します。これは usage-gate と `claude` stream-json の rate_limit_event 経路の両方で共通の挙動です。
+- 取得失敗時、および該当アカウントが `ok:false`（認証切れ等で ai-usage がエラーを報告）のときは fail-closed（使用率を確認できない以上、安全側で停止）。`ok:false` は取得成功でも「使用率を確認できない」状態であり、スケジュール解決（`ScheduleResolver`）が `ok:false` を失敗として fallback するのと一貫します（この検査が無いと `ok:false` かつ `used_percent` 欠損で走り続ける fail-open になります）。該当エントリ無し・`used_percent` 欠損（`ok:true`）時は過剰停止を避けて続行します。`stop_file` の作成にも失敗した場合（ディスクフル等）は黙って継続せず、エラーを伝搬してワーカーを止めます。pause file を書けない場合も同様に恒久停止へ倒します（待機の根拠を共有できない以上、走り続けるより止める側が安全）。
+- stop file 作成は `create_new` で冪等（並列ワーカーから同時に呼ばれても安全）。既に走行中のタスクは止められませんが、次のタスク開始前チェックで停止・待機します。これは usage-gate と `claude` stream-json の rate_limit_event 経路の両方で共通の挙動です。
 
 ### モニターペインの ai-usage 表示
 
@@ -165,7 +197,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 `execute_plan_tmux` はタスクキュー方式で並列実行します。
 
 - 各タスクは `queue_dir/pending-<idx>` と `tasks/task-<idx>.sh` として事前に書き出される
-- ワーカーは `pending-<idx>` を `mv` でアトミックに `claimed-<idx>` にリネームして claim し、対応する `task-<idx>.sh` を `source` で実行する
+- ワーカーは残 pending の有無を確認 → `token-burn gate-wait` を通す → `pending-<idx>` を `mv` でアトミックに `claimed-<idx>` にリネームして claim、の順で進み、対応する `task-<idx>.sh` を `source` で実行する。stop file の有無を直接見るのではなくゲートを通すのは、5 時間枠のように待てば回復する枠での停止から再開できるようにするため（前述「ワーカーのゲート」）
 - 各タスクを `source` する前にワーカーループ先頭で `CANCELLED` フラグを 0 にリセットする。直前タスクの実行中に SIGINT/SIGTERM を受けて `CANCELLED=1` が立ったまま成功・早期 return しても、後続タスクの通常エラーを誤って `Cancelled` 判定しエラー記録を欠落させるのを防ぐ
 - タスクがエラー終了してもワーカーは `exec sleep infinity` せず、即座に次の `pending-*` を取りに行く
 - ワーカーは claim できる pending が尽きるまで処理を続け、尽きて初めて `worker-done-<w>` を作成して終了する。終了するとそのペインは閉じるため、画面には走行中のワーカーだけが残る
@@ -226,22 +258,23 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 
 ### レート制限の自動停止判定
 
-`rate_limit_event` による自動停止は、**実際にリクエストを止める枠だけ**を基準にします。判定に使うのは `rate_limit_info.unifiedWindows` の `five_hour` / `seven_day` の使用率で、その最大値が `rate_limit_threshold` 以上なら stop file を作成します。top-level の `utilization` は `rateLimitType` が指す枠の値でしかないため、そのまま閾値と比較してはいけません。
+`rate_limit_event` による自動停止は、**実際にリクエストを止める枠だけ**を基準にします。判定に使うのは `rate_limit_info.unifiedWindows` の `five_hour` / `seven_day` の使用率で、これを枠ごとに `rate_control::evaluate` へかけます（前述「停止の 2 種類」。5 時間枠だけが触れているなら一時停止、7 日枠が触れていれば恒久停止）。top-level の `utilization` は `rateLimitType` が指す枠の値でしかないため、そのまま閾値と比較してはいけません。
 
 実データ（13 セッション）には `rateLimitType:"overage"` / `utilization:1.03` の警告が 188 件あり、同じイベントの `unifiedWindows.five_hour` は 0.13、`status` は `allowed_warning`（リクエストは通っている）でした。overage は月次の追加課金枠で、このアカウントでは `overageDisabledReason:"org_level_disabled"` により組織レベルで無効化されており実行に影響しません。top-level を基準にしていた頃は、5 時間枠が 13% でも `⛔ Rate limit auto-stop: 103% used (overage) (warning at 100%) >= threshold 90% resets 09:00` を出して全タスクを止めていました。top-level の `resetsAt` も overage 枠のもの（09:00）で、5 時間枠の実際のリセット（13:10）とは別物です。
 
 - `seven_day_overage_included` は判定に使いません。overage 込みで分母が変わる派生指標で、実データでは常に `seven_day` より小さくなります（`seven_day:0.31` に対し `0.19`）。
 - 停止行には判定に使った枠の名前・使用率・**その枠自身の** `resetsAt` を出し、`[5h 13% / 7d 54%]` の形で実測値を併記します。`surpassedThreshold` は top-level の `rateLimitType` について通過を報告した閾値なので、停止理由が別の枠になったときは併記しません（overage の `warning at 100%` を 5 時間枠の停止行に持ち込むと、その枠の警告閾値だと誤読される）。
+- 一時停止の行は `⏸ Rate limit pause: 90% used (five_hour) ... >= threshold 90% — resuming at 11:50` の形で、恒久停止（`⛔ Rate limit auto-stop`）と区別できるようにします。恒久停止を選んだのが閾値超過以外の理由（`reset time unavailable` / `implausible reset <n>s ahead`）のときは括弧で併記します。これを落とすと、なぜ待たずに止めたのかがログから追えません。
 - 停止判定に使わない枠（overage）の警告は `⚠ Rate limit warning: 103% used (overage, no auto-stop) (warning at 100%) [5h 13% / 7d 54%] resets 09:00` として表示だけ行います。判定に使う枠の実測値は主語が何であれ併記します（主語が 5 時間枠でも、警告に出ない 7 日枠の残量や、壊れて判定から外れた枠があることは、なぜ止まった/止まらなかったのかを読むのに要る）。
 - 判定は `allowed` と `allowed_warning` の両方で行います。両者の違いはサーバー側が警告閾値を跨いだかどうかだけで、`rate_limit_threshold` をサーバーの警告閾値より低く設定すると `allowed` のまま超過し得ます（実データの `allowed` は最大 5h 89% / 7d 68%）。表示は従来どおり `allowed` では補足情報があるときだけ出します（1 セッションで 480 件の高頻度イベントのため）。
 - `unifiedWindows` を持たない形式へのフォールバックでは、`rateLimitType` が `overage` のときだけ判定をスキップし、それ以外は従来どおり top-level `utilization` で判定します。使用率が読めない枠（欠損・NaN・負値）は判定から外し、読める枠だけで判定します。判定基準が無い曖昧な警告では停止しない（fail-open）方針です。本当に枯れていれば `rejected` か、実行を止める枠側の警告として届きます。usage-gate という第 2 の停止経路もあるため、ここで曖昧なイベントを理由に全体を止める必要はありません。
-- `rejected` は `rateLimitType` に依らず無条件で停止します（fail-closed）。リクエストが実際に拒否された結果であり、どの枠が原因でも走り続ける意味がありません。
+- `rejected` は必ず後続を止めます（fail-closed）。ただし止め方は原因の枠で分けます。`rateLimitType` が `five_hour` で、かつ 7 日枠の実測値が読めて閾値未満で、かつ overage を使っていない（`isUsingOverage` / `overageInUse` がいずれも true でない）ことを確認できたときだけ、その枠のリセットまでの一時停止にします。それ以外は恒久停止です。overage が絡む拒否は月次の追加課金枠まで使い切った状態であり、5 時間枠のリセットを待っても再開できません（実データの `overageResetsAt` は 28 日先）。
 
 処理済み状態は有効な設定ファイルと同じディレクトリの `state.json` に保存されます（デフォルト: `~/.config/token-burn/state.json`）。エージェント名は昇順、各エージェント内のエントリは処理時刻の降順（同時刻はパス昇順で安定化）で書き出します。内側のマップを `serde_json::Map` へ `collect()` してはいけません。`preserve_order` feature を有効にしていない serde_json の `Map` は `BTreeMap` であり、collect した時点でキー（パス）昇順へ再ソートされ、並べ替えが丸ごと捨てられます（実際の `state.json` も全エージェントがパスのアルファベット順になっていました）。順序を保つために `OrderedEntries` ラッパーで `serialize_map` を直接使います。
 
 `[settings]` の `limit` は 1 以上である必要があります。
 `[settings]` の `parallelism` は 1 以上である必要があります（CLI の `--workers` / `-w` で実行ごとに上書き可能）。
-`[settings]` の `rate_limit_threshold` は 1〜100 の範囲で指定する必要があります（デフォルト: 95）。`rate_limit_event` の `unifiedWindows` が示す 5 時間枠 / 7 日枠の使用率がこの閾値以上になると、現在のタスク完了後に後続タスクの実行を停止します（月次の追加課金枠 `overage` の使用率では停止しません。前述「レート制限の自動停止判定」）。`rejected` イベント受信時も同様に停止します。ai-usage 連携が有効な場合は、各タスク完了後に該当 agent の実使用率（weekly / five_hour の最大）でも `usage-gate` が判定し、閾値以上なら停止します。
+`[settings]` の `rate_limit_threshold` は 1〜100 の範囲で指定する必要があります（デフォルト: 95）。`rate_limit_event` の `unifiedWindows` が示す 5 時間枠 / 7 日枠の使用率がこの閾値以上になると、現在のタスク完了後に後続タスクの実行を止めます（月次の追加課金枠 `overage` の使用率では停止しません。前述「レート制限の自動停止判定」）。止め方は枠の周期で分かれ、**5 時間枠ならその枠のリセットまでの一時停止、7 日枠なら恒久停止**です（前述「停止の 2 種類」）。`rejected` イベント受信時も同様に止めます。ai-usage 連携が有効な場合は、各タスク完了後に該当 agent の実使用率（weekly / five_hour）でも `usage-gate` が同じ判定を行います。
 `[settings]` の `skip_within` と `cleanup_after` には `d` / `h` / `m` / `s` を使った有効な期間文字列を指定する必要があり、不正または `chrono::Duration` で表現できない値は設定読み込み時にエラーになります。期間自体は表現できても日時の減算範囲を超える場合、`skip_within` は警告後に前回リセット時刻へフォールバックし、レポートクリーンアップはエラーを返します。
 
 ### 処理済み履歴の共有範囲（dedup_scope）

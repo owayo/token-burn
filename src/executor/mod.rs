@@ -477,6 +477,18 @@ pub fn execute_plan_tmux(
         }
     }
 
+    // ワーカーが次のタスクを claim する前に通すゲート。恒久停止なら非ゼロ終了し、
+    // 一時停止中（5 時間枠のように待てば回復する枠での停止）なら再開時刻まで待つ。
+    // デッドラインは相対秒ではなく絶対 epoch で渡す。ワーカーは別プロセスで、しかも
+    // 待機を挟むため、相対値だと基準時刻がプロセスごとにずれる。
+    let deadline_epoch = chrono::Utc::now().timestamp() + deadline.as_secs() as i64;
+    let gate_wait_cmd = format!(
+        "{} gate-wait --stop-file {} --deadline-epoch {}",
+        shell_escape(&exe_path.to_string_lossy()),
+        shell_escape(&stop_file.to_string_lossy()),
+        deadline_epoch,
+    );
+
     let mut script_paths = Vec::new();
     for w in 0..worker_count {
         let script_path = tmp_dir.join(format!("worker-{}.sh", w));
@@ -485,8 +497,8 @@ pub fn execute_plan_tmux(
             queue_dir: &queue_dir,
             task_dir: &task_dir,
             marker_dir: &marker_dir,
-            stop_file: &stop_file,
             usage_gate_cmd: usage_gate_cmd.as_deref(),
+            gate_wait_cmd: &gate_wait_cmd,
         });
         std::fs::write(&script_path, &worker_script)?;
         ensure_executable(&script_path)?;
