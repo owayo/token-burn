@@ -53,6 +53,7 @@ pub(crate) fn handle_rate_limit_event(
     out: &mut impl Write,
     stop_file: Option<&Path>,
     threshold: u8,
+    signal_failed: &mut bool,
 ) -> Result<()> {
     let info = &v["rate_limit_info"];
     let status = info["status"].as_str().unwrap_or("");
@@ -67,11 +68,11 @@ pub(crate) fn handle_rate_limit_event(
             match decide(info, &windows, threshold) {
                 Decision::Stop { basis, detail } => {
                     write_auto_stop(out, info, &basis, detail.as_deref(), &windows, threshold)?;
-                    apply_stop(out, stop_file, &basis.reason(threshold))?;
+                    apply_stop(out, stop_file, &basis.reason(threshold), signal_failed)?;
                 }
                 Decision::Pause { resume_at, basis } => {
                     write_auto_pause(out, info, &basis, resume_at, &windows, threshold)?;
-                    apply_pause(out, stop_file, resume_at, &basis, threshold)?;
+                    apply_pause(out, stop_file, resume_at, &basis, threshold, signal_failed)?;
                 }
                 Decision::Proceed => {
                     if status == "allowed_warning" {
@@ -101,9 +102,14 @@ pub(crate) fn handle_rate_limit_event(
             match rejected_decision(info, &windows, threshold) {
                 Some((resume_at, basis)) => {
                     write_rejected_pause(out, &basis, resume_at)?;
-                    apply_pause(out, stop_file, resume_at, &basis, threshold)?;
+                    apply_pause(out, stop_file, resume_at, &basis, threshold, signal_failed)?;
                 }
-                None => apply_stop(out, stop_file, &format!("request rejected ({limit_type})"))?,
+                None => apply_stop(
+                    out,
+                    stop_file,
+                    &format!("request rejected ({limit_type})"),
+                    signal_failed,
+                )?,
             }
         }
         _ => {}
@@ -165,9 +171,15 @@ fn rejected_decision(
     if info["rateLimitType"].as_str()? != "five_hour" {
         return None;
     }
-    if info["isUsingOverage"].as_bool() == Some(true)
-        || info["overageInUse"].as_bool() == Some(true)
-    {
+    // overage を使っていないことを**明示的に**確認できたときだけ先へ進む。フィールドが
+    // 欠けているだけで一時停止を許すと、「確認できた」ではなく「確認できなかった」状態で
+    // 待機に倒れる。実データの `rejected` は必ずこれらを伴うため、欠損は想定外の形式で
+    // あり、そこで安全側を選ぶ。
+    let is_using = info["isUsingOverage"].as_bool();
+    let in_use = info["overageInUse"].as_bool();
+    let uses_overage = is_using == Some(true) || in_use == Some(true);
+    let confirmed_not_using = is_using == Some(false) || in_use == Some(false);
+    if uses_overage || !confirmed_not_using {
         return None;
     }
     // 週次枠の実測値が読めない、または閾値に触れているなら一時停止にはできない。
@@ -470,14 +482,20 @@ fn format_reset_datetime(
 ///
 /// 既存ファイル（`AlreadyExists`）は別ワーカーが既に作成済みの冪等な正常系として無視する。
 /// それ以外の作成失敗（ENOSPC・権限不足等）は、後続タスクを止める停止シグナルが
-/// 生成されないことを意味する。`format-stream` はパイプ中段（`cmd | format-stream | tee`）で
-/// 動くため exit code も観測されず、握り潰すと安全機構が無言で失効する。よって失敗は
-/// `out` に明示してログ上で可視化する。
-fn apply_stop(out: &mut impl Write, stop_file: Option<&Path>, reason: &str) -> Result<()> {
+/// 生成されないことを意味する。ログに明示するだけでなく `signal_failed` を立て、
+/// `format-stream` 自体を停止シグナル書き込み不能の終了コードで終わらせる。ここを
+/// ログだけで済ませると、止めるべき状況で全ワーカーが走り続ける（fail-open）。
+fn apply_stop(
+    out: &mut impl Write,
+    stop_file: Option<&Path>,
+    reason: &str,
+    signal_failed: &mut bool,
+) -> Result<()> {
     let Some(path) = stop_file else {
         return Ok(());
     };
     if let Err(e) = rate_control::write_stop(path, reason) {
+        *signal_failed = true;
         writeln!(
             out,
             "\x1b[31m  \u{26d4} stop file ({}) の作成に失敗しました: {}（後続タスクの自動停止が効きません）\x1b[0m",
@@ -491,14 +509,15 @@ fn apply_stop(out: &mut impl Write, stop_file: Option<&Path>, reason: &str) -> R
 /// 一時停止を pause file へ記録する（`resume_at` 以降は後続タスクを再開してよい）。
 ///
 /// 恒久停止と違い、こちらは「いつまで止めるか」を持つ。書き込みに失敗した場合は
-/// `apply_stop` と同じ理由でログへ明示する。停止シグナルが生成されないと安全機構が
-/// 無言で失効するため、ここでは恒久停止へフォールバックして止める側に倒す。
+/// 恒久停止へフォールバックして止める側に倒し、そちらも書けなければ `signal_failed` が
+/// 立つ（`apply_stop` 参照）。
 fn apply_pause(
     out: &mut impl Write,
     stop_file: Option<&Path>,
     resume_at: i64,
     basis: &Basis,
     threshold: u8,
+    signal_failed: &mut bool,
 ) -> Result<()> {
     let Some(path) = stop_file else {
         return Ok(());
@@ -513,7 +532,7 @@ fn apply_pause(
             out,
             "\x1b[31m  \u{26d4} pause file の書き込みに失敗しました: {e}（恒久停止へ切り替えます）\x1b[0m",
         )?;
-        apply_stop(out, stop_file, &basis.reason(threshold))?;
+        apply_stop(out, stop_file, &basis.reason(threshold), signal_failed)?;
     }
     Ok(())
 }

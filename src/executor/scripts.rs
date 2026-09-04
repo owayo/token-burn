@@ -403,9 +403,9 @@ pub(super) struct WorkerCtx<'a> {
     pub(super) marker_dir: &'a Path,
     /// 各タスク完了後に実行する usage-gate コマンド（ai-usage 連携時のみ）。
     pub(super) usage_gate_cmd: Option<&'a str>,
-    /// 次のタスクを claim する前に実行するゲートコマンド。恒久停止なら非ゼロ終了し、
-    /// 一時停止中なら再開時刻まで待ってからゼロ終了する。
-    pub(super) gate_wait_cmd: &'a str,
+    /// 停止判定とキューからの claim をまとめて行うコマンド。claim できた番号を stdout へ
+    /// 出し、終了コードで 0=claim 成功 / 10=恒久停止 / 20=pending 無し を返す。
+    pub(super) gate_claim_cmd: &'a str,
 }
 
 /// キューから claim したワーカーが source して実行する、タスク単位のシェルスクリプトを生成する。
@@ -490,8 +490,20 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
         script += "FORMAT_EXIT=${PIPE_STATUS[1]}\n";
         script += "TEE_EXIT=${PIPE_STATUS[2]}\n";
         script += "CURRENT_FAILED_MARKER=\"\"\n";
+        // 停止シグナル（stop / pause file）を書けなかった場合の専用コード。閾値を超えた
+        // のに後続を止める手段が無い状態なので、このタスクを失敗として記録するだけでなく
+        // ワーカーごと止める。`return 0` で次のタスクへ進むと、止めるべき状況のまま
+        // クォータを使い続ける。
         script += &format!(
             concat!(
+                "if [ \"$FORMAT_EXIT\" -eq {signal_exit} ]; then\n",
+                "  printf '%scannot write the stop signal — aborting this worker\\n' {prefix} > {error}\n",
+                "  touch {failed}\n",
+                "  echo '━━━ Error - stop signal unwritable ━━━'\n",
+                "  echo ''\n",
+                "  WORKER_ABORT=1\n",
+                "  return 0\n",
+                "fi\n",
                 "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ] || [ ! -s {jsonl} ]; then\n",
                 "  printf '%slogging/classification pipeline failed (format=%s tee=%s)\\n' {prefix} \"$FORMAT_EXIT\" \"$TEE_EXIT\" > {error}\n",
                 "  touch {failed}\n",
@@ -504,6 +516,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             error = error_file,
             failed = failed_marker,
             jsonl = jsonl_file,
+            signal_exit = crate::format_stream::EXIT_STOP_SIGNAL_UNWRITABLE,
         );
     } else {
         script += &format!("{cmd_str} 2>&1 | tee {log_file}\n");
@@ -662,42 +675,29 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "\n",
             "QUEUE_DIR={queue_dir}\n",
             "TASK_DIR={task_dir}\n",
+            "WORKER_ABORT=0\n",
             "\n",
             "while true; do\n",
-            // 残タスクが無ければゲートを通さずに終了する。一時停止中でも、取るものが
-            // 無いワーカーを待たせる意味は無い（待つと空のペインがリセットまで居座る）。
-            "  HAS_PENDING=0\n",
-            "  for pending in \"$QUEUE_DIR\"/pending-*; do\n",
-            "    if [ -e \"$pending\" ]; then HAS_PENDING=1; break; fi\n",
-            "  done\n",
-            "  if [ $HAS_PENDING -eq 0 ]; then\n",
+            // 停止判定と claim を 1 コマンドにまとめる。判定と `mv` をシェル側で 2 段に
+            // 分けていた頃は、その隙間に別ワーカーが停止を発行すると停止後にタスクが
+            // 開始されていた。gate-claim は両方を同じロックの下で行う。一時停止中なら
+            // 再開時刻まで待ち、処理できる pending が無ければ 20 で終わる。
+            "  CLAIMED=$({gate_claim_cmd})\n",
+            "  CLAIM_RC=$?\n",
+            "  if [ $CLAIM_RC -ne 0 ]; then\n",
+            "    if [ $CLAIM_RC -eq 10 ]; then\n",
+            "      printf '\\033]2;Worker {w} stopped\\033\\\\'\n",
+            "      echo '━━━ Stopped ━━━'\n",
+            "    fi\n",
             "    break\n",
             "  fi\n",
-            // 恒久停止なら非ゼロ終了、一時停止中なら再開時刻まで待ってからゼロ終了する。
-            // 停止シグナルの有無を直接見ていた頃は、5 時間枠のように待てば回復する枠で
-            // 止まっても二度と再開できなかった。
-            "  if ! {gate_wait_cmd}; then\n",
-            "    printf '\\033]2;Worker {w} stopped\\033\\\\'\n",
-            "    echo '━━━ Stopped ━━━'\n",
+            "  if [ -z \"$CLAIMED\" ]; then\n",
             "    break\n",
             "  fi\n",
             // 各タスク開始前に必ずリセットする。直前タスクの実行中に SIGINT/SIGTERM を
             // 受けて CANCELLED=1 が立ったまま成功・早期 return した場合でも、後続タスクの
             // 通常エラーを誤って「Cancelled」と判定しエラー記録を欠落させるのを防ぐ。
             "  CANCELLED=0\n",
-            "  CLAIMED=\"\"\n",
-            "  for pending in \"$QUEUE_DIR\"/pending-*; do\n",
-            "    [ -e \"$pending\" ] || continue\n",
-            "    base=$(basename \"$pending\")\n",
-            "    idx=${{base#pending-}}\n",
-            "    if mv \"$pending\" \"$QUEUE_DIR/claimed-$idx\" 2>/dev/null; then\n",
-            "      CLAIMED=\"$idx\"\n",
-            "      break\n",
-            "    fi\n",
-            "  done\n",
-            "  if [ -z \"$CLAIMED\" ]; then\n",
-            "    break\n",
-            "  fi\n",
             "  TASK_SCRIPT=\"$TASK_DIR/task-$CLAIMED.sh\"\n",
             "  if [ ! -f \"$TASK_SCRIPT\" ]; then\n",
             "    echo \"━━━ Missing task script: $TASK_SCRIPT ━━━\"\n",
@@ -705,6 +705,12 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "  fi\n",
             "  # shellcheck disable=SC1090\n",
             "  source \"$TASK_SCRIPT\"\n",
+            // 停止シグナルを書けなかったタスクはワーカーごと止める。閾値を超えたのに
+            // 後続を止める手段が無い状態で走り続けると、クォータを使い切ってしまう。
+            "  if [ \"$WORKER_ABORT\" = 1 ]; then\n",
+            "    echo '━━━ Stopped (stop signal unwritable) ━━━'\n",
+            "    break\n",
+            "  fi\n",
             "{gate_line}",
             "done\n",
             "\n",
@@ -730,7 +736,7 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
         w = w,
         worker_done = worker_done,
         gate_line = gate_line,
-        gate_wait_cmd = ctx.gate_wait_cmd,
+        gate_claim_cmd = ctx.gate_claim_cmd,
     )
 }
 
@@ -1046,13 +1052,19 @@ mod tests {
             queue_dir: &tmp.join("queue"),
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
-            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
+            gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
             usage_gate_cmd: None,
         });
 
         assert!(script.contains("#!/bin/bash"));
-        // mv でアトミック claim
-        assert!(script.contains("mv \"$pending\" \"$QUEUE_DIR/claimed-$idx\""));
+        // claim はシェルではなく gate-claim が行う（停止判定と同じロックの下で
+        // rename するため。シェルで `mv` していた頃は、停止の確認と claim の隙間に
+        // 停止が発行されるとタスクが 1 件余計に始まっていた）。
+        assert!(
+            !script.contains("mv \"$pending\""),
+            "claim をシェルで行ってはいけない: {script}"
+        );
+        assert!(script.contains("CLAIMED=$(tb gate-claim"));
         // source で個別タスクを取り込む
         assert!(script.contains("source \"$TASK_SCRIPT\""));
         // ワーカー完了マーカー
@@ -1069,7 +1081,7 @@ mod tests {
             queue_dir: &tmp.join("queue"),
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
-            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
+            gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
             usage_gate_cmd: Some("tb usage-gate --profile P --provider claude"),
         });
         let source_idx = script
@@ -1094,7 +1106,7 @@ mod tests {
             queue_dir: &tmp.join("queue"),
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
-            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
+            gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
             usage_gate_cmd: Some("tb usage-gate --profile P --provider claude"),
         });
         // 非ゼロ終了で break する分岐を持つこと
@@ -1118,7 +1130,7 @@ mod tests {
             queue_dir: &tmp.join("queue"),
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
-            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
+            gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
             usage_gate_cmd: None,
         });
         assert!(!script.contains("usage-gate"));
@@ -1135,7 +1147,7 @@ mod tests {
             queue_dir: &tmp.join("queue"),
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
-            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
+            gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
             usage_gate_cmd: None,
         });
 
@@ -1159,7 +1171,7 @@ mod tests {
             queue_dir: std::path::Path::new("/tmp/my queue"),
             task_dir: std::path::Path::new("/tmp/my tasks"),
             marker_dir: std::path::Path::new("/tmp/my markers"),
-            gate_wait_cmd: "tb gate-wait --stop-file '/tmp/my stop'",
+            gate_claim_cmd: "tb gate-claim --stop-file '/tmp/my stop'",
             usage_gate_cmd: None,
         });
         assert!(script.contains("QUEUE_DIR='/tmp/my queue'"));
@@ -1256,7 +1268,7 @@ mod tests {
             queue_dir: std::path::Path::new("/tmp/queue"),
             task_dir: std::path::Path::new("/tmp/tasks"),
             marker_dir: std::path::Path::new("/tmp/markers"),
-            gate_wait_cmd: "tb gate-wait --stop-file /tmp/stop",
+            gate_claim_cmd: "tb gate-claim --stop-file /tmp/stop",
             usage_gate_cmd: None,
         });
         assert!(
@@ -2097,42 +2109,43 @@ mod tests {
     }
 
     #[test]
-    fn build_worker_script_waits_at_the_gate_before_claiming() {
-        // ワーカーは stop file の有無を直接見るのではなく、gate を通してから claim する。
-        // 直接見ていた頃は、待てば回復する枠での停止から二度と再開できなかった。
+    fn build_worker_script_takes_its_task_from_the_gate() {
+        // 停止判定と claim は同じロックの下で行う必要があるため、ワーカーは自分で
+        // stop file を見たりキューを rename したりせず、gate-claim の結果に従う。
         let tmp = std::path::PathBuf::from("/tmp/burn");
         let script = build_worker_script(&WorkerCtx {
             worker_id: 0,
             queue_dir: &tmp.join("queue"),
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
-            gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop --deadline-epoch 123",
+            gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop --deadline-epoch 123",
             usage_gate_cmd: None,
         });
         assert!(
             script.contains(
-                "if ! tb gate-wait --stop-file /tmp/burn/stop --deadline-epoch 123; then"
+                "CLAIMED=$(tb gate-claim --stop-file /tmp/burn/stop --deadline-epoch 123)"
             ),
-            "gate の非ゼロ終了で停止すべき: {script}"
+            "claim した番号を gate から受け取るべき: {script}"
         );
-        let gate_idx = script.find("tb gate-wait").expect("gate missing");
-        let claim_idx = script
-            .find("mv \"$pending\" \"$QUEUE_DIR/claimed-$idx\"")
-            .expect("claim missing");
+        // 恒久停止（10）と pending 無し（20）を区別する。後者で「Stopped」と出すと、
+        // 消化し切ったのか止められたのか読み取れない。
+        assert!(script.contains("if [ $CLAIM_RC -eq 10 ]; then"), "{script}");
         assert!(
-            gate_idx < claim_idx,
-            "gate は claim より前に通すべき: {script}"
+            !script.contains("$QUEUE_DIR\"/pending-*"),
+            "キューの走査をシェルに残してはいけない: {script}"
         );
-        // 残タスクが無ければ待たずに終える（空のワーカーをリセットまで居座らせない）。
-        let pending_check = script.find("HAS_PENDING=0").expect("pending check missing");
-        assert!(
-            pending_check < gate_idx,
-            "残タスクの確認は gate より前に行うべき: {script}"
-        );
+        let gate_idx = script.find("tb gate-claim").expect("gate missing");
+        let source_idx = script
+            .find("source \"$TASK_SCRIPT\"")
+            .expect("source missing");
+        assert!(gate_idx < source_idx, "gate はタスク実行より前: {script}");
     }
 
     /// ワーカースクリプトを実際に bash で走らせて、マーカーの生成結果を返す。
-    fn run_worker_script(gate_wait_cmd: &str, task_count: usize) -> (tempfile::TempDir, String) {
+    ///
+    /// `gate_claim_cmd` は claim した番号を stdout へ出し、終了コードで分岐する
+    /// `token-burn gate-claim` の代役（テストでは実バイナリを呼べないためスタブを使う）。
+    fn run_worker_script(gate_claim_cmd: &str, task_count: usize) -> (tempfile::TempDir, String) {
         let tmp = tempfile::TempDir::new().unwrap();
         let queue = tmp.path().join("queue");
         let tasks = tmp.path().join("tasks");
@@ -2153,7 +2166,7 @@ mod tests {
             queue_dir: &queue,
             task_dir: &tasks,
             marker_dir: &markers,
-            gate_wait_cmd,
+            gate_claim_cmd,
             usage_gate_cmd: None,
         });
         let script_path = tmp.path().join("worker.sh");
@@ -2177,25 +2190,31 @@ mod tests {
         (tmp, listing)
     }
 
+    /// N 件を順に claim して、その後 20（pending 無し）を返すスタブ。
+    fn claim_stub(count: usize) -> String {
+        format!(
+            "n=$(cat \"$TASK_DIR/../n\" 2>/dev/null || echo 0); n=$((n+1));              echo $n > \"$TASK_DIR/../n\";              if [ $n -le {count} ]; then printf '%04d\\n' $n; exit 0; else exit 20; fi"
+        )
+    }
+
     #[test]
-    fn worker_script_processes_tasks_when_the_gate_allows() {
-        // ゲートが通せば従来どおり全タスクを処理する。期限切れの一時停止が残っていても
-        // ゲートは通る（それが 5 時間枠の枯渇から再開できるようになった経路）。
-        let (_tmp, markers) = run_worker_script("true", 2);
+    fn worker_script_runs_the_tasks_the_gate_hands_it() {
+        // ゲートが番号を返す限りタスクを処理し、pending が尽きたら（20）静かに終わる。
+        let (_tmp, markers) = run_worker_script(&claim_stub(2), 2);
         assert_eq!(markers, "done-1,done-2,worker-done-0");
     }
 
     #[test]
-    fn worker_script_stops_when_the_gate_refuses() {
-        // 恒久停止ではタスクを 1 件も処理せず、ワーカー終了マーカーだけを残す。
-        let (_tmp, markers) = run_worker_script("false", 2);
+    fn worker_script_stops_when_the_gate_reports_a_permanent_stop() {
+        // 恒久停止（10）ではタスクを 1 件も処理せず、ワーカー終了マーカーだけを残す。
+        let (_tmp, markers) = run_worker_script("exit 10", 2);
         assert_eq!(markers, "worker-done-0");
     }
 
     #[test]
-    fn worker_script_skips_the_gate_when_no_tasks_remain() {
-        // 残タスクが無ければゲートを通さない。通すと、一時停止中に取るものが無い
-        // ワーカーがリセット時刻まで空のペインで待ち続ける。
+    fn worker_script_ends_quietly_when_the_queue_is_empty() {
+        // pending 無し（20）は停止ではないので「Stopped」を出さずに終える。ここで
+        // 停止と表示すると、正常に消化し切ったのか止められたのか区別できなくなる。
         let tmp = tempfile::TempDir::new().unwrap();
         let queue = tmp.path().join("queue");
         let tasks = tmp.path().join("tasks");
@@ -2203,13 +2222,12 @@ mod tests {
         for dir in [&queue, &tasks, &markers] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        let probe = tmp.path().join("gate-called");
         let script = build_worker_script(&WorkerCtx {
             worker_id: 0,
             queue_dir: &queue,
             task_dir: &tasks,
             marker_dir: &markers,
-            gate_wait_cmd: &format!("touch {}", shell_escape(&probe.to_string_lossy())),
+            gate_claim_cmd: "exit 20",
             usage_gate_cmd: None,
         });
         let script_path = tmp.path().join("worker.sh");
@@ -2219,10 +2237,8 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success());
-        assert!(
-            !probe.exists(),
-            "残タスクが無いのにゲートで待たせてはいけない"
-        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("Stopped"), "{stdout}");
         assert!(markers.join("worker-done-0").exists());
     }
 
@@ -2236,7 +2252,7 @@ mod tests {
                 queue_dir: &tmp.join("queue"),
                 task_dir: &tmp.join("tasks"),
                 marker_dir: &tmp.join("markers"),
-                gate_wait_cmd: "tb gate-wait --stop-file /tmp/burn/stop",
+                gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
                 usage_gate_cmd: gate,
             });
             assert_valid_bash(&script, "worker script");

@@ -677,7 +677,7 @@ fn rejected_by_five_hour_window_pauses_until_it_resets() {
     let stop_file = tmp.path().join("stop");
     let five_hour_reset = chrono::Local::now().timestamp() + 900;
     let input = format!(
-        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","unifiedWindows":{{"five_hour":{{"utilization":1.0,"resetsAt":{five_hour_reset}}},"seven_day":{{"utilization":0.43}}}}}}}}"#
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","isUsingOverage":false,"overageInUse":false,"unifiedWindows":{{"five_hour":{{"utilization":1.0,"resetsAt":{five_hour_reset}}},"seven_day":{{"utilization":0.43}}}}}}}}"#
     );
     let clean = strip_ansi(&run_process_with_opts(&input, None, Some(&stop_file), 90));
     assert!(clean.contains("rejected"), "{clean}");
@@ -719,7 +719,7 @@ fn rejected_stops_when_weekly_window_is_also_exhausted() {
     let stop_file = tmp.path().join("stop");
     let five_hour_reset = chrono::Local::now().timestamp() + 900;
     let input = format!(
-        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","unifiedWindows":{{"five_hour":{{"utilization":1.0,"resetsAt":{five_hour_reset}}},"seven_day":{{"utilization":0.95}}}}}}}}"#
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","isUsingOverage":false,"unifiedWindows":{{"five_hour":{{"utilization":1.0,"resetsAt":{five_hour_reset}}},"seven_day":{{"utilization":0.95}}}}}}}}"#
     );
     let _ = strip_ansi(&run_process_with_opts(&input, None, Some(&stop_file), 90));
     assert!(stop_file.exists(), "週次枠も枯れているなら恒久停止すべき");

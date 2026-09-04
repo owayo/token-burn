@@ -174,17 +174,24 @@ enum Commands {
         /// 分類対象の jsonl ファイル
         jsonl: PathBuf,
     },
-    /// 次のタスクを開始してよいか判定し、一時停止中なら再開時刻まで待つ（ワーカースクリプト専用）
+    /// 停止判定とキューからの claim を同じロックの下で行う（ワーカースクリプト専用）
     ///
-    /// 終了コード 0 は続行、それ以外は恒久停止。
-    #[command(hide = true, name = "gate-wait")]
-    GateWait {
+    /// 一時停止中なら再開時刻まで待つ。終了コードは 0=claim 成功（番号を stdout へ出力）、
+    /// 10=恒久停止、20=処理できる pending 無し。
+    #[command(hide = true, name = "gate-claim")]
+    GateClaim {
         /// 恒久停止シグナルのファイルパス（一時停止ファイルはこの隣に置かれる）
         #[arg(long)]
         stop_file: PathBuf,
+        /// `pending-*` / `claimed-*` を置くキューディレクトリ
+        #[arg(long)]
+        queue_dir: PathBuf,
         /// 実行全体のデッドライン（Unix epoch 秒）。これを越える待機はせず停止する
         #[arg(long)]
         deadline_epoch: Option<i64>,
+        /// 一時停止から再開する直前に実行する再検証コマンド（usage-gate）
+        #[arg(long)]
+        revalidate: Option<String>,
     },
     /// ai-usage の使用率をチェックし閾値超過なら stop file を作成する（ワーカースクリプト専用）
     #[command(hide = true, name = "usage-gate")]
@@ -245,7 +252,10 @@ async fn main() -> Result<()> {
         threshold,
     } = &command
     {
-        return format_stream::run(raw_output.as_deref(), stop_file.as_deref(), *threshold);
+        // 停止シグナルを書けなかった場合だけ非ゼロ。タスクスクリプトはこの終了コードを
+        // 見て、後続を止められない状態のままワーカーが走り続けるのを防ぐ。
+        let code = format_stream::run(raw_output.as_deref(), stop_file.as_deref(), *threshold)?;
+        std::process::exit(code);
     }
 
     if let Commands::Mark {
@@ -266,17 +276,26 @@ async fn main() -> Result<()> {
         std::process::exit(class.exit_code());
     }
 
-    if let Commands::GateWait {
+    if let Commands::GateClaim {
         stop_file,
+        queue_dir,
         deadline_epoch,
+        revalidate,
     } = &command
     {
-        let outcome = rate_control::run_gate_wait(stop_file, *deadline_epoch).await?;
-        // ワーカーはこの終了コードでループを継続するか抜けるかを決める。
-        std::process::exit(match outcome {
-            rate_control::GateOutcome::Proceed => 0,
-            rate_control::GateOutcome::Stop => 10,
-        });
+        let outcome = rate_control::run_gate_claim(
+            stop_file,
+            queue_dir,
+            *deadline_epoch,
+            revalidate.as_deref(),
+        )
+        .await?;
+        // claim できた番号だけを stdout に出す（進捗や警告は stderr）。ワーカーは
+        // これをタスクスクリプト名の組み立てに使い、終了コードで分岐する。
+        if let rate_control::ClaimOutcome::Claimed(index) = &outcome {
+            println!("{index}");
+        }
+        std::process::exit(outcome.exit_code());
     }
 
     if let Commands::UsageGate {
@@ -352,7 +371,7 @@ async fn main() -> Result<()> {
         Commands::Init { .. } => unreachable!(),
         Commands::FormatStream { .. } => unreachable!(),
         Commands::ClassifyResult { .. } => unreachable!(),
-        Commands::UsageGate { .. } | Commands::GateWait { .. } => unreachable!(),
+        Commands::UsageGate { .. } | Commands::GateClaim { .. } => unreachable!(),
     }
 
     Ok(())

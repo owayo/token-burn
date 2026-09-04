@@ -445,19 +445,16 @@ pub async fn run_usage_gate(
 
 /// 短 TTL のキャッシュを介して ai-usage --json を取得する。
 async fn load_usage_cached(command: &[String], cache_file: &Path) -> Result<AiUsageSnapshot> {
-    const TTL_SECS: u64 = 20;
-    if let Ok(meta) = std::fs::metadata(cache_file)
-        && let Ok(modified) = meta.modified()
-        && modified
-            .elapsed()
-            .map(|e| e.as_secs() < TTL_SECS)
-            .unwrap_or(false)
-        && let Ok(content) = std::fs::read(cache_file)
-        && let Ok(parsed) = serde_json::from_slice::<AiUsageOutput>(&content)
-    {
-        return Ok(AiUsageSnapshot {
-            accounts: parsed.accounts,
-        });
+    if let Some(snapshot) = read_fresh_cache(cache_file) {
+        return Ok(snapshot);
+    }
+
+    // TTL 切れの瞬間に並列ワーカーが揃って到達すると、全員が ai-usage を起動する
+    // （一時停止から一斉に再開したときに起きやすい）。ロックを取ってからもう一度
+    // TTL を確認し、待っている間に別ワーカーが更新していればその結果を使う。
+    let _guard = rate_control::FileLock::acquire(&rate_control::sidecar_lock_path(cache_file))?;
+    if let Some(snapshot) = read_fresh_cache(cache_file) {
+        return Ok(snapshot);
     }
 
     anyhow::ensure!(!command.is_empty(), "ai_usage.command is empty");
@@ -473,6 +470,21 @@ async fn load_usage_cached(command: &[String], cache_file: &Path) -> Result<AiUs
     // （途中書き込みの不完全 JSON を別ワーカーが読むのを防ぐ）。
     write_cache_atomic(cache_file, &output.stdout);
     Ok(AiUsageSnapshot {
+        accounts: parsed.accounts,
+    })
+}
+
+/// TTL 内のキャッシュがあれば読む。無い / 期限切れ / 壊れている場合は `None`。
+fn read_fresh_cache(cache_file: &Path) -> Option<AiUsageSnapshot> {
+    const TTL_SECS: u64 = 20;
+    let meta = std::fs::metadata(cache_file).ok()?;
+    let modified = meta.modified().ok()?;
+    if modified.elapsed().ok()?.as_secs() >= TTL_SECS {
+        return None;
+    }
+    let content = std::fs::read(cache_file).ok()?;
+    let parsed = serde_json::from_slice::<AiUsageOutput>(&content).ok()?;
+    Some(AiUsageSnapshot {
         accounts: parsed.accounts,
     })
 }

@@ -477,17 +477,24 @@ pub fn execute_plan_tmux(
         }
     }
 
-    // ワーカーが次のタスクを claim する前に通すゲート。恒久停止なら非ゼロ終了し、
-    // 一時停止中（5 時間枠のように待てば回復する枠での停止）なら再開時刻まで待つ。
+    // ワーカーの「停止判定 + claim」。恒久停止なら 10、pending が無ければ 20 で終わり、
+    // 一時停止中（5 時間枠のように待てば回復する枠での停止）は再開時刻まで待つ。
     // デッドラインは相対秒ではなく絶対 epoch で渡す。ワーカーは別プロセスで、しかも
     // 待機を挟むため、相対値だと基準時刻がプロセスごとにずれる。
     let deadline_epoch = chrono::Utc::now().timestamp() + deadline.as_secs() as i64;
-    let gate_wait_cmd = format!(
-        "{} gate-wait --stop-file {} --deadline-epoch {}",
+    let mut gate_claim_cmd = format!(
+        "{} gate-claim --stop-file {} --queue-dir {} --deadline-epoch {}",
         shell_escape(&exe_path.to_string_lossy()),
         shell_escape(&stop_file.to_string_lossy()),
+        shell_escape(&queue_dir.to_string_lossy()),
         deadline_epoch,
     );
+    // 一時停止から再開する直前に、実データで使用率を確かめ直す。待機の根拠は停止時点の
+    // 観測なので、これが無いと状況が変わっていても 1 件は開始してしまう。
+    if let Some(cmd) = usage_gate_cmd.as_deref() {
+        gate_claim_cmd.push_str(" --revalidate ");
+        gate_claim_cmd.push_str(&shell_escape(cmd));
+    }
 
     let mut script_paths = Vec::new();
     for w in 0..worker_count {
@@ -498,7 +505,7 @@ pub fn execute_plan_tmux(
             task_dir: &task_dir,
             marker_dir: &marker_dir,
             usage_gate_cmd: usage_gate_cmd.as_deref(),
-            gate_wait_cmd: &gate_wait_cmd,
+            gate_claim_cmd: &gate_claim_cmd,
         });
         std::fs::write(&script_path, &worker_script)?;
         ensure_executable(&script_path)?;

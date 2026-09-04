@@ -28,11 +28,23 @@ use tools::progress::handle_tool_progress;
 
 /// `claude -p` の stream-json 出力を読みやすいテキストに変換する。
 /// JSON以外の行はそのまま出力（任意のエージェントで動作）。
-pub fn run(raw_output: Option<&Path>, stop_file: Option<&Path>, threshold: u8) -> Result<()> {
+/// 停止シグナル（stop / pause file）を書けなかったときの終了コード。
+///
+/// `format-stream` はパイプ中段（`cmd | format-stream | tee`）で動くため、ここで
+/// 黙って正常終了すると「止めるべきなのに全ワーカーが走り続ける」状態になる。
+/// タスクスクリプトはこのコードを見てワーカーごと止める。
+pub const EXIT_STOP_SIGNAL_UNWRITABLE: i32 = 11;
+
+pub fn run(raw_output: Option<&Path>, stop_file: Option<&Path>, threshold: u8) -> Result<i32> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let out = stdout.lock();
-    process(stdin.lock(), out, raw_output, stop_file, threshold)
+    let signal_failed = process(stdin.lock(), out, raw_output, stop_file, threshold)?;
+    Ok(if signal_failed {
+        EXIT_STOP_SIGNAL_UNWRITABLE
+    } else {
+        0
+    })
 }
 
 fn process(
@@ -41,7 +53,11 @@ fn process(
     raw_output: Option<&Path>,
     stop_file: Option<&Path>,
     threshold: u8,
-) -> Result<()> {
+) -> Result<bool> {
+    // 停止シグナルを書けなかった事実。ストリームは最後まで処理してから終了コードで
+    // 伝える。ここで即座に打ち切ると、パイプが閉じて実行中の `claude` が SIGPIPE で
+    // 落ち、数時間の実行を巻き添えにする。
+    let mut signal_failed = false;
     let mut tool_id_map: HashMap<String, String> = HashMap::new();
     let mut shown_notices = std::collections::HashSet::new();
     let mut blocks: HashMap<usize, ContentBlockState> = HashMap::new();
@@ -130,7 +146,7 @@ fn process(
             }
             "rate_limit_event" => {
                 render_out_of_band_event(&mut out, &mut blocks, |pending| {
-                    handle_rate_limit_event(&v, pending, stop_file, threshold)
+                    handle_rate_limit_event(&v, pending, stop_file, threshold, &mut signal_failed)
                 })?;
             }
             "tool_progress" => {
@@ -150,7 +166,7 @@ fn process(
         writer.flush()?;
     }
 
-    Ok(())
+    Ok(signal_failed)
 }
 
 /// 入力を 1 行ずつ読み、不正な UTF-8 バイトは U+FFFD へ置換して返す。
