@@ -696,6 +696,57 @@ fn rejected_by_five_hour_window_pauses_until_it_resets() {
 }
 
 #[test]
+fn rejected_pause_reason_does_not_claim_a_threshold_breach() {
+    // 拒否は閾値超過とは別の理由で起きる。実データでは 5 時間枠が閾値未満でも
+    // 拒否される。`Basis::reason` をそのまま書くと `five_hour 42% >= threshold 90%`
+    // という成立していない不等式が pause file に残り、デッドライン超過時の停止理由
+    // としてもそのまま出るため、後から「なぜ待っていたのか」を誤読する。
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    let five_hour_reset = chrono::Local::now().timestamp() + 900;
+    let input = format!(
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","isUsingOverage":false,"overageInUse":false,"unifiedWindows":{{"five_hour":{{"utilization":0.42,"resetsAt":{five_hour_reset}}},"seven_day":{{"utilization":0.43}}}}}}}}"#
+    );
+    run_process_with_opts(&input, None, Some(&stop_file), 90);
+
+    let state = crate::rate_control::read_pause(&crate::rate_control::pause_path_for(&stop_file))
+        .unwrap()
+        .expect("pause file が作成されるべき");
+    assert!(
+        !state.reason.contains(">= threshold"),
+        "成立していない閾値の不等式を理由にしてはいけない: {}",
+        state.reason
+    );
+    assert!(
+        state.reason.contains("rejected"),
+        "拒否が理由であることを残すべき: {}",
+        state.reason
+    );
+    assert!(
+        state.reason.contains("42%"),
+        "実測の使用率を残すべき: {}",
+        state.reason
+    );
+}
+
+/// 閾値超過で待つ場合は、従来どおり不等式を理由に残す（こちらは事実）。
+#[test]
+fn threshold_pause_reason_keeps_the_inequality() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let stop_file = tmp.path().join("stop");
+    let five_hour_reset = chrono::Local::now().timestamp() + 600;
+    let input = format!(
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed","rateLimitType":"five_hour","utilization":0.9,"unifiedWindows":{{"five_hour":{{"utilization":0.9,"resetsAt":{five_hour_reset}}},"seven_day":{{"utilization":0.43}}}}}}}}"#
+    );
+    run_process_with_opts(&input, None, Some(&stop_file), 90);
+
+    let state = crate::rate_control::read_pause(&crate::rate_control::pause_path_for(&stop_file))
+        .unwrap()
+        .expect("pause file が作成されるべき");
+    assert_eq!(state.reason, "five_hour 90% >= threshold 90%");
+}
+
+#[test]
 fn rejected_while_using_overage_stops_permanently() {
     // 追加課金枠まで使い切った拒否は、5 時間枠のリセットを待っても再開できない
     // （実データでは復旧が 28 日先）。

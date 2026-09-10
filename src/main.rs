@@ -328,8 +328,6 @@ async fn main() -> Result<()> {
     let public_only = cli.public_only;
     let interactive = cli.interactive;
     let workers = cli.workers;
-    let dedup_scope = resolve_dedup_scope(&config, cli.dedup_scope)?;
-
     match command {
         Commands::Status => {
             let runtime_agents = config.expand_runtime_agents()?;
@@ -337,6 +335,9 @@ async fn main() -> Result<()> {
             display::print_status(&runtime_agents, &resolver)?;
         }
         Commands::Run { paths } => {
+            // 検証はここで行う。共通部で解決すると、処理済み判定を使わない
+            // `status` / `clean` まで `--dedup-scope global` でエラーになる。
+            let dedup_scope = resolve_dedup_scope(&config, cli.dedup_scope)?;
             run(RunOptions {
                 config,
                 config_path,
@@ -353,6 +354,7 @@ async fn main() -> Result<()> {
             .await?;
         }
         Commands::List { paths } => {
+            let dedup_scope = resolve_dedup_scope(&config, cli.dedup_scope)?;
             list(ListOptions {
                 config,
                 config_path,
@@ -969,7 +971,14 @@ fn dedup_peers(
         config::DedupScope::Agent => DedupPeers::Named(HashSet::from([agent.name.clone()])),
         config::DedupScope::Provider => {
             // provider 未設定のエージェントはグルーピングの手掛かりが無いので自分自身のみ。
-            let Some(provider) = agent.provider.as_deref() else {
+            // 空文字（`provider = ""`）も未設定と同じに扱う。有効な provider として
+            // 扱うと、空文字を書いたエージェント同士が互いの履歴でスキップし合う。
+            let Some(provider) = agent
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|provider| !provider.is_empty())
+            else {
                 return DedupPeers::Named(HashSet::from([agent.name.clone()]));
             };
             let names = runtime_agents
@@ -2005,6 +2014,23 @@ mod tests {
 
         let peers = dedup_peers(config::DedupScope::Provider, agent, &runtime);
         assert!(peers.contains("codex-alt"));
+    }
+
+    /// `provider = ""`（空文字）は未設定と同じに扱い、自分自身の記録だけを見る。
+    /// 有効な provider として扱うと、空文字を書いたエージェント同士が互いの履歴で
+    /// スキップし合い、片方が一巡したリポジトリをもう片方が処理できなくなる。
+    #[test]
+    fn dedup_peers_treats_blank_provider_as_unset() {
+        let conf = dedup_test_config(&[("a1", Some("")), ("a2", Some("  "))], Some("2d"));
+        let runtime = conf.expand_runtime_agents().expect("expand");
+        let agent = runtime.iter().find(|a| a.name == "a1").unwrap();
+
+        let peers = dedup_peers(config::DedupScope::Provider, agent, &runtime);
+        assert!(peers.contains("a1"), "自分自身は含む");
+        assert!(
+            !peers.contains("a2"),
+            "空 provider 同士をグルーピングしてはいけない"
+        );
     }
 
     /// スキップ内訳は件数降順・同数はエージェント名昇順で安定して並ぶ。

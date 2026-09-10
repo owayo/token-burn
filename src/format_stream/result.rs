@@ -207,6 +207,7 @@ fn write_session_total(
 
     let mut total_input = 0u64;
     let mut total_output = 0u64;
+    let mut total_thinking = 0u64;
     for usage in model_usage.values() {
         for key in [
             "inputTokens",
@@ -216,6 +217,8 @@ fn write_session_total(
             total_input = total_input.saturating_add(usage[key].as_u64().unwrap_or(0));
         }
         total_output = total_output.saturating_add(usage["outputTokens"].as_u64().unwrap_or(0));
+        total_thinking =
+            total_thinking.saturating_add(usage["thinkingTokens"].as_u64().unwrap_or(0));
     }
 
     // メインループ分と一致する（＝サブエージェントを使っていない）場合は重複表示になる。
@@ -225,11 +228,21 @@ fn write_session_total(
         return Ok(());
     }
 
+    // `modelUsage[].thinkingTokens` はサブエージェント込みの思考トークンで、実ログでは
+    // 総出力の 66%（1,219,128 / 1,843,731）を占める。`usage.output_tokens_details`
+    // 側はメインループ分（89,291）しか含まないため、これを落とすとサブエージェントに
+    // 消えたトークンの最大の内訳が丸ごと見えなくなる。
+    let thinking = if total_thinking > 0 {
+        format!("thinking:{}, ", format_number(total_thinking))
+    } else {
+        String::new()
+    };
     writeln!(
         out,
-        "\x1b[33m\u{1f4ca} total in:{} out:{} (incl. subagents)\x1b[0m",
+        "\x1b[33m\u{1f4ca} total in:{} out:{} ({}incl. subagents)\x1b[0m",
         format_number(total_input),
-        format_number(total_output)
+        format_number(total_output),
+        thinking
     )?;
     Ok(())
 }

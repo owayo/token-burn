@@ -187,7 +187,23 @@ fn find_repos(
         }
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        // 走査中の `readdir` 失敗（マウント断・削除・ACL 変更）を黙って捨てない。
+        // 握り潰すとそのリポジトリが警告も無く対象から消え、`Found N repositories`
+        // の N が静かに減るだけで理由を追えなくなる。他の経路（base_dir 不在・
+        // read_dir 自体の失敗・git 不在・remote 取得失敗）と同じく警告して継続する。
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!(
+                    "{}: failed to read an entry in {}: {}, skipping",
+                    "Warning".yellow(),
+                    dir.display(),
+                    e
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         // シンボリックリンクの追跡による無限再帰を防止
         if path.is_symlink() || !path.is_dir() {

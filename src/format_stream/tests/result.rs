@@ -130,6 +130,43 @@ fn process_result_shows_session_total_when_subagents_consumed_tokens() {
 }
 
 #[test]
+fn process_result_shows_session_total_thinking_tokens() {
+    // 実 jsonl 20260904_090738/0001_depup より。usage 側の thinking_tokens はメイン
+    // ループ分（89,291）しか含まず、サブエージェント込みの思考は modelUsage の
+    // thinkingTokens（1,219,128 = 総出力の 66%）にしか出ない。
+    let input = r#"{"type":"result","subtype":"success","usage":{"input_tokens":804,"output_tokens":270227,"output_tokens_details":{"thinking_tokens":89291},"cache_read_input_tokens":161790386,"cache_creation_input_tokens":611340},"modelUsage":{"claude-opus-5":{"costUSD":263.7,"inputTokens":2950,"outputTokens":1843731,"cacheReadInputTokens":359336322,"cacheCreationInputTokens":5702466,"thinkingTokens":1219128}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(clean.contains("out:270,227 (thinking:89,291)"), "{clean}");
+    assert!(
+        clean.contains("total in:365,041,738 out:1,843,731 (thinking:1,219,128, incl. subagents)"),
+        "{clean}"
+    );
+}
+
+#[test]
+fn process_result_session_total_omits_thinking_when_absent() {
+    // modelUsage に thinkingTokens が無い形式では従来どおりの表記を保つ。
+    let input = r#"{"type":"result","subtype":"success","usage":{"input_tokens":10,"output_tokens":20},"modelUsage":{"claude-opus-5":{"costUSD":1.0,"inputTokens":100,"outputTokens":200,"cacheReadInputTokens":1000}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(
+        clean.contains("total in:1,100 out:200 (incl. subagents)"),
+        "{clean}"
+    );
+    assert!(!clean.contains("thinking:"), "{clean}");
+}
+
+#[test]
+fn process_result_session_total_sums_thinking_across_models() {
+    // 複数モデルにまたがる思考トークンも合算する。
+    let input = r#"{"type":"result","subtype":"success","usage":{"input_tokens":10,"output_tokens":20},"modelUsage":{"claude-opus-5":{"costUSD":1.0,"inputTokens":100,"outputTokens":200,"thinkingTokens":150},"claude-haiku-4-5":{"costUSD":0.1,"inputTokens":50,"outputTokens":30,"thinkingTokens":25}}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    assert!(clean.contains("(thinking:175, incl. subagents)"), "{clean}");
+}
+
+#[test]
 fn process_result_hides_session_total_without_subagents() {
     // spawned:0 のセッションでは usage と modelUsage が一致するため、総計行は重複ノイズ。
     let input = r#"{"type":"result","subtype":"success","subagent_stats":{"spawned":0},"usage":{"input_tokens":100,"output_tokens":67798,"cache_read_input_tokens":14640463},"modelUsage":{"claude-opus-5":{"costUSD":1.0,"inputTokens":100,"outputTokens":67798,"cacheReadInputTokens":14640463}}}"#;

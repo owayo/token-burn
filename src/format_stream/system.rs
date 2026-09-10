@@ -157,13 +157,28 @@ fn write_task_started(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
     } else {
         subagent_type
     };
+    let mut attrs = Vec::new();
+    if !display_type.is_empty() {
+        attrs.push(truncate_inline(display_type, 30));
+    }
+    // 入れ子起動（サブエージェントが起動したサブエージェント）は実行時間とトークン
+    // 消費が指数的に膨らむ。`result.subagent_stats.max_depth` は最終集計しか持たない
+    // ため、これを落とすと「どのタスクが深いのか」を追えない。深さ 1 は通常の
+    // トップレベル起動でノイズになるので 2 以上のときだけ添える。
+    if let Some(depth) = v["spawn_depth"].as_u64().filter(|depth| *depth >= 2) {
+        attrs.push(format!("depth:{depth}"));
+    }
+    // `is_backgrounded` は表示しない。Claude Code はサブエージェントを常に背景で
+    // 起動するため実データの local_agent では 50 件すべて true で情報量が無く、
+    // 長時間 Bash の自動バックグラウンド移行は完了行の `assistantAutoBackgrounded`、
+    // 明示的な背景起動は `Agent` ツール行の `run_in_background` で既に見えている。
     if !desc.is_empty() {
-        if !display_type.is_empty() {
+        if !attrs.is_empty() {
             writeln!(
                 out,
                 "\x1b[2m  \u{23f3} {} ({})\x1b[0m",
                 truncate_str(desc, 80),
-                display_type
+                attrs.join(", ")
             )?;
         } else {
             writeln!(out, "\x1b[2m  \u{23f3} {}\x1b[0m", truncate_str(desc, 80))?;

@@ -306,3 +306,45 @@ fn commands_changed_writes_nothing() {
     );
     assert!(out.is_empty(), "{out:?}");
 }
+
+/// 入れ子起動（サブエージェントが起動したサブエージェント）は深さを添える。
+/// 実 jsonl 20260904_090738/0001_depup の `spawn_depth:2` / `depth:3` より。
+#[test]
+fn task_started_shows_nested_spawn_depth() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_started","description":"Audit Go go.mod handling","task_type":"local_agent","subagent_type":"general-purpose","spawn_depth":2,"is_backgrounded":true}"#,
+    );
+    assert!(out.contains("Audit Go go.mod handling"), "{out:?}");
+    assert!(out.contains("general-purpose"), "{out:?}");
+    assert!(out.contains("depth:2"), "{out:?}");
+}
+
+/// 深さ 1 は通常のトップレベル起動なので添えない（実データの 30 件が該当）。
+#[test]
+fn task_started_omits_top_level_spawn_depth() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_started","description":"PHP/Composer バージョン仕様監査","task_type":"local_agent","subagent_type":"general-purpose","spawn_depth":1,"is_backgrounded":true}"#,
+    );
+    assert!(out.contains("(general-purpose)"), "{out:?}");
+    assert!(!out.contains("depth:"), "{out:?}");
+}
+
+/// `is_backgrounded` は実データの local_agent で常に true のため表示しない。
+/// 長時間 Bash の自動バックグラウンド移行は完了行の `assistantAutoBackgrounded`、
+/// 明示的な背景起動は `Agent` ツール行の `run_in_background` で既に見えている。
+#[test]
+fn task_started_omits_backgrounded_flag() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_started","description":"依存パッケージを最新化","task_type":"local_bash","is_backgrounded":true}"#,
+    );
+    assert!(out.contains("(local_bash)"), "{out:?}");
+    assert!(!out.contains("background"), "{out:?}");
+}
+
+/// 深さも種別も無い形式では説明だけを出す（従来の表示を保つ）。
+#[test]
+fn task_started_without_type_shows_description_only() {
+    let out = render(r#"{"type":"system","subtype":"task_started","description":"plain task"}"#);
+    assert!(out.contains("plain task"), "{out:?}");
+    assert!(!out.contains('('), "{out:?}");
+}

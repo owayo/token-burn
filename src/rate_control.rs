@@ -412,7 +412,21 @@ pub fn write_pause(pause_file: &Path, state: &PauseState) -> Result<bool> {
 ///
 /// 既に存在する場合は上書きせず `false` を返す。並列ワーカーから同時に呼ばれても
 /// 最初の理由が残る。
+///
+/// 作成は claim / pause 更新と同じ sidecar ロックの下で行う。これが無いと、
+/// `run_gate_claim` がロック内で「停止が無い」ことを確認してから `rename` で claim する
+/// までの隙間に停止が発行され、停止後にタスクが 1 件開始され得る。
+/// ロックを取れなかった場合でも停止シグナルは書く。直列化の取りこぼしより、
+/// 停止を伝えられないまま走り続ける方が危険なため（fail-closed）。
 pub fn write_stop(stop_file: &Path, reason: &str) -> std::io::Result<bool> {
+    let _guard = FileLock::acquire(&pause_lock_path(&pause_path_for(stop_file))).ok();
+    write_stop_unlocked(stop_file, reason)
+}
+
+/// ロックを取らずに stop file を作成する。呼び出し側が既に control ロックを保持して
+/// いる場合（同一プロセスからの再取得は `flock` の意味論上ブロックしないが、意図を
+/// 明示するため経路を分ける）に使う。
+fn write_stop_unlocked(stop_file: &Path, reason: &str) -> std::io::Result<bool> {
     match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -515,6 +529,12 @@ pub async fn run_gate_claim(
                     run_revalidation(cmd, stop_file);
                     continue;
                 }
+                // 再開が確定したので、期限切れの一時停止状態を片付ける。残したままだと
+                // pause file は「存在するが resume_at を過ぎている」状態で居座り、
+                // 以後の claim（タスクごとに別プロセス）が毎回 Resumed 判定になって
+                // 再検証（ai-usage 起動）が走り続ける。再検証は一時停止を抜けた
+                // 1 回だけで足りる。
+                clear_expired_pause(&pause_file);
             }
         }
 
@@ -599,13 +619,39 @@ fn next_pending(queue_dir: &Path) -> Result<Option<PathBuf>> {
     Ok(best)
 }
 
+/// 再開時刻を過ぎた pause file を削除する。
+///
+/// control ロックの下で読み直してから消すため、待機中の別ワーカーによる延長
+/// （read-modify-write）と競合しない。まだ未来を指す pause は消さない。
+/// 待機中のワーカーは再開時刻を自分の変数に持っているので、削除しても待ち続ける。
+fn clear_expired_pause(pause_file: &Path) {
+    let _ = with_control_lock(&pause_lock_path(pause_file), || {
+        if let Ok(Some(state)) = read_pause(pause_file)
+            && state.resume_at <= now_epoch()
+        {
+            let _ = std::fs::remove_file(pause_file);
+        }
+        Ok(())
+    });
+}
+
 /// 一時停止から再開する直前の再検証コマンドを実行する。
 ///
 /// 失敗は握り潰す。`usage-gate` は自分で stop / pause を書くため、直後の判定で結果を
 /// 読み取れる。ここでエラーにすると、再検証の起動に失敗しただけでワーカーが止まる。
+///
+/// 子の stdout は捨てる。`gate-claim` の stdout は claim 番号専用で、ワーカーの
+/// `CLAIMED=$(... gate-claim ...)` へ直結している。子が 1 行でも stdout へ書くと
+/// それが claim 番号に連結され、タスクスクリプト名が壊れて claim 済みのタスクが
+/// マーカーも残さず失われる。診断は stderr に出るのでワーカーペインからは見える。
 fn run_revalidation(cmd: &str, stop_file: &Path) {
     eprintln!("\x1b[33m  \u{21bb} 再開前に使用率を再確認します\x1b[0m");
-    match std::process::Command::new("sh").arg("-c").arg(cmd).status() {
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .status()
+    {
         Ok(status) if status.success() => {}
         Ok(status) => {
             // usage-gate は fail-closed で非ゼロ終了する。停止シグナルは既に書かれて
@@ -759,7 +805,7 @@ fn read_pause_for_gate(
         Err(e) => {
             let reason = format!("unreadable pause state: {e}");
             let _ = write_stop(stop_file, &reason);
-            println!("\x1b[31m  \u{26d4} gate-wait: {reason}（停止します）\x1b[0m");
+            eprintln!("\x1b[31m  \u{26d4} gate-wait: {reason}（停止します）\x1b[0m");
             Err(GateOutcome::Stop)
         }
     }
@@ -1172,6 +1218,59 @@ mod tests {
             ClaimOutcome::Claimed(_)
         ));
         assert!(probe.exists(), "再開前に使用率を確かめ直すべき");
+    }
+
+    #[tokio::test]
+    async fn gate_clears_an_expired_pause_after_resuming() {
+        // 期限切れの pause file を残したままにすると、claim（タスクごとに別プロセス）が
+        // 毎回「一時停止から再開した」と判定して再検証コマンドを起動し続ける。
+        // 再検証は一時停止を抜けた 1 回だけで足りる。
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = queue_with(tmp.path(), 2);
+        let stop = tmp.path().join("stop");
+        let pause_file = pause_path_for(&stop);
+        pause_at(&pause_file, now_epoch() - 60);
+
+        assert!(matches!(
+            run_gate_claim(&stop, &queue, None, None).await.unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+        assert!(!pause_file.exists(), "再開が確定した一時停止は片付けるべき");
+
+        // 2 件目の claim では再検証コマンドを起動しない（pause が無いため）。
+        let probe = tmp.path().join("revalidated");
+        let cmd = format!("touch {}", probe.display());
+        assert!(matches!(
+            run_gate_claim(&stop, &queue, None, Some(&cmd))
+                .await
+                .unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+        assert!(!probe.exists(), "片付けた後は再検証を繰り返してはいけない");
+    }
+
+    #[test]
+    fn clear_expired_pause_keeps_a_future_pause() {
+        // まだ未来を指す一時停止は消さない。待機中の別ワーカーが延長を読み直す
+        // 根拠であり、消すと「待つべき時間」が共有できなくなる。
+        let tmp = tempfile::tempdir().unwrap();
+        let pause_file = tmp.path().join("stop-pause.json");
+        pause_at(&pause_file, now_epoch() + 3600);
+
+        clear_expired_pause(&pause_file);
+
+        assert!(pause_file.exists(), "未来の一時停止を消してはいけない");
+    }
+
+    #[test]
+    fn clear_expired_pause_removes_an_expired_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pause_file = tmp.path().join("stop-pause.json");
+        pause_at(&pause_file, now_epoch() - 1);
+
+        clear_expired_pause(&pause_file);
+
+        assert!(!pause_file.exists(), "期限切れの一時停止は片付けるべき");
     }
 
     #[tokio::test]

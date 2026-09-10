@@ -72,7 +72,8 @@ pub(crate) fn handle_rate_limit_event(
                 }
                 Decision::Pause { resume_at, basis } => {
                     write_auto_pause(out, info, &basis, resume_at, &windows, threshold)?;
-                    apply_pause(out, stop_file, resume_at, &basis, threshold, signal_failed)?;
+                    let reason = basis.reason(threshold);
+                    apply_pause(out, stop_file, resume_at, &basis, &reason, signal_failed)?;
                 }
                 Decision::Proceed => {
                     if status == "allowed_warning" {
@@ -102,7 +103,14 @@ pub(crate) fn handle_rate_limit_event(
             match rejected_decision(info, &windows, threshold) {
                 Some((resume_at, basis)) => {
                     write_rejected_pause(out, &basis, resume_at)?;
-                    apply_pause(out, stop_file, resume_at, &basis, threshold, signal_failed)?;
+                    // 拒否は閾値超過とは別の理由で起きる（実データでは 5 時間枠が
+                    // 42% でも拒否される）。閾値の不等式を書くと、後から pause file を
+                    // 読んだときに成立していない条件が待機の根拠に見える。
+                    let reason = format!(
+                        "request rejected ({limit_type}); {} at {:.0}%",
+                        basis.window, basis.used_percent
+                    );
+                    apply_pause(out, stop_file, resume_at, &basis, &reason, signal_failed)?;
                 }
                 None => apply_stop(
                     out,
@@ -511,12 +519,16 @@ fn apply_stop(
 /// 恒久停止と違い、こちらは「いつまで止めるか」を持つ。書き込みに失敗した場合は
 /// 恒久停止へフォールバックして止める側に倒し、そちらも書けなければ `signal_failed` が
 /// 立つ（`apply_stop` 参照）。
+/// `reason` は pause file に残り、待機がデッドラインを越えたときの停止理由にもなる。
+/// 閾値超過で待つ場合と `rejected` で待つ場合では成立している条件が違うため、
+/// 呼び出し側が事実に合う文言を渡す（`Basis::reason` を無条件に使うと、`rejected`
+/// では `five_hour 42% >= threshold 95%` のような成立していない不等式が残る）。
 fn apply_pause(
     out: &mut impl Write,
     stop_file: Option<&Path>,
     resume_at: i64,
     basis: &Basis,
-    threshold: u8,
+    reason: &str,
     signal_failed: &mut bool,
 ) -> Result<()> {
     let Some(path) = stop_file else {
@@ -525,14 +537,14 @@ fn apply_pause(
     let state = rate_control::PauseState {
         resume_at,
         window: basis.window.clone(),
-        reason: basis.reason(threshold),
+        reason: reason.to_string(),
     };
     if let Err(e) = rate_control::write_pause(&rate_control::pause_path_for(path), &state) {
         writeln!(
             out,
             "\x1b[31m  \u{26d4} pause file の書き込みに失敗しました: {e}（恒久停止へ切り替えます）\x1b[0m",
         )?;
-        apply_stop(out, stop_file, &basis.reason(threshold), signal_failed)?;
+        apply_stop(out, stop_file, reason, signal_failed)?;
     }
     Ok(())
 }

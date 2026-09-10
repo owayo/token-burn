@@ -99,8 +99,19 @@ pub(crate) fn format_byte_size(bytes: u64) -> String {
     }
 }
 
+/// 表示用に切り詰める。返却文字列の char 数は必ず `max` 以下になる。
+///
+/// 改行（LF / CR）は空白へ畳んでから切り詰める。呼び出し元はすべて「1 行の中へ
+/// 埋め込む」用途だが、実データの Bash `command` はヒアドキュメントや複数行
+/// スクリプトで改行を含み、2,797 件中 284 件が先頭 60 文字以内で改行していた。
+/// そのまま埋め込むと 1 行のはずのツール行が複数行へ割れ、`\x1b[2m` を開いたまま
+/// 改行して閉じる `\x1b[0m` が最終行にしか出ない（実ログの整形結果で 145 件）。
+/// このモジュールは `break_open_line` まで作り込んで「1 イベント 1 行」を守って
+/// いるので、切り詰め側でも行を割らないことを保証する。
 pub(crate) fn truncate_str(s: &str, max: usize) -> String {
-    let mut iter = s.chars();
+    let mut iter = s
+        .chars()
+        .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch });
     let mut prefix = String::new();
     for _ in 0..max {
         match iter.next() {

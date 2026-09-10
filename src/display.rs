@@ -14,6 +14,12 @@ const REDACTED_COMMAND_VALUE: &str = "<redacted>";
 pub fn format_command(command: &[String]) -> String {
     let mut rendered = Vec::with_capacity(command.len());
     let mut redact_next = false;
+    // 環境変数代入として扱うのは、実行ファイルより前に並ぶ `KEY=VALUE`（`env FOO=1 cmd`
+    // の前置き）だけに限る。実行ファイル以降の `key=value` はサブコマンドのオプション値で、
+    // 既定 config の `codex -c model='gpt-5.3-codex'` や自動注入の `-c approval_policy=never`
+    // が該当する。これらまで伏せると、ドライランの目的（何が起動されるかの確認）そのものが
+    // 果たせない（モデル・reasoning effort・承認方針が丸ごと `<redacted>` になる）。
+    let mut in_env_prefix = true;
 
     for (index, arg) in command.iter().enumerate() {
         if index == 0 {
@@ -26,13 +32,21 @@ pub fn format_command(command: &[String]) -> String {
             continue;
         }
 
-        if let Some((key, _)) = arg.split_once('=')
-            && (is_env_key(key) || is_sensitive_option(key))
-        {
-            rendered.push(format!("{key}={REDACTED_COMMAND_VALUE}"));
-            continue;
+        match arg.split_once('=') {
+            // 認証系オプションの `--key=value` 形式は位置に関わらず伏せる。
+            Some((key, _)) if is_sensitive_option(key) => {
+                rendered.push(format!("{key}={REDACTED_COMMAND_VALUE}"));
+                continue;
+            }
+            Some((key, _)) if in_env_prefix && is_env_key(key) => {
+                rendered.push(format!("{key}={REDACTED_COMMAND_VALUE}"));
+                continue;
+            }
+            _ => {}
         }
 
+        // `=` を含まない引数が現れた時点が実行ファイル本体。以降は前置き代入ではない。
+        in_env_prefix = false;
         rendered.push(arg.clone());
         redact_next = is_sensitive_option(arg);
     }
@@ -161,6 +175,58 @@ mod tests {
             format_command(&command),
             "env API_TOKEN=<redacted> ai-usage --json"
         );
+    }
+
+    /// 実行ファイル以降の `key=value` はサブコマンドのオプション値なので伏せない。
+    /// 既定 config の codex エージェントと、自動注入される `-c approval_policy=never`
+    /// がこの形。伏せるとドライランでモデルも承認方針も確認できなくなる。
+    #[test]
+    fn format_command_keeps_subcommand_key_value_options() {
+        let command = vec![
+            "codex".to_string(),
+            "-c".to_string(),
+            "approval_policy=never".to_string(),
+            "exec".to_string(),
+            "--full-auto".to_string(),
+            "-c".to_string(),
+            "model='gpt-5.3-codex'".to_string(),
+            "-c".to_string(),
+            "model_reasoning_effort='xhigh'".to_string(),
+        ];
+
+        assert_eq!(
+            format_command(&command),
+            "codex -c approval_policy=never exec --full-auto -c model='gpt-5.3-codex' -c model_reasoning_effort='xhigh'"
+        );
+    }
+
+    /// 前置きの環境変数代入は伏せたまま、実行ファイル以降のオプション値は残す。
+    #[test]
+    fn format_command_redacts_env_prefix_but_keeps_later_options() {
+        let command = vec![
+            "env".to_string(),
+            "CLAUDE_CONFIG_DIR=/home/me/.claude".to_string(),
+            "codex".to_string(),
+            "-c".to_string(),
+            "model='gpt-5.3-codex'".to_string(),
+        ];
+
+        assert_eq!(
+            format_command(&command),
+            "env CLAUDE_CONFIG_DIR=<redacted> codex -c model='gpt-5.3-codex'"
+        );
+    }
+
+    /// 認証系オプションの `--key=value` は実行ファイルより後ろでも伏せる。
+    #[test]
+    fn format_command_redacts_sensitive_option_after_executable() {
+        let command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "--api-key=top-secret".to_string(),
+        ];
+
+        assert_eq!(format_command(&command), "codex exec --api-key=<redacted>");
     }
 
     #[test]

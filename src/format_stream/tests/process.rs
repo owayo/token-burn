@@ -619,6 +619,43 @@ fn truncate_str_multibyte_counts_chars() {
 }
 
 #[test]
+fn truncate_str_folds_newlines_into_spaces() {
+    // 呼び出し元はすべて 1 行の中へ埋め込む用途。改行が残ると 1 イベント 1 行の
+    // 不変条件が破れ、`\x1b[2m` を開いたまま改行して閉じる `\x1b[0m` が最終行に
+    // しか出ない（実ログの Bash ツール行 145 件がこれで割れていた）。
+    assert_eq!(truncate_str("a\nb", 10), "a b");
+    assert_eq!(truncate_str("a\r\nb", 10), "a  b");
+    // 改行も 1 文字として数えるので、切り詰め幅の契約は変わらない。
+    assert_eq!(truncate_str("ab\ncdefgh", 7), "ab c...");
+}
+
+#[test]
+fn process_bash_tool_line_stays_on_one_line() {
+    // 実データの Bash コマンドはヒアドキュメントや複数行スクリプトで改行を含む
+    // （2,797 件中 284 件が先頭 60 文字以内で改行）。ツール行は必ず 1 行に収める。
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Bash","id":"t_nl","input":{}}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\": \"cat > f <<'EOF'\nimport re\nprint(1)\nEOF\", \"description\": \"multi\nline\"}"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+
+    let output = run_process(&input);
+    let tool_lines: Vec<&str> = output
+        .lines()
+        .filter(|line| line.contains("\u{1f527}"))
+        .collect();
+
+    assert_eq!(tool_lines.len(), 1, "ツール行は 1 行であるべき: {output:?}");
+    assert!(
+        tool_lines[0].ends_with("\x1b[0m"),
+        "行末で装飾を閉じるべき: {:?}",
+        tool_lines[0]
+    );
+    assert!(!strip_ansi(tool_lines[0]).contains('\n'));
+}
+
+#[test]
 fn process_empty_tool_input_on_block_stop() {
     // tool_input が空（partial_json なし）で content_block_stop が来た場合
     let input = [
@@ -638,6 +675,55 @@ fn process_unknown_tool_result_id() {
     let output = run_process(input);
     let clean = strip_ansi(&output);
     assert!(clean.contains("?"), "不明なツールは '?' と表示されるべき");
+}
+
+#[test]
+fn tool_result_from_subagent_shows_task_attribution() {
+    // 実 jsonl 20260904_090738/0001_depup より。サブエージェント内で走ったツールの
+    // 結果はメインループの出力と同じストリームへ混ざるため、どのタスクのものかを
+    // 添えないと並列 22 タスクの `✓ Bash` を区別できない。
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"Bash","id":"t_sub"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop"}}"#,
+        r#"{"type":"user","subagent_type":"general-purpose","task_description":"registry/HTTP/OSVレビュー","message":{"content":[{"type":"tool_result","tool_use_id":"t_sub","is_error":false,"content":"ok"}]}}"#,
+    ]
+    .join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert!(clean.contains("Bash @registry/HTTP/OSVレビュー"), "{clean}");
+}
+
+#[test]
+fn tool_result_from_subagent_falls_back_to_agent_type() {
+    // description を持たない形式では種別へ落とす。
+    let input = r#"{"type":"user","subagent_type":"Explore","message":{"content":[{"type":"tool_result","tool_use_id":"unknown","content":"ok"}]}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("@Explore"), "{clean}");
+}
+
+#[test]
+fn tool_result_from_main_loop_has_no_attribution() {
+    // メインループの結果には task_description / subagent_type が無く、従来表示のまま。
+    let input = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"unknown","content":"ok"}]},"tool_use_result":{"stdout":"done"}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(!clean.contains('@'), "{clean}");
+    assert!(clean.contains("stdout:done"), "{clean}");
+}
+
+#[test]
+fn tool_result_error_from_subagent_keeps_summary_and_attribution() {
+    // エラー行でも帰属をツール名の直後に置き、エラーサマリーと両立させる。
+    let input = r#"{"type":"user","subagent_type":"general-purpose","task_description":"PHP 版比較のバグ修正","message":{"content":[{"type":"tool_result","tool_use_id":"unknown","is_error":true,"content":"File does not exist."}]}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("@PHP 版比較のバグ修正"), "{clean}");
+    assert!(clean.contains("File does not exist."), "{clean}");
+}
+
+#[test]
+fn tool_result_attribution_ignores_blank_task_description() {
+    // 空白だけの description は帰属として無意味なので種別へ落とす。
+    let input = r#"{"type":"user","subagent_type":"codex","task_description":"   ","message":{"content":[{"type":"tool_result","tool_use_id":"unknown","content":"ok"}]}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("@codex"), "{clean}");
 }
 
 #[test]
@@ -1427,6 +1513,41 @@ fn process_shows_hook_feedback_for_other_hook_events() {
         clean.contains("⚠ Hook feedback (PostToolUse:Bash): blocked by policy"),
         "{clean:?}"
     );
+}
+
+/// 小文字化でバイト長が伸びる文字（`İ` U+0130 → `i` + U+0307）がマーカーの前に
+/// あっても panic しない。`to_lowercase()` した別文字列のバイト位置を元文字列へ
+/// 流用していた頃は、範囲外スライスで panic → パイプが閉じて上流の `claude` が
+/// SIGPIPE で死ぬ経路だった。
+#[test]
+fn process_hook_feedback_with_lengthening_lowercase_does_not_panic() {
+    let input = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"İşlem hook feedback:\nblocked"}]},"isSynthetic":true}"#;
+
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.contains("Hook feedback (İşlem): blocked"),
+        "{clean:?}"
+    );
+}
+
+/// 小文字化でバイト長が縮む文字（`K` KELVIN SIGN U+212A → `k`）でも panic しない。
+/// 旧実装ではマルチバイト文字の途中を指して非文字境界スライスになっていた。
+#[test]
+fn process_hook_feedback_with_shortening_lowercase_does_not_panic() {
+    let input = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"K hook feedback: blocked"}]},"isSynthetic":true}"#;
+
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("Hook feedback"), "{clean:?}");
+    assert!(clean.contains("blocked"), "{clean:?}");
+}
+
+/// マーカーの照合は ASCII の大文字小文字を無視する（旧 `to_lowercase()` の意図を保つ）。
+#[test]
+fn process_hook_feedback_matches_marker_case_insensitively() {
+    let input = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Stop Hook Feedback: blocked"}]},"isSynthetic":true}"#;
+
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("Hook feedback (Stop): blocked"), "{clean:?}");
 }
 
 /// スキル本文の注入も `isSynthetic` で届くが、SKILL.md 全文を含んで巨大になり

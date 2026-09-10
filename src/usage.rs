@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde::Deserialize;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
@@ -336,6 +334,11 @@ async fn spawn_ai_usage_with_timeout(command: &[String]) -> Result<std::process:
 /// - 該当エントリが無い / 使用率欠損のときは過剰停止を避けて続行する。
 /// - `stop_file` の作成は `create_new` で冪等（並列 worker から同時に呼ばれても安全）。
 /// - `cache_file` に短 TTL で ai-usage 出力をキャッシュし、並列実行時の重複取得を抑える。
+///
+/// **通知は必ず stderr へ書く。** このゲートは `gate-claim` の `--revalidate` からも
+/// 起動され、そのとき stdout はワーカーの `CLAIMED=$(... gate-claim ...)` に直結して
+/// いる。1 行でも stdout へ書くと claim 番号に連結され、タスクスクリプト名が壊れて、
+/// 既に `claimed-*` へ rename 済みのタスクがマーカーも残さず失われる。
 pub async fn run_usage_gate(
     profile: &str,
     provider: &str,
@@ -356,7 +359,7 @@ pub async fn run_usage_gate(
             // 既に他ワーカーが stop_file を作成済みなら write_stop_file は false を返す
             // が、その場合も他経路で停止シグナルは伝わるため正常終了でよい。
             if write_stop_file(stop_file, &format!("usage-gate failed: {e}")) {
-                println!(
+                eprintln!(
                     "\x1b[31m  \u{26d4} usage-gate: ai-usage を確認できないため停止 ({e})\x1b[0m"
                 );
             } else if !stop_file.exists() {
@@ -381,7 +384,7 @@ pub async fn run_usage_gate(
     if !acc.ok {
         let reason = acc.error.as_deref().unwrap_or("ai-usage account not ok");
         if write_stop_file(stop_file, &format!("usage-gate account not ok: {reason}")) {
-            println!(
+            eprintln!(
                 "\x1b[31m  \u{26d4} usage-gate: {profile}/{provider} の使用率を確認できないため停止 ({reason})\x1b[0m"
             );
         } else if !stop_file.exists() {
@@ -402,7 +405,7 @@ pub async fn run_usage_gate(
             let reason = basis.reason(threshold);
             let detail = detail.map(|d| format!(" ({d})")).unwrap_or_default();
             if write_stop_file(stop_file, &format!("usage-gate: {reason}")) {
-                println!(
+                eprintln!(
                     "\x1b[31m  \u{26d4} usage-gate: {profile}/{provider} {reason}{detail} のため後続を停止\x1b[0m"
                 );
             } else if !stop_file.exists() {
@@ -426,14 +429,14 @@ pub async fn run_usage_gate(
                 rate_control::write_pause(&rate_control::pause_path_for(stop_file), &state)
             {
                 if write_stop_file(stop_file, &format!("usage-gate: {reason}")) {
-                    println!(
+                    eprintln!(
                         "\x1b[31m  \u{26d4} usage-gate: pause を記録できないため停止 ({e})\x1b[0m"
                     );
                 } else if !stop_file.exists() {
                     anyhow::bail!("usage-gate: failed to write pause file: {e}");
                 }
             } else {
-                println!(
+                eprintln!(
                     "\x1b[33m  \u{23f8} usage-gate: {profile}/{provider} {reason} のため {} の枠がリセットされるまで待機\x1b[0m",
                     basis.window
                 );
@@ -534,17 +537,9 @@ fn gate_observations(acc: &AiUsageAccount) -> Vec<WindowObservation> {
 }
 
 fn write_stop_file(stop_file: &Path, reason: &str) -> bool {
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(stop_file)
-    {
-        Ok(mut f) => {
-            let _ = writeln!(f, "{reason}");
-            true
-        }
-        Err(_) => false,
-    }
+    // 実装は `rate_control::write_stop` へ寄せる。ここに複製を持つと、停止発行を
+    // claim と同じロックで直列化する等の変更が片方だけに入って再発する。
+    rate_control::write_stop(stop_file, reason).unwrap_or(false)
 }
 
 #[cfg(test)]

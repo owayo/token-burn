@@ -112,8 +112,20 @@ run_with_timeout() {{
     local cpid=$!
     ( sleep "$secs"; kill -TERM $cpid 2>/dev/null; sleep 1; kill -KILL $cpid 2>/dev/null ) >/dev/null 2>&1 &
     local wpid=$!
-    wait $cpid 2>/dev/null
-    local rc=$?
+    local rc
+    # bash の `wait` は trap を設定したシグナルを受け取ると 128 超の終了ステータスで
+    # 即座に返る。monitor は `trap 'RESIZED=1' WINCH` を張っており、ワーカーのペインが
+    # 閉じるたびに SIGWINCH が届くため、10 秒ごとの ai-usage 取得と容易に重なる。
+    # そのまま失敗扱いにすると (1) 取得済みの出力を捨ててキャッシュ更新が飛び、
+    # (2) `kill -TERM $wpid` は監視サブシェルしか殺さないので ai-usage 本体が
+    # 削除済み tmp の fd を掴んだまま孤児化する。子が本当に終わるまで待ち直す。
+    while :; do
+        wait $cpid 2>/dev/null
+        rc=$?
+        if [ $rc -le 128 ] || ! kill -0 $cpid 2>/dev/null; then
+            break
+        fi
+    done
     kill -TERM $wpid 2>/dev/null
     wait $wpid 2>/dev/null
     return $rc
@@ -694,6 +706,16 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "  if [ -z \"$CLAIMED\" ]; then\n",
             "    break\n",
             "  fi\n",
+            // gate-claim の stdout は claim 番号だけという契約。番号以外が混ざった場合、
+            // タスクは既に claimed へ rename 済みでスクリプト名だけが壊れるため、
+            // そのまま続けると「マーカーも残さず消えたタスク」が生まれる。異常を
+            // 握り潰さずワーカーを止めて、集計と原因表示に残す。
+            "  case \"$CLAIMED\" in\n",
+            "    *[!0-9]*)\n",
+            "      echo \"━━━ Invalid claim output — stopping worker ━━━\"\n",
+            "      break\n",
+            "      ;;\n",
+            "  esac\n",
             // 各タスク開始前に必ずリセットする。直前タスクの実行中に SIGINT/SIGTERM を
             // 受けて CANCELLED=1 が立ったまま成功・早期 return した場合でも、後続タスクの
             // 通常エラーを誤って「Cancelled」と判定しエラー記録を欠落させるのを防ぐ。
@@ -1071,6 +1093,54 @@ mod tests {
         assert!(script.contains("worker-done-0"));
         // 停止シグナル対応
         assert!(script.contains("trap handle_cancel INT TERM"));
+    }
+
+    #[test]
+    fn build_worker_script_rejects_non_numeric_claim_output() {
+        // gate-claim の stdout は claim 番号だけという契約。診断メッセージ等が
+        // 混ざるとタスクスクリプト名が壊れ、既に claimed へ rename 済みのタスクが
+        // マーカーも残さず消える。番号以外を検出したらワーカーごと止める。
+        let tmp = std::path::PathBuf::from("/tmp/burn");
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &tmp.join("queue"),
+            task_dir: &tmp.join("tasks"),
+            marker_dir: &tmp.join("markers"),
+            gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
+            usage_gate_cmd: None,
+        });
+
+        assert!(
+            script.contains("*[!0-9]*)"),
+            "数字以外の claim 出力を検査すべき: {script}"
+        );
+        assert!(script.contains("Invalid claim output"), "{script}");
+
+        // 実際に bash で走らせて、数字以外を返す gate-claim ではタスクを開始せずに
+        // 抜けることを確かめる。
+        if !bash_available() {
+            return;
+        }
+        let harness = script
+            .replace(
+                "tb gate-claim --stop-file /tmp/burn/stop",
+                "printf 'paused message\\n0001'",
+            )
+            .replace("/tmp/burn/markers", "/tmp/burn-test-markers");
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&harness)
+            .output()
+            .expect("bash should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Invalid claim output"),
+            "混入を検出して止めるべき: {stdout}"
+        );
+        assert!(
+            !stdout.contains("Missing task script"),
+            "壊れた名前でタスクを探しに行ってはいけない: {stdout}"
+        );
     }
 
     #[test]
@@ -1974,6 +2044,67 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(15),
             "hanging command must be killed at the deadline (took {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_survives_a_trapped_signal() {
+        // monitor は `trap 'RESIZED=1' WINCH` を張っており、ワーカーのペインが閉じる
+        // たびに SIGWINCH が届く。bash の `wait` は trap 対象のシグナルで 128 超を
+        // 返して即座に抜けるため、素朴な実装では取得済みの出力を捨てて失敗扱いにし、
+        // ai-usage 本体を孤児化させていた（10 秒ごとの取得と容易に重なる）。
+        if !bash_available() {
+            return;
+        }
+        let fragment = extract_run_with_timeout(&monitor_script_for_test());
+        let harness = format!(
+            "{fragment}\n\
+             trap 'RESIZED=1' WINCH\n\
+             ( sleep 0.3; kill -WINCH $$ ) &\n\
+             if run_with_timeout 10 bash -c 'sleep 1; echo hello'; then\n\
+             printf 'rc=0'\n\
+             else\n\
+             printf 'rc=%s' \"$?\"\n\
+             fi\n"
+        );
+
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&harness)
+            .output()
+            .expect("bash should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            stdout.contains("hello"),
+            "trap で中断されても出力を取りこぼしてはいけない: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("rc=0"),
+            "trap による中断を失敗扱いにしてはいけない: {stdout:?}"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_propagates_nonzero_exit_code() {
+        // trap 対応のループ化で通常の終了コードが潰れていないこと。
+        if !bash_available() {
+            return;
+        }
+        let fragment = extract_run_with_timeout(&monitor_script_for_test());
+        let harness =
+            format!("{fragment}\nrun_with_timeout 5 bash -c 'exit 3'\nprintf 'rc=%s' \"$?\"\n");
+
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&harness)
+            .output()
+            .expect("bash should run");
+
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("rc=3"),
+            "終了コードはそのまま伝搬すべき: {:?}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 

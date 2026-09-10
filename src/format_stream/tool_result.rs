@@ -40,22 +40,31 @@ pub(crate) fn handle_tool_result_event(
         let id = item["tool_use_id"].as_str().unwrap_or("");
         let name = tool_id_map.get(id).map(|s| s.as_str()).unwrap_or("?");
         let is_error = item["is_error"].as_bool().unwrap_or(false);
+        let owner = subagent_attribution(value);
         let metadata = build_metadata(value, id, is_error);
 
         if is_error {
             // エラー内容のサマリーがある場合は併記する
             let summary = extract_tool_result_summary(&item["content"]);
             if summary.is_empty() {
-                writeln!(out, "\x1b[31m  \u{2717} {}{}\x1b[0m", name, metadata)?;
+                writeln!(
+                    out,
+                    "\x1b[31m  \u{2717} {}{}{}\x1b[0m",
+                    name, owner, metadata
+                )?;
             } else {
                 writeln!(
                     out,
-                    "\x1b[31m  \u{2717} {} \u{2014} {}{}\x1b[0m",
-                    name, summary, metadata
+                    "\x1b[31m  \u{2717} {}{} \u{2014} {}{}\x1b[0m",
+                    name, owner, summary, metadata
                 )?;
             }
         } else {
-            writeln!(out, "\x1b[2m  \u{2713} {}{}\x1b[0m", name, metadata)?;
+            writeln!(
+                out,
+                "\x1b[2m  \u{2713} {}{}{}\x1b[0m",
+                name, owner, metadata
+            )?;
         }
     }
     Ok(())
@@ -112,14 +121,39 @@ fn synthetic_text(content: &serde_json::Value) -> String {
     }
 }
 
+/// ASCII の大文字小文字だけ無視して `needle` の位置を `haystack` 自身のバイト位置で返す。
+///
+/// `str::to_lowercase()` の結果へ `find` した位置を元文字列のスライスに流用しては
+/// いけない。小文字化はバイト長を保存せず、`İ`(U+0130, 2 バイト) は `i` + U+0307
+/// (3 バイト) へ伸び、`K`(U+212A, 3 バイト) は `k` (1 バイト) へ縮む。伸びた側では
+/// 範囲外スライス、縮んだ側では非文字境界スライスとなり、どちらも panic する。
+/// `format-stream` はパイプの中段なので、panic はパイプを閉じて上流の `claude` を
+/// SIGPIPE で道連れにし、数時間の実行を巻き添えにする。
+///
+/// `needle` は ASCII のみ（`HOOK_FEEDBACK_MARKER`）を前提とする。UTF-8 では ASCII
+/// バイトが多バイト列の内部に現れないため、返す位置は必ず文字境界になる。
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    debug_assert!(needle.is_ascii(), "needle は ASCII のみを前提とする");
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
 /// hook feedback 本文を「どのフックか」と「差し戻された内容」に分ける。
 /// 第 1 行が `<Event> hook feedback:` でなければ `None`（＝表示対象外）。
 /// 第 2 行以降が無い場合はラベルだけが情報なので、内容もラベルで埋める。
 fn split_hook_feedback(text: &str) -> Option<(String, String)> {
     let mut lines = text.lines();
     let head = lines.next()?.trim();
-    let lowered = head.to_lowercase();
-    let marker_at = lowered.find(HOOK_FEEDBACK_MARKER)?;
+    let marker_at = find_ascii_case_insensitive(head, HOOK_FEEDBACK_MARKER)?;
     // マーカー前がフック名（`Stop` / `PostToolUse:Bash` 等）。前置きが無い形式も許す。
     let label = head[..marker_at].trim().to_string();
     // マーカー直後に同じ行で内容が続く形式（`... feedback: <内容>`）も拾う。
@@ -139,6 +173,27 @@ fn split_hook_feedback(text: &str) -> Option<(String, String)> {
         detail
     };
     Some((label, detail))
+}
+
+/// サブエージェント由来のツール完了行に付ける帰属表示（` @<タスク名>`）を組み立てる。
+///
+/// サブエージェント内で走ったツールの結果は、メインループの出力と同じストリームへ
+/// user イベントとしてインラインに混ざる。実ログでは 22 個のサブエージェントが並列で
+/// 動き、ツール完了行の 69%（2,309 / 3,350 件）がサブエージェント由来だった。帰属が
+/// 無いと画面が `✓ Bash` の羅列になり、どの `✓ Bash` が誰の作業かを後から追えない。
+///
+/// `task_description` は Agent 起動時の description（実ログの「PHP 版比較のバグ修正」
+/// 等）で、並列タスクを一意に識別できる唯一の手掛かりのため優先する。サブエージェント
+/// 内部からの結果でも description を持たない形式に備えて `subagent_type` へ落とす。
+/// どちらも無いメインループの結果では空文字を返し、従来どおりの表示を保つ。
+fn subagent_attribution(value: &serde_json::Value) -> String {
+    for key in ["task_description", "subagent_type"] {
+        let owner = value[key].as_str().unwrap_or("").trim();
+        if !owner.is_empty() {
+            return format!(" @{}", truncate_inline(owner, 40));
+        }
+    }
+    String::new()
 }
 
 /// 完了行に付ける `[...]` 形式の補足を組み立てる。補足が無ければ空文字を返す。

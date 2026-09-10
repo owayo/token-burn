@@ -19,6 +19,7 @@ use ratatui::{DefaultTerminal, Frame};
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::scanner::{ResolvedTarget, Visibility};
 
@@ -216,7 +217,12 @@ impl SelectorState {
     }
 
     /// カーソル行を隣と入れ替え、カーソルも一緒に動かす（掴んだまま運ぶ操作）。
-    /// 選択番号は項目に付いたままなので、表示位置を変えても実行順は変わらない。
+    ///
+    /// 実行順（`selection_order`）は行に付いて動くのではなく、その位置に留まる。
+    /// `swap` だけだと選択番号ごと項目が移動してしまい、表示位置を変えても実行順は
+    /// 変わらないまま画面の番号だけが降順に乱れる（`J` / `K` が実質無効になる）。
+    /// 入れ替える両方が選択済みのときだけ番号も交換すれば、未選択行を跨いだだけでは
+    /// 選択済み同士の相対順が変わらず、画面の番号も常に昇順に保たれる。
     fn reorder(&mut self, delta: isize) -> KeyOutcome {
         if self.items.is_empty() {
             return KeyOutcome::Continue;
@@ -235,6 +241,12 @@ impl SelectorState {
             }
         };
         self.items.swap(self.cursor, target);
+        let moved = self.items[target].selection_order;
+        let displaced = self.items[self.cursor].selection_order;
+        if moved.is_some() && displaced.is_some() {
+            self.items[target].selection_order = displaced;
+            self.items[self.cursor].selection_order = moved;
+        }
         self.cursor = target;
         KeyOutcome::Continue
     }
@@ -460,29 +472,42 @@ fn row_line(item: &SelectorItem, order: Option<usize>, path_width: usize) -> Lin
     ])
 }
 
-/// 文字数で切り詰める（超過分は末尾を `…` に置き換える）。
+/// 表示幅（端末セル数）で切り詰める（超過分は末尾を `…` に置き換える）。
 ///
-/// バイト単位で切ると日本語を含むリポジトリ名で文字境界を割ってパニックするため、
-/// 常に char 単位で数える。
+/// ratatui は `unicode-width` の表示幅でレイアウトするため、バイト数はもちろん
+/// char 数で数えても列は揃わない。日本語のような East Asian Wide 文字は 1 文字で
+/// 2 セルを占めるので、char 数を基準にすると名前 1 文字ごとに 1 セルずつ後続の列が
+/// 右へずれ、狭い端末では行末が枠で切り落とされる。
 fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
+    if text.width() <= max {
         return text.to_string();
     }
     if max == 0 {
         return String::new();
     }
-    let kept: String = text.chars().take(max - 1).collect();
-    format!("{kept}…")
+    // 末尾の `…`（幅 1）のぶんを残して詰める。
+    let mut kept = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > max - 1 {
+            break;
+        }
+        kept.push(ch);
+        used += w;
+    }
+    kept.push('…');
+    kept
 }
 
-/// 文字数で右側を空白埋めする（`format!("{:<width$}")` は char 数ではなくバイト幅で
-/// 数えるため、マルチバイト名で列がずれる）。
+/// 表示幅で右側を空白埋めする（`format!("{:<width$}")` はバイト幅で数えるため
+/// マルチバイト名で列がずれる。char 数で数えても全角文字では揃わない）。
 fn pad_end(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count >= width {
+    let used = text.width();
+    if used >= width {
         return text.to_string();
     }
-    format!("{text}{}", " ".repeat(width - count))
+    format!("{text}{}", " ".repeat(width - used))
 }
 
 /// 表示用にパスを縮める。ホーム配下は `~` に畳み、それでも長い場合は**先頭**を `…` で
@@ -495,11 +520,22 @@ fn display_path(path: &Path, max: usize) -> String {
         },
         None => path.display().to_string(),
     };
-    let count = raw.chars().count();
-    if count <= max || max == 0 {
+    if raw.width() <= max || max == 0 {
         return raw;
     }
-    let tail: String = raw.chars().skip(count - (max - 1)).collect();
+    // 先頭の `…`（幅 1）を除いた分だけ末尾から残す。表示幅で数えるのは名前列と同じ理由。
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0usize;
+    for ch in raw.chars().rev() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > max - 1 {
+            break;
+        }
+        tail.push(ch);
+        used += w;
+    }
+    tail.reverse();
+    let tail: String = tail.into_iter().collect();
     format!("…{tail}")
 }
 
@@ -766,9 +802,9 @@ mod tests {
         assert_eq!(selected_names(state), vec!["r0", "r2", "r1"]);
     }
 
-    /// 行を移動しても Space で指定した実行順は項目に付いたまま変わらない。
+    /// 未選択行を跨いだだけの移動では、選択済み同士の相対順は変わらない。
     #[test]
-    fn moving_rows_preserves_selection_order() {
+    fn moving_rows_across_unselected_preserves_selection_order() {
         let mut state = state_with(3, 0);
         state.on_key(press(KeyCode::Char('G')));
         state.on_key(press(KeyCode::Char(' '))); // r2 が 1
@@ -782,6 +818,42 @@ mod tests {
         assert_eq!(names(&state), vec!["r0", "r2", "r1"]);
         assert_eq!(order_numbers(state.items()), vec![Some(2), Some(1), None]);
         assert_eq!(selected_names(state), vec!["r2", "r0"]);
+    }
+
+    /// 選択済み同士を入れ替えると実行順も入れ替わる。これが効かないと
+    /// `J` / `K` が表示位置だけを変え、画面の番号が降順に乱れたまま
+    /// 実行順は Space を押した順のまま残る（並べ替え機能が実質無効になる）。
+    #[test]
+    fn moving_rows_swaps_selection_order_between_selected_rows() {
+        let mut state = state_with(3, 3); // r0=1, r1=2, r2=3 が初期選択
+
+        assert_eq!(
+            order_numbers(state.items()),
+            vec![Some(1), Some(2), Some(3)]
+        );
+
+        state.on_key(press(KeyCode::Char('J'))); // r0 を 1 行下へ
+
+        assert_eq!(names(&state), vec!["r1", "r0", "r2"]);
+        // 画面の番号は上から 1, 2, 3 のまま（降順に乱れない）
+        assert_eq!(
+            order_numbers(state.items()),
+            vec![Some(1), Some(2), Some(3)]
+        );
+        // 実行順も表示どおりに入れ替わる
+        assert_eq!(selected_names(state), vec!["r1", "r0", "r2"]);
+    }
+
+    /// 並べ替えた結果は決定時の実行順（`into_selected_targets`）にも反映される。
+    #[test]
+    fn moving_rows_changes_execution_order() {
+        let mut state = state_with(3, 3);
+        state.on_key(press(KeyCode::Char('G'))); // 末尾 r2 へ
+        state.on_key(press(KeyCode::Char('K'))); // r2 を 1 行上へ
+        state.on_key(press(KeyCode::Char('K'))); // さらに上へ（先頭）
+
+        assert_eq!(names(&state), vec!["r2", "r0", "r1"]);
+        assert_eq!(selected_names(state), vec!["r2", "r0", "r1"]);
     }
 
     /// 未知のキーは状態を変えない（誤爆でキャンセル・決定しない）。
@@ -847,10 +919,10 @@ mod tests {
         assert!(!text.contains("3."), "未選択行に実行順は出さない: {text}");
     }
 
-    /// 列は char 単位で数える。バイト単位で切ると日本語を含む名前で文字境界を割って
-    /// パニックし、パディングもずれる。
+    /// 列は表示幅（端末セル数）で数える。ratatui のレイアウトが unicode-width 基準
+    /// なので、バイト数はもちろん char 数で数えても全角文字を含む名前で列がずれる。
     #[test]
-    fn truncate_chars_cuts_on_character_boundaries() {
+    fn truncate_chars_cuts_on_display_width() {
         assert_eq!(truncate_chars("abcdef", 10), "abcdef");
         assert_eq!(
             truncate_chars("abcdef", 6),
@@ -858,16 +930,38 @@ mod tests {
             "ちょうどなら切らない"
         );
         assert_eq!(truncate_chars("abcdef", 4), "abc…");
-        assert_eq!(truncate_chars("日本語のリポジトリ", 5), "日本語の…");
+        // 全角は 1 文字 2 セル。幅 5 に収めるので「日本」(4) + `…`(1)。
+        assert_eq!(truncate_chars("日本語のリポジトリ", 5), "日本…");
+        assert_eq!(
+            truncate_chars("日本", 4),
+            "日本",
+            "表示幅ちょうどなら切らない"
+        );
         assert_eq!(truncate_chars("abc", 0), "");
     }
 
     #[test]
-    fn pad_end_counts_characters_not_bytes() {
+    fn pad_end_counts_display_width_not_characters() {
         assert_eq!(pad_end("ab", 4), "ab  ");
         assert_eq!(pad_end("abcd", 4), "abcd");
         assert_eq!(pad_end("abcde", 4), "abcde", "幅を超える場合は切らない");
-        assert_eq!(pad_end("日本", 4), "日本  ");
+        // 「日本」は 2 文字だが 4 セル。char 数で数えていた頃は空白 2 つを足して
+        // 6 セルにしてしまい、この行だけ後続の列が右へずれていた。
+        assert_eq!(pad_end("日本", 4), "日本");
+        assert_eq!(pad_end("日本", 6), "日本  ");
+    }
+
+    /// 全角を含むパスも表示幅で切る。
+    #[test]
+    fn display_path_truncates_on_display_width() {
+        let path = Path::new("/tmp/日本語ディレクトリ/repo");
+        let shown = display_path(path, 12);
+        assert!(shown.starts_with('…'), "先頭を落とす: {shown}");
+        assert!(
+            shown.width() <= 12,
+            "表示幅が上限を超えてはいけない: {shown} ({} cells)",
+            shown.width()
+        );
     }
 
     /// パスは末尾（リポジトリ名側）を残して先頭を落とす。前を残すと、どのリポジトリか
