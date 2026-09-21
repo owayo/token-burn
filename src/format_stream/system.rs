@@ -168,6 +168,13 @@ fn write_task_started(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
     if let Some(depth) = v["spawn_depth"].as_u64().filter(|depth| *depth >= 2) {
         attrs.push(format!("depth:{depth}"));
     }
+    // `spawn_depth` が付くのは `local_agent` だけ（実データ 30 件）で、サブエージェント
+    // が起動した background Bash は `owned_by_subagent:true` の `local_bash`（84 件）
+    // として届き、深さの手掛かりを一切持たない。入れ子起動のコストを追うという
+    // `depth:` と同じ目的なので、こちらも印を付ける。
+    if v["owned_by_subagent"].as_bool() == Some(true) {
+        attrs.push("nested".to_string());
+    }
     // `is_backgrounded` は表示しない。Claude Code はサブエージェントを常に背景で
     // 起動するため実データの local_agent では 50 件すべて true で情報量が無く、
     // 長時間 Bash の自動バックグラウンド移行は完了行の `assistantAutoBackgrounded`、
@@ -187,21 +194,38 @@ fn write_task_started(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
     Ok(())
 }
 
-/// `task_progress`: サブエージェント進捗の説明と最後のツール名を表示する。
+/// `task_progress`: サブエージェント進捗の説明・最後のツール名・累積トークンを表示する。
+///
+/// `usage.total_tokens` は実データ 1,254 件すべてに入り、10 万トークン級が常態
+/// （`{"total_tokens":99967,"tool_uses":3,"duration_ms":8571}`）。token-burn は
+/// トークン消費の可視化そのものが目的である一方、`result.usage` はメインループ分しか
+/// 持たない（`modelUsage` の合計を併記しているのと同じ問題）。進捗行に載せれば、
+/// どのサブエージェントが枠を食っているかを実行中に読み取れる。`tool_uses` /
+/// `duration_ms` は完了時の `✓ Agent [duration:… tokens:…]` と重複するので出さない。
 fn write_task_progress(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
     let desc = v["description"].as_str().unwrap_or("");
-    let tool = v["last_tool_name"].as_str().unwrap_or("");
-    if !desc.is_empty() {
-        if !tool.is_empty() {
-            writeln!(
-                out,
-                "\x1b[2m  \u{1f504} {} ({})\x1b[0m",
-                truncate_str(desc, 80),
-                tool
-            )?;
-        } else {
-            writeln!(out, "\x1b[2m  \u{1f504} {}\x1b[0m", truncate_str(desc, 80))?;
-        }
+    if desc.is_empty() {
+        return Ok(());
+    }
+    let mut attrs = Vec::new();
+    if let Some(tool) = v["last_tool_name"].as_str().filter(|tool| !tool.is_empty()) {
+        attrs.push(tool.to_string());
+    }
+    if let Some(tokens) = v["usage"]["total_tokens"]
+        .as_u64()
+        .filter(|tokens| *tokens > 0)
+    {
+        attrs.push(format!("tokens:{}", format_number(tokens)));
+    }
+    if attrs.is_empty() {
+        writeln!(out, "\x1b[2m  \u{1f504} {}\x1b[0m", truncate_str(desc, 80))?;
+    } else {
+        writeln!(
+            out,
+            "\x1b[2m  \u{1f504} {} ({})\x1b[0m",
+            truncate_str(desc, 80),
+            attrs.join(", ")
+        )?;
     }
     Ok(())
 }

@@ -86,6 +86,31 @@ fn process_rate_limit_allowed_with_details_is_shown() {
 }
 
 #[test]
+fn allowed_details_keep_the_overage_reset_time_intact() {
+    // 実データの `five_hour` + overage 一式は 85 文字で、枠名まで同じ切り詰め予算へ
+    // 入れると末尾の `overage_resets:` が `10/...` の形で消える（実ログの整形結果で
+    // 41 件、overage 付き allowed 行の全件）。復旧が数週間先であることを示す唯一の
+    // 手掛かりなので、切り詰めの犠牲にしてはいけない。
+    let input = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":1776009600,"overageStatus":"rejected","overageResetsAt":1777000000,"overageDisabledReason":"org_level_disabled_until","isUsingOverage":false}}"#;
+    let clean = strip_ansi(&run_process(input));
+
+    let expected = chrono::DateTime::from_timestamp(1_777_000_000, 0)
+        .expect("固定値のタイムスタンプは常に変換できる")
+        .with_timezone(&chrono::Local)
+        .format("%m/%d %H:%M")
+        .to_string();
+    assert!(
+        clean.contains(&format!("overage_resets:{expected}")),
+        "overage のリセット日時が切り詰められずに出るべき (期待: {expected}): {clean}"
+    );
+    assert!(
+        !clean.contains("..."),
+        "補足が切り詰められるべきでない: {clean}"
+    );
+    assert!(clean.contains("five_hour"), "枠名も残るべき: {clean}");
+}
+
+#[test]
 fn process_rate_limit_event_breaks_open_text_line() {
     // 実ログではテキスト delta の単語途中に rate_limit_event が到着する。通知を直接
     // 書くと `I<通知>'ll` のように本文と同じ行へ混入するため、独立した行へ分離する。

@@ -668,3 +668,64 @@ fn process_result_context_window_zero_is_hidden() {
         clean
     );
 }
+
+/// `is_error:true` のセッションは、失敗の事実と HTTP ステータス・原因本文を出す。
+/// 実データでは 47 ドル・30 分を消費したセッションが `subtype:"success"` のまま
+/// `is_error:true` / 429 / 支出上限メッセージで終わっており、フッターに出ていたのは
+/// `terminal api_error` の 1 行だけだった。
+#[test]
+fn result_error_shows_status_and_message() {
+    let input = r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"terminal_reason":"api_error","result":"You've hit your individual spend limit · run /usage-credits to raise it","total_cost_usd":47.1158}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("error (HTTP 429)"), "{clean}");
+    assert!(
+        clean.contains("You've hit your individual spend limit"),
+        "{clean}"
+    );
+}
+
+/// HTTP ステータスを伴わない失敗でも、失敗の事実と本文は出す。
+#[test]
+fn result_error_without_status_still_shows_message() {
+    let input = r#"{"type":"result","is_error":true,"result":"Execution cancelled by the user"}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.contains("error: Execution cancelled by the user"),
+        "{clean}"
+    );
+    assert!(!clean.contains("HTTP"), "{clean}");
+}
+
+/// 成功セッションの `result` は最終テキストとして既にストリーム済みなので出さない。
+#[test]
+fn result_success_does_not_repeat_the_final_text() {
+    let input = r#"{"type":"result","is_error":false,"result":"done","total_cost_usd":0.5}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(!clean.contains("error"), "{clean}");
+    assert!(!clean.contains("done"), "{clean}");
+}
+
+/// サブエージェントの種別内訳。`codex` が 2 体なのか `Explore` が 5 体なのかで
+/// コストの意味が全く違うため、件数だけの `spawned:12` では読み取れない。
+#[test]
+fn subagent_summary_lists_the_type_breakdown() {
+    let input = r#"{"type":"result","subagent_stats":{"spawned":12,"completed":12,"by_type":{"general-purpose":4,"Explore":5,"security-engineer":1,"codex":2}}}"#;
+    let clean = strip_ansi(&run_process(input));
+    // 多い順（同数は名前順）で安定させる。
+    assert!(
+        clean.contains("[Explore:5 general-purpose:4 codex:2 security-engineer:1]"),
+        "{clean}"
+    );
+}
+
+/// `by_type` が無い / 空の形式では従来どおり件数だけを出す。
+#[test]
+fn subagent_summary_without_type_breakdown_keeps_the_short_form() {
+    let input = r#"{"type":"result","subagent_stats":{"spawned":2,"completed":2,"by_type":{}}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.contains("subagents spawned:2 completed:2 failed:0"),
+        "{clean}"
+    );
+    assert!(!clean.contains('['), "{clean}");
+}

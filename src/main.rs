@@ -981,15 +981,26 @@ fn dedup_peers(
             else {
                 return DedupPeers::Named(HashSet::from([agent.name.clone()]));
             };
+            // 照合は**両辺**を trim する。左辺だけ trim していた頃は、
+            // `provider = "claude "` のように空白付きで書いたエージェントが自分自身を
+            // 照合から落とし（`"claude " != "claude"`）、同じ provider の相手も居なければ
+            // peers が空集合になって重複排除が無言で無効化されていた。毎回同じ先頭
+            // `limit` 件を再処理してクォータを二重消費する一方、ログには
+            // 「スキップ 0 件」としか出ないので原因を追えない。
             let names = runtime_agents
                 .iter()
                 .filter(|candidate| {
                     candidate
                         .provider
                         .as_deref()
+                        .map(str::trim)
                         .is_some_and(|p| p.eq_ignore_ascii_case(provider))
                 })
                 .map(|candidate| candidate.name.clone())
+                // 実行中のエージェントは provider の表記に関わらず必ず自分の履歴を見る。
+                // 書き込み側は常に実行したエージェント名のキーへ記録するため、参照側が
+                // 自分を外すと「自分が処理したのに未処理」と判定してしまう。
+                .chain(std::iter::once(agent.name.clone()))
                 .collect();
             DedupPeers::Named(names)
         }
@@ -2031,6 +2042,46 @@ mod tests {
             !peers.contains("a2"),
             "空 provider 同士をグルーピングしてはいけない"
         );
+    }
+
+    /// `provider` の前後空白は両辺で無視する。片側だけ trim していた頃は、
+    /// `provider = "claude "` のように空白付きで書いたエージェントが**自分自身**を
+    /// 照合から落とし、同じ provider の相手も居なければ peers が空集合になって
+    /// 重複排除が無言で無効化されていた（毎回同じ先頭 limit 件を再処理し、
+    /// スキップ 0 件としか出ないので原因も追えない）。
+    #[test]
+    fn dedup_peers_ignores_surrounding_whitespace_in_provider() {
+        let conf = dedup_test_config(
+            &[("claude", Some("claude ")), ("claude-alt", Some(" CLAUDE"))],
+            Some("2d"),
+        );
+        let runtime = conf.expand_runtime_agents().expect("expand");
+        let agent = runtime.iter().find(|a| a.name == "claude").unwrap();
+
+        let peers = dedup_peers(config::DedupScope::Provider, agent, &runtime);
+        assert!(peers.contains("claude"), "自分自身を必ず含む");
+        assert!(
+            peers.contains("claude-alt"),
+            "空白違いは同じ provider として扱う"
+        );
+    }
+
+    /// 実行中のエージェントは、provider の表記がどうであれ自分の記録を必ず見る。
+    /// 書き込み側は常に実行したエージェント名のキーへ記録するため、参照側が
+    /// 自分を外すと「自分が処理したのに未処理と判定する」状態になる。
+    #[test]
+    fn dedup_peers_always_includes_the_running_agent() {
+        for provider in ["claude", "", "  ", " claude "] {
+            let conf = dedup_test_config(&[("solo", Some(provider))], Some("2d"));
+            let runtime = conf.expand_runtime_agents().expect("expand");
+            let agent = runtime.iter().find(|a| a.name == "solo").unwrap();
+
+            let peers = dedup_peers(config::DedupScope::Provider, agent, &runtime);
+            assert!(
+                peers.contains("solo"),
+                "provider = {provider:?} で自分自身が外れている"
+            );
+        }
     }
 
     /// スキップ内訳は件数降順・同数はエージェント名昇順で安定して並ぶ。

@@ -360,10 +360,18 @@ pub fn execute_plan_tmux(
         .context("tmux is not installed")?;
 
     let session = "token-burn";
+    // セッションを指し示すときは `=` 付きの厳密一致ターゲットを使う。tmux の
+    // `-t` は「完全一致 → 前方一致 → fnmatch」の順に解決するため、素の
+    // `token-burn` はセッションが存在しないとき `token-burn-notes` のような
+    // 無関係なセッションへ当たる（実測で確認）。`kill-session` がそれを掴むと
+    // ユーザーの別セッションを黙って破壊し、`has-session` が掴むと「デタッチ
+    // された」と誤判定して最終集計を出さずに終わる。
+    // `new-session -s` は新しい名前の指定であってターゲットではないので素の名前を渡す。
+    let session_target = format!("={session}");
 
     // 既存セッションがあれば終了
     let _ = std::process::Command::new("tmux")
-        .args(["kill-session", "-t", session])
+        .args(["kill-session", "-t", &session_target])
         .output();
 
     let tmp_dir = std::env::temp_dir().join("token-burn");
@@ -616,7 +624,7 @@ pub fn execute_plan_tmux(
             // セッション作成後にペイン初期化が失敗した場合、モニターだけが残って
             // デッドラインまで動き続けないよう、自分で起動したセッションを回収する。
             let _ = std::process::Command::new("tmux")
-                .args(["kill-session", "-t", session])
+                .args(["kill-session", "-t", &session_target])
                 .status();
         }
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -678,7 +686,7 @@ pub fn execute_plan_tmux(
         .context("Failed to attach to tmux session")?;
 
     let session_alive = std::process::Command::new("tmux")
-        .args(["has-session", "-t", session])
+        .args(["has-session", "-t", &session_target])
         .status()
         .map(|status| status.success())
         .unwrap_or(false);

@@ -781,9 +781,28 @@ fn process_task_progress_shows_subagent_progress() {
     let output = run_process(&input);
     let clean = strip_ansi(&output);
 
+    // 累積トークンは実データ 1,254 件すべてに入り、10 万トークン級が常態。
+    // どのサブエージェントが枠を食っているかを実行中に読み取る唯一の手掛かり。
+    assert!(
+        clean.contains("\u{1f504} Running List all files (Bash, tokens:5,000)"),
+        "expected task progress in: {}",
+        clean
+    );
+}
+
+#[test]
+fn process_task_progress_without_usage_keeps_the_short_form() {
+    // usage を持たない形式では 0 トークンを捏造せず、従来どおりツール名だけを出す。
+    let input = r#"{"type":"system","subtype":"task_progress","task_id":"abc","description":"Running List all files","last_tool_name":"Bash"}"#;
+    let clean = strip_ansi(&run_process(input));
     assert!(
         clean.contains("\u{1f504} Running List all files (Bash)"),
         "expected task progress in: {}",
+        clean
+    );
+    assert!(
+        !clean.contains("tokens:"),
+        "usage が無いのにトークンを出すべきでない: {}",
         clean
     );
 }
@@ -1585,4 +1604,81 @@ fn process_hook_feedback_breaks_open_thinking_line() {
         clean.contains("💭 .\n  ⚠ Hook feedback (Stop): hook error\n"),
         "{clean:?}"
     );
+}
+
+/// サブエージェント内部のツール使用は `assistant` イベントにしか現れない
+/// （`stream_event` は実データ 98,061 件すべてが `parent_tool_use_id: null` の
+/// メインループ専用）。これを表示しないと、ツール完了行の 44% が
+/// `✓ Bash @<タスク名>` だけになり、何のコマンドを打ったのかが消える。
+#[test]
+fn subagent_tool_use_is_shown_with_input_and_attribution() {
+    let input = r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","subagent_type":"general-purpose","task_description":"AI モジュールのバグレビュー","message":{"id":"msg_1","content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"cargo test --all","description":"テストを実行"}}]}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.contains("\u{1f527} Bash @AI モジュールのバグレビュー"),
+        "{clean}"
+    );
+    assert!(clean.contains("cargo test --all"), "{clean}");
+}
+
+/// メインループの assistant は `stream_event` と同じ内容を再送するだけなので、
+/// ここで書くと 1 ツールにつき 🔧 行が 2 本出る。
+#[test]
+fn main_loop_assistant_tool_use_is_not_duplicated() {
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"Bash","input":{}}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"ls"}}]}}"#,
+    ]
+    .join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert_eq!(
+        clean.matches("\u{1f527} Bash").count(),
+        1,
+        "メインループのツール行が二重に出ている: {clean}"
+    );
+}
+
+/// `--include-partial-messages` が同一 message id を再送しても、ツール使用 id で
+/// 重複排除するので 🔧 行は 1 本に保たれる（完了行との対応が崩れない）。
+#[test]
+fn subagent_tool_use_is_deduplicated_by_tool_id() {
+    let event = r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","subagent_type":"Explore","message":{"id":"msg_1","content":[{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"/repo/a.rs"}}]}}"#;
+    let clean = strip_ansi(&run_process(&[event, event].join("\n")));
+    assert_eq!(clean.matches("\u{1f527} Read").count(), 1, "{clean}");
+}
+
+/// サブエージェントの最終レポートは `assistant` の text にしかなく、
+/// `task_notification.summary` は 60 文字に切られ、`✓ Agent` の完了行も
+/// メタデータを持つため要約フォールバックに乗らない。全文は 363KB あるので
+/// ブロックごとに 1 行へ畳む。
+#[test]
+fn subagent_text_is_summarized_into_one_line() {
+    let input = r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","subagent_type":"general-purpose","task_description":"レビュー","message":{"id":"msg_1","content":[{"type":"text","text":"Review scope\n\n対象ファイルを確認しました。"}]}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.contains("\u{1f4ac} @レビュー Review scope"),
+        "{clean}"
+    );
+    // 1 ブロック 1 行に畳む（本文の改行をそのまま流さない）。
+    let line_count = clean.lines().filter(|l| l.contains('\u{1f4ac}')).count();
+    assert_eq!(line_count, 1, "{clean}");
+}
+
+/// メインループの text は `stream_event` で逐次出ているので、ここでは出さない。
+#[test]
+fn main_loop_assistant_text_is_not_echoed() {
+    let input = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"メインループの応答"}]}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(!clean.contains('\u{1f4ac}'), "{clean}");
+    assert!(!clean.contains("メインループの応答"), "{clean}");
+}
+
+/// 帰属情報が無い（＝サブエージェントと判別できない）assistant は従来どおり素通し。
+#[test]
+fn assistant_without_attribution_is_not_treated_as_subagent() {
+    let input = r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","message":{"id":"msg_1","content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"ls"}}]}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(!clean.contains('\u{1f527}'), "{clean}");
 }

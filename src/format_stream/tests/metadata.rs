@@ -1135,3 +1135,67 @@ fn process_text_block_array_tool_use_result_is_shown() {
     let clean = strip_ansi(&run_process(&input));
     assert!(clean.contains("[result:Context7 result body]"), "{clean}");
 }
+
+/// `sed -i` / `cargo fmt` / `depup` 等、Edit/Write を通らない Bash 経由の書き換えは
+/// `filePath` も `structuredPatch` も出ないため、完了行に痕跡が 1 つも残らなかった。
+/// 実データでは Bash 結果 102 件が `bashEditDiff` を持ち、うち 36 件が実変更だった。
+#[test]
+fn bash_edit_diff_shows_the_path_for_a_single_file() {
+    let result: serde_json::Value = serde_json::from_str(
+        r#"{"bashEditDiff":{"files":[{"filePath":"/repo/src/lib.rs","hunks":[{"lines":["-old","+new","+added"," ctx"]}]}],"changedFiles":["/repo/src/lib.rs"],"moreFiles":0}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        tool_result_metadata(&result),
+        "bash-edits:/repo/src/lib.rs +2/-1"
+    );
+}
+
+/// 複数ファイルは件数と加除行数でまとめる。
+#[test]
+fn bash_edit_diff_summarizes_multiple_files() {
+    let result: serde_json::Value = serde_json::from_str(
+        r#"{"bashEditDiff":{"files":[{"filePath":"/repo/Cargo.lock","hunks":[{"lines":["-a","+b"]}]},{"filePath":"/repo/Cargo.toml","hunks":[{"lines":["-c","+d"]}]}],"changedFiles":["/repo/Cargo.lock","/repo/Cargo.toml"],"moreFiles":0}}"#,
+    )
+    .unwrap();
+    assert_eq!(tool_result_metadata(&result), "bash-edits:2 files +2/-2");
+}
+
+/// `moreFiles` が非ゼロなら加除行数は詳細分しか数えられていないので、その旨を添える。
+/// 件数自体は `changedFiles`（変更された全ファイル）を正とする。
+#[test]
+fn bash_edit_diff_marks_omitted_files() {
+    let result: serde_json::Value = serde_json::from_str(
+        r#"{"bashEditDiff":{"files":[{"filePath":"/repo/a.rs","hunks":[{"lines":["+x"]}]}],"changedFiles":["/repo/a.rs","/repo/b.rs","/repo/c.rs"],"moreFiles":2}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        tool_result_metadata(&result),
+        "bash-edits:3 files +1/-0 (+2 more)"
+    );
+}
+
+/// ファイルを変更しなかった Bash（実データ 102 件中 66 件）では何も出さない。
+#[test]
+fn bash_edit_diff_with_no_files_is_silent() {
+    let result: serde_json::Value =
+        serde_json::from_str(r#"{"bashEditDiff":{"files":[],"shared":true}}"#).unwrap();
+    assert_eq!(tool_result_metadata(&result), "");
+}
+
+/// `type:"create"` は Write が新規作成だったケース。`file:` はどちらでも出るので、
+/// これが無いと既存ファイルを潰したのかどうかが区別できない。
+#[test]
+fn tool_result_type_create_is_reported() {
+    let result: serde_json::Value =
+        serde_json::from_str(r#"{"type":"create","filePath":"/repo/new.rs"}"#).unwrap();
+    assert_eq!(tool_result_metadata(&result), "file:/repo/new.rs, created");
+}
+
+/// `type:"text"`（通常の読み取り）には印を付けない。
+#[test]
+fn tool_result_type_text_is_not_reported() {
+    let result: serde_json::Value =
+        serde_json::from_str(r#"{"type":"text","filePath":"/repo/a.rs"}"#).unwrap();
+    assert_eq!(tool_result_metadata(&result), "file:/repo/a.rs");
+}

@@ -437,4 +437,35 @@ mod tests {
         assert_eq!(sched.state_cutoff.hour(), 9, "previous hour mismatch");
         assert_eq!(sched.state_cutoff.minute(), 0, "previous minute mismatch");
     }
+
+    #[test]
+    fn schedule_source_labels_distinguish_ai_usage_from_fixed() {
+        // `status` / `run` はこのラベルだけで導出元を伝える。ai-usage が解決に失敗して
+        // 固定計算へ戻ったことが読み取れなくなると、実際のリセットとずれた時刻で
+        // 走り続けていても気付けない。文言を固定して静かな退行を防ぐ。
+        assert_eq!(
+            ScheduleSource::AiUsage(UsageWindow::Weekly).label(),
+            "ai-usage (weekly)"
+        );
+        assert_eq!(
+            ScheduleSource::AiUsage(UsageWindow::FiveHour).label(),
+            "ai-usage (five_hour)"
+        );
+        assert_eq!(ScheduleSource::Fixed.label(), "fixed");
+        assert_eq!(
+            ScheduleSource::FixedFallback("ai-usage command not found".to_string()).label(),
+            "fixed fallback: ai-usage command not found"
+        );
+    }
+
+    #[test]
+    fn usage_window_period_and_label_match_the_slot_names() {
+        // これは `kind` が未知・欠損だったときの既定値（`UsageWindowData::period` の
+        // フォールバック先）。ここがずれると state_cutoff が実際の枠開始点から外れ、
+        // 処理済みフィルタが黙って効かなくなる。
+        assert_eq!(UsageWindow::Weekly.period(), chrono::Duration::days(7));
+        assert_eq!(UsageWindow::FiveHour.period(), chrono::Duration::hours(5));
+        assert_eq!(UsageWindow::Weekly.label(), "weekly");
+        assert_eq!(UsageWindow::FiveHour.label(), "five_hour");
+    }
 }

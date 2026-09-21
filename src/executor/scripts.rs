@@ -92,7 +92,7 @@ restore_terminal() {{ tput cnorm 2>/dev/null; printf '\033[?7h'; }}
 # 明示的に exit する（モニターが最後のペインならこの exit でもセッションは閉じる）。
 finish_session() {{
     restore_terminal
-    tmux kill-session -t "$SESSION" 2>/dev/null
+    tmux kill-session -t "=$SESSION" 2>/dev/null
     exit 0
 }}
 
@@ -203,7 +203,7 @@ handle_signal() {{
         echo ""
         echo " 📁 Logs: $REPORT_DIR"
         echo " Force killing session..."
-        tmux kill-session -t "$SESSION" 2>/dev/null
+        tmux kill-session -t "=$SESSION" 2>/dev/null
         exit
     fi
 }}
@@ -1297,8 +1297,17 @@ mod tests {
         );
         assert!(script.contains("finish_session() {"));
         assert!(
-            script.contains("    restore_terminal\n    tmux kill-session -t \"$SESSION\" 2>/dev/null\n    exit 0"),
+            script.contains(
+                "    restore_terminal\n    tmux kill-session -t \"=$SESSION\" 2>/dev/null\n    exit 0"
+            ),
             "finish_session must restore the terminal, kill the session, then exit: {script}"
+        );
+        // `=` 付きの厳密一致ターゲットを使う。素の名前だと tmux が前方一致で
+        // `token-burn-notes` のような無関係なセッションへ当たり、ユーザーの
+        // 別セッションを黙って kill し得る。
+        assert!(
+            !script.contains("kill-session -t \"$SESSION\""),
+            "kill-session must use the exact-match target: {script}"
         );
         // Ctrl-C 待ちの案内と無限待機は残さない。残っていると自動終了しなくなる。
         assert!(

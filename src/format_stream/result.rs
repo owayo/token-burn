@@ -8,6 +8,7 @@ use std::io::Write;
 use crate::format_stream::state::StreamSummary;
 use crate::format_stream::util::{
     format_millis_as_seconds, format_number, format_token_size, normalize_model_name,
+    truncate_inline,
 };
 
 pub(crate) fn handle_result(
@@ -89,6 +90,30 @@ fn write_subagent_summary(v: &serde_json::Value, out: &mut impl Write) -> Result
         .filter(|depth| *depth > 0)
     {
         parts.push(format!("max-depth:{depth}"));
+    }
+
+    // どの種類のサブエージェントを何体使ったか。実データでは
+    // `{"general-purpose":4,"Explore":5,"security-engineer":1,"codex":2}` のように
+    // 混在し、`codex` が 2 体なのか `Explore` が 5 体なのかでコストの意味が全く違う。
+    // 件数だけの `spawned:12` では読み取れない。
+    if let Some(by_type) = stats.get("by_type").and_then(|value| value.as_object())
+        && !by_type.is_empty()
+    {
+        let mut kinds: Vec<(&str, u64)> = by_type
+            .iter()
+            .filter_map(|(kind, count)| count.as_u64().map(|count| (kind.as_str(), count)))
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        // 多い順（同数は名前順）で安定させる。
+        kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        if !kinds.is_empty() {
+            let detail = kinds
+                .iter()
+                .map(|(kind, count)| format!("{kind}:{count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            parts.push(format!("[{detail}]"));
+        }
     }
 
     let detail = parts.join(" ");
@@ -398,6 +423,39 @@ fn write_model_usage(v: &serde_json::Value, out: &mut impl Write) -> Result<()> 
     Ok(())
 }
 
+/// `is_error:true` のセッションで、失敗の事実と原因（HTTP ステータス・本文）を表示する。
+///
+/// 実データでは 47 ドル・30 分を消費したセッションが
+/// `is_error:true` / `api_error_status:429` /
+/// `result:"You've hit your individual spend limit …"` で終わっていたのに、フッターへ
+/// 出ていたのは `terminal api_error` の 1 行だけだった。`subtype` は `success` のまま
+/// なので、その 1 行を読み落とすと**正常完了したように見える**。
+///
+/// `rate_limit_event` 由来の `🚫 Rate limited` 行は「five_hour が rejected」としか
+/// 言わず、真因（個人の支出上限）は伝えない。両者は別情報なので重複にはならない。
+/// `api_error_status` は `classify-result` が 408/429/5xx で再試行を判断する値そのもの
+/// なので、ログと分類結果を突き合わせられるようになる。
+///
+/// 成功時の `result` は最終テキストとして既にストリーム済みなので出さない。
+fn write_error_result(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    if v["is_error"].as_bool() != Some(true) {
+        return Ok(());
+    }
+    let status = v["api_error_status"]
+        .as_u64()
+        .map(|status| format!(" (HTTP {status})"))
+        .unwrap_or_default();
+    let message = v["result"]
+        .as_str()
+        .map(|message| truncate_inline(message, 160))
+        .filter(|message| !message.is_empty());
+    match message {
+        Some(message) => writeln!(out, "\x1b[31m   error{}: {}\x1b[0m", status, message)?,
+        None => writeln!(out, "\x1b[31m   error{}\x1b[0m", status)?,
+    }
+    Ok(())
+}
+
 /// fast_mode / 無効化理由 / origin / 終了理由 / 権限拒否件数を表示する。
 fn write_terminal_info(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
     // fast_mode の表示（off 以外の場合）
@@ -423,6 +481,7 @@ fn write_terminal_info(v: &serde_json::Value, out: &mut impl Write) -> Result<()
     {
         writeln!(out, "\x1b[33m   terminal {}\x1b[0m", reason)?;
     }
+    write_error_result(v, out)?;
     // 権限拒否されたツール呼び出しの件数を表示
     if let Some(denials) = v["permission_denials"].as_array()
         && !denials.is_empty()

@@ -12,7 +12,9 @@ use std::io::Write;
 use crate::format_stream::tools::metadata::{
     tool_result_meta_metadata, tool_result_metadata, tool_result_string_summary,
 };
-use crate::format_stream::util::{extract_tool_result_summary, truncate_inline};
+use crate::format_stream::util::{
+    extract_tool_result_summary, subagent_attribution, truncate_inline,
+};
 
 /// 合成 user メッセージのうち、フック差し戻しを示す第 1 行の目印。
 /// 実データは `"Stop hook feedback:\n⏱ Stop hook timed out after 120s: cargo"`。
@@ -173,27 +175,6 @@ fn split_hook_feedback(text: &str) -> Option<(String, String)> {
         detail
     };
     Some((label, detail))
-}
-
-/// サブエージェント由来のツール完了行に付ける帰属表示（` @<タスク名>`）を組み立てる。
-///
-/// サブエージェント内で走ったツールの結果は、メインループの出力と同じストリームへ
-/// user イベントとしてインラインに混ざる。実ログでは 22 個のサブエージェントが並列で
-/// 動き、ツール完了行の 69%（2,309 / 3,350 件）がサブエージェント由来だった。帰属が
-/// 無いと画面が `✓ Bash` の羅列になり、どの `✓ Bash` が誰の作業かを後から追えない。
-///
-/// `task_description` は Agent 起動時の description（実ログの「PHP 版比較のバグ修正」
-/// 等）で、並列タスクを一意に識別できる唯一の手掛かりのため優先する。サブエージェント
-/// 内部からの結果でも description を持たない形式に備えて `subagent_type` へ落とす。
-/// どちらも無いメインループの結果では空文字を返し、従来どおりの表示を保つ。
-fn subagent_attribution(value: &serde_json::Value) -> String {
-    for key in ["task_description", "subagent_type"] {
-        let owner = value[key].as_str().unwrap_or("").trim();
-        if !owner.is_empty() {
-            return format!(" @{}", truncate_inline(owner, 40));
-        }
-    }
-    String::new()
 }
 
 /// 完了行に付ける `[...]` 形式の補足を組み立てる。補足が無ければ空文字を返す。

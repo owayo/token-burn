@@ -25,6 +25,30 @@ pub(crate) fn truncate_inline(s: &str, max: usize) -> String {
     truncate_str(&normalized, max)
 }
 
+/// サブエージェント由来の行に付ける帰属表示（` @<タスク名>`）を組み立てる。
+///
+/// サブエージェント内で走ったツールの結果は、メインループの出力と同じストリームへ
+/// user イベントとしてインラインに混ざる。実ログでは 22 個のサブエージェントが並列で
+/// 動き、ツール完了行の 69%（2,309 / 3,350 件）がサブエージェント由来だった。帰属が
+/// 無いと画面が `✓ Bash` の羅列になり、どの `✓ Bash` が誰の作業かを後から追えない。
+///
+/// `task_description` は Agent 起動時の description（実ログの「PHP 版比較のバグ修正」
+/// 等）で、並列タスクを一意に識別できる唯一の手掛かりのため優先する。サブエージェント
+/// 内部からの結果でも description を持たない形式に備えて `subagent_type` へ落とす。
+/// どちらも無いメインループの結果では空文字を返し、従来どおりの表示を保つ。
+///
+/// `user`（ツール完了行）と `assistant`（サブエージェントのツール使用・テキスト）の
+/// 両方から使う。どちらもイベント top-level に同じキーで帰属情報を持つ。
+pub(crate) fn subagent_attribution(value: &serde_json::Value) -> String {
+    for key in ["task_description", "subagent_type"] {
+        let owner = value[key].as_str().unwrap_or("").trim();
+        if !owner.is_empty() {
+            return format!(" @{}", truncate_inline(owner, 40));
+        }
+    }
+    String::new()
+}
+
 /// Claude Code がモデル名の末尾へ混入させる壊れた SGR 断片を除去する。
 ///
 /// 実際の stream-json では `claude-opus-5[1m]` のように ESC を欠いた装飾が

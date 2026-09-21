@@ -191,6 +191,9 @@ fn append_file_metadata(obj: &serde_json::Map<String, serde_json::Value>, attrs:
     if let Some(summary) = structured_patch_summary(obj.get("structuredPatch")) {
         attrs.push(summary);
     }
+    if let Some(summary) = bash_edit_diff_summary(obj.get("bashEditDiff")) {
+        attrs.push(summary);
+    }
     if obj
         .get("replaceAll")
         .or_else(|| obj.get("replace_all"))
@@ -208,16 +211,22 @@ fn append_file_metadata(obj: &serde_json::Map<String, serde_json::Value>, attrs:
     {
         attrs.push("memdir-stamped".to_string());
     }
-    // 結果種別。実データでは "text"（通常の読み取り）/"update"（書き込み）に加えて
-    // "file_unchanged" が現れる。前回読み取りから内容が変わっていないため本文が返らな
-    // かったケースで、表示しないと通常の読み取り成功と区別できない（ポーリング中の
-    // Read が実は何も取得していない、という判断材料を失う）。
-    if obj
-        .get("type")
-        .and_then(|value| value.as_str())
-        .is_some_and(|kind| kind == "file_unchanged")
-    {
-        attrs.push("file-unchanged".to_string());
+    // 結果種別。実データ（94MB / 7 セッション）では "text"（通常の読み取り、69 件）/
+    // "create"（新規作成、7 件）/ "file_unchanged"（3 件）が現れる。
+    //
+    // - `file_unchanged`: 前回読み取りから内容が変わっていないため本文が返らなかった
+    //   ケース。パス情報も `file.filePath` に入れ子で入り top-level メタデータには何も
+    //   出ないため、表示しないと通常の Read 成功と区別できない（サブエージェント出力を
+    //   ポーリング中の Read が実は何も取得していない、という判断材料を失う）。
+    // - `create`: Write が既存ファイルの上書きではなく新規作成だったケース。`file:` は
+    //   どちらでも出るので、これが無いと上書きと区別できない。既存ファイルを潰したのか
+    //   どうかは無人実行のレビューで最初に知りたい差。
+    if let Some(kind) = obj.get("type").and_then(|value| value.as_str()) {
+        match kind {
+            "file_unchanged" => attrs.push("file-unchanged".to_string()),
+            "create" => attrs.push("created".to_string()),
+            _ => {}
+        }
     }
     // Read は読み取り結果を file オブジェクトに格納する。部分読み取り（limit 指定や
     // ファイル途中までの読み取り）では numLines < totalLines となり、切り詰めの判断材料になる。
@@ -658,12 +667,12 @@ fn append_background_metadata(
     }
 }
 
-fn structured_patch_summary(value: Option<&serde_json::Value>) -> Option<String> {
-    let hunks = value?.as_array()?;
-    if hunks.is_empty() {
-        return None;
-    }
-
+/// hunk 配列の追加・削除行数を数える。
+///
+/// `lines` は hunk 内の行だけを保持しファイルヘッダーを含まないため、`+` / `-` で
+/// 始まる全行を加除として数える。これにより、内容自体が `++` / `--` で始まる行が
+/// diff 上で `+++` / `---` になっても過少計上しない。
+fn count_hunk_lines(hunks: &[serde_json::Value]) -> (usize, usize) {
     let mut added = 0usize;
     let mut removed = 0usize;
     for hunk in hunks {
@@ -681,11 +690,86 @@ fn structured_patch_summary(value: Option<&serde_json::Value>) -> Option<String>
             }
         }
     }
+    (added, removed)
+}
 
+fn structured_patch_summary(value: Option<&serde_json::Value>) -> Option<String> {
+    let hunks = value?.as_array()?;
+    if hunks.is_empty() {
+        return None;
+    }
+
+    let (added, removed) = count_hunk_lines(hunks);
     let hunk_label = if hunks.len() == 1 { "hunk" } else { "hunks" };
     Some(format!(
         "patch:{} {hunk_label} +{added}/-{removed}",
         hunks.len()
+    ))
+}
+
+/// `bashEditDiff` から、Bash 経由で書き換わったファイルの規模をまとめる。
+///
+/// `sed -i` / `cargo fmt` / `depup` / スクリプト経由の書き換えは Edit/Write を
+/// 通らないため、`filePath` も `structuredPatch` も出ず、完了行に痕跡が 1 つも
+/// 残らない（実データでは Bash 結果 102 件が `bashEditDiff` を持ち、うち 36 件が
+/// 実際にファイルを変更していた）。無人実行で「いつの間にかファイルが変わって
+/// いる」理由を追う手掛かりが消えるため、`vcs_state_changed` を表示するのと同じ
+/// 理由でここも出す。
+///
+/// 件数は `changedFiles`（変更された全ファイル）を正とし、加除行数は `files`
+/// （hunk を持つ詳細分）から数える。`moreFiles` が非ゼロなら詳細が間引かれて
+/// いるので、加除が一部しか数えられていないことを `(+N more)` で明示する。
+fn bash_edit_diff_summary(value: Option<&serde_json::Value>) -> Option<String> {
+    let diff = value?.as_object()?;
+    let files = diff.get("files").and_then(|value| value.as_array())?;
+    if files.is_empty() {
+        return None;
+    }
+
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for file in files {
+        if let Some(hunks) = file.get("hunks").and_then(|value| value.as_array()) {
+            let (a, r) = count_hunk_lines(hunks);
+            added += a;
+            removed += r;
+        }
+    }
+
+    let changed = diff
+        .get("changedFiles")
+        .and_then(|value| value.as_array())
+        .map(|paths| paths.len())
+        .filter(|count| *count > 0)
+        .unwrap_or(files.len());
+    let more = diff
+        .get("moreFiles")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let more_text = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
+
+    // 1 ファイルだけならパスそのものを出す。Edit の `file:<path>` と同じ粒度で
+    // 「どこが変わったか」が分かる。
+    if changed == 1
+        && let Some(path) = files
+            .first()
+            .and_then(|file| file.get("filePath"))
+            .and_then(|value| value.as_str())
+            .filter(|path| !path.is_empty())
+    {
+        return Some(format!(
+            "bash-edits:{} +{added}/-{removed}",
+            truncate_path_tail(path, 60)
+        ));
+    }
+
+    let file_label = if changed == 1 { "file" } else { "files" };
+    Some(format!(
+        "bash-edits:{changed} {file_label} +{added}/-{removed}{more_text}"
     ))
 }
 

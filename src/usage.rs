@@ -894,6 +894,74 @@ mod tests {
     }
 
     #[test]
+    fn schedule_for_prefers_explicit_kind_over_the_slot_name() {
+        // `weekly` スロットに 5 時間枠（kind:"five_hour"）が入る向きの食い違いでも、
+        // 周期は kind 側で決める。daily / monthly のテストは「スロットより長い枠」
+        // しか見ておらず、短い枠へ倒れる `Some("five_hour")` の分岐は素通りしていた。
+        let snapshot = AiUsageSnapshot {
+            accounts: vec![account(
+                "Work",
+                "claude",
+                true,
+                Some(window_data_with_kind(
+                    "five_hour",
+                    Some("2099-01-01T05:00:00+00:00"),
+                )),
+                None,
+                None,
+            )],
+        };
+        let r = resolver(UsageState::Loaded(snapshot));
+        let agent = rt_agent(
+            "Work",
+            "claude",
+            UsageWindowPolicy::Weekly,
+            UsageFallback::Fixed,
+        );
+        let sched = r.schedule_for(&agent).unwrap().expect("should resolve");
+        let diff = sched.next_reset - sched.state_cutoff;
+        assert_eq!(
+            diff.num_hours(),
+            5,
+            "five_hour kind のカットオフは 5 時間前であるべき"
+        );
+    }
+
+    #[test]
+    fn schedule_for_weekly_kind_in_five_hour_slot_uses_seven_days() {
+        // 逆向き（`five_hour` スロットに週次枠）でも kind を優先する。スロット名で
+        // 決め打ちすると 7 日枠を 5 時間として扱い、カットオフが実際の枠開始点より
+        // はるかに新しくなって、同じ週に処理済みのターゲットを何度も拾い直す。
+        let snapshot = AiUsageSnapshot {
+            accounts: vec![account(
+                "Work",
+                "claude",
+                true,
+                None,
+                Some(window_data_with_kind(
+                    "weekly",
+                    Some("2099-01-08T00:00:00+00:00"),
+                )),
+                None,
+            )],
+        };
+        let r = resolver(UsageState::Loaded(snapshot));
+        let agent = rt_agent(
+            "Work",
+            "claude",
+            UsageWindowPolicy::FiveHour,
+            UsageFallback::Fixed,
+        );
+        let sched = r.schedule_for(&agent).unwrap().expect("should resolve");
+        let diff = sched.next_reset - sched.state_cutoff;
+        assert_eq!(
+            diff.num_days(),
+            7,
+            "weekly kind のカットオフは 7 日前であるべき"
+        );
+    }
+
+    #[test]
     fn schedule_for_falls_back_to_fixed_when_entry_missing() {
         let snapshot = AiUsageSnapshot { accounts: vec![] };
         let r = resolver(UsageState::Loaded(snapshot));

@@ -348,3 +348,24 @@ fn task_started_without_type_shows_description_only() {
     assert!(out.contains("plain task"), "{out:?}");
     assert!(!out.contains('('), "{out:?}");
 }
+
+/// サブエージェント発の background Bash は `owned_by_subagent:true` の `local_bash`
+/// として届き（実データ 84 件）、`spawn_depth` を持たない（こちらは `local_agent`
+/// 30 件だけ）。印を付けないと入れ子起動のコストが `depth:` からも漏れる。
+#[test]
+fn task_started_marks_subagent_owned_tasks_as_nested() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_started","description":"Run the test suite","task_type":"local_bash","owned_by_subagent":true}"#,
+    );
+    assert!(out.contains("(local_bash, nested)"), "{out:?}");
+}
+
+/// トップレベル起動（`owned_by_subagent` 無し / false）には印を付けない。
+#[test]
+fn task_started_without_subagent_owner_is_not_nested() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_started","description":"Run the test suite","task_type":"local_bash","owned_by_subagent":false}"#,
+    );
+    assert!(out.contains("(local_bash)"), "{out:?}");
+    assert!(!out.contains("nested"), "{out:?}");
+}

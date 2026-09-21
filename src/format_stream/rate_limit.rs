@@ -353,6 +353,16 @@ fn write_allowed(out: &mut impl Write, info: &serde_json::Value) -> Result<()> {
     if extras.is_empty() && resets_at.is_empty() {
         return Ok(());
     }
+    // 切り詰めは overage の補足だけを対象にし、枠名（`rateLimitType`）は予算の外へ
+    // 置く。両方を同じ 80 文字へ入れていた頃は、実データの
+    // `five_hour overage:rejected reason:org_level_disabled_until overage_resets:10/01 10:40`
+    // が 85 文字で超過し、末尾が `overage_resets:10/...` の形で切り落とされていた
+    // （実ログの整形結果で 41 件、overage 付き allowed 行の全件）。この日時は
+    // 「5 時間枠のリセットまで待てば再開できる」という誤読を防ぐために足した
+    // フィールドで、真っ先に消えては意味が無いうえ、残った `10/` は日付とも時刻とも
+    // 読める断片になって誤読を増やす。他の経路（`wrap_overage_details`）も枠名を
+    // 予算の外へ置いているので、そちらへ揃える。
+    let extras = truncate_str(&extras, 80);
     let details = if limit_type.is_empty() {
         extras
     } else if extras.is_empty() {
@@ -360,7 +370,6 @@ fn write_allowed(out: &mut impl Write, info: &serde_json::Value) -> Result<()> {
     } else {
         format!("{limit_type} {extras}")
     };
-    let details = truncate_str(&details, 80);
     if details.is_empty() {
         writeln!(
             out,
