@@ -272,9 +272,71 @@ fn append_tool(tools: &str, tool: &str) -> String {
     }
 }
 
+/// どのセッションで起動するかを決める claude のフラグ（値付き・値なしの両方）。
+///
+/// これらがエージェントの command に既にあると、token-burn が足す `--resume <id>` と
+/// 衝突する（`--continue` は直近の別セッションを、`--session-id` は固定 ID を選び、
+/// `--no-session-persistence` はそもそも再開できるセッションを残さない）。
+const CLAUDE_SESSION_FLAGS: [&str; 8] = [
+    "--resume",
+    "-r",
+    "--continue",
+    "-c",
+    "--session-id",
+    "--fork-session",
+    "--no-session-persistence",
+    "--from-pr",
+];
+
+/// command に既にあるセッション系フラグを返す（最初の 1 つ）。
+///
+/// シェル文字列の部分一致ではなく argv の要素として判定する（`--resume=<id>` 形式も拾う）。
+/// `--` 以降は位置引数なので見ない。
+pub(super) fn claude_session_flag(command: &[String]) -> Option<&str> {
+    command
+        .iter()
+        .skip(1)
+        .take_while(|arg| arg.as_str() != "--")
+        .find_map(|arg| {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+            CLAUDE_SESSION_FLAGS.contains(&flag).then_some(flag)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_session_flag_detects_flags_as_argv_elements() {
+        let cmd = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(claude_session_flag(&cmd(&["claude", "-p"])), None);
+        assert_eq!(
+            claude_session_flag(&cmd(&["claude", "--continue", "-p"])),
+            Some("--continue")
+        );
+        assert_eq!(claude_session_flag(&cmd(&["claude", "-c"])), Some("-c"));
+        assert_eq!(
+            claude_session_flag(&cmd(&["claude", "--session-id=0633fa18"])),
+            Some("--session-id")
+        );
+        assert_eq!(
+            claude_session_flag(&cmd(&["claude", "--no-session-persistence"])),
+            Some("--no-session-persistence")
+        );
+        // 部分一致では拾わない（別オプションの値やモデル名に含まれる文字列）
+        assert_eq!(
+            claude_session_flag(&cmd(&["claude", "--model=resume-model", "--resumes"])),
+            None
+        );
+        // `--` 以降は位置引数
+        assert_eq!(
+            claude_session_flag(&cmd(&["claude", "-p", "--", "--resume"])),
+            None
+        );
+        // 実行ファイル自体の名前は見ない
+        assert_eq!(claude_session_flag(&cmd(&["-c"])), None);
+    }
 
     fn make_agent(command: Vec<&str>) -> RuntimeAgent {
         RuntimeAgent {

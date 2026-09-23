@@ -16,7 +16,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -31,6 +31,8 @@ pub struct SelectorItem {
     pub selection_order: Option<usize>,
     /// 追跡ファイルの最終更新時刻（取得できたものだけ）。
     pub last_modified: Option<DateTime<Utc>>,
+    /// レート制限で中断したセッションを引き継いで続きから処理するターゲットか。
+    pub resumable: bool,
 }
 
 /// 画面ヘッダーに出す実行コンテキスト。
@@ -77,6 +79,7 @@ impl SelectorState {
     pub fn new(
         targets: Vec<ResolvedTarget>,
         modified: &HashMap<PathBuf, DateTime<Utc>>,
+        resumable: &HashSet<PathBuf>,
         initial_selected: usize,
     ) -> Self {
         let items = targets
@@ -85,6 +88,7 @@ impl SelectorState {
             .map(|(i, target)| SelectorItem {
                 last_modified: modified.get(&target.directory).copied(),
                 selection_order: (i < initial_selected).then_some(i + 1),
+                resumable: resumable.contains(&target.directory),
                 target,
             })
             .collect();
@@ -108,6 +112,11 @@ impl SelectorState {
             .iter()
             .filter(|item| item.selection_order.is_some())
             .count()
+    }
+
+    /// 中断したセッションを引き継ぐ候補の数。
+    pub fn resumable_count(&self) -> usize {
+        self.items.iter().filter(|item| item.resumable).count()
     }
 
     pub fn notice(&self) -> Option<&str> {
@@ -279,6 +288,7 @@ impl SelectorState {
 pub fn select_targets(
     targets: Vec<ResolvedTarget>,
     modified: &HashMap<PathBuf, DateTime<Utc>>,
+    resumable: &HashSet<PathBuf>,
     initial_selected: usize,
     ctx: &RunContext,
 ) -> Result<Outcome> {
@@ -291,7 +301,7 @@ pub fn select_targets(
         "--interactive requires a terminal; stdin and stdout must both be a TTY"
     );
 
-    let mut state = SelectorState::new(targets, modified, initial_selected);
+    let mut state = SelectorState::new(targets, modified, resumable, initial_selected);
     // ratatui::init() は raw mode / alternate screen へ入り、panic hook も差し替えて
     // パニック時に端末を戻す。復元漏れは直後に起動する tmux の表示を壊すため、
     // ループのエラーは持ち帰って restore() の後に伝搬する。
@@ -383,7 +393,35 @@ fn header(state: &SelectorState, ctx: &RunContext) -> Paragraph<'static> {
             Span::styled(format!("   Workers: {}", ctx.workers), dim),
         ]),
     ];
+    // 引き継ぎのある候補が 1 件でもあるときだけ、行頭の `↻` の意味を示す。
+    let resumable = state.resumable_count();
+    let lines = if resumable > 0 {
+        let mut lines = lines;
+        lines.push(Line::from(vec![
+            Span::styled(" ", dim),
+            Span::styled(RESUME_MARK, resume_style()),
+            Span::styled(
+                format!(
+                    " = continues the session interrupted by a rate limit ({resumable} target{})",
+                    if resumable == 1 { "" } else { "s" }
+                ),
+                dim,
+            ),
+        ]));
+        lines
+    } else {
+        lines
+    };
     Paragraph::new(lines)
+}
+
+/// 中断したセッションを引き継ぐ行に付ける印（ヘッダーの凡例と同じ記号）。
+const RESUME_MARK: &str = "↻";
+
+fn resume_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn footer(state: &SelectorState) -> Paragraph<'static> {
@@ -418,6 +456,7 @@ const MODIFIED_WIDTH: usize = 16;
 const FIXED_COLUMNS_WIDTH: usize = 4        // "[x] "
     + 5                                     // "  1. "
     + 10                                    // "[UNKNOWN] "
+    + 2                                     // 引き継ぎの印 "↻ "
     + NAME_WIDTH
     + 2                                     // 名前と更新日時の区切り
     + MODIFIED_WIDTH
@@ -458,11 +497,18 @@ fn row_line(item: &SelectorItem, order: Option<usize>, path_width: usize) -> Lin
         None => "(mtime unknown)".to_string(),
     };
     let modified = pad_end(&modified, MODIFIED_WIDTH);
+    // 引き継ぎの無い行も同じ幅の空白を置き、名前の列を揃える。
+    let resume = if item.resumable {
+        Span::styled(format!("{RESUME_MARK} "), resume_style())
+    } else {
+        Span::raw("  ")
+    };
 
     Line::from(vec![
         Span::styled(format!("{mark} "), mark_style),
         Span::styled(order_text, dim),
         Span::styled(visibility, visibility_style),
+        resume,
         Span::raw(name),
         Span::styled(format!("  {modified}"), dim),
         Span::styled(
@@ -555,7 +601,7 @@ mod tests {
 
     fn state_with(count: usize, initial_selected: usize) -> SelectorState {
         let targets = (0..count).map(|i| target(&format!("r{i}"))).collect();
-        SelectorState::new(targets, &HashMap::new(), initial_selected)
+        SelectorState::new(targets, &HashMap::new(), &HashSet::new(), initial_selected)
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -873,7 +919,7 @@ mod tests {
     /// 空リストでも操作でパニックしない（呼び出し側が弾くが、状態側も落ちない）。
     #[test]
     fn empty_list_survives_every_key() {
-        let mut state = SelectorState::new(Vec::new(), &HashMap::new(), 5);
+        let mut state = SelectorState::new(Vec::new(), &HashMap::new(), &HashSet::new(), 5);
 
         for code in [
             KeyCode::Up,
@@ -897,6 +943,7 @@ mod tests {
             target: target("repo-a"),
             selection_order: Some(3),
             last_modified: None,
+            resumable: false,
         };
         let text: String = row_line(&item, Some(3), 40)
             .spans
@@ -917,6 +964,74 @@ mod tests {
             .collect();
         assert!(text.contains("[ ]"), "未選択マーク: {text}");
         assert!(!text.contains("3."), "未選択行に実行順は出さない: {text}");
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// 中断したセッションを引き継ぐ行には `↻` を付け、無い行も同じ幅を空けて列を揃える。
+    #[test]
+    fn row_line_marks_targets_that_resume_an_interrupted_session() {
+        let mut item = SelectorItem {
+            target: target("repo-a"),
+            selection_order: Some(1),
+            last_modified: None,
+            resumable: true,
+        };
+        let marked = line_text(&row_line(&item, Some(1), 40));
+        assert!(marked.contains("↻ repo-a"), "引き継ぎの印: {marked}");
+
+        item.resumable = false;
+        let plain = line_text(&row_line(&item, Some(1), 40));
+        assert!(!plain.contains('↻'), "{plain}");
+        // 印の有無で後続の列がずれない
+        assert_eq!(marked.width(), plain.width(), "{marked:?} / {plain:?}");
+        assert_eq!(
+            marked.find("repo-a").map(|i| marked[..i].width()),
+            plain.find("repo-a").map(|i| plain[..i].width())
+        );
+    }
+
+    /// 引き継ぎのある候補があるときだけ、ヘッダーに `↻` の意味と件数を出す。
+    #[test]
+    fn header_explains_the_resume_mark_only_when_needed() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        let ctx = RunContext {
+            agent_name: "claude".to_string(),
+            reset_in: "1d".to_string(),
+            schedule_source: "fixed".to_string(),
+            workers: 2,
+        };
+        let render = |state: &SelectorState| {
+            let area = Rect::new(0, 0, 120, 4);
+            let mut buf = Buffer::empty(area);
+            header(state, &ctx).render(area, &mut buf);
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let targets: Vec<_> = (0..3).map(|i| target(&format!("r{i}"))).collect();
+        let resumable = HashSet::from([PathBuf::from("/repos/r1")]);
+        let state = SelectorState::new(targets.clone(), &HashMap::new(), &resumable, 3);
+        assert_eq!(state.resumable_count(), 1);
+        let text = render(&state);
+        assert!(
+            text.contains("↻ = continues the session interrupted by a rate limit (1 target)"),
+            "{text}"
+        );
+
+        let state = SelectorState::new(targets, &HashMap::new(), &HashSet::new(), 3);
+        assert!(!render(&state).contains('↻'));
     }
 
     /// 列は表示幅（端末セル数）で数える。ratatui のレイアウトが unicode-width 基準
@@ -1003,8 +1118,14 @@ mod tests {
             workers: 2,
         };
 
-        let error = select_targets(vec![target("r0")], &HashMap::new(), 1, &ctx)
-            .expect_err("TTY が無ければエラーになるべき");
+        let error = select_targets(
+            vec![target("r0")],
+            &HashMap::new(),
+            &HashSet::new(),
+            1,
+            &ctx,
+        )
+        .expect_err("TTY が無ければエラーになるべき");
 
         assert!(
             error.to_string().contains("requires a terminal"),
@@ -1022,7 +1143,7 @@ mod tests {
             workers: 2,
         };
 
-        let error = select_targets(Vec::new(), &HashMap::new(), 1, &ctx)
+        let error = select_targets(Vec::new(), &HashMap::new(), &HashSet::new(), 1, &ctx)
             .expect_err("候補が空ならエラーになるべき");
 
         assert!(

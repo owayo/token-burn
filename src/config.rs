@@ -39,6 +39,10 @@ pub struct Settings {
     /// 処理済み判定を共有する範囲（デフォルト: agent = エージェントごとに分離）。
     #[serde(default)]
     pub dedup_scope: DedupScope,
+    /// レート制限で中断した claude セッションを保存し、次回の実行で `--resume` して
+    /// 続きから処理する（デフォルト: true）。
+    #[serde(default = "default_true")]
+    pub resume_interrupted: bool,
 }
 
 /// 処理済み判定（`state.json` の照会）を共有する範囲。
@@ -86,6 +90,9 @@ fn default_rate_limit_threshold() -> u8 {
 #[derive(Debug, Deserialize)]
 pub struct Prompts {
     pub default: String,
+    /// 中断したセッションを再開するときに送る継続プロンプト（省略時は組み込みの既定文）。
+    /// `.md` で終わる値はファイルパスとして読み込む（`default` と同じ規則）。
+    pub resume: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -285,6 +292,14 @@ impl Config {
             Ok(content.trim().to_string())
         } else {
             Ok(value.to_string())
+        }
+    }
+
+    /// 中断セッションの再開時に送る継続プロンプト。`[prompts] resume` が無ければ既定文。
+    pub fn resume_prompt(&self) -> Result<String> {
+        match self.prompts.resume.as_deref() {
+            Some(value) => self.resolve_prompt(value),
+            None => Ok(crate::resume::DEFAULT_RESUME_PROMPT.to_string()),
         }
     }
 
@@ -697,9 +712,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: Prompts {
                 default: "review".to_string(),
+                resume: None,
             },
             agents: vec![Agent {
                 name: "agent".to_string(),
@@ -778,6 +795,36 @@ mod tests {
             DedupScope::Agent,
             "省略時は従来の挙動（分離）"
         );
+    }
+
+    /// 中断セッションの再開は既定で有効。既存の設定ファイルに何も足さなくても効く。
+    #[test]
+    fn resume_settings_default_to_enabled_with_the_builtin_prompt() {
+        let settings: Settings = toml::from_str("parallelism = 1").expect("parse");
+        assert!(settings.resume_interrupted);
+        let settings: Settings =
+            toml::from_str("parallelism = 1\nresume_interrupted = false").expect("parse");
+        assert!(!settings.resume_interrupted);
+
+        let prompts: Prompts = toml::from_str("default = \"review\"").expect("parse");
+        assert_eq!(prompts.resume, None);
+    }
+
+    #[test]
+    fn resume_prompt_uses_the_builtin_text_unless_configured() {
+        let mut config = base_config();
+        assert_eq!(
+            config.resume_prompt().unwrap(),
+            crate::resume::DEFAULT_RESUME_PROMPT
+        );
+        config.prompts.resume = Some("続きをやってください".to_string());
+        assert_eq!(config.resume_prompt().unwrap(), "続きをやってください");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("resume.md"), "  continue from the file \n").unwrap();
+        config.config_dir = dir.path().to_path_buf();
+        config.prompts.resume = Some("resume.md".to_string());
+        assert_eq!(config.resume_prompt().unwrap(), "continue from the file");
     }
 
     #[test]

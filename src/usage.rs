@@ -558,9 +558,11 @@ mod tests {
                 limit: 1,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: Prompts {
                 default: String::new(),
+                resume: None,
             },
             agents: Vec::new(),
             scan: Vec::new(),

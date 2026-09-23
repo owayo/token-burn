@@ -1,19 +1,22 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, FixedOffset, Local};
 use colored::Colorize;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::RuntimeAgent;
 use crate::display;
+use crate::resume::ResumeEntry;
 use crate::scanner::{ResolvedTarget, Visibility};
 
 mod flags;
 mod scripts;
 mod util;
 
-use flags::{agent_is_claude, ensure_required_flags};
+use flags::{agent_is_claude, claude_session_flag, ensure_required_flags};
 use scripts::{
-    TaskCtx, WorkerCtx, build_refresh_cmd, build_statusline_cmd, build_task_script,
+    TaskCtx, TaskResume, WorkerCtx, build_refresh_cmd, build_statusline_cmd, build_task_script,
     build_worker_script, env_prefix_parts, generate_monitor_script, shell_escape,
 };
 use util::{sanitize_filename, strip_ansi_from_dir, truncate};
@@ -32,6 +35,76 @@ pub struct ExecutionPlan {
     pub agent: RuntimeAgent,
     pub tasks: Vec<ResolvedTarget>,
     pub usage_gate: Option<UsageGateConfig>,
+    pub resume: ResumePlan,
+}
+
+/// 中断セッションの再開に関する計画。
+#[derive(Debug, Default)]
+pub struct ResumePlan {
+    /// レート制限で中断したタスクのセッションを保存するか（claude かつ設定で有効）。
+    /// `--no-resume` / `--fresh` は「今回は再開しない」だけで、新しい中断は保存する。
+    pub save_interrupted: bool,
+    /// 今回再開するタスク（ディレクトリ → 保存済み記録）。計画に含まれるものだけ。
+    pub sessions: HashMap<PathBuf, ResumeEntry>,
+    /// 再開時に送る継続プロンプト。
+    pub prompt: String,
+    /// 再開するセッションを止めた 5 時間枠がまだリセットされていないときの待機時刻。
+    /// 早すぎる再実行で即座に同じ枠へ拒否され、継続プロンプトだけが transcript に
+    /// 積み重なるのを防ぐ。
+    pub hold_until: Option<DateTime<FixedOffset>>,
+}
+
+/// `build_plan` へ渡す再開の入力（呼び出し側が保存済み記録から判定した結果）。
+#[derive(Debug, Default)]
+pub struct ResumeOptions {
+    pub save_interrupted: bool,
+    pub sessions: HashMap<PathBuf, ResumeEntry>,
+    pub prompt: String,
+}
+
+/// エージェントが中断セッションの自動再開に対応しているか。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeSupport {
+    Supported,
+    /// claude 以外（stream-json の分類パイプラインが無く、中断を判定できない）。
+    NotClaude,
+    /// command に既にセッション系フラグがある。自動で `--resume` を足すと衝突する。
+    ConflictingFlag(String),
+}
+
+impl ResumeSupport {
+    /// 対応していない理由（表示用）。対応していれば `None`。
+    pub fn unsupported_reason(&self) -> Option<String> {
+        match self {
+            ResumeSupport::Supported => None,
+            ResumeSupport::NotClaude => Some("not a claude agent".to_string()),
+            ResumeSupport::ConflictingFlag(flag) => {
+                Some(format!("the agent command already passes {flag}"))
+            }
+        }
+    }
+}
+
+/// エージェントが中断セッションの自動再開に対応しているかを判定する。
+pub fn resume_support(agent: &RuntimeAgent) -> ResumeSupport {
+    if !agent_is_claude(agent) {
+        return ResumeSupport::NotClaude;
+    }
+    match claude_session_flag(&agent.command) {
+        Some(flag) => ResumeSupport::ConflictingFlag(flag.to_string()),
+        None => ResumeSupport::Supported,
+    }
+}
+
+/// 再開するセッションのうち、最も遅い「再開してよい時刻」がまだ先ならそれを返す。
+fn resume_hold_until<'a>(
+    entries: impl Iterator<Item = &'a ResumeEntry>,
+    now: DateTime<FixedOffset>,
+) -> Option<DateTime<FixedOffset>> {
+    entries
+        .filter_map(|entry| entry.retry_after)
+        .max()
+        .filter(|at| *at > now)
 }
 
 /// ai-usage 使用率ゲートの設定（各タスク完了後にワーカーが実行）。
@@ -122,6 +195,7 @@ pub fn build_plan(
     agent: &RuntimeAgent,
     targets: Vec<ResolvedTarget>,
     ai_usage_command: Option<Vec<String>>,
+    resume: ResumeOptions,
 ) -> ExecutionPlan {
     let mut agent = agent.clone();
     // usage-gate / monitor statusline に渡す env は、ユーザーが設定した実行文脈
@@ -140,10 +214,22 @@ pub fn build_plan(
         }),
         _ => None,
     };
+    // 再開するのは計画に残ったタスクだけ（limit や TUI で外れたターゲットは待機の根拠にも
+    // しない）。claude 以外は分類パイプラインが無いので、渡されても再開しない。
+    let is_claude = agent_is_claude(&agent);
+    let mut sessions = resume.sessions;
+    sessions.retain(|dir, _| is_claude && targets.iter().any(|t| &t.directory == dir));
+    let hold_until = resume_hold_until(sessions.values(), Local::now().fixed_offset());
     ExecutionPlan {
         agent,
         tasks: targets,
         usage_gate,
+        resume: ResumePlan {
+            save_interrupted: resume.save_interrupted && is_claude,
+            sessions,
+            prompt: resume.prompt,
+            hold_until,
+        },
     }
 }
 
@@ -295,7 +381,34 @@ pub fn print_plan(plan: &ExecutionPlan, parallelism: usize) {
             "      Path:   {}",
             task.directory.display().to_string().dimmed()
         );
-        println!("      Prompt: {}", truncate(&task.prompt, 60).dimmed());
+        match plan.resume.sessions.get(&task.directory) {
+            // 再開するタスクに送るのは元のプロンプトではなく継続プロンプト（元の指示は
+            // 会話履歴に残っている）。実際に送る方を見せる。
+            Some(entry) => {
+                println!(
+                    "      Resume: {} {}",
+                    entry.session_id.cyan(),
+                    format!("({})", entry.summary()).dimmed()
+                );
+                println!(
+                    "      Prompt: {}",
+                    format!("(continuation) {}", truncate(&plan.resume.prompt, 60)).dimmed()
+                );
+            }
+            None => println!("      Prompt: {}", truncate(&task.prompt, 60).dimmed()),
+        }
+    }
+    if let Some(hold) = plan.resume.hold_until {
+        println!();
+        println!(
+            "{} {}",
+            "Hold:".yellow(),
+            format!(
+                "a resumed session hit the five_hour limit — workers wait until {} before starting",
+                hold.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+            )
+            .yellow()
+        );
     }
     println!();
 }
@@ -403,12 +516,46 @@ pub fn execute_plan_tmux(
     let stop_file = tmp_dir.join("stop");
     let is_claude = agent_is_claude(&plan.agent);
 
+    // 継続プロンプトは全タスク共通なので 1 ファイルにまとめる。
+    let resume_prompt_file = tmp_dir.join("resume-prompt.txt");
+    if !plan.resume.sessions.is_empty() {
+        std::fs::write(&resume_prompt_file, &plan.resume.prompt)?;
+    }
+
+    // 再開するセッションを止めた 5 時間枠がまだリセットされていなければ、実行全体を
+    // その時刻まで一時停止した状態で始める。枠はアカウント単位なので、再開以外の
+    // タスクも同じ時刻まで通らない。実行中に 5 時間枠へ触れたときと同じ pause file を
+    // 使うため、待機・デッドライン超過時の停止・ai-usage による再開前の再確認は
+    // すべて既存の gate-claim がそのまま扱う。
+    if let Some(hold) = plan.resume.hold_until
+        && hold.timestamp() > crate::rate_control::now_epoch()
+    {
+        let pause = crate::rate_control::PauseState {
+            resume_at: hold.timestamp(),
+            window: "five_hour".to_string(),
+            reason: format!(
+                "a resumed session was rate limited (five_hour) until {}",
+                hold.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+            ),
+        };
+        crate::rate_control::write_pause(&crate::rate_control::pause_path_for(&stop_file), &pause)
+            .context("failed to write the pause file for the resumed sessions")?;
+    }
+
     // 各タスクの実行スクリプトと pending マーカーを書き出す
     for (idx_zero, task) in plan.tasks.iter().enumerate() {
         let idx = idx_zero + 1;
         let prompt_file = tmp_dir.join(format!("prompt-{}.txt", idx));
         std::fs::write(&prompt_file, &task.prompt)?;
 
+        let resume = plan
+            .resume
+            .sessions
+            .get(&task.directory)
+            .map(|entry| TaskResume {
+                entry,
+                prompt_file: &resume_prompt_file,
+            });
         let task_script = build_task_script(&TaskCtx {
             idx,
             total,
@@ -422,6 +569,8 @@ pub fn execute_plan_tmux(
             stop_file: &stop_file,
             rate_limit_threshold,
             is_claude,
+            save_interrupted: plan.resume.save_interrupted,
+            resume,
         });
         let task_path = task_dir.join(format!("task-{:04}.sh", idx));
         std::fs::write(&task_path, &task_script)?;
@@ -1037,7 +1186,7 @@ mod tests {
             visibility: Visibility::Public,
             defer: false,
         }];
-        let plan = build_plan(&agent, targets, None);
+        let plan = build_plan(&agent, targets, None, ResumeOptions::default());
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].display_name, "repo");
         // claude エージェントにはフラグが自動付与される
@@ -1047,6 +1196,130 @@ mod tests {
                 .command
                 .contains(&"--disallowedTools=AskUserQuestion".to_string())
         );
+    }
+
+    fn saved_session(retry_after: Option<DateTime<FixedOffset>>) -> ResumeEntry {
+        ResumeEntry {
+            session_id: "0633fa18-8643-40f7-9106-a35330ed247d".to_string(),
+            interrupted_at: Local::now().fixed_offset(),
+            retry_after,
+            prompt_hash: crate::resume::prompt_hash("review"),
+            message: None,
+            log: None,
+            failed_resumes: 0,
+        }
+    }
+
+    fn repo_target(dir: &str) -> ResolvedTarget {
+        ResolvedTarget {
+            directory: PathBuf::from(dir),
+            display_name: "repo".to_string(),
+            prompt: "review".to_string(),
+            visibility: Visibility::Public,
+            defer: false,
+        }
+    }
+
+    #[test]
+    fn build_plan_keeps_resumes_only_for_planned_tasks() {
+        // limit や TUI で外れたターゲットの記録は、再開にも待機の根拠にも使わない。
+        let agent = make_agent(vec!["claude", "-p"]);
+        let later = Local::now().fixed_offset() + chrono::Duration::hours(1);
+        let sessions = HashMap::from([
+            (PathBuf::from("/tmp/repo"), saved_session(None)),
+            (PathBuf::from("/tmp/dropped"), saved_session(Some(later))),
+        ]);
+        let plan = build_plan(
+            &agent,
+            vec![repo_target("/tmp/repo")],
+            None,
+            ResumeOptions {
+                save_interrupted: true,
+                sessions,
+                prompt: "continue".to_string(),
+            },
+        );
+        assert_eq!(plan.resume.sessions.len(), 1);
+        assert!(plan.resume.sessions.contains_key(Path::new("/tmp/repo")));
+        assert!(plan.resume.save_interrupted);
+        assert_eq!(plan.resume.hold_until, None);
+    }
+
+    #[test]
+    fn build_plan_never_resumes_non_claude_agents() {
+        let agent = RuntimeAgent {
+            name: "codex".to_string(),
+            command: vec!["codex".to_string(), "exec".to_string()],
+            ..Default::default()
+        };
+        let plan = build_plan(
+            &agent,
+            vec![repo_target("/tmp/repo")],
+            None,
+            ResumeOptions {
+                save_interrupted: true,
+                sessions: HashMap::from([(PathBuf::from("/tmp/repo"), saved_session(None))]),
+                prompt: "continue".to_string(),
+            },
+        );
+        assert!(plan.resume.sessions.is_empty());
+        assert!(!plan.resume.save_interrupted);
+    }
+
+    #[test]
+    fn build_plan_holds_until_the_latest_future_retry_time() {
+        let agent = make_agent(vec!["claude", "-p"]);
+        let now = Local::now().fixed_offset();
+        let soon = now + chrono::Duration::minutes(10);
+        let later = now + chrono::Duration::minutes(40);
+        let past = now - chrono::Duration::minutes(40);
+        let sessions = HashMap::from([
+            (PathBuf::from("/tmp/a"), saved_session(Some(soon))),
+            (PathBuf::from("/tmp/b"), saved_session(Some(later))),
+            (PathBuf::from("/tmp/c"), saved_session(Some(past))),
+        ]);
+        let plan = build_plan(
+            &agent,
+            vec![
+                repo_target("/tmp/a"),
+                repo_target("/tmp/b"),
+                repo_target("/tmp/c"),
+            ],
+            None,
+            ResumeOptions {
+                save_interrupted: true,
+                sessions,
+                prompt: "continue".to_string(),
+            },
+        );
+        // 全セッションが同じ枠の制限を受けるので、最も遅い時刻まで待つ
+        assert_eq!(plan.resume.hold_until, Some(later));
+
+        // すべて過ぎていれば待たない
+        assert_eq!(
+            resume_hold_until([saved_session(Some(past))].iter(), now),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_support_rejects_non_claude_and_conflicting_flags() {
+        assert_eq!(
+            resume_support(&make_agent(vec!["claude", "-p"])),
+            ResumeSupport::Supported
+        );
+        assert_eq!(
+            resume_support(&make_agent(vec!["claude", "--continue"])),
+            ResumeSupport::ConflictingFlag("--continue".to_string())
+        );
+        let codex = RuntimeAgent {
+            name: "codex".to_string(),
+            command: vec!["codex".to_string(), "exec".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(resume_support(&codex), ResumeSupport::NotClaude);
+        assert!(ResumeSupport::NotClaude.unsupported_reason().is_some());
+        assert_eq!(ResumeSupport::Supported.unsupported_reason(), None);
     }
 
     #[test]
@@ -1064,6 +1337,7 @@ mod tests {
             &agent,
             vec![],
             Some(vec!["ai-usage".to_string(), "--json".to_string()]),
+            ResumeOptions::default(),
         );
         let gate = plan.usage_gate.expect("usage_gate should be set");
         // ユーザー設定の env は usage-gate に引き継ぐが、claude 専用の注入 env は含めない

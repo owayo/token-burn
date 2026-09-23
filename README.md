@@ -51,7 +51,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Usage-rate gate**: When ai-usage integration is enabled, re-checks each agent's real utilization (`weekly` / `five_hour`) per window after every task and stops or pauses new tasks once `rate_limit_threshold` is reached — extending threshold-based auto-stop to `codex`, not just Claude Code's in-task `rate_limit_event`
 - **Monitor usage panel**: When ai-usage integration is enabled, the tmux monitor pane shows `ai-usage --statusline --logos` (each account's 5h / weekly utilization bars) refreshed every 10 seconds, rendered from a cached `--input` snapshot alongside the per-second progress bar. The refresh returns as soon as `ai-usage` does, so it never freezes the pane and the progress bar keeps its per-second update
 - **Multi-account expansion**: Expands a single agent across multiple accounts (e.g. `claude` → `claude-work` / `claude-home`), each launched with its own environment and tracked separately in `state.json`
-- **Cross-account continuation**: `dedup_scope` lets one account resume where another stopped instead of re-visiting the same repositories, while still recording which account did the work — opt out per run with `--dedup-scope agent`
+- **Cross-account continuation**: `dedup_scope` lets one account pick up where another stopped instead of re-visiting the same repositories, while still recording which account did the work — opt out per run with `--dedup-scope agent`
 - **Credential-safe command display**: Redacts environment assignments and common credential option values as `<redacted>` in dry-run plans and ai-usage startup errors while executing the original values unchanged. Only `KEY=VALUE` pairs that precede the executable (the `env FOO=1 cmd` prefix) count as environment assignments — subcommand options such as `codex -c model='gpt-5.3-codex'` or the auto-injected `-c approval_policy=never` stay visible, since hiding them would defeat the point of a dry run
 - **Smart scheduling**: Automatically selects the agent closest to its reset deadline
 - **Deadline-aware stop**: Stops starting new tasks when the reset time arrives and waits for current tasks to finish
@@ -100,7 +100,8 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **API retry visibility**: Shows retry attempts with error details during transient failures
 - **Collision-safe logs**: Per-task logs are numbered to avoid overwrite when display names collide
 - **Prompt files**: Prompts can be `.md` files or inline strings
-- **Resume**: Automatically skips already-processed directories; configurable skip duration
+- **Skip processed targets**: Automatically skips already-processed directories; configurable skip duration
+- **Resume interrupted sessions**: A Claude Code task cut off by a rate limit (`You've hit your session limit · resets 2:30pm`) no longer starts over. Its session ID is saved to `resume.json`, and the next run that picks the same repository with the same agent continues that session with `claude --resume` and a continuation prompt, so re-running the same command is enough. Resumable targets go first, a run started before the five-hour window resets waits for the reset, and a session Claude Code has already deleted falls back to a fresh start within the same task ([details](#resuming-interrupted-sessions))
 - **Concurrent-safe state**: Parallel workers update `state.json` with atomic rename under a stable sidecar lock file; malformed or unreadable existing state aborts the update without overwriting previously recorded history
 - **Dry run**: Preview execution plan without running commands
 
@@ -187,7 +188,8 @@ token-burn run
 | `--config <PATH>` | `-c` | Config file path (default: `~/.config/token-burn/config.toml`) |
 | `--agent <NAME>` | | Force specific agent |
 | `--dry-run` | `-n` | Preview without executing |
-| `--fresh` | | Ignore saved state and process all targets |
+| `--fresh` | | Ignore saved state — both the processed history and saved interrupted sessions — and process all targets from scratch |
+| `--no-resume` | | Start every target in a new session, ignoring saved interrupted sessions (processed targets are still skipped) |
 | `--limit <N>` | `-l` | Maximum number of targets to process (`N >= 1`) |
 | `--no-limit` | | Process all targets without limit |
 | `--workers <N>` | `-w` | Number of concurrent workers (`N >= 1`, overrides `parallelism`) |
@@ -197,17 +199,19 @@ token-burn run
 | `--help` | `-h` | Show help |
 | `--version` | `-V` | Show version |
 
+`--no-resume` ignores [saved interrupted sessions](#resuming-interrupted-sessions) for a single run while processed targets are still skipped. The saved sessions stay in place: one is removed when its target completes successfully and overwritten when the target is rate-limited again, and new interruptions during the run are still saved. `--fresh` goes further and ignores both the processed history and the saved sessions.
+
 `--dedup-scope` overrides the configured [`dedup_scope`](#sharing-processed-target-history-across-agents) for a single run. Use `--dedup-scope agent` to opt out of sharing and let this account re-visit repositories another account already processed.
 
 `--workers` overrides the configured `parallelism` for a single run. The number of workers that actually start is capped by the number of tasks, and the effective value is shown as `Workers:` in the execution plan (visible with `--dry-run`).
 
-`--interactive` opens a picker before the run. Every candidate is listed — not only the first `limit` — with the first `limit` rows pre-selected, so pressing Enter runs exactly what a non-interactive run would. Keys: `↑↓` / `j` `k` to move, `Space` to toggle, `J` / `K` (or `Shift+↑↓`) to move a row and change the order, `a` / `n` to select all or none, `g` / `G` for top and bottom, `Enter` to run, `q` / `Esc` to cancel. The number shown on each selected row is the order workers will process it in. It needs a real terminal, so it errors out when stdin or stdout is redirected; combine it with `--dry-run` to review the plan without executing.
+`--interactive` opens a picker before the run. Every candidate is listed — not only the first `limit` — with the first `limit` rows pre-selected, so pressing Enter runs exactly what a non-interactive run would. Keys: `↑↓` / `j` `k` to move, `Space` to toggle, `J` / `K` (or `Shift+↑↓`) to move a row and change the order, `a` / `n` to select all or none, `g` / `G` for top and bottom, `Enter` to run, `q` / `Esc` to cancel. The number shown on each selected row is the order workers will process it in, and rows that will resume an interrupted session are marked with `↻`. It needs a real terminal, so it errors out when stdin or stdout is redirected; combine it with `--dry-run` to review the plan without executing.
 
 `init` also accepts `--force` (`-f`) to overwrite existing files without confirmation.
 
 `clean` accepts `--older-than` to override the configured `cleanup_after` duration (e.g., `--older-than 3d`).
 
-When you pass one or more `PATH` arguments to `run`, scan discovery and state-based skipping are bypassed for those directories. Equivalent paths such as `repo` and `./repo` are normalized and deduplicated, so the same directory is never executed twice in a single run.
+When you pass one or more `PATH` arguments to `run`, scan discovery and state-based skipping are bypassed for those directories. Equivalent paths such as `repo` and `./repo` are normalized and deduplicated, so the same directory is never executed twice in a single run. Saved interrupted sessions still apply, so after a rate limit, re-running the same `token-burn run PATH...` continues the interrupted session.
 
 ## Configuration
 
@@ -232,14 +236,15 @@ skip_within = "7d"    # optional
 | `limit` | Maximum number of targets to process per run (`>= 1`) | `10` (default) |
 | `rate_limit_threshold` | Hold back new tasks when the five-hour / seven-day window utilization reaches this percentage (`1-100`). A seven-day window stops the run permanently; a five-hour window only pauses until it resets. The monthly overage window never triggers either | `95` (default) |
 | `dedup_scope` | How widely processed-target history is shared (`global` / `provider` / `agent`) | `agent` (default) |
+| `resume_interrupted` | Save a Claude Code session cut off by a rate limit and continue it on the next run instead of starting over. `false` turns this off: interrupted sessions are neither saved nor resumed. See [Resuming interrupted sessions](#resuming-interrupted-sessions) | `true` (default) |
 
-`skip_within` and `cleanup_after` accept duration strings using `d` (days), `h` (hours), `m` (minutes), and `s` (seconds). Invalid or unrepresentable values are rejected when the config file is loaded. If `skip_within` is omitted, directories processed since the previous reset are skipped. A representable duration that still exceeds the date-time range cannot panic: `skip_within` falls back to the previous-reset cutoff with a warning, while cleanup returns an error. Use `--fresh` to ignore saved state entirely.
+`skip_within` and `cleanup_after` accept duration strings using `d` (days), `h` (hours), `m` (minutes), and `s` (seconds). Invalid or unrepresentable values are rejected when the config file is loaded. If `skip_within` is omitted, directories processed since the previous reset are skipped. A representable duration that still exceeds the date-time range cannot panic: `skip_within` falls back to the previous-reset cutoff with a warning, while cleanup returns an error. Use `--fresh` to ignore saved state entirely — both the processed history and saved interrupted sessions.
 
 `rate_limit_threshold` is enforced on two paths. During a task, Claude Code's stream-json `rate_limit_event` is monitored in real time and new tasks are held back once the threshold is exceeded. In addition, when [ai-usage integration](#ai-usage-integration-optional) is enabled, after each task completes the agent's real utilization is re-checked against this threshold using the matching `(profile, provider)` pair's `weekly` and `five_hour` `used_percent` values; this applies to both `claude` and `codex` agents (the latter previously had no real-time monitoring).
 
 Both paths decide **how** to hold back by the period of the window that crossed the threshold. A weekly window shares its period with the run's deadline, so it stops the run permanently. A short window — `five_hour`, or a 24-hour window reported as `kind:"daily"` — only pauses until that window resets; a worker whose resume time has passed simply continues with the next task. The period comes from `kind`, never from the slot name, because providers do report a 24-hour window in the `five_hour` slot. A pause falls back to a permanent stop when the reset time is missing, implausible (further ahead than one period of that window), or later than the run's deadline.
 
-State is stored in `<config-dir>/state.json` (same directory as the active config file). Updates are written to a same-directory temporary file and atomically swapped into place with `rename`, while a stable sidecar lock file such as `.state.json.lock` serializes parallel workers. If the existing file contains malformed JSON, the update fails without replacing it, preserving the original data for recovery instead of silently discarding processed-target history. Within each agent, entries are written most-recently-processed first (ties broken by ascending path), so the newest activity stays at the top of the file. With the default config path, this is `~/.config/token-burn/state.json`.
+State is stored in `<config-dir>/state.json` (same directory as the active config file). Updates are written to a same-directory temporary file and atomically swapped into place with `rename`, while a stable sidecar lock file such as `.state.json.lock` serializes parallel workers. If the existing file contains malformed JSON, the update fails without replacing it, preserving the original data for recovery instead of silently discarding processed-target history. Within each agent, entries are written most-recently-processed first (ties broken by ascending path), so the newest activity stays at the top of the file. With the default config path, this is `~/.config/token-burn/state.json`. Sessions interrupted by a rate limit are saved separately in `resume.json` in the same directory; see [Resuming interrupted sessions](#resuming-interrupted-sessions).
 
 #### Sharing processed-target history across agents
 
@@ -432,7 +437,10 @@ Prompt values ending with `.md` are read as file paths. Relative paths resolve f
 ```toml
 [prompts]
 default = "prompts/default.md"
+# resume = "prompts/resume.md"   # optional: continuation prompt sent when resuming an interrupted session
 ```
+
+`resume` (optional) is the continuation prompt sent when [resuming an interrupted session](#resuming-interrupted-sessions). It is resolved the same way as `default`, and a built-in English prompt is used when it is omitted. Only this prompt is sent on resume: the original instructions are already in the session's history.
 
 ### Explicit targets (merged with scan results)
 
@@ -451,13 +459,46 @@ If a target's `directory` matches a scan result, the explicit target takes prece
 
 ### Processing order
 
-Targets are processed **least-recently-modified first**: the repository whose newest file change is the oldest goes first. `defer` keeps its priority, and visibility groups public repositories ahead of private ones **only when at least one `[[scan]]` sets `public_first = true`**. The reordering happens within those groups, and it is a stable sort, so targets sharing a modification time keep their original order. Repositories whose modification time cannot be determined go last within their group. `token-burn run PATH...` keeps the order given on the command line.
+Targets are processed **least-recently-modified first**: the repository whose newest file change is the oldest goes first. `defer` keeps its priority, and visibility groups public repositories ahead of private ones **only when at least one `[[scan]]` sets `public_first = true`**. The reordering happens within those groups, and it is a stable sort, so targets sharing a modification time keep their original order. Repositories whose modification time cannot be determined go last within their group. Targets that will [resume an interrupted session](#resuming-interrupted-sessions) are placed ahead of the modification-time order within their group. `token-burn run PATH...` keeps the order given on the command line.
 
 When every `[[scan]]` sets `public_first = false` (or the config has no `[[scan]]` at all), visibility is left out of the sort key entirely, so the order depends only on `defer` and modification time. This matters together with `limit`: while visibility grouping is active, private repositories are never reached as long as at least `limit` public repositories remain queued.
 
 Without this, the processing order was fixed, so every run took the first `limit` targets from the same list head. The already-processed cutoff (`skip_within`, or the previous reset) is an absolute time window, so once a run falls outside it the whole history is invalidated at once and the same head repositories are picked again — while the tail is never reached.
 
 The order is based on the repository's own last file modification time rather than the recorded processing time, so a run that was cut short by a rate limit (and therefore changed nothing) is not treated as progress. The timestamp comes from the newest mtime among files listed by `git ls-files`, which naturally excludes build artifacts and `.gitignore`d paths while still picking up uncommitted edits. `list` and `run` print it next to each target as `(modified: ...)` so the resulting order can be verified at a glance.
+
+### Resuming interrupted sessions
+
+When a Claude Code task ends because the account hit a rate limit (for example `You've hit your session limit · resets 2:30pm (Asia/Tokyo)`), token-burn saves that session's ID. The next `token-burn run` that picks the same repository with the same agent continues the interrupted session with `claude --resume <session_id>` and a continuation prompt instead of starting the work over:
+
+1. `token-burn run` — a task is cut off by the rate limit. It is still reported as failed, and its session ID is saved.
+2. Run the same command again: `token-burn run`, or `token-burn run ~/GitHub/my-repo` for a single repository. If the interruption recorded when the five-hour window resets and that time has not come yet, the whole run starts paused until then — the same pause a run uses when the five-hour window fills up, since that window belongs to the account and would reject the other tasks too. It stops instead if waiting would pass the deadline, and the execution plan shows the hold.
+3. The target is listed with a `↻ resume` line (short session ID and when it was rate limited), moved to the front of its group, and continues where the interrupted session stopped.
+
+A saved session is resumed only when all of the following hold. Otherwise the target starts a new session as before, and `list` / `run` show why the saved session was not used.
+
+- Resuming is enabled: neither `--no-resume` nor `--fresh` is given, and `resume_interrupted` is not `false`.
+- The agent's `command` does not pass its own session flags (`--resume` / `-r`, `--continue` / `-c`, `--session-id`, `--fork-session`, `--no-session-persistence`, `--from-pr`). If it does, an added `--resume` would conflict with them, so interrupted sessions of that agent are neither saved nor resumed (a session saved earlier is listed with the reason it is not used).
+- The target's prompt is unchanged since the interruption. Continuing old instructions after you edited them makes no sense.
+- No agent within the current [`dedup_scope`](#sharing-processed-target-history-across-agents) has processed the target since the interruption — with `dedup_scope = "global"`, for example, another account may have finished it in the meantime.
+
+There is no fixed expiry. Claude Code deletes old transcripts according to its own retention settings, so whether a session still exists is found out by resuming it:
+
+| Outcome of the resumed task | Saved session |
+|-----------------------------|---------------|
+| Success | Removed; the target is recorded in `state.json` as usual |
+| Rate-limited again | Saved again with the new interruption time and a cleared failure count, so the next run continues the same session |
+| The session no longer exists | Removed, and a new session starts right away with the original prompt in the same task. That attempt is logged to `<NNNN>_<name>.fresh.jsonl` / `.fresh.log` next to the original log |
+| Any other failure, including a crash that leaves no result | Kept, since failures such as an expired login are not the session's fault. After 3 failed resume attempts it is dropped, and the next run starts fresh |
+| Retryable error or cancellation (Ctrl-C) | Kept unchanged |
+
+The built-in continuation prompt (in English) tells Claude that the previous session was cut off by a rate limit and this one continues it; to check the repository first (`git status`, the current branch, `git worktree list`, uncommitted changes); that subagents and background tasks that were running have stopped, so their results must be verified rather than assumed; not to blindly repeat operations that already completed, such as commits, pushes, and releases; and then to finish the rest of the original instructions. Replace it with [`[prompts].resume`](#prompts).
+
+Only `claude` agents are covered, and only when the task ended on a rate limit. Retryable errors (such as `API Error: Connection closed mid-response`), crashes, cancellations, and logging-pipeline failures still start over on the next run, and Codex sessions are not resumed. Sessions are saved per agent: a transcript lives in that account's `CLAUDE_CONFIG_DIR`, so another account cannot continue it.
+
+Resumable targets are moved to the front of their group. `defer` and `public_first` grouping still come first, but within a group resumable targets go ahead of the least-recently-modified order: an interrupted repository was being modified right up to the interruption, so oldest-first ordering alone would push it to the end, where `limit` could drop it before it is ever resumed. `token-burn run PATH...` keeps the command-line order and still resumes. For a resumed task, the execution plan shows `Resume: <session id>` and the continuation prompt as its prompt, and the `-i` picker marks the row with `↻`.
+
+Saved sessions are stored in `resume.json` next to `state.json` (default `~/.config/token-burn/resume.json`) and updated with the same sidecar lock and atomic rename. They live in a separate file so that `state.json` keeps its format and older token-burn versions can still read it. `--no-resume` ignores saved sessions for one run, and `resume_interrupted = false` turns the feature off entirely.
 
 ## Development
 

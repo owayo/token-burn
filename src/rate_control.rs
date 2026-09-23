@@ -35,7 +35,7 @@ pub const RESET_PROPAGATION_GRACE_SECS: i64 = 30;
 /// 枠 1 周期ぶんより先を指す `resetsAt` は、枠の取り違え（月次の追加課金枠や週次枠の
 /// 時刻を短周期枠のものとして読んだ）か壊れた値。一時停止の根拠にはせず恒久停止へ
 /// 倒す（fail-closed）。
-const RESET_SKEW_MARGIN_SECS: i64 = 3600;
+pub(crate) const RESET_SKEW_MARGIN_SECS: i64 = 3600;
 
 /// 実行全体のデッドラインと同じ周期とみなす下限（＝週次）。
 const DEADLINE_PERIOD_SECS: i64 = 7 * 86_400;

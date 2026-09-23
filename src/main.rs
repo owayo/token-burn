@@ -6,6 +6,7 @@ mod executor;
 mod format_stream;
 mod init;
 mod rate_control;
+mod resume;
 mod scanner;
 mod schedule;
 mod state;
@@ -75,9 +76,13 @@ struct Cli {
     #[arg(short = 'n', long, global = true)]
     dry_run: bool,
 
-    /// 保存済み状態を無視して全ターゲットを処理する
+    /// 保存済み状態（処理済み履歴と中断セッション）を無視して全ターゲットを最初から処理する
     #[arg(long, global = true)]
     fresh: bool,
+
+    /// レート制限で中断したセッションを再開せず、新しいセッションで処理する
+    #[arg(long, global = true)]
+    no_resume: bool,
 
     /// 処理するターゲット数の上限（デフォルト: 設定値または 10）
     #[arg(
@@ -168,11 +173,17 @@ enum Commands {
         #[arg(long, default_value_t = 95)]
         threshold: u8,
     },
-    /// jsonl を分類して終了コード (0=success,1=failed,2=rate-limited,3=retryable) を返す（ワーカースクリプト専用）
+    /// jsonl を分類して終了コード (0=success,1=failed,2=rate-limited,3=retryable,4=resume-unavailable) を返す（ワーカースクリプト専用）
     #[command(hide = true, name = "classify-result")]
     ClassifyResult {
         /// 分類対象の jsonl ファイル
         jsonl: PathBuf,
+    },
+    /// 中断したセッションの再開記録（resume.json）を更新する（ワーカースクリプト専用）
+    #[command(hide = true, name = "resume-entry")]
+    ResumeEntry {
+        #[command(subcommand)]
+        action: ResumeEntryAction,
     },
     /// 停止判定とキューからの claim を同じロックの下で行う（ワーカースクリプト専用）
     ///
@@ -215,6 +226,122 @@ enum Commands {
         #[arg(last = true)]
         command: Vec<String>,
     },
+}
+
+/// `resume-entry` の操作。いずれも `resume.json` は `state_file` と同じディレクトリに置く。
+#[derive(Subcommand)]
+enum ResumeEntryAction {
+    /// レート制限で中断したセッションを保存する
+    Save {
+        /// エージェント名
+        agent: String,
+        /// 処理したディレクトリ
+        directory: PathBuf,
+        /// state.json のパス
+        state_file: PathBuf,
+        /// 中断した実行の jsonl（session_id を取り出す）
+        #[arg(long)]
+        jsonl: PathBuf,
+        /// タスクの元のプロンプト（再開してよいかの照合に使うハッシュを取る）
+        #[arg(long)]
+        prompt_file: PathBuf,
+    },
+    /// 再開できなかったセッションの記録を消す（保存済みの ID と一致する場合だけ）
+    Forget {
+        agent: String,
+        directory: PathBuf,
+        state_file: PathBuf,
+        #[arg(long)]
+        session: String,
+    },
+    /// 再開したセッションの失敗を数える（上限に達したら記録を捨てる）
+    Fail {
+        agent: String,
+        directory: PathBuf,
+        state_file: PathBuf,
+        #[arg(long)]
+        session: String,
+    },
+}
+
+/// `resume-entry` を実行する。表示はワーカーペインに出る（stdout）。
+fn run_resume_entry(action: ResumeEntryAction) -> Result<()> {
+    match action {
+        ResumeEntryAction::Save {
+            agent,
+            directory,
+            state_file,
+            jsonl,
+            prompt_file,
+        } => {
+            let path = resume::resume_path(&state_file);
+            let entry = resume::save_from_jsonl(&path, &agent, &directory, &jsonl, &prompt_file)?;
+            let after = entry
+                .retry_after
+                .map(|at| {
+                    format!(
+                        " after {}",
+                        at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+                    )
+                })
+                .unwrap_or_default();
+            println!(
+                "{}",
+                format!(
+                    "  ↻ Saved session {} — the next run resumes it{after}",
+                    entry.short_id()
+                )
+                .cyan()
+            );
+        }
+        ResumeEntryAction::Forget {
+            agent,
+            directory,
+            state_file,
+            session,
+        } => {
+            resume::forget_atomic(
+                &resume::resume_path(&state_file),
+                &agent,
+                &directory,
+                Some(&session),
+            )?;
+        }
+        ResumeEntryAction::Fail {
+            agent,
+            directory,
+            state_file,
+            session,
+        } => {
+            let outcome = resume::record_failure_atomic(
+                &resume::resume_path(&state_file),
+                &agent,
+                &directory,
+                &session,
+            )?;
+            let short = resume::short_session_id(&session);
+            match outcome {
+                resume::FailureOutcome::Counted(n) => println!(
+                    "{}",
+                    format!(
+                        "  ↻ Resuming session {short} failed ({n}/{}); the next run tries it again",
+                        resume::MAX_FAILED_RESUMES
+                    )
+                    .yellow()
+                ),
+                resume::FailureOutcome::Dropped => println!(
+                    "{}",
+                    format!(
+                        "  ↻ Gave up resuming session {short} after {} failures; the next run starts a new session",
+                        resume::MAX_FAILED_RESUMES
+                    )
+                    .yellow()
+                ),
+                resume::FailureOutcome::Missing => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_positive_usize(value: &str, option: &str) -> Result<usize, String> {
@@ -265,7 +392,25 @@ async fn main() -> Result<()> {
     } = command
     {
         state::mark_completed_atomic(&state_file, &agent, &directory)?;
+        // 完了したので、中断セッションの記録（あれば）はもう要らない。処理済み記録を先に
+        // 確定させてから消すので、間で落ちても二重処理にはならない（次回は処理済みとして
+        // スキップされ、残った記録は使われない）。消せなくても完了の記録は済んでいるため、
+        // 警告に留めてタスクを失敗にしない。
+        if let Err(e) =
+            resume::forget_atomic(&resume::resume_path(&state_file), &agent, &directory, None)
+        {
+            eprintln!(
+                "{}: failed to clear the resume entry for {}: {:#}",
+                "Warning".yellow(),
+                directory.display(),
+                e
+            );
+        }
         return Ok(());
+    }
+
+    if let Commands::ResumeEntry { action } = command {
+        return run_resume_entry(action);
     }
 
     if let Commands::ClassifyResult { jsonl } = &command {
@@ -320,6 +465,7 @@ async fn main() -> Result<()> {
     let agent_name = cli.agent;
     let dry_run = cli.dry_run;
     let fresh = cli.fresh;
+    let no_resume = cli.no_resume;
     let limit = if cli.no_limit {
         Some(usize::MAX)
     } else {
@@ -344,6 +490,7 @@ async fn main() -> Result<()> {
                 agent_name,
                 dry_run,
                 fresh,
+                no_resume,
                 limit_override: limit,
                 workers_override: workers,
                 public_only,
@@ -360,6 +507,7 @@ async fn main() -> Result<()> {
                 config_path,
                 agent_name,
                 fresh,
+                no_resume,
                 public_only,
                 dedup_scope,
                 force_paths: paths,
@@ -373,6 +521,7 @@ async fn main() -> Result<()> {
         Commands::Init { .. } => unreachable!(),
         Commands::FormatStream { .. } => unreachable!(),
         Commands::ClassifyResult { .. } => unreachable!(),
+        Commands::ResumeEntry { .. } => unreachable!(),
         Commands::UsageGate { .. } | Commands::GateClaim { .. } => unreachable!(),
     }
 
@@ -385,6 +534,8 @@ struct RunOptions {
     agent_name: Option<String>,
     dry_run: bool,
     fresh: bool,
+    /// 保存済みの中断セッションを今回は再開しない（新しい中断は保存する）。
+    no_resume: bool,
     limit_override: Option<usize>,
     workers_override: Option<usize>,
     public_only: bool,
@@ -399,6 +550,7 @@ struct ListOptions {
     config_path: PathBuf,
     agent_name: Option<String>,
     fresh: bool,
+    no_resume: bool,
     public_only: bool,
     dedup_scope: config::DedupScope,
     force_paths: Vec<PathBuf>,
@@ -429,6 +581,7 @@ async fn list(opts: ListOptions) -> Result<()> {
         config_path,
         agent_name,
         fresh,
+        no_resume,
         public_only,
         dedup_scope,
         force_paths,
@@ -497,17 +650,32 @@ async fn list(opts: ListOptions) -> Result<()> {
         )
     };
 
+    let resumes = resolve_resumes(
+        &targets,
+        agent,
+        &runtime_agents,
+        &run_state,
+        &resume::ResumeStore::load_or_warn(&resume::resume_path(&state_file)),
+        dedup_scope,
+        resume_disabled_reason(&config, agent, fresh, no_resume).as_deref(),
+    );
+
     // 最終ファイル変更日時が古い順に並べ替える（force_paths 指定時は CLI 指定順を尊重）
     let modified = if force_paths.is_empty() {
         let dirs: Vec<_> = targets.iter().map(|t| t.directory.clone()).collect();
         let modified = scanner::repo_last_modified_map(&dirs).await;
-        sort_by_least_recent(&mut targets, &modified, public_first_enabled(&config));
+        sort_by_least_recent(
+            &mut targets,
+            &modified,
+            public_first_enabled(&config),
+            &resumable_directories(&resumes),
+        );
         modified
     } else {
         HashMap::new()
     };
 
-    display::print_targets(&targets, &modified);
+    display::print_targets(&targets, &modified, &resumes);
 
     if public_filtered > 0 {
         println!(
@@ -533,6 +701,7 @@ async fn run(opts: RunOptions) -> Result<()> {
         agent_name,
         dry_run,
         fresh,
+        no_resume,
         limit_override,
         workers_override,
         public_only,
@@ -616,13 +785,31 @@ async fn run(opts: RunOptions) -> Result<()> {
         )
     };
 
+    // レート制限で中断したセッションのうち、今回再開するものを決める。並べ替えより前に
+    // 判定するのは、再開するターゲットを各グループの先頭へ寄せるため。
+    let resumes = resolve_resumes(
+        &targets,
+        agent,
+        &runtime_agents,
+        &run_state,
+        &resume::ResumeStore::load_or_warn(&resume::resume_path(&state_file)),
+        dedup_scope,
+        resume_disabled_reason(&config, agent, fresh, no_resume).as_deref(),
+    );
+    let resumable = resumable_directories(&resumes);
+
     // 最終ファイル変更日時が古い順に並べ替えてから limit を適用する。
     // これをしないと limit で毎回リストの先頭だけが選ばれ、末尾のリポジトリに到達しない。
     // force_paths 指定時は CLI 指定順を尊重する。
     let modified = if force_paths.is_empty() {
         let dirs: Vec<_> = targets.iter().map(|t| t.directory.clone()).collect();
         let modified = scanner::repo_last_modified_map(&dirs).await;
-        sort_by_least_recent(&mut targets, &modified, public_first_enabled(&config));
+        sort_by_least_recent(
+            &mut targets,
+            &modified,
+            public_first_enabled(&config),
+            &resumable,
+        );
         modified
     } else {
         HashMap::new()
@@ -644,7 +831,7 @@ async fn run(opts: RunOptions) -> Result<()> {
             schedule_source: sched.source.label().to_string(),
             workers: parallelism,
         };
-        match tui::select_targets(targets, &modified, limit, &ctx)? {
+        match tui::select_targets(targets, &modified, &resumable, limit, &ctx)? {
             tui::Outcome::Confirmed(selected) => (selected, 0),
             tui::Outcome::Cancelled => {
                 println!("{}", "Cancelled - nothing was executed.".yellow());
@@ -656,7 +843,7 @@ async fn run(opts: RunOptions) -> Result<()> {
         (targets.into_iter().take(limit).collect(), truncated)
     };
 
-    display::print_targets(&targets, &modified);
+    display::print_targets(&targets, &modified, &resumes);
 
     if truncated > 0 {
         println!(
@@ -694,7 +881,8 @@ async fn run(opts: RunOptions) -> Result<()> {
         .as_ref()
         .filter(|g| g.enabled)
         .map(|g| g.command.clone());
-    let plan = executor::build_plan(agent, targets, ai_usage_command);
+    let resume_options = resume_options(&config, agent, resumes)?;
+    let plan = executor::build_plan(agent, targets, ai_usage_command, resume_options);
     executor::print_plan(&plan, parallelism);
 
     if dry_run {
@@ -861,17 +1049,127 @@ fn remaining_until(reset: DateTime<chrono::FixedOffset>) -> std::time::Duration 
 /// 無条件に `visibility` をソートキーへ入れると、`public_first = false` を指定しても
 /// 公開リポジトリが必ず先頭に寄り、設定が黙って無視される（`limit` と併用すると
 /// 公開リポジトリが limit 件以上ある限り非公開リポジトリに永久に到達しない）。
+///
+/// 中断セッションを再開するターゲット（`resumable`）は、同じグループ内の先頭に寄せる。
+/// 中断したリポジトリは直前まで編集されていて変更日時が最も新しいので、古い順だけで
+/// 並べると末尾へ回り、`limit` から外れて再開されないまま放置される。一方で明示的な
+/// `defer` と `public_first` は再開より優先する（再開のためにユーザーの設定を覆さない）。
 fn sort_by_least_recent(
     targets: &mut [scanner::ResolvedTarget],
     modified: &HashMap<PathBuf, DateTime<Utc>>,
     public_first: bool,
+    resumable: &HashSet<PathBuf>,
 ) {
     targets.sort_by_cached_key(|t| {
         let last_modified = modified.get(&t.directory).copied();
         // public_first = false のときは全要素が None になり、可視性はキーとして効かない。
         let visibility = public_first.then(|| t.visibility.clone());
-        (t.defer, visibility, last_modified.is_none(), last_modified)
+        let fresh_start = !resumable.contains(&t.directory);
+        (
+            t.defer,
+            visibility,
+            fresh_start,
+            last_modified.is_none(),
+            last_modified,
+        )
     });
+}
+
+/// 今回は保存済みの中断セッションを再開しない理由。`None` なら再開してよい。
+///
+/// `--fresh` は「保存済み状態を無視して最初から」という意味なので、処理済み履歴と
+/// 同じく中断セッションも見ない。`--no-resume` は処理済みスキップを保ったまま再開だけを
+/// 止める。どちらも今回の再開を止めるだけで、新しい中断は保存する。
+fn resume_disabled_reason(
+    config: &config::Config,
+    agent: &config::RuntimeAgent,
+    fresh: bool,
+    no_resume: bool,
+) -> Option<String> {
+    if fresh {
+        return Some("--fresh".to_string());
+    }
+    if no_resume {
+        return Some("--no-resume".to_string());
+    }
+    if !config.settings.resume_interrupted {
+        return Some("settings.resume_interrupted = false".to_string());
+    }
+    executor::resume_support(agent).unsupported_reason()
+}
+
+/// 保存済みの中断セッションを、ターゲットごとに再開するかどうか判定する。
+///
+/// 記録はエージェント展開名ごとに引く（transcript はそのアカウントの config dir にあり、
+/// 別アカウントからは再開できない）。処理済み判定と同じ dedup scope で「中断より新しい
+/// 処理記録」を探し、あれば古いと見なす（共有 scope で別エージェントが仕上げた等）。
+/// 記録の無いターゲットは結果に含めない。
+fn resolve_resumes(
+    targets: &[scanner::ResolvedTarget],
+    agent: &config::RuntimeAgent,
+    runtime_agents: &[config::RuntimeAgent],
+    run_state: &state::State,
+    store: &resume::ResumeStore,
+    scope: config::DedupScope,
+    disabled: Option<&str>,
+) -> HashMap<PathBuf, resume::ResumeDecision> {
+    let peers = dedup_peers(scope, agent, runtime_agents);
+    targets
+        .iter()
+        .filter_map(|target| {
+            let entry = store.get(&agent.name, &target.directory)?;
+            let decision = match disabled {
+                Some(why) => resume::ResumeDecision::Skip {
+                    session_id: entry.session_id.clone(),
+                    reason: resume::SkipReason::Disabled(why.to_string()),
+                },
+                None => {
+                    let latest = run_state
+                        .last_processed_in_scope(&target.directory, |name| peers.contains(name));
+                    resume::decide(entry, &target.prompt, latest.as_ref())
+                }
+            };
+            Some((target.directory.clone(), decision))
+        })
+        .collect()
+}
+
+/// 再開すると判定したターゲットのディレクトリ。
+fn resumable_directories(resumes: &HashMap<PathBuf, resume::ResumeDecision>) -> HashSet<PathBuf> {
+    resumes
+        .iter()
+        .filter(|(_, decision)| decision.resume_entry().is_some())
+        .map(|(dir, _)| dir.clone())
+        .collect()
+}
+
+/// 実行計画へ渡す再開の設定を組み立てる。
+///
+/// 継続プロンプトは再開するタスクがあるときだけ解決する。使わない実行で `[prompts] resume`
+/// の `.md` が読めないことを理由に止めない。
+fn resume_options(
+    config: &config::Config,
+    agent: &config::RuntimeAgent,
+    resumes: HashMap<PathBuf, resume::ResumeDecision>,
+) -> Result<executor::ResumeOptions> {
+    let sessions: HashMap<PathBuf, resume::ResumeEntry> = resumes
+        .into_iter()
+        .filter_map(|(dir, decision)| match decision {
+            resume::ResumeDecision::Resume(entry) => Some((dir, entry)),
+            resume::ResumeDecision::Skip { .. } => None,
+        })
+        .collect();
+    let prompt = if sessions.is_empty() {
+        String::new()
+    } else {
+        config.resume_prompt()?
+    };
+    Ok(executor::ResumeOptions {
+        save_interrupted: config.settings.resume_interrupted
+            && executor::resume_support(agent) == executor::ResumeSupport::Supported,
+        sessions,
+        prompt,
+    })
 }
 
 /// いずれかの `[[scan]]` が `public_first` を有効にしているか。
@@ -1081,6 +1379,7 @@ mod tests {
             limit: 10,
             rate_limit_threshold: 95,
             dedup_scope: crate::config::DedupScope::Agent,
+            resume_interrupted: true,
         };
         let dir = resolve_report_dir(&settings);
         assert!(dir.ends_with("Documents/token-burn"));
@@ -1096,6 +1395,7 @@ mod tests {
             limit: 10,
             rate_limit_threshold: 95,
             dedup_scope: crate::config::DedupScope::Agent,
+            resume_interrupted: true,
         };
         let dir = resolve_report_dir(&settings);
         // チルダが展開されていることを確認
@@ -1119,6 +1419,7 @@ mod tests {
             limit: 10,
             rate_limit_threshold: 95,
             dedup_scope: crate::config::DedupScope::Agent,
+            resume_interrupted: true,
         };
         let dir = resolve_report_dir(&settings);
         assert!(
@@ -1148,6 +1449,7 @@ mod tests {
             limit: 10,
             rate_limit_threshold: 95,
             dedup_scope: crate::config::DedupScope::Agent,
+            resume_interrupted: true,
         };
         let dir = resolve_report_dir(&settings);
         assert_eq!(
@@ -1180,9 +1482,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
+                resume: None,
             },
             agents: vec![agent.clone()],
             scan: vec![],
@@ -1263,9 +1567,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
+                resume: None,
             },
             agents: vec![agent.clone()],
             scan: vec![],
@@ -1328,7 +1634,7 @@ mod tests {
         ];
         let modified = modified_at(&[("fresh", 1), ("stale", 60), ("middle", 10)]);
 
-        sort_by_least_recent(&mut targets, &modified, true);
+        sort_by_least_recent(&mut targets, &modified, true, &HashSet::new());
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(order, vec!["stale", "middle", "fresh"]);
@@ -1349,7 +1655,7 @@ mod tests {
             ("public-fresh", 1),
         ]);
 
-        sort_by_least_recent(&mut targets, &modified, true);
+        sort_by_least_recent(&mut targets, &modified, true, &HashSet::new());
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(
@@ -1383,7 +1689,7 @@ mod tests {
             ("public-middle", 30),
         ]);
 
-        sort_by_least_recent(&mut targets, &modified, true);
+        sort_by_least_recent(&mut targets, &modified, true, &HashSet::new());
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(
@@ -1410,7 +1716,7 @@ mod tests {
         ];
         let modified = modified_at(&[("known-fresh", 1)]);
 
-        sort_by_least_recent(&mut targets, &modified, true);
+        sort_by_least_recent(&mut targets, &modified, true, &HashSet::new());
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(order, vec!["known-fresh", "unknown"]);
@@ -1431,7 +1737,7 @@ mod tests {
             .map(|t| (t.directory.clone(), same))
             .collect();
 
-        sort_by_least_recent(&mut targets, &modified, true);
+        sort_by_least_recent(&mut targets, &modified, true, &HashSet::new());
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(order, vec!["first", "second", "third"]);
@@ -1457,7 +1763,7 @@ mod tests {
             ("unknown-middle", 30),
         ]);
 
-        sort_by_least_recent(&mut targets, &modified, false);
+        sort_by_least_recent(&mut targets, &modified, false, &HashSet::new());
 
         // 可視性は無視され、純粋に最終更新の古い順になる
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
@@ -1477,7 +1783,7 @@ mod tests {
         ];
         let modified = modified_at(&[("deferred-stale", 300), ("normal-fresh", 1)]);
 
-        sort_by_least_recent(&mut targets, &modified, false);
+        sort_by_least_recent(&mut targets, &modified, false, &HashSet::new());
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(order, vec!["normal-fresh", "deferred-stale"]);
@@ -1494,7 +1800,7 @@ mod tests {
         ];
         let modified = modified_at(&[("known", 5)]);
 
-        sort_by_least_recent(&mut targets, &modified, false);
+        sort_by_least_recent(&mut targets, &modified, false, &HashSet::new());
 
         let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
         assert_eq!(order, vec!["known", "no-mtime-a", "no-mtime-b"]);
@@ -1521,9 +1827,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
+                resume: None,
             },
             agents: vec![],
             scan: scans,
@@ -1599,9 +1907,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
+                resume: None,
             },
             agents: vec![agent.clone()],
             scan: vec![],
@@ -1689,9 +1999,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
+                resume: None,
             },
             agents: vec![agent.clone()],
             scan: vec![],
@@ -1744,9 +2056,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: config::Prompts {
                 default: "review".to_string(),
+                resume: None,
             },
             agents: agents
                 .iter()
@@ -2160,9 +2474,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: config::Prompts {
                 default: "default".to_string(),
+                resume: None,
             },
             agents: vec![config::Agent {
                 name: "agent".to_string(),
@@ -2209,9 +2525,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: config::Prompts {
                 default: "default".to_string(),
+                resume: None,
             },
             agents: vec![config::Agent {
                 name: "agent".to_string(),
@@ -2247,9 +2565,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: config::Prompts {
                 default: "default".to_string(),
+                resume: None,
             },
             agents: vec![config::Agent {
                 name: "agent".to_string(),
@@ -2296,9 +2616,11 @@ mod tests {
                     limit: 10,
                     rate_limit_threshold: 95,
                     dedup_scope: crate::config::DedupScope::Agent,
+                    resume_interrupted: true,
                 },
                 prompts: config::Prompts {
                     default: "default prompt".to_string(),
+                    resume: None,
                 },
                 agents: vec![config::Agent {
                     name: "agent".to_string(),
@@ -2348,9 +2670,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: config::Prompts {
                 default: "default prompt".to_string(),
+                resume: None,
             },
             agents: vec![config::Agent {
                 name: "agent".to_string(),
@@ -2396,9 +2720,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: config::Prompts {
                 default: "default prompt".to_string(),
+                resume: None,
             },
             agents: vec![config::Agent {
                 name: "agent".to_string(),
@@ -2422,5 +2748,302 @@ mod tests {
         assert_eq!(resolved[0].prompt, "default prompt");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // ─────────── 中断セッションの再開 ───────────
+
+    const SESSION: &str = "0633fa18-8643-40f7-9106-a35330ed247d";
+
+    /// 中断を 1 時間前に記録した resume.json を作り、読み込んで返す。
+    fn store_with(entries: &[(&str, &str, &str)]) -> resume::ResumeStore {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let path = tmp.path().join("resume.json");
+        for (agent, dir, prompt) in entries {
+            resume::save_atomic(
+                &path,
+                agent,
+                std::path::Path::new(dir),
+                resume::ResumeEntry {
+                    session_id: SESSION.to_string(),
+                    interrupted_at: (chrono::Local::now() - chrono::Duration::hours(1))
+                        .fixed_offset(),
+                    retry_after: None,
+                    prompt_hash: resume::prompt_hash(prompt),
+                    message: None,
+                    log: None,
+                    failed_resumes: 0,
+                },
+            )
+            .expect("save");
+        }
+        resume::ResumeStore::load_or_warn(&path)
+    }
+
+    #[test]
+    fn sort_by_least_recent_puts_resumable_targets_first_within_groups() {
+        use scanner::Visibility;
+        let mut targets = vec![
+            target_at("stale", Visibility::Public, false),
+            target_at("interrupted", Visibility::Public, false),
+            target_at("private-interrupted", Visibility::Private, false),
+            target_at("deferred-interrupted", Visibility::Public, true),
+        ];
+        // 中断したリポジトリは直前まで編集されていて変更日時が最も新しい
+        let modified = modified_at(&[
+            ("stale", 90),
+            ("interrupted", 0),
+            ("private-interrupted", 30),
+            ("deferred-interrupted", 0),
+        ]);
+        let resumable: HashSet<PathBuf> = [
+            "/tmp/interrupted",
+            "/tmp/private-interrupted",
+            "/tmp/deferred-interrupted",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+
+        // 再開するものはグループの先頭へ寄せるが、defer と public_first は覆さない
+        let mut public_first = targets.clone();
+        sort_by_least_recent(&mut public_first, &modified, true, &resumable);
+        let order: Vec<_> = public_first
+            .iter()
+            .map(|t| t.display_name.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "interrupted",
+                "stale",
+                "private-interrupted",
+                "deferred-interrupted"
+            ]
+        );
+
+        // public_first が無ければ、再開するもの同士は変更日時の古い順
+        sort_by_least_recent(&mut targets, &modified, false, &resumable);
+        let order: Vec<_> = targets.iter().map(|t| t.display_name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "private-interrupted",
+                "interrupted",
+                "stale",
+                "deferred-interrupted"
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_resumes_resumes_only_the_running_agents_sessions_with_the_same_prompt() {
+        let conf = dedup_test_config(
+            &[("claude", Some("claude")), ("claude-home", Some("claude"))],
+            Some("2d"),
+        );
+        let (runtime, _) = dedup_runtime(&conf, "claude");
+        let agent = runtime.iter().find(|a| a.name == "claude").unwrap();
+        let store = store_with(&[
+            ("claude", "/tmp/same-prompt", "review"),
+            ("claude", "/tmp/edited-prompt", "old instructions"),
+            // 別アカウントの transcript は再開できない
+            ("claude-home", "/tmp/other-account", "review"),
+        ]);
+        let targets = vec![
+            target_at("same-prompt", scanner::Visibility::Unknown, false),
+            target_at("edited-prompt", scanner::Visibility::Unknown, false),
+            target_at("other-account", scanner::Visibility::Unknown, false),
+            target_at("never-interrupted", scanner::Visibility::Unknown, false),
+        ];
+
+        let resumes = resolve_resumes(
+            &targets,
+            agent,
+            &runtime,
+            &state::State::default(),
+            &store,
+            config::DedupScope::Agent,
+            None,
+        );
+
+        assert!(matches!(
+            resumes.get(std::path::Path::new("/tmp/same-prompt")),
+            Some(resume::ResumeDecision::Resume(_))
+        ));
+        assert!(matches!(
+            resumes.get(std::path::Path::new("/tmp/edited-prompt")),
+            Some(resume::ResumeDecision::Skip {
+                reason: resume::SkipReason::PromptChanged,
+                ..
+            })
+        ));
+        assert!(!resumes.contains_key(std::path::Path::new("/tmp/other-account")));
+        assert!(!resumes.contains_key(std::path::Path::new("/tmp/never-interrupted")));
+        assert_eq!(
+            resumable_directories(&resumes),
+            HashSet::from([PathBuf::from("/tmp/same-prompt")])
+        );
+    }
+
+    /// 共有 scope で別エージェントが中断後に処理済みにしたら、そのセッションは古い。
+    /// agent scope（既定）では他エージェントの記録を見ないので再開する。
+    #[test]
+    fn resolve_resumes_follows_the_dedup_scope_for_newer_processed_records() {
+        let conf = dedup_test_config(
+            &[("claude", Some("claude")), ("claude-home", Some("claude"))],
+            Some("2d"),
+        );
+        let (runtime, _) = dedup_runtime(&conf, "claude");
+        let agent = runtime.iter().find(|a| a.name == "claude").unwrap();
+        let store = store_with(&[("claude", "/tmp/repo-a", "review")]);
+        // 中断（1 時間前）より後に、別エージェントが処理した
+        let run_state = state_with(&[("claude-home", "/tmp/repo-a")]);
+        let targets = vec![target_at("repo-a", scanner::Visibility::Unknown, false)];
+
+        let global = resolve_resumes(
+            &targets,
+            agent,
+            &runtime,
+            &run_state,
+            &store,
+            config::DedupScope::Global,
+            None,
+        );
+        assert_eq!(
+            global.get(std::path::Path::new("/tmp/repo-a")),
+            Some(&resume::ResumeDecision::Skip {
+                session_id: SESSION.to_string(),
+                reason: resume::SkipReason::Superseded {
+                    agent_name: "claude-home".to_string()
+                },
+            })
+        );
+
+        let agent_scope = resolve_resumes(
+            &targets,
+            agent,
+            &runtime,
+            &run_state,
+            &store,
+            config::DedupScope::Agent,
+            None,
+        );
+        assert!(matches!(
+            agent_scope.get(std::path::Path::new("/tmp/repo-a")),
+            Some(resume::ResumeDecision::Resume(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_resumes_reports_why_resuming_is_disabled() {
+        let conf = dedup_test_config(&[("claude", Some("claude"))], None);
+        let (runtime, _) = dedup_runtime(&conf, "claude");
+        let agent = &runtime[0];
+        let store = store_with(&[("claude", "/tmp/repo-a", "review")]);
+        let targets = vec![target_at("repo-a", scanner::Visibility::Unknown, false)];
+
+        let resumes = resolve_resumes(
+            &targets,
+            agent,
+            &runtime,
+            &state::State::default(),
+            &store,
+            config::DedupScope::Agent,
+            Some("--no-resume"),
+        );
+        assert_eq!(
+            resumes.get(std::path::Path::new("/tmp/repo-a")),
+            Some(&resume::ResumeDecision::Skip {
+                session_id: SESSION.to_string(),
+                reason: resume::SkipReason::Disabled("--no-resume".to_string()),
+            })
+        );
+        assert!(resumable_directories(&resumes).is_empty());
+    }
+
+    #[test]
+    fn resume_disabled_reason_covers_flags_settings_and_agent_support() {
+        let mut conf = dedup_test_config(&[("claude", Some("claude"))], None);
+        let claude = config::RuntimeAgent {
+            name: "claude".to_string(),
+            command: vec!["claude".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(resume_disabled_reason(&conf, &claude, false, false), None);
+        assert_eq!(
+            resume_disabled_reason(&conf, &claude, true, false).as_deref(),
+            Some("--fresh")
+        );
+        assert_eq!(
+            resume_disabled_reason(&conf, &claude, false, true).as_deref(),
+            Some("--no-resume")
+        );
+        let codex = config::RuntimeAgent {
+            name: "codex".to_string(),
+            command: vec!["codex".to_string(), "exec".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            resume_disabled_reason(&conf, &codex, false, false).as_deref(),
+            Some("not a claude agent")
+        );
+        conf.settings.resume_interrupted = false;
+        assert_eq!(
+            resume_disabled_reason(&conf, &claude, false, false).as_deref(),
+            Some("settings.resume_interrupted = false")
+        );
+    }
+
+    #[test]
+    fn resume_options_resolve_the_prompt_only_when_something_is_resumed() {
+        let mut conf = dedup_test_config(&[("claude", Some("claude"))], None);
+        // 読めない .md を指していても、再開しない実行は止めない
+        conf.prompts.resume = Some("missing-resume-prompt.md".to_string());
+        let claude = config::RuntimeAgent {
+            name: "claude".to_string(),
+            command: vec!["claude".to_string()],
+            ..Default::default()
+        };
+        let options = resume_options(&conf, &claude, HashMap::new()).expect("no prompt needed");
+        assert!(options.sessions.is_empty());
+        assert!(options.save_interrupted);
+
+        let store = store_with(&[("claude", "/tmp/repo-a", "review")]);
+        let entry = store
+            .get("claude", std::path::Path::new("/tmp/repo-a"))
+            .unwrap()
+            .clone();
+        let resumes = HashMap::from([(
+            PathBuf::from("/tmp/repo-a"),
+            resume::ResumeDecision::Resume(entry),
+        )]);
+        assert!(
+            resume_options(&conf, &claude, resumes.clone()).is_err(),
+            "再開するなら継続プロンプトが読めないことはエラー"
+        );
+
+        conf.prompts.resume = None;
+        let options = resume_options(&conf, &claude, resumes).expect("default prompt");
+        assert_eq!(options.prompt, resume::DEFAULT_RESUME_PROMPT);
+        assert_eq!(options.sessions.len(), 1);
+
+        // 再開に対応しないエージェントでは中断を保存しない
+        let codex = config::RuntimeAgent {
+            name: "codex".to_string(),
+            command: vec!["codex".to_string(), "exec".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !resume_options(&conf, &codex, HashMap::new())
+                .unwrap()
+                .save_interrupted
+        );
+    }
+
+    #[test]
+    fn cli_parses_no_resume() {
+        let cli = Cli::try_parse_from(["token-burn", "run", "--no-resume"]).expect("parse");
+        assert!(cli.no_resume);
+        assert!(!cli.fresh);
     }
 }

@@ -202,51 +202,59 @@ pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) ->
         state.mark_completed(agent_name, directory);
 
         let serialized = serde_json::to_string_pretty(&state)?;
-
-        // 同一ディレクトリ内のテンポラリファイルに書き出し、rename でアトミックに置換する。
-        // PID とナノ秒タイムスタンプでファイル名を一意化し、並行ワーカー間での衝突を避ける。
-        let parent = path.parent().unwrap_or(Path::new("."));
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "state.json".to_string());
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp_path = parent.join(format!(
-            ".{}.tmp.{}.{}",
-            file_name,
-            std::process::id(),
-            unique
-        ));
-
-        let write_result = (|| -> Result<()> {
-            let mut tmp_file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-            tmp_file.write_all(serialized.as_bytes())?;
-            tmp_file.sync_data()?;
-            Ok(())
-        })();
-
-        if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-
-        if let Err(e) = std::fs::rename(&tmp_path, path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
-        Ok(())
+        write_file_atomic(path, serialized.as_bytes())
     })();
 
     // Rust 1.89 の File::unlock ではなく、MSRV 1.88 で使える fs2 の実装を明示する。
     let _ = fs2::FileExt::unlock(&lock_file);
     result
+}
+
+/// 同一ディレクトリ内のテンポラリファイルに書き出し、rename で `path` をアトミックに置き換える。
+///
+/// PID とナノ秒タイムスタンプでファイル名を一意化し、並行ワーカー間での衝突を避ける。
+/// 書き込み途中の ENOSPC やクラッシュでも本体は壊れず、失敗時はテンポラリファイルを
+/// 掃除する（次回起動時に残骸が積み重ならない）。排他は呼び出し側が sidecar ロックで取る。
+pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::fs::OpenOptions;
+
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "state.json".to_string());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(
+        ".{}.tmp.{}.{}",
+        file_name,
+        std::process::id(),
+        unique
+    ));
+
+    let write_result = (|| -> Result<()> {
+        let mut tmp_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        tmp_file.write_all(contents)?;
+        tmp_file.sync_data()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 pub fn state_path(config_path: &Path) -> PathBuf {

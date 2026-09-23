@@ -730,9 +730,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: Prompts {
                 default: "review".to_string(),
+                resume: None,
             },
             agents: vec![Agent {
                 name: "agent".to_string(),
@@ -798,9 +800,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: Prompts {
                 default: "default prompt".to_string(),
+                resume: None,
             },
             agents: vec![Agent {
                 name: "agent".to_string(),
@@ -873,9 +877,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: Prompts {
                 default: "default".to_string(),
+                resume: None,
             },
             agents: vec![Agent {
                 name: "agent".to_string(),
@@ -962,9 +968,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: Prompts {
                 default: "default prompt".to_string(),
+                resume: None,
             },
             agents: vec![Agent {
                 name: "agent".to_string(),
@@ -1041,9 +1049,11 @@ mod tests {
                     limit: 10,
                     rate_limit_threshold: 95,
                     dedup_scope: crate::config::DedupScope::Agent,
+                    resume_interrupted: true,
                 },
                 prompts: Prompts {
                     default: "default prompt".to_string(),
+                    resume: None,
                 },
                 agents: vec![Agent {
                     name: "agent".to_string(),
@@ -1126,9 +1136,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: Prompts {
                 default: "test".to_string(),
+                resume: None,
             },
             agents: vec![Agent {
                 name: "agent".to_string(),
@@ -1187,9 +1199,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: Prompts {
                 default: "default".to_string(),
+                resume: None,
             },
             agents: vec![Agent {
                 name: "agent".to_string(),
@@ -1281,9 +1295,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: Prompts {
                 default: "default".to_string(),
+                resume: None,
             },
             agents: vec![Agent {
                 name: "agent".to_string(),
@@ -1362,9 +1378,11 @@ mod tests {
                 limit: 10,
                 rate_limit_threshold: 95,
                 dedup_scope: crate::config::DedupScope::Agent,
+                resume_interrupted: true,
             },
             prompts: Prompts {
                 default: "default".to_string(),
+                resume: None,
             },
             agents: vec![Agent {
                 name: "agent".to_string(),

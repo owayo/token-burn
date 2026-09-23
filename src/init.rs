@@ -12,10 +12,13 @@ limit = 10                         # 1回の実行で処理する最大ターゲ
 rate_limit_threshold = 95          # レート制限使用率がこの閾値(%)を超えたら自動停止
 dedup_scope = "global"             # 処理済み判定の共有範囲: global(全エージェント横断) | provider(同じCLI同士) | agent(分離)
                                    # global/provider は skip_within 必須。--dedup-scope agent で実行ごとに解除できる
+# resume_interrupted = true        # レート制限で中断した claude セッションを次回の実行で --resume して続きから処理する
+                                   # --no-resume で実行ごとに無効化できる（--fresh でも再開しない）
 
 [prompts]
 default = "prompts/default.md"     # .md で終わる値はファイルパスとして読み込み
 # default = "prompts/default.ja.md"
+# resume = "prompts/resume.md"     # 中断セッションを再開するときの継続プロンプト（省略時は組み込みの既定文）
 
 # ---- ai-usage 連携（任意） ----
 # `ai-usage --json` と連携して、リセットまでの時間を実データから自動取得します。

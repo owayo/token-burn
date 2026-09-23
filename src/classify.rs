@@ -11,6 +11,9 @@ pub enum ResultClass {
     Retryable(String),
     /// プロバイダ側で恒久的にエラーとなった。
     Failed(String),
+    /// `--resume` に渡したセッションが見つからなかった（transcript が消えている等）。
+    /// 会話が 1 ターンも始まっていないので、新規セッションで始め直せる。
+    ResumeUnavailable(String),
 }
 
 impl ResultClass {
@@ -21,15 +24,61 @@ impl ResultClass {
             ResultClass::Failed(_) => 1,
             ResultClass::RateLimited => 2,
             ResultClass::Retryable(_) => 3,
+            ResultClass::ResumeUnavailable(_) => 4,
         }
     }
 
     pub fn message(&self) -> Option<&str> {
         match self {
             ResultClass::Success | ResultClass::RateLimited => None,
-            ResultClass::Failed(m) | ResultClass::Retryable(m) => Some(m.as_str()),
+            ResultClass::Failed(m)
+            | ResultClass::Retryable(m)
+            | ResultClass::ResumeUnavailable(m) => Some(m.as_str()),
         }
     }
+}
+
+/// `claude --resume <id>` が対象のセッションを見つけられなかったときのエラー文。
+///
+/// 実測（Claude Code 2.1.280）では exit 1 と共に
+/// `{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+/// "errors":["No conversation found with session ID: <id>"]}` が出る（`result` 文字列は無い）。
+const RESUME_NOT_FOUND_MESSAGE: &str = "No conversation found with session ID";
+
+/// result イベントのメッセージ。`result` 文字列が無ければ `errors[]` を `; ` で連結する。
+///
+/// 起動直後に失敗した result（`error_during_execution`）は `result` を持たず `errors[]`
+/// だけを持つ。`result` だけを見ていた頃は、エラー記録が空文字になって原因を追えなかった。
+pub fn result_message(result: &serde_json::Value) -> Option<String> {
+    if let Some(text) = result.get("result").and_then(|r| r.as_str()) {
+        return Some(text.to_string());
+    }
+    let errors: Vec<&str> = result
+        .get("errors")
+        .and_then(|e| e.as_array())?
+        .iter()
+        .filter_map(|e| e.as_str())
+        .filter(|e| !e.is_empty())
+        .collect();
+    (!errors.is_empty()).then(|| errors.join("; "))
+}
+
+/// 「`--resume` したセッションが存在しない」ことを示す result か。
+///
+/// 任意のエラー文で判定しない。起動時の実行エラー（`error_during_execution`）で、かつ
+/// `errors[]` にセッション不存在の文言があるときだけ。取り違えると、本当に失敗した
+/// タスクを「まだ始まっていない」と見なして新規セッションで二重に実行してしまう。
+fn is_resume_not_found(result: &serde_json::Value) -> bool {
+    result.get("subtype").and_then(|s| s.as_str()) == Some("error_during_execution")
+        && result
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .is_some_and(|errors| {
+                errors
+                    .iter()
+                    .filter_map(|e| e.as_str())
+                    .any(|e| e.contains(RESUME_NOT_FOUND_MESSAGE))
+            })
 }
 
 /// jsonl ファイルから最後の `"type":"result"` イベントを取り出して分類する。
@@ -68,11 +117,11 @@ pub fn classify_content(content: &str) -> ResultClass {
         return ResultClass::Success;
     }
 
-    let message = v
-        .get("result")
-        .and_then(|r| r.as_str())
-        .unwrap_or("")
-        .to_string();
+    let message = result_message(&v).unwrap_or_default();
+
+    if is_resume_not_found(&v) {
+        return ResultClass::ResumeUnavailable(message);
+    }
 
     if is_rate_limit_message(&message) {
         return ResultClass::RateLimited;
@@ -527,5 +576,61 @@ mod tests {
     fn rate_limit_wins_over_transport_branch() {
         let content = r#"{"type":"result","is_error":true,"terminal_reason":"api_error","result":"You've hit your org's monthly spend limit"}"#;
         assert_eq!(classify_content(content), ResultClass::RateLimited);
+    }
+
+    /// 実測（Claude Code 2.1.280）: 存在しないセッションを `--resume` したときの result。
+    /// `result` 文字列は無く、`errors[]` だけを持つ。
+    const RESUME_NOT_FOUND: &str = r#"{"type":"result","subtype":"error_during_execution","duration_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"00000000-0000-4000-8000-000000000000","total_cost_usd":0,"errors":["No conversation found with session ID: 00000000-0000-4000-8000-000000000000"],"result_index":0}"#;
+
+    #[test]
+    fn missing_resumed_session_is_resume_unavailable() {
+        assert_eq!(
+            classify_content(RESUME_NOT_FOUND),
+            ResultClass::ResumeUnavailable(
+                "No conversation found with session ID: 00000000-0000-4000-8000-000000000000"
+                    .to_string()
+            )
+        );
+        assert_eq!(classify_content(RESUME_NOT_FOUND).exit_code(), 4);
+    }
+
+    /// 同じ文言でも起動時の実行エラーでなければ再開不能とは見なさない。取り違えると、
+    /// 本当に失敗したタスクを新規セッションで二重に実行してしまう。
+    #[test]
+    fn resume_unavailable_requires_the_startup_error_shape() {
+        let in_result_text = r#"{"type":"result","subtype":"success","is_error":true,"result":"No conversation found with session ID: x"}"#;
+        assert!(matches!(
+            classify_content(in_result_text),
+            ResultClass::Failed(_)
+        ));
+        let other_startup_error = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"errors":["Invalid API key"]}"#;
+        assert_eq!(
+            classify_content(other_startup_error),
+            ResultClass::Failed("Invalid API key".to_string())
+        );
+    }
+
+    /// `result` 文字列が無い失敗では `errors[]` をメッセージに使う（以前は空文字だった）。
+    #[test]
+    fn errors_array_is_used_when_result_text_is_missing() {
+        let content = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["first","","second"]}"#;
+        assert_eq!(
+            classify_content(content),
+            ResultClass::Failed("first; second".to_string())
+        );
+        // `result` があればそちらを優先する
+        let both = r#"{"type":"result","is_error":true,"result":"primary","errors":["secondary"]}"#;
+        assert_eq!(
+            classify_content(both),
+            ResultClass::Failed("primary".to_string())
+        );
+    }
+
+    #[test]
+    fn message_for_resume_unavailable() {
+        assert_eq!(
+            ResultClass::ResumeUnavailable("gone".to_string()).message(),
+            Some("gone")
+        );
     }
 }

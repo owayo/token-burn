@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::config::RuntimeAgent;
+use crate::resume::ResumeEntry;
 use crate::scanner::ResolvedTarget;
 
 use super::AI_USAGE_MONITOR_TIMEOUT_SECS;
@@ -406,6 +407,17 @@ pub(super) struct TaskCtx<'a> {
     pub(super) stop_file: &'a Path,
     pub(super) rate_limit_threshold: u8,
     pub(super) is_claude: bool,
+    /// レート制限で中断したらセッションを保存し、次回の実行で再開できるようにする。
+    pub(super) save_interrupted: bool,
+    /// 保存済みの中断セッションを再開するタスクなら、その記録と継続プロンプト。
+    pub(super) resume: Option<TaskResume<'a>>,
+}
+
+/// 中断セッションを再開するタスクの情報。
+pub(super) struct TaskResume<'a> {
+    pub(super) entry: &'a ResumeEntry,
+    /// 継続プロンプトのファイル（元の指示は会話履歴に残っているので、元のプロンプトは送らない）。
+    pub(super) prompt_file: &'a Path,
 }
 
 pub(super) struct WorkerCtx<'a> {
@@ -491,45 +503,85 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
         failed = failed_marker,
     );
 
+    let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
+    // resume-entry に渡す「どのエージェントの、どのターゲットか」。mark と同じ並び。
+    let entry_args = format!(
+        "{} {} {}",
+        shell_escape(&ctx.agent.name),
+        shell_escape(&ctx.task.directory.to_string_lossy()),
+        shell_escape(&ctx.state_file.to_string_lossy()),
+    );
+
     if ctx.is_claude {
-        let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
-        script += &format!(
-            "{cmd_str} 2>&1 | {tb_cmd} format-stream --raw-output {jsonl_file} --stop-file {stop_file_escaped} --threshold {rate_limit_threshold} 2>&1 | tee {log_file}\n",
-            rate_limit_threshold = ctx.rate_limit_threshold,
-        );
-        script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
-        script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
-        script += "FORMAT_EXIT=${PIPE_STATUS[1]}\n";
-        script += "TEE_EXIT=${PIPE_STATUS[2]}\n";
-        script += "CURRENT_FAILED_MARKER=\"\"\n";
-        // 停止シグナル（stop / pause file）を書けなかった場合の専用コード。閾値を超えた
-        // のに後続を止める手段が無い状態なので、このタスクを失敗として記録するだけでなく
-        // ワーカーごと止める。`return 0` で次のタスクへ進むと、止めるべき状況のまま
-        // クォータを使い続ける。
-        script += &format!(
-            concat!(
-                "if [ \"$FORMAT_EXIT\" -eq {signal_exit} ]; then\n",
-                "  printf '%scannot write the stop signal — aborting this worker\\n' {prefix} > {error}\n",
-                "  touch {failed}\n",
-                "  echo '━━━ Error - stop signal unwritable ━━━'\n",
-                "  echo ''\n",
-                "  WORKER_ABORT=1\n",
-                "  return 0\n",
-                "fi\n",
-                "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ] || [ ! -s {jsonl} ]; then\n",
-                "  printf '%slogging/classification pipeline failed (format=%s tee=%s)\\n' {prefix} \"$FORMAT_EXIT\" \"$TEE_EXIT\" > {error}\n",
-                "  touch {failed}\n",
-                "  echo '━━━ Error - logging pipeline failed ━━━'\n",
-                "  echo ''\n",
-                "  return 0\n",
-                "fi\n",
-            ),
-            prefix = error_prefix,
-            error = error_file,
-            failed = failed_marker,
-            jsonl = jsonl_file,
-            signal_exit = crate::format_stream::EXIT_STOP_SIGNAL_UNWRITABLE,
-        );
+        let attempt = ClaudeAttempt {
+            tb: &tb_cmd,
+            stop_file: &stop_file_escaped,
+            threshold: ctx.rate_limit_threshold,
+            prefix: &error_prefix,
+            error: &error_file,
+            failed: &failed_marker,
+        };
+        match &ctx.resume {
+            Some(resume) => {
+                let session = shell_escape(&resume.entry.session_id);
+                let mut resume_command = ctx.agent.command.clone();
+                resume_command.push("--resume".to_string());
+                resume_command.push(resume.entry.session_id.clone());
+                let resume_cmd =
+                    build_shell_command(&resume_command, &ctx.agent.env, resume.prompt_file);
+                // RESUMING はワーカーのシェルに残る。再開しないタスクでも必ず値を入れ直す。
+                script += "RESUMING=1\n";
+                script += &format!(
+                    "echo {}\n",
+                    shell_escape(&format!(
+                        "↻ Resuming session {} ({})",
+                        resume.entry.session_id,
+                        resume.entry.summary()
+                    ))
+                );
+                script += &attempt.script(&resume_cmd, &jsonl_file, &log_file);
+                // セッションが見つからない（transcript が消えている等）ときは、同じタスクの
+                // まま元のプロンプトで新規セッションを始める。次回の実行でも結局同じ新規起動に
+                // なるだけなので、ここで 1 実行ぶん待たせる理由が無い。会話は 1 ターンも
+                // 始まっていない（num_turns:0）ので二重実行にもならない。試行ごとにログを分ける。
+                let fresh_jsonl = shell_escape(
+                    &ctx.run_dir
+                        .join(format!("{log_base}.fresh.jsonl"))
+                        .to_string_lossy(),
+                );
+                let fresh_log = shell_escape(
+                    &ctx.run_dir
+                        .join(format!("{log_base}.fresh.log"))
+                        .to_string_lossy(),
+                );
+                script += &format!(
+                    concat!(
+                        "if [ \"$CLASS_CODE\" -eq {unavailable} ] && [ \"$CANCELLED\" -eq 0 ]; then\n",
+                        "  {tb} resume-entry forget {args} --session {session} || true\n",
+                        "  echo {notice}\n",
+                        "  RESUMING=0\n",
+                        "  CURRENT_FAILED_MARKER={failed}\n",
+                        "{fresh}",
+                        "fi\n",
+                    ),
+                    unavailable =
+                        crate::classify::ResultClass::ResumeUnavailable(String::new()).exit_code(),
+                    tb = tb_cmd,
+                    args = entry_args,
+                    session = session,
+                    notice = shell_escape(&format!(
+                        "━━━ Session {} could not be resumed — starting a new session ━━━",
+                        resume.entry.session_id
+                    )),
+                    failed = failed_marker,
+                    fresh = attempt.script(&cmd_str, &fresh_jsonl, &fresh_log),
+                );
+            }
+            None => {
+                script += "RESUMING=0\n";
+                script += &attempt.script(&cmd_str, &jsonl_file, &log_file);
+            }
+        }
     } else {
         script += &format!("{cmd_str} 2>&1 | tee {log_file}\n");
         script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
@@ -553,17 +605,51 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
     }
 
     if ctx.is_claude {
-        let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
+        // レート制限で中断したセッションを保存し、次回の実行で続きから再開できるようにする。
+        // 保存に失敗しても次回が新規セッションになるだけなので、ワーカーは止めない。
+        // プロンプトは元の指示（再開時も ctx.prompt_file は元のプロンプト）のハッシュを残す。
+        let save_line = if ctx.save_interrupted {
+            format!(
+                "    {tb} resume-entry save {args} --jsonl \"$JSONL\" --prompt-file {prompt} || echo {warn}\n",
+                tb = tb_cmd,
+                args = entry_args,
+                prompt = shell_escape(&ctx.prompt_file.to_string_lossy()),
+                warn = shell_escape(
+                    "  ⚠ could not save the session for resuming — the next run starts a new session"
+                ),
+            )
+        } else {
+            String::new()
+        };
+        // 再開したセッションがレート制限以外の理由で失敗したら数える。上限に達すると記録を
+        // 捨て、次回は新規セッションで始める（続けられないセッションを延々と再開しない）。
+        // result を出さずに異常終了した場合（`*)` の分岐）も数える。transcript の読み込みで
+        // 落ち続けるセッションは result を残さないため、ここを数えないと記録が永久に残る。
+        let fail_cmd = ctx.resume.as_ref().map(|resume| {
+            format!(
+                "if [ \"$RESUMING\" = 1 ]; then {tb} resume-entry fail {args} --session {session} || true; fi\n",
+                tb = tb_cmd,
+                args = entry_args,
+                session = shell_escape(&resume.entry.session_id),
+            )
+        });
+        let indented_fail = |indent: &str| {
+            fail_cmd
+                .as_deref()
+                .map(|cmd| format!("{indent}{cmd}"))
+                .unwrap_or_default()
+        };
+        let fail_line = indented_fail("      ");
+        let crash_fail_line = indented_fail("        ");
         script += &format!(
             concat!(
-                "CLASSIFIED=$({tb} classify-result {jsonl} 2>/dev/null)\n",
-                "CLASS_CODE=$?\n",
                 "case $CLASS_CODE in\n",
                 "  2)\n",
                 // 後続タスクが誤って「Cancelled」と判定されないよう、ここでフラグを必ずリセットする
                 "    CANCELLED=0\n",
                 "    touch {failed}\n",
                 "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
+                "{save_line}",
                 "    ;;\n",
                 "  3)\n",
                 // 後続タスクが誤って「Cancelled」と判定されないよう、ここでフラグを必ずリセットする
@@ -574,7 +660,9 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "    touch {retry}\n",
                 "    echo \"━━━ Retryable error (will retry next run): $CLASSIFIED ━━━\"\n",
                 "    ;;\n",
-                "  1)\n",
+                // 4（再開不能）は新規セッションへ切り替えた後はここに来ない。キャンセルで
+                // 切り替えなかった場合と、再開しないタスクで万一返った場合は失敗として扱う。
+                "  1|4)\n",
                 "    if [ $CANCELLED -eq 1 ]; then\n",
                 "      CANCELLED=0\n",
                 "      touch {failed}\n",
@@ -583,6 +671,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
                 "      touch {failed}\n",
                 "      echo '━━━ Error - continuing ━━━'\n",
+                "{fail_line}",
                 "    fi\n",
                 "    ;;\n",
                 "  *)\n",
@@ -596,6 +685,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "        printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
                 "        touch {failed}\n",
                 "        echo '━━━ Error - continuing ━━━'\n",
+                "{crash_fail_line}",
                 "      fi\n",
                 "    elif {mark}; then\n",
                 "      touch {done}\n",
@@ -613,9 +703,10 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             failed = failed_marker,
             retry = retry_marker,
             done = done_marker,
-            jsonl = jsonl_file,
-            tb = tb_cmd,
             mark = mark_cmd,
+            save_line = save_line,
+            fail_line = fail_line,
+            crash_fail_line = crash_fail_line,
         );
     } else {
         script += &format!(
@@ -649,6 +740,70 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
     }
     script += "echo ''\n";
     script
+}
+
+/// claude の 1 回分の起動（パイプライン → 失敗検査 → 分類）を組み立てる。
+///
+/// 再開できなかったタスクを同じタスクのまま新規セッションで起動し直すため、同じ形を
+/// 2 回出せるように切り出している。分類結果は `CLASS_CODE` / `CLASSIFIED` に、分類した
+/// jsonl のパスは `JSONL` に入る（後段の `resume-entry save` が読む）。
+struct ClaudeAttempt<'a> {
+    tb: &'a str,
+    stop_file: &'a str,
+    threshold: u8,
+    prefix: &'a str,
+    error: &'a str,
+    failed: &'a str,
+}
+
+impl ClaudeAttempt<'_> {
+    fn script(&self, cmd_str: &str, jsonl_file: &str, log_file: &str) -> String {
+        let mut script = String::new();
+        script += &format!("JSONL={jsonl_file}\n");
+        script += &format!(
+            "{cmd_str} 2>&1 | {tb} format-stream --raw-output {jsonl_file} --stop-file {stop} --threshold {threshold} 2>&1 | tee {log_file}\n",
+            tb = self.tb,
+            stop = self.stop_file,
+            threshold = self.threshold,
+        );
+        script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
+        script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
+        script += "FORMAT_EXIT=${PIPE_STATUS[1]}\n";
+        script += "TEE_EXIT=${PIPE_STATUS[2]}\n";
+        script += "CURRENT_FAILED_MARKER=\"\"\n";
+        // 停止シグナル（stop / pause file）を書けなかった場合の専用コード。閾値を超えた
+        // のに後続を止める手段が無い状態なので、このタスクを失敗として記録するだけでなく
+        // ワーカーごと止める。`return 0` で次のタスクへ進むと、止めるべき状況のまま
+        // クォータを使い続ける。
+        script += &format!(
+            concat!(
+                "if [ \"$FORMAT_EXIT\" -eq {signal_exit} ]; then\n",
+                "  printf '%scannot write the stop signal — aborting this worker\\n' {prefix} > {error}\n",
+                "  touch {failed}\n",
+                "  echo '━━━ Error - stop signal unwritable ━━━'\n",
+                "  echo ''\n",
+                "  WORKER_ABORT=1\n",
+                "  return 0\n",
+                "fi\n",
+                "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ] || [ ! -s {jsonl} ]; then\n",
+                "  printf '%slogging/classification pipeline failed (format=%s tee=%s)\\n' {prefix} \"$FORMAT_EXIT\" \"$TEE_EXIT\" > {error}\n",
+                "  touch {failed}\n",
+                "  echo '━━━ Error - logging pipeline failed ━━━'\n",
+                "  echo ''\n",
+                "  return 0\n",
+                "fi\n",
+                "CLASSIFIED=$({tb} classify-result {jsonl} 2>/dev/null)\n",
+                "CLASS_CODE=$?\n",
+            ),
+            prefix = self.prefix,
+            error = self.error,
+            failed = self.failed,
+            jsonl = jsonl_file,
+            tb = self.tb,
+            signal_exit = crate::format_stream::EXIT_STOP_SIGNAL_UNWRITABLE,
+        );
+        script
+    }
 }
 
 /// 共通ワーカースクリプト: queue_dir/pending-* をアトミックに claim しつつタスクを逐次実行する。
@@ -947,6 +1102,8 @@ mod tests {
             stop_file: std::path::Path::new("/tmp/stop"),
             rate_limit_threshold: 95,
             is_claude,
+            save_interrupted: is_claude,
+            resume: None,
         }
     }
 
@@ -2437,5 +2594,347 @@ mod tests {
             build_shell_command(&cmd, &unset_env, prompt),
             "env -u CLAUDE_CONFIG_DIR 'claude' '-p' \"$(cat '/tmp/prompt.txt')\""
         );
+    }
+
+    // ─────────── 中断セッションの再開（resume） ───────────
+
+    const SESSION: &str = "0633fa18-8643-40f7-9106-a35330ed247d";
+
+    fn saved_session() -> ResumeEntry {
+        ResumeEntry {
+            session_id: SESSION.to_string(),
+            interrupted_at: chrono::DateTime::parse_from_rfc3339("2026-09-23T13:04:23+09:00")
+                .unwrap(),
+            retry_after: None,
+            prompt_hash: crate::resume::prompt_hash("review"),
+            message: None,
+            log: None,
+            failed_resumes: 0,
+        }
+    }
+
+    #[test]
+    fn claude_task_saves_the_session_when_rate_limited() {
+        let agent = agent_for_test("claude", &["claude", "-p"]);
+        let task = target_for_test("/tmp/repo");
+        let tmp = std::path::PathBuf::from("/tmp");
+        let script = build_task_script(&task_ctx_for_test(1, &agent, &task, &tmp, true));
+
+        // レート制限の分岐で、分類した jsonl と元のプロンプトを渡して保存する
+        let case2 = script.find("  2)\n").expect("case 2 missing");
+        let case3 = script.find("  3)\n").expect("case 3 missing");
+        let branch = &script[case2..case3];
+        assert!(
+            branch.contains(
+                "'/usr/local/bin/token-burn' resume-entry save 'claude' '/tmp/repo' '/tmp/state.json' --jsonl \"$JSONL\" --prompt-file '/tmp/prompt.txt' ||"
+            ),
+            "{branch}"
+        );
+        // 保存に失敗してもワーカーは止めない（次回が新規セッションになるだけ）
+        assert!(branch.contains("could not save the session"), "{branch}");
+        // 再開しないタスクでも RESUMING を入れ直す（ワーカーのシェルに前の値が残る）
+        assert!(script.contains("RESUMING=0\n"), "{script}");
+        assert!(!script.contains("--resume"), "{script}");
+        assert!(!script.contains("resume-entry fail"), "{script}");
+        assert!(script.contains("  1|4)\n"), "{script}");
+        assert_valid_bash(&script, "claude task script");
+    }
+
+    #[test]
+    fn claude_task_does_not_save_when_resuming_is_disabled() {
+        let agent = agent_for_test("claude", &["claude", "-p"]);
+        let task = target_for_test("/tmp/repo");
+        let tmp = std::path::PathBuf::from("/tmp");
+        let mut ctx = task_ctx_for_test(1, &agent, &task, &tmp, true);
+        ctx.save_interrupted = false;
+        let script = build_task_script(&ctx);
+        assert!(!script.contains("resume-entry"), "{script}");
+    }
+
+    #[test]
+    fn resumed_task_passes_the_session_and_the_continuation_prompt() {
+        let agent = agent_for_test("claude", &["claude", "-p"]);
+        let task = target_for_test("/tmp/repo");
+        let tmp = std::path::PathBuf::from("/tmp");
+        let entry = saved_session();
+        let mut ctx = task_ctx_for_test(4, &agent, &task, &tmp, true);
+        ctx.resume = Some(TaskResume {
+            entry: &entry,
+            prompt_file: std::path::Path::new("/tmp/resume-prompt.txt"),
+        });
+        let script = build_task_script(&ctx);
+
+        // 1 回目は保存済みセッションを継続プロンプトで再開する
+        assert!(
+            script.contains(&format!(
+                "'claude' '-p' '--resume' '{SESSION}' \"$(cat '/tmp/resume-prompt.txt')\" 2>&1 | '/usr/local/bin/token-burn' format-stream --raw-output '/tmp/0004_repo.jsonl'"
+            )),
+            "{script}"
+        );
+        assert!(script.contains("RESUMING=1\n"), "{script}");
+        assert!(
+            script.contains(&format!(
+                "echo '↻ Resuming session {SESSION} (rate limited "
+            )),
+            "{script}"
+        );
+        // 再開できなければ記録を消し、元のプロンプトの新規セッションを別ログで起動する
+        let fallback = script
+            .find("if [ \"$CLASS_CODE\" -eq 4 ] && [ \"$CANCELLED\" -eq 0 ]; then")
+            .expect("fallback missing");
+        let rest = &script[fallback..];
+        assert!(
+            rest.contains(&format!(
+                "resume-entry forget 'claude' '/tmp/repo' '/tmp/state.json' --session '{SESSION}' || true"
+            )),
+            "{rest}"
+        );
+        assert!(
+            rest.contains(
+                "'claude' '-p' \"$(cat '/tmp/prompt.txt')\" 2>&1 | '/usr/local/bin/token-burn' format-stream --raw-output '/tmp/0004_repo.fresh.jsonl'"
+            ),
+            "{rest}"
+        );
+        assert!(rest.contains("| tee '/tmp/0004_repo.fresh.log'"), "{rest}");
+        // 新規セッションの実行中も、キャンセルで失敗マーカーを残せるようにする
+        assert!(
+            rest.contains("  CURRENT_FAILED_MARKER='/tmp/failed-4'\n"),
+            "{rest}"
+        );
+        // 再開したセッションの失敗は数える
+        assert!(
+            script.contains(&format!(
+                "if [ \"$RESUMING\" = 1 ]; then '/usr/local/bin/token-burn' resume-entry fail 'claude' '/tmp/repo' '/tmp/state.json' --session '{SESSION}' || true; fi"
+            )),
+            "{script}"
+        );
+        assert_valid_bash(&script, "resumed task script");
+    }
+
+    /// 生成したタスクスクリプトを偽の claude / token-burn で実際に走らせる。
+    ///
+    /// 偽の claude は `--resume` 付きなら `RESUME_OUT`、無ければ `FRESH_OUT` を出力する。
+    /// 偽の token-burn は format-stream を `tee`、classify-result を出力内容の目印で
+    /// 分類し、mark / resume-entry の呼び出しを `calls.log` に残す。
+    fn run_resumed_task(resume_out: &str, fresh_out: &str) -> (tempfile::TempDir, String, String) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = root.join("repo");
+        let run_dir = root.join("run");
+        let markers = root.join("markers");
+        for dir in [&repo, &run_dir, &markers] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let calls = root.join("calls.log");
+        let prompts = root.join("prompts.log");
+        let claude = root.join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                concat!(
+                    "#!/bin/bash\n",
+                    "for last; do :; done\n",
+                    "printf '%s\\n' \"$last\" >> {prompts}\n",
+                    "case \" $* \" in\n",
+                    "  *' --resume '*) printf '%s\\n' {resume_out}; case {resume_out} in NOT_FOUND|CRASH) exit 1 ;; esac ;;\n",
+                    "  *) printf '%s\\n' {fresh_out} ;;\n",
+                    "esac\n",
+                    "exit 0\n",
+                ),
+                prompts = shell_escape(&prompts.to_string_lossy()),
+                resume_out = shell_escape(resume_out),
+                fresh_out = shell_escape(fresh_out),
+            ),
+        )
+        .unwrap();
+        let tb = root.join("token-burn");
+        std::fs::write(
+            &tb,
+            format!(
+                concat!(
+                    "#!/bin/bash\n",
+                    "case \"$1\" in\n",
+                    "  format-stream) tee \"$3\" ;;\n",
+                    "  classify-result)\n",
+                    "    if grep -q NOT_FOUND \"$2\"; then echo 'No conversation found'; exit 4; fi\n",
+                    "    if grep -q RATE \"$2\"; then exit 2; fi\n",
+                    "    if grep -q FAIL \"$2\"; then echo boom; exit 1; fi\n",
+                    "    exit 0 ;;\n",
+                    "  *) echo \"$*\" >> {calls} ;;\n",
+                    "esac\n",
+                ),
+                calls = shell_escape(&calls.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        for exe in [&claude, &tb] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let prompt_file = root.join("prompt-1.txt");
+        std::fs::write(&prompt_file, "original prompt").unwrap();
+        let resume_prompt = root.join("resume-prompt.txt");
+        std::fs::write(&resume_prompt, "continue please").unwrap();
+
+        let agent = agent_for_test("claude", &[&claude.to_string_lossy(), "-p"]);
+        let task = ResolvedTarget {
+            directory: repo.clone(),
+            display_name: "repo".to_string(),
+            prompt: "original prompt".to_string(),
+            visibility: Visibility::Public,
+            defer: false,
+        };
+        let entry = saved_session();
+        let state_file = root.join("state.json");
+        let stop_file = root.join("stop");
+        let script = build_task_script(&TaskCtx {
+            idx: 1,
+            total: 1,
+            task: &task,
+            agent: &agent,
+            prompt_file: &prompt_file,
+            run_dir: &run_dir,
+            marker_dir: &markers,
+            exe_path: &tb,
+            state_file: &state_file,
+            stop_file: &stop_file,
+            rate_limit_threshold: 95,
+            is_claude: true,
+            save_interrupted: true,
+            resume: Some(TaskResume {
+                entry: &entry,
+                prompt_file: &resume_prompt,
+            }),
+        });
+        let script_path = root.join("task.sh");
+        std::fs::write(&script_path, &script).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "CANCELLED=0; source {}",
+                shell_escape(&script_path.to_string_lossy())
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "task script must finish: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        let prompts = std::fs::read_to_string(&prompts).unwrap_or_default();
+        (tmp, calls, prompts)
+    }
+
+    fn marker_names(tmp: &tempfile::TempDir) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(tmp.path().join("markers"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn resumed_task_that_succeeds_is_marked_done() {
+        if !bash_available() {
+            return;
+        }
+        let (tmp, calls, prompts) = run_resumed_task("ok", "unused");
+        assert_eq!(
+            prompts, "continue please\n",
+            "再開には継続プロンプトだけを送る"
+        );
+        assert!(calls.starts_with("mark claude "), "{calls}");
+        assert!(!calls.contains("resume-entry"), "{calls}");
+        assert_eq!(marker_names(&tmp), vec!["done-1"]);
+    }
+
+    #[test]
+    fn missing_session_falls_back_to_a_new_session_in_the_same_task() {
+        if !bash_available() {
+            return;
+        }
+        let (tmp, calls, prompts) = run_resumed_task("NOT_FOUND", "ok");
+        // 再開を試みてから、元のプロンプトで新規セッションを起動する
+        assert_eq!(prompts, "continue please\noriginal prompt\n");
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines.len(), 2, "{calls}");
+        assert!(
+            lines[0].starts_with("resume-entry forget claude ")
+                && lines[0].ends_with(&format!("--session {SESSION}")),
+            "{calls}"
+        );
+        assert!(lines[1].starts_with("mark claude "), "{calls}");
+        assert_eq!(marker_names(&tmp), vec!["done-1"]);
+        // 試行ごとにログを分ける
+        assert!(tmp.path().join("run/0001_repo.jsonl").exists());
+        assert!(tmp.path().join("run/0001_repo.fresh.jsonl").exists());
+        assert!(tmp.path().join("run/0001_repo.fresh.log").exists());
+    }
+
+    #[test]
+    fn rate_limited_fallback_saves_the_new_session_log() {
+        if !bash_available() {
+            return;
+        }
+        // 新規セッションへ切り替えた後にレート制限で止まったら、新しい方の jsonl を保存する
+        let (tmp, calls, _) = run_resumed_task("NOT_FOUND", "RATE");
+        let save = calls
+            .lines()
+            .find(|l| l.starts_with("resume-entry save"))
+            .unwrap_or_else(|| panic!("save missing: {calls}"));
+        assert!(save.contains("0001_repo.fresh.jsonl"), "{save}");
+        assert!(
+            save.contains("prompt-1.txt"),
+            "元のプロンプトで照合する: {save}"
+        );
+        assert_eq!(marker_names(&tmp), vec!["failed-1"]);
+    }
+
+    #[test]
+    fn resumed_task_rate_limited_again_saves_the_session_again() {
+        if !bash_available() {
+            return;
+        }
+        let (tmp, calls, prompts) = run_resumed_task("RATE", "unused");
+        assert_eq!(prompts, "continue please\n", "新規セッションは起動しない");
+        assert_eq!(calls.lines().count(), 1, "{calls}");
+        let save = calls.lines().next().unwrap();
+        assert!(save.starts_with("resume-entry save claude "), "{save}");
+        assert!(
+            save.contains("--jsonl ") && save.contains("run/0001_repo.jsonl"),
+            "{save}"
+        );
+        assert!(save.contains("prompt-1.txt"), "{save}");
+        assert_eq!(marker_names(&tmp), vec!["failed-1"]);
+    }
+
+    #[test]
+    fn resumed_task_crash_without_a_result_is_counted() {
+        if !bash_available() {
+            return;
+        }
+        // result を出さずに非ゼロ終了（transcript の読み込みで落ちる等）。数えないと、
+        // 続けられないセッションの記録が永久に残って毎回再開しては落ちる。
+        let (tmp, calls, _) = run_resumed_task("CRASH", "unused");
+        assert_eq!(calls.lines().count(), 1, "{calls}");
+        assert!(calls.starts_with("resume-entry fail claude "), "{calls}");
+        assert!(marker_names(&tmp).contains(&"failed-1".to_string()));
+    }
+
+    #[test]
+    fn resumed_task_failure_is_counted() {
+        if !bash_available() {
+            return;
+        }
+        let (tmp, calls, _) = run_resumed_task("FAIL", "unused");
+        assert_eq!(calls.lines().count(), 1, "{calls}");
+        assert!(
+            calls.starts_with("resume-entry fail claude ")
+                && calls.trim_end().ends_with(&format!("--session {SESSION}")),
+            "{calls}"
+        );
+        assert_eq!(marker_names(&tmp), vec!["error-1", "failed-1"]);
     }
 }

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config::RuntimeAgent;
+use crate::resume::ResumeDecision;
 use crate::scanner::{ResolvedTarget, Visibility};
 use crate::usage::ScheduleResolver;
 
@@ -114,7 +115,15 @@ pub fn print_status(agents: &[RuntimeAgent], resolver: &ScheduleResolver) -> any
 ///
 /// `modified` は実行順の根拠になった最終ファイル変更日時。渡された分だけローカル時刻で
 /// 併記し、「なぜこの順番になったのか」を目視で確認できるようにする。
-pub fn print_targets(targets: &[ResolvedTarget], modified: &HashMap<PathBuf, DateTime<Utc>>) {
+///
+/// `resumes` は保存済みの中断セッションの判定。再開するものは `↻ resume ...`、記録は
+/// あるが使わないものはその理由を出す（新規セッションで始まる理由が見えないと、再開される
+/// つもりで実行したのに最初からやり直している、という状況に気付けない）。
+pub fn print_targets(
+    targets: &[ResolvedTarget],
+    modified: &HashMap<PathBuf, DateTime<Utc>>,
+    resumes: &HashMap<PathBuf, ResumeDecision>,
+) {
     println!("{}", "=== Targets ===".bold());
     println!("  Found {} repositories", targets.len());
     println!();
@@ -140,6 +149,15 @@ pub fn print_targets(targets: &[ResolvedTarget], modified: &HashMap<PathBuf, Dat
             last_modified.dimmed()
         );
         println!("      {}", target.directory.display().to_string().dimmed());
+        match resumes.get(&target.directory) {
+            Some(decision @ ResumeDecision::Resume(_)) => {
+                println!("      {}", decision.describe().cyan());
+            }
+            Some(decision @ ResumeDecision::Skip { .. }) => {
+                println!("      {}", decision.describe().dimmed());
+            }
+            None => {}
+        }
     }
     println!();
 }
