@@ -411,6 +411,9 @@ pub(super) struct TaskCtx<'a> {
     pub(super) save_interrupted: bool,
     /// 保存済みの中断セッションを再開するタスクなら、その記録と継続プロンプト。
     pub(super) resume: Option<TaskResume<'a>>,
+    /// 保存済みの記録を使わずに新しいセッションで始めるなら、その古い session_id。
+    /// 新しいセッションを起動する直前に破棄する。
+    pub(super) discard_session: Option<&'a str>,
 }
 
 /// 中断セッションを再開するタスクの情報。
@@ -579,6 +582,19 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             }
             None => {
                 script += "RESUMING=0\n";
+                // 保存済みの記録を使わずに新しいセッションで始める（--no-resume / --fresh /
+                // プロンプト変更 等）。新しいセッションが作業を始めた時点で、古い記録の文脈は
+                // リポジトリの実態より古い。残すと、このセッションがリトライ可能エラーで
+                // 終わった（＝保存されない）ときに、次の実行がより古いセッションを再開する。
+                // 保存済みの ID と一致するときだけ消すので、後から保存された記録は消さない。
+                if let Some(old) = ctx.discard_session {
+                    script += &format!(
+                        "{tb} resume-entry forget {args} --session {session} || true\n",
+                        tb = tb_cmd,
+                        args = entry_args,
+                        session = shell_escape(old),
+                    );
+                }
                 script += &attempt.script(&cmd_str, &jsonl_file, &log_file);
             }
         }
@@ -1104,6 +1120,7 @@ mod tests {
             is_claude,
             save_interrupted: is_claude,
             resume: None,
+            discard_session: None,
         }
     }
 
@@ -2640,6 +2657,34 @@ mod tests {
         assert_valid_bash(&script, "claude task script");
     }
 
+    /// 保存済みの記録を使わずに新しいセッションで始めるときは、起動の直前に古い記録を
+    /// 破棄する（ID が一致するときだけ）。残すと、新しいセッションがリトライ可能エラーで
+    /// 終わったとき、次の実行がより古いセッションを再開してしまう。
+    #[test]
+    fn fresh_start_discards_the_unused_saved_session() {
+        let agent = agent_for_test("claude", &["claude", "-p"]);
+        let task = target_for_test("/tmp/repo");
+        let tmp = std::path::PathBuf::from("/tmp");
+        let mut ctx = task_ctx_for_test(2, &agent, &task, &tmp, true);
+        ctx.discard_session = Some(SESSION);
+        let script = build_task_script(&ctx);
+
+        let forget = script
+            .find(&format!(
+                "'/usr/local/bin/token-burn' resume-entry forget 'claude' '/tmp/repo' '/tmp/state.json' --session '{SESSION}' || true\n"
+            ))
+            .unwrap_or_else(|| panic!("forget missing: {script}"));
+        let launch = script
+            .find("format-stream --raw-output '/tmp/0002_repo.jsonl'")
+            .expect("launch missing");
+        assert!(forget < launch, "起動より前に破棄する: {script}");
+        assert_valid_bash(&script, "fresh start script");
+
+        // 破棄する記録が無ければ何も足さない
+        let plain = build_task_script(&task_ctx_for_test(2, &agent, &task, &tmp, true));
+        assert!(!plain.contains("resume-entry forget"), "{plain}");
+    }
+
     #[test]
     fn claude_task_does_not_save_when_resuming_is_disabled() {
         let agent = agent_for_test("claude", &["claude", "-p"]);
@@ -2805,6 +2850,7 @@ mod tests {
                 entry: &entry,
                 prompt_file: &resume_prompt,
             }),
+            discard_session: None,
         });
         let script_path = root.join("task.sh");
         std::fs::write(&script_path, &script).unwrap();

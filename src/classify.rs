@@ -65,11 +65,15 @@ pub fn result_message(result: &serde_json::Value) -> Option<String> {
 
 /// 「`--resume` したセッションが存在しない」ことを示す result か。
 ///
-/// 任意のエラー文で判定しない。起動時の実行エラー（`error_during_execution`）で、かつ
-/// `errors[]` にセッション不存在の文言があるときだけ。取り違えると、本当に失敗した
-/// タスクを「まだ始まっていない」と見なして新規セッションで二重に実行してしまう。
+/// 任意のエラー文で判定しない。起動時の実行エラー（`error_during_execution`）で、
+/// この試行で会話が 1 ターンも進んでおらず（`num_turns: 0`）、かつ `errors[]` に
+/// セッション不存在の文言があるときだけ。取り違えると、本当に失敗したタスクを
+/// 「まだ始まっていない」と見なして新規セッションで二重に実行してしまう。
+/// `num_turns` を見るのは、作業が進んだ後に同じ文言が混ざっても、元のプロンプトから
+/// やり直させないため（ターンが進んでいれば、やり直しは二重実行になる）。
 fn is_resume_not_found(result: &serde_json::Value) -> bool {
     result.get("subtype").and_then(|s| s.as_str()) == Some("error_during_execution")
+        && result.get("num_turns").and_then(|n| n.as_u64()) == Some(0)
         && result
             .get("errors")
             .and_then(|e| e.as_array())
@@ -608,6 +612,18 @@ mod tests {
             classify_content(other_startup_error),
             ResultClass::Failed("Invalid API key".to_string())
         );
+        // 会話が進んだ後の失敗は、同じ文言が混ざっていても再開不能と見なさない
+        // （元のプロンプトからやり直すと二重実行になる）
+        let after_progress = RESUME_NOT_FOUND.replace("\"num_turns\":0", "\"num_turns\":12");
+        assert!(matches!(
+            classify_content(&after_progress),
+            ResultClass::Failed(_)
+        ));
+        let without_turns = RESUME_NOT_FOUND.replace("\"num_turns\":0,", "");
+        assert!(matches!(
+            classify_content(&without_turns),
+            ResultClass::Failed(_)
+        ));
     }
 
     /// `result` 文字列が無い失敗では `errors[]` をメッセージに使う（以前は空文字だった）。

@@ -46,6 +46,9 @@ pub struct ResumePlan {
     pub save_interrupted: bool,
     /// 今回再開するタスク（ディレクトリ → 保存済み記録）。計画に含まれるものだけ。
     pub sessions: HashMap<PathBuf, ResumeEntry>,
+    /// 保存済みの記録があるのに再開しないタスク（ディレクトリ → その session_id）。
+    /// 新しいセッションを始めた時点で古い記録は破棄する（下記 `ResumeOptions::discard`）。
+    pub discard: HashMap<PathBuf, String>,
     /// 再開時に送る継続プロンプト。
     pub prompt: String,
     /// 再開するセッションを止めた 5 時間枠がまだリセットされていないときの待機時刻。
@@ -59,6 +62,13 @@ pub struct ResumePlan {
 pub struct ResumeOptions {
     pub save_interrupted: bool,
     pub sessions: HashMap<PathBuf, ResumeEntry>,
+    /// 保存済みの記録を使わずに新しいセッションで始めるターゲット（→ 古い session_id）。
+    ///
+    /// 新しいセッションが作業を始めた時点で、古い記録の文脈はリポジトリの実態より古い。
+    /// 残しておくと、`--no-resume` / `--fresh` で始めた新しいセッションがリトライ可能
+    /// エラーで終わった（＝保存されない）場合に、次の実行がより古い中断セッションを
+    /// 再開してしまう。
+    pub discard: HashMap<PathBuf, String>,
     pub prompt: String,
 }
 
@@ -217,8 +227,11 @@ pub fn build_plan(
     // 再開するのは計画に残ったタスクだけ（limit や TUI で外れたターゲットは待機の根拠にも
     // しない）。claude 以外は分類パイプラインが無いので、渡されても再開しない。
     let is_claude = agent_is_claude(&agent);
+    let planned = |dir: &PathBuf| is_claude && targets.iter().any(|t| &t.directory == dir);
     let mut sessions = resume.sessions;
-    sessions.retain(|dir, _| is_claude && targets.iter().any(|t| &t.directory == dir));
+    sessions.retain(|dir, _| planned(dir));
+    let mut discard = resume.discard;
+    discard.retain(|dir, _| planned(dir) && !sessions.contains_key(dir));
     let hold_until = resume_hold_until(sessions.values(), Local::now().fixed_offset());
     ExecutionPlan {
         agent,
@@ -227,6 +240,7 @@ pub fn build_plan(
         resume: ResumePlan {
             save_interrupted: resume.save_interrupted && is_claude,
             sessions,
+            discard,
             prompt: resume.prompt,
             hold_until,
         },
@@ -571,6 +585,7 @@ pub fn execute_plan_tmux(
             is_claude,
             save_interrupted: plan.resume.save_interrupted,
             resume,
+            discard_session: plan.resume.discard.get(&task.directory).map(String::as_str),
         });
         let task_path = task_dir.join(format!("task-{:04}.sh", idx));
         std::fs::write(&task_path, &task_script)?;
@@ -880,7 +895,58 @@ pub fn execute_plan_tmux(
         "Logs:".dimmed(),
         run_dir.display().to_string().cyan()
     );
+    // レート制限で中断して保存したセッションがあれば、同じコマンドで続きから再開できる
+    // ことを伝える。失敗の集計だけだと「最初からやり直しになる」と読める。
+    if plan.resume.save_interrupted {
+        let store =
+            crate::resume::ResumeStore::load_or_warn(&crate::resume::resume_path(state_file));
+        if let Some(line) =
+            saved_sessions_notice(&store, &plan.agent.name, &plan.tasks, now.fixed_offset())
+        {
+            println!("  {}", line.cyan());
+        }
+    }
     Ok(())
+}
+
+/// この実行で保存された中断セッションの案内（無ければ `None`）。
+///
+/// `since` より後に保存された記録だけを数える（前の実行から残っている記録は含めない）。
+/// 再開可能時刻が分かっていれば、それより前に打ち直しても待つことになる旨を添える。
+fn saved_sessions_notice(
+    store: &crate::resume::ResumeStore,
+    agent_name: &str,
+    tasks: &[ResolvedTarget],
+    since: DateTime<FixedOffset>,
+) -> Option<String> {
+    let saved: Vec<&ResumeEntry> = tasks
+        .iter()
+        .filter_map(|task| store.get(agent_name, &task.directory))
+        .filter(|entry| entry.interrupted_at >= since)
+        .collect();
+    if saved.is_empty() {
+        return None;
+    }
+    let count = saved.len();
+    let (noun, pronoun) = if count == 1 {
+        ("session", "it")
+    } else {
+        ("sessions", "them")
+    };
+    let after = saved
+        .iter()
+        .filter_map(|entry| entry.retry_after)
+        .max()
+        .map(|at| {
+            format!(
+                " (the rate limit resets at {})",
+                at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+            )
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "↻ Saved {count} interrupted {noun} — run the same command again to continue {pronoun}{after}"
+    ))
 }
 
 #[cfg(test)]
@@ -1237,12 +1303,80 @@ mod tests {
                 save_interrupted: true,
                 sessions,
                 prompt: "continue".to_string(),
+                discard: HashMap::new(),
             },
         );
         assert_eq!(plan.resume.sessions.len(), 1);
         assert!(plan.resume.sessions.contains_key(Path::new("/tmp/repo")));
         assert!(plan.resume.save_interrupted);
         assert_eq!(plan.resume.hold_until, None);
+    }
+
+    #[test]
+    fn saved_sessions_notice_counts_only_sessions_saved_in_this_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("resume.json");
+        let started = Local::now().fixed_offset();
+        let reset = started + chrono::Duration::hours(1);
+        let mut fresh = saved_session(Some(reset));
+        fresh.interrupted_at = started + chrono::Duration::seconds(5);
+        let mut stale = saved_session(None);
+        stale.interrupted_at = started - chrono::Duration::days(1);
+        crate::resume::save_atomic(&path, "claude", Path::new("/tmp/a"), fresh).unwrap();
+        crate::resume::save_atomic(&path, "claude", Path::new("/tmp/b"), stale).unwrap();
+        let store = crate::resume::ResumeStore::load_or_warn(&path);
+        let tasks = vec![repo_target("/tmp/a"), repo_target("/tmp/b")];
+
+        let notice = saved_sessions_notice(&store, "claude", &tasks, started).expect("notice");
+        assert!(
+            notice.starts_with(
+                "↻ Saved 1 interrupted session — run the same command again to continue it"
+            ),
+            "{notice}"
+        );
+        assert!(
+            notice.contains(&format!(
+                "(the rate limit resets at {})",
+                reset.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+            )),
+            "{notice}"
+        );
+        // 別エージェントの記録や、この実行より前の記録だけなら案内しない
+        assert_eq!(
+            saved_sessions_notice(&store, "claude-home", &tasks, started),
+            None
+        );
+        assert_eq!(
+            saved_sessions_notice(&store, "claude", &tasks[1..], started),
+            None
+        );
+    }
+
+    #[test]
+    fn build_plan_discards_only_unused_sessions_of_planned_tasks() {
+        let agent = make_agent(vec!["claude", "-p"]);
+        let old = "11111111-2222-4333-8444-555555555555".to_string();
+        let plan = build_plan(
+            &agent,
+            vec![repo_target("/tmp/repo"), repo_target("/tmp/fresh")],
+            None,
+            ResumeOptions {
+                save_interrupted: true,
+                sessions: HashMap::from([(PathBuf::from("/tmp/repo"), saved_session(None))]),
+                discard: HashMap::from([
+                    (PathBuf::from("/tmp/fresh"), old.clone()),
+                    // 再開するタスクの記録は破棄しない
+                    (PathBuf::from("/tmp/repo"), old.clone()),
+                    // 計画外（limit / TUI で外れた）ターゲットの記録には触れない
+                    (PathBuf::from("/tmp/dropped"), old.clone()),
+                ]),
+                prompt: "continue".to_string(),
+            },
+        );
+        assert_eq!(
+            plan.resume.discard,
+            HashMap::from([(PathBuf::from("/tmp/fresh"), old)])
+        );
     }
 
     #[test]
@@ -1260,6 +1394,7 @@ mod tests {
                 save_interrupted: true,
                 sessions: HashMap::from([(PathBuf::from("/tmp/repo"), saved_session(None))]),
                 prompt: "continue".to_string(),
+                discard: HashMap::new(),
             },
         );
         assert!(plan.resume.sessions.is_empty());
@@ -1290,6 +1425,7 @@ mod tests {
                 save_interrupted: true,
                 sessions,
                 prompt: "continue".to_string(),
+                discard: HashMap::new(),
             },
         );
         // 全セッションが同じ枠の制限を受けるので、最も遅い時刻まで待つ

@@ -1146,19 +1146,25 @@ fn resumable_directories(resumes: &HashMap<PathBuf, resume::ResumeDecision>) -> 
 /// 実行計画へ渡す再開の設定を組み立てる。
 ///
 /// 継続プロンプトは再開するタスクがあるときだけ解決する。使わない実行で `[prompts] resume`
-/// の `.md` が読めないことを理由に止めない。
+/// の `.md` が読めないことを理由に止めない。再開しないと判定した記録は、そのターゲットで
+/// 新しいセッションを始めた時点で破棄させる（`ResumeOptions::discard`）。
 fn resume_options(
     config: &config::Config,
     agent: &config::RuntimeAgent,
     resumes: HashMap<PathBuf, resume::ResumeDecision>,
 ) -> Result<executor::ResumeOptions> {
-    let sessions: HashMap<PathBuf, resume::ResumeEntry> = resumes
-        .into_iter()
-        .filter_map(|(dir, decision)| match decision {
-            resume::ResumeDecision::Resume(entry) => Some((dir, entry)),
-            resume::ResumeDecision::Skip { .. } => None,
-        })
-        .collect();
+    let mut sessions: HashMap<PathBuf, resume::ResumeEntry> = HashMap::new();
+    let mut discard: HashMap<PathBuf, String> = HashMap::new();
+    for (dir, decision) in resumes {
+        match decision {
+            resume::ResumeDecision::Resume(entry) => {
+                sessions.insert(dir, entry);
+            }
+            resume::ResumeDecision::Skip { session_id, .. } => {
+                discard.insert(dir, session_id);
+            }
+        }
+    }
     let prompt = if sessions.is_empty() {
         String::new()
     } else {
@@ -1168,6 +1174,7 @@ fn resume_options(
         save_interrupted: config.settings.resume_interrupted
             && executor::resume_support(agent) == executor::ResumeSupport::Supported,
         sessions,
+        discard,
         prompt,
     })
 }
@@ -3026,6 +3033,22 @@ mod tests {
         let options = resume_options(&conf, &claude, resumes).expect("default prompt");
         assert_eq!(options.prompt, resume::DEFAULT_RESUME_PROMPT);
         assert_eq!(options.sessions.len(), 1);
+        assert!(options.discard.is_empty());
+
+        // 再開しないと判定した記録は、新しいセッションを始めるときに破棄させる
+        let skipped = HashMap::from([(
+            PathBuf::from("/tmp/repo-b"),
+            resume::ResumeDecision::Skip {
+                session_id: SESSION.to_string(),
+                reason: resume::SkipReason::Disabled("--no-resume".to_string()),
+            },
+        )]);
+        let options = resume_options(&conf, &claude, skipped).expect("nothing to resume");
+        assert!(options.sessions.is_empty());
+        assert_eq!(
+            options.discard,
+            HashMap::from([(PathBuf::from("/tmp/repo-b"), SESSION.to_string())])
+        );
 
         // 再開に対応しないエージェントでは中断を保存しない
         let codex = config::RuntimeAgent {
