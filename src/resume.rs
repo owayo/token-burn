@@ -453,6 +453,9 @@ pub fn save_from_jsonl(
         prompt_hash: prompt_hash(&prompt),
         message: interruption.message,
         log: Some(jsonl.to_path_buf()),
+        // 同じセッションの再保存でも失敗回数は持ち越さない。レート制限まで走れたこと
+        // 自体が、そのセッションを続けられる（transcript を読み込めて作業が進む）証拠で、
+        // 上限（MAX_FAILED_RESUMES）が止めたいのは「毎回すぐ落ちて進まない」セッションの方。
         failed_resumes: 0,
     };
     save_atomic(path, agent_name, directory, entry.clone())?;
@@ -910,6 +913,41 @@ mod tests {
         assert_eq!(
             ResumeStore::load_or_warn(&path).get("claude", Path::new("/tmp/repo")),
             Some(&saved)
+        );
+    }
+
+    /// 再開後に失敗したことがあっても、同じセッションがレート制限まで走れたら失敗回数は
+    /// 0 に戻る（続けられるセッションだと分かったため）。意図した挙動として固定する。
+    #[test]
+    fn saving_the_same_session_again_resets_the_failure_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("resume.json");
+        let dir = Path::new("/tmp/repo");
+        let jsonl = tmp.path().join("0001_repo.jsonl");
+        let prompt = tmp.path().join("prompt-1.txt");
+        std::fs::write(&jsonl, interrupted_jsonl(Utc::now().timestamp() + 600)).unwrap();
+        std::fs::write(&prompt, "review").unwrap();
+
+        save_from_jsonl(&path, "claude", dir, &jsonl, &prompt).unwrap();
+        record_failure_atomic(&path, "claude", dir, SESSION).unwrap();
+        record_failure_atomic(&path, "claude", dir, SESSION).unwrap();
+        assert_eq!(
+            ResumeStore::load_or_warn(&path)
+                .get("claude", dir)
+                .unwrap()
+                .failed_resumes,
+            2
+        );
+
+        let saved = save_from_jsonl(&path, "claude", dir, &jsonl, &prompt).unwrap();
+        assert_eq!(saved.session_id, SESSION);
+        assert_eq!(saved.failed_resumes, 0);
+        assert_eq!(
+            ResumeStore::load_or_warn(&path)
+                .get("claude", dir)
+                .unwrap()
+                .failed_resumes,
+            0
         );
     }
 
