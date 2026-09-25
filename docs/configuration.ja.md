@@ -35,7 +35,7 @@ skip_within = "7d"    # 任意
 |----|--------------------------|
 | `global` | 全エージェント。`state.json` にしか存在しない名前（改名・削除済みのエージェント）も含む。あるアカウントの続きから別アカウントが処理する |
 | `provider` | 同じ `provider` のエージェント同士（例: `codex` 系アカウント同士は共有するが `claude` とは共有しない）。`provider` 未設定のエージェント（空文字・空白のみも未設定として扱う）と、設定に無い名前は自分自身の履歴のみ参照する |
-| `agent` | 実行中のエージェントのみ（デフォルト、従来の挙動） |
+| `agent` | 実行中のエージェントのみ（デフォルト） |
 
 書き込み側は変わりません。完了は常に実際に実行したエージェント名で記録されるため、`state.json` にはアカウントごとの履歴がそのまま残り、スキーマも変わりません。広がるのは参照側だけです。
 
@@ -93,12 +93,12 @@ timezone = "Asia/Tokyo"
 
 ## ai-usage 連携（任意）
 
-外部ツール `ai-usage --json` と連携すると、各エージェントの reset 時刻を実データ（`weekly.resets_at`）から自動取得できます。従来は `reset_weekday` / `reset_time` / `timezone` から固定計算していましたが、ai-usage 連携を有効化すると実際の利用状況に基づいた reset 時刻が使われます（固定計算は解決失敗時のフォールバックとして引き続き機能します）。
+既定では、各エージェントの reset 時刻を `reset_weekday` / `reset_time` / `timezone` から固定計算します。外部ツール `ai-usage --json` と連携すると、reset 時刻を実データ（`weekly.resets_at`）から自動取得し、実際の利用状況に基づいた reset 時刻を使います（固定計算は解決失敗時のフォールバックとして残ります）。
 
-連携が無い、または `enabled = false` の場合は従来どおり曜日計算のみで動作します。
+連携が無い、または `enabled = false` の場合は曜日計算だけで動作します。
 
 ```toml
-[ai_usage]                 # 任意。無い or enabled=false なら従来の曜日計算のみ
+[ai_usage]                 # 任意。無い or enabled=false なら曜日計算のみ
 enabled = true
 command = ["ai-usage", "--json"]   # デフォルト
 window = "weekly"          # weekly | five_hour | nearest（deadline 算出枠、デフォルト weekly）
@@ -133,7 +133,7 @@ profiles = ["work", "home"]    # 参照する profile 名。複数指定でア�
 
 | フィールド | 説明 | デフォルト |
 |-----------|------|-----------|
-| `enabled` | ai-usage 連携を有効化する。無い or `false` なら従来の曜日計算のみ | `false` |
+| `enabled` | ai-usage 連携を有効化する。無い or `false` なら曜日計算のみ | `false` |
 | `command` | 実行する ai-usage コマンドと引数 | `["ai-usage", "--json"]` |
 | `window` | deadline 算出に使う枠。`weekly` / `five_hour` / `nearest` | `"weekly"` |
 | `fallback` | 解決失敗時の挙動。`fixed`（曜日計算へフォールバック）/ `skip`（候補から除外）/ `error`（停止） | `"fixed"` |
@@ -160,7 +160,7 @@ profiles = ["work", "home"]    # 参照する profile 名。複数指定でア�
 - 実行時に agent × profile を展開します。例: `claude` + `["work", "home"]` → `claude-work` / `claude-home` の 2 エージェント。各々プロファイルの `env` を付与して起動します。**profile を 1 つだけ参照する場合は展開名が agent 名のまま**（例: `codex` が `["home"]` のみ → `codex`）で、サフィックス `<agent>-<profile>` が付くのは 2 つ以上参照したときだけです。起動コマンドが異なる各アカウントを別 agent として定義しても展開名が冗長にならず、`state.json` キーも安定します。
 - 展開名は `state.json` のキーにも使われ、アカウントごとに処理済み状態が分離されます。
 - `ai-usage --json` は 1 プロセスにつき 1 回だけ実行されます。
-- **使用率ゲート（完了後チェック）**: ai-usage 連携が有効な場合、各タスク完了後に該当 agent の `(profile, provider)` の weekly / five_hour の `used_percent` を ai-usage から取得し、`rate_limit_threshold` 以上の枠があれば後続タスクの開始を止めます。Claude の stream-json `rate_limit_event` によるリアルタイム監視（タスク実行中の停止）に加えてこの完了後チェックが効くため、**従来リアルタイム監視が無かった codex でも実使用率で確実に止まります**（claude / codex 両方に適用）。
+- **使用率ゲート（完了後チェック）**: ai-usage 連携が有効な場合、各タスク完了後に該当 agent の `(profile, provider)` の weekly / five_hour の `used_percent` を ai-usage から取得し、`rate_limit_threshold` 以上の枠があれば後続タスクの開始を止めます。Claude の stream-json `rate_limit_event` によるリアルタイム監視（タスク実行中の停止）に加えてこの完了後チェックが効くため、**リアルタイムの監視が無い codex でも実使用率で確実に止まります**（claude / codex 両方に適用）。
   - 止め方は枠の周期で分かれます。週次枠なら恒久停止、5 時間枠（や `kind:"daily"` の 24 時間枠）ならその枠のリセットまでの一時停止です。周期はスロット名ではなく `kind` から導くため、`five_hour` スロットに 24 時間枠を返すプロバイダでも取り違えません。
   - 完了後チェック用の ai-usage 出力は短い TTL（20 秒）でキャッシュされ、並列ワーカーからの重複取得を抑えます。
   - 取得失敗時、および該当アカウントが `ok:false`（認証切れ等で ai-usage がエラー報告）のときは fail-closed（使用率を確認できないため安全側で停止）。該当エントリが無い、または `ok:true` かつ `used_percent` が欠損している場合は過剰停止を避けて続行します。

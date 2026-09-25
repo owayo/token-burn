@@ -20,7 +20,7 @@ When a Claude Code task ends because the account hit a rate limit (for example `
 2. Run the same command again: `token-burn run`, or `token-burn run ~/GitHub/my-repo` for a single repository. If the interruption recorded when the five-hour window resets and that time has not come yet, the whole run starts paused until then — the same pause a run uses when the five-hour window fills up, since that window belongs to the account and would reject the other tasks too. It stops instead if waiting would pass the deadline, and the execution plan shows the hold.
 3. The target is listed with a `↻ resume` line (short session ID and when it was rate limited), moved to the front of its group, and continues where the interrupted session stopped.
 
-A saved session is resumed only when all of the following hold. Otherwise the target starts a new session as before, `list` / `run` show why the saved session was not used, and the unused saved session is discarded right before the new session starts. Keeping it would let a later run go back to that older session if the new one ended without being saved (for example on a retryable error).
+A saved session is resumed only when all of the following hold. Otherwise the target starts a new session, `list` / `run` show why the saved session was not used, and the unused saved session is discarded right before the new session starts. Keeping it would let a later run go back to that older session if the new one ended without being saved (for example on a retryable error).
 
 - Resuming is enabled: neither `--no-resume` nor `--fresh` is given, and `resume_interrupted` is not `false`.
 - The agent's `command` does not pass its own session flags (`--resume` / `-r`, `--continue` / `-c`, `--session-id`, `--fork-session`, `--no-session-persistence`, `--from-pr`). If it does, an added `--resume` would conflict with them, so interrupted sessions of that agent are neither saved nor resumed (a session saved earlier is listed with the reason it is not used).
@@ -31,7 +31,7 @@ There is no fixed expiry. Claude Code deletes old transcripts according to its o
 
 | Outcome of the resumed task | Saved session |
 |-----------------------------|---------------|
-| Success | Removed; the target is recorded in `state.json` as usual |
+| Success | Removed; the target is recorded in `state.json` |
 | Rate-limited again | Saved again with the new interruption time and a cleared failure count, so the next run continues the same session |
 | The session no longer exists | Removed, and a new session starts right away with the original prompt in the same task. That attempt is logged to `<NNNN>_<name>.fresh.jsonl` / `.fresh.log` next to the original log |
 | Any other failure, including a crash that leaves no result | Kept, since failures such as an expired login are not the session's fault. After 3 failed resume attempts it is dropped, and the next run starts fresh |
