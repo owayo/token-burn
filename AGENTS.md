@@ -44,8 +44,10 @@ token-burn/
 │   ├── resume.rs           # 中断セッション（レート制限で終了）の session_id 保存・再開判定（resume.json）
 │   ├── tui.rs              # --interactive の対象選択 TUI（ratatui。選択・並べ替え）
 │   └── display.rs          # ステータス表示・プログレス出力
-├── Makefile                # ビルドコマンド
-└── .github/workflows/      # CI/CD
+├── Makefile                # 開発コマンド (make help で一覧)
+├── mise.toml               # ツールチェーンの版 (rust)。ローカルと CI の正
+├── docs/                   # README から分けた詳細 (x.md と x.ja.md の対)
+└── .github/workflows/      # CI (ci.yml) とリリース (release.yml)
 ```
 
 ## 技術スタック
@@ -55,12 +57,18 @@ token-burn/
 
 ## 開発コマンド
 
+開発コマンドは `make help` (引数なしの `make`) で一覧できます。ツールの版は `mise.toml` が正で、Makefile は cargo を `mise exec` 経由で呼びます。clone した直後は `make setup` を先に実行します。
+
 ```bash
+make setup    # ツールチェーン (mise) と依存を取得
 make build    # デバッグビルド
 make test     # テスト
-make check    # clippy + fmt チェック
+make check    # fmt-check と clippy (書き換えない)
+make ci       # CI の quality ジョブと同じ検査 (check + test)
 make release  # リリースビルド
 ```
+
+CI (`.github/workflows/ci.yml`) の quality ジョブは Linux と macOS で `make setup` と `make ci` だけを実行します。検査を足すときは Makefile の `ci` に足します。
 
 ## 設定ファイル
 

@@ -1,0 +1,25 @@
+# Rate limits
+
+How token-burn holds back new tasks when an account's usage window fills up, and how it classifies tasks that ended on a limit. The threshold is `rate_limit_threshold` in [Settings](configuration.md#settings).
+
+## Checking the threshold
+
+`rate_limit_threshold` is enforced on two paths. During a task, Claude Code's stream-json `rate_limit_event` is monitored in real time and new tasks are held back once the threshold is exceeded. In addition, when [ai-usage integration](configuration.md#ai-usage-integration-optional) is enabled, after each task completes the agent's real utilization is re-checked against this threshold using the matching `(profile, provider)` pair's `weekly` and `five_hour` `used_percent` values; this applies to both `claude` and `codex` agents (the latter previously had no real-time monitoring).
+
+Both paths decide **how** to hold back by the period of the window that crossed the threshold. A weekly window shares its period with the run's deadline, so it stops the run permanently. A short window — `five_hour`, or a 24-hour window reported as `kind:"daily"` — only pauses until that window resets; a worker whose resume time has passed simply continues with the next task. The period comes from `kind`, never from the slot name, because providers do report a 24-hour window in the `five_hour` slot. A pause falls back to a permanent stop when the reset time is missing, implausible (further ahead than one period of that window), or later than the run's deadline.
+
+## Stopping and pausing
+
+- **A spent five-hour window no longer throws away the whole run**: Stops are split by how long the window takes to reset. A weekly window (the same period as the run's deadline) means a permanent stop, but a window that recovers on its own — the five-hour window — only pauses until that window resets, and workers continue with the remaining tasks once the time passes. Previously a five-hour window touching the threshold discarded every task left before the weekly reset: in a real log the window reset minutes after the stop, yet not one of the remaining tasks ran (the weekly window was at 43%, with 4h52m left before the deadline). Waiting past the deadline, or a reset time that cannot be read, still stops permanently. Resuming from a pause re-checks real utilization first, so a run waits again if the situation changed while it waited
+- **Checking for a stop and taking a task are inseparable**: A worker does both under one lock. While they were two steps, a stop published in between started one more task after the run was supposed to have stopped
+- **Usage-rate gate**: When ai-usage integration is enabled, re-checks each agent's real utilization (`weekly` / `five_hour`) per window after every task and stops or pauses new tasks once `rate_limit_threshold` is reached — extending threshold-based auto-stop to `codex`, not just Claude Code's in-task `rate_limit_event`
+- **Auto-stop keyed to the windows that actually gate execution**: The stop decision uses the `five_hour` / `seven_day` utilization from `unifiedWindows`, never the monthly overage window. Real logs carry `rateLimitType:"overage"` / `utilization:1.03` warnings while the five-hour window sits at 13%, and comparing that number against the threshold used to stop every task. The stop line now names the window it acted on, prints **that window's own** reset time, and appends the measured values as `[5h 13% / 7d 54%]`; overage warnings are shown as `(overage, no auto-stop)` without stopping anything
+- **Rate limit alerts**: Displays utilization warnings, rejected request notifications, overage status and overage reset time (shown on warning and rejection events too), and the server-side warning threshold that was crossed (e.g. `warning at 90%`) for `allowed_warning` events; holds back further tasks when the configured threshold is exceeded — permanently for the seven-day window, until the window resets for the five-hour one (if the stop file cannot be created due to ENOSPC/permissions, the failure is surfaced instead of being silently swallowed)
+
+## Classifying limited tasks
+
+- **Limit-aware result classification**: Treats limit-reached results — clock times including minutes such as `resets 2:30am`, and messages such as `You've hit your session limit` or `You've hit your org's monthly spend limit` — as rate limits rather than retryable provider errors, since retrying cannot clear them
+- **Dated reset times**: Reset times that fall on a later day are shown as `MM/DD HH:MM`, since `seven_day` and overage windows can reset up to a month out and a bare clock time reads as "later today"
+- **Transient connection errors retried**: Connection-level failures without an HTTP status (e.g. `API Error: Connection closed mid-response`) are classified as retryable rather than permanent, so the worker moves on to the next target instead of stopping (the target is reprocessed on the next run)
+
+A Claude Code task cut off by a rate limit can continue on the next run; see [Resuming interrupted sessions](usage.md#resuming-interrupted-sessions).

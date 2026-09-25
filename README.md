@@ -5,123 +5,88 @@
 <h1 align="center">token-burn</h1>
 
 <p align="center">
-  <strong>CLI tool to consume AI coding assistant tokens before weekly reset</strong>
+  CLI tool that spends leftover Claude Code and Codex CLI tokens before the weekly reset by running your prompts across your repositories in parallel
+</p>
+
+<!-- standard:badges:start -->
+<h3 align="center">Supported Platforms</h3>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-000000?logo=apple&amp;logoColor=white" alt="macOS">
 </p>
 
 <p align="center">
-  <a href="https://github.com/owayo/token-burn/actions/workflows/ci.yml">
-    <img alt="CI" src="https://github.com/owayo/token-burn/actions/workflows/ci.yml/badge.svg?branch=main">
-  </a>
-  <a href="https://github.com/owayo/token-burn/releases/latest">
-    <img alt="Version" src="https://img.shields.io/github/v/release/owayo/token-burn">
-  </a>
-  <a href="LICENSE">
-    <img alt="License" src="https://img.shields.io/github/license/owayo/token-burn">
-  </a>
+  <a href="https://github.com/owayo/token-burn/actions/workflows/ci.yml"><img src="https://github.com/owayo/token-burn/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/owayo/token-burn/releases/latest"><img src="https://img.shields.io/github/v/release/owayo/token-burn" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/owayo/token-burn" alt="License"></a>
 </p>
 
 <p align="center">
-  English | <a href="README.ja.md">日本語</a>
+  <a href="README.md">English</a> |
+  <a href="README.ja.md">日本語</a>
 </p>
+<!-- standard:badges:end -->
 
 ---
 
-## Overview
-
 Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Japanese *mottainai* (もったいない) spirit — the belief that waste is something to be avoided — **token-burn** puts those remaining tokens to work. It runs your prompts across repositories in parallel before the reset deadline — code reviews, bug hunts, refactoring, test improvements, or anything else you define. When the reset time arrives, token-burn stops starting new tasks and waits for the tasks already running to finish.
 
-<p align="center">
-  <img src="docs/images/screenshot.png" width="800" alt="token-burn running">
-</p>
-
-<p align="center">
-  <img src="docs/images/deadline.png" width="800" alt="Deadline reached — waiting for tasks to finish">
-</p>
+<p align="center"><img src="docs/images/screenshot.png" width="800" alt="token-burn running"></p>
 
 ## Features
 
-- **Auto-discovery**: Scans directories for git repos, filters by username in remote URL
-- **Multiple scan sources**: Define separate scan configs for GitHub, GitLab, etc.
-- **Duplicate-safe scan merge**: If multiple scan sources find the same directory, it is processed only once
-- **Visibility-aware**: Prioritizes public repositories over private ones (matched by remote repository name)
-- **Multi-agent**: Supports Claude Code, Codex CLI, and custom agents
-- **ai-usage integration**: Derives reset times from real usage data via `ai-usage --json` (with the configured fixed-schedule calculation kept as a fallback)
-- **A spent five-hour window no longer throws away the whole run**: Stops are split by how long the window takes to reset. A weekly window (the same period as the run's deadline) means a permanent stop, but a window that recovers on its own — the five-hour window — only pauses until that window resets, and workers continue with the remaining tasks once the time passes. Previously a five-hour window touching the threshold discarded every task left before the weekly reset: in a real log the window reset minutes after the stop, yet not one of the remaining tasks ran (the weekly window was at 43%, with 4h52m left before the deadline). Waiting past the deadline, or a reset time that cannot be read, still stops permanently. Resuming from a pause re-checks real utilization first, so a run waits again if the situation changed while it waited
-- **Checking for a stop and taking a task are inseparable**: A worker does both under one lock. While they were two steps, a stop published in between started one more task after the run was supposed to have stopped
-- **Usage-rate gate**: When ai-usage integration is enabled, re-checks each agent's real utilization (`weekly` / `five_hour`) per window after every task and stops or pauses new tasks once `rate_limit_threshold` is reached — extending threshold-based auto-stop to `codex`, not just Claude Code's in-task `rate_limit_event`
-- **Monitor usage panel**: When ai-usage integration is enabled, the tmux monitor pane shows `ai-usage --statusline --logos` (each account's 5h / weekly utilization bars) refreshed every 10 seconds, rendered from a cached `--input` snapshot alongside the per-second progress bar. The refresh returns as soon as `ai-usage` does, so it never freezes the pane and the progress bar keeps its per-second update
-- **Multi-account expansion**: Expands a single agent across multiple accounts (e.g. `claude` → `claude-work` / `claude-home`), each launched with its own environment and tracked separately in `state.json`
-- **Cross-account continuation**: `dedup_scope` lets one account pick up where another stopped instead of re-visiting the same repositories, while still recording which account did the work — opt out per run with `--dedup-scope agent`
-- **Credential-safe command display**: Redacts environment assignments and common credential option values as `<redacted>` in dry-run plans and ai-usage startup errors while executing the original values unchanged. Only `KEY=VALUE` pairs that precede the executable (the `env FOO=1 cmd` prefix) count as environment assignments — subcommand options such as `codex -c model='gpt-5.3-codex'` or the auto-injected `-c approval_policy=never` stay visible, since hiding them would defeat the point of a dry run
-- **Smart scheduling**: Automatically selects the agent closest to its reset deadline
-- **Deadline-aware stop**: Stops starting new tasks when the reset time arrives and waits for current tasks to finish
-- **Interactive target picker** (`-i` / `--interactive`): Opens a TUI before the run where you choose which repositories to process and in what order — workers claim the queue in exactly that order. All candidates are listed (not just the first `limit`), with the first `limit` pre-selected so pressing Enter reproduces the non-interactive run
-- **Parallel execution**: Runs multiple prompts concurrently in tmux split panes with progress monitor
-- **Self-closing run**: Workers close their own pane as soon as they run out of tasks, and the monitor tears down the tmux session once everything is processed — no Ctrl-C needed. The final tally and log path are reprinted on the terminal you started from
-- **Detach-safe tmux runtime**: Keeps worker scripts and queues when you detach, so background tasks continue safely until the tmux session ends
-- **Failure-safe tmux startup**: Removes the partially created session and temporary runtime directory if pane construction fails
-- **Unattended Claude execution**: Automatically disallows Claude Code's `AskUserQuestion` tool so token-burn jobs do not block waiting for interactive answers
-- **Sub-agent monitoring**: Real-time start, progress, status updates, and completion notifications for Claude Code team/agent tasks; `task_started` prefers the concrete `subagent_type`, failed notifications include their summary, and `task_updated` with `killed` is highlighted as a failure
-- **Sub-agent result summary**: Displays `result.subagent_stats` totals for spawned/completed/failed/killed/refused agents, background and nested launches, and maximum depth. A successful top-level result is still highlighted when its sub-agents failed
-- **System notification visibility**: Shows Claude Code system notifications such as stop-hook errors, plus hook diagnostics when `hook_progress` / `hook_response` include stderr or output
-- **Hook feedback visibility**: When a Stop hook exits 2 or times out, Claude Code feeds its output back to the model as a synthetic user message (`isSynthetic`) that appears in neither `hook_response` nor `notification`. Messages whose first line is `<Event> hook feedback:` are rendered as `⚠ Hook feedback (Stop): ⏱ Stop hook timed out after 120s: cargo`. In unattended runs the Stop hook is what performs the automatic commit/push, so dropping this leaves no way to explain why the work finished but nothing was committed. Skill body injections (`Base directory for this skill: ...`) arrive as the same synthetic message but stay hidden — they carry the whole SKILL.md and duplicate the `Skill` tool line
-- **Long-running tool heartbeat**: Displays `tool_progress` elapsed time for long-running tools instead of leaving the monitor apparently idle
-- **Refusal fallback visibility**: Displays `model_refusal_fallback` source/destination models and category without exposing the event's content or explanation
-- **Richer tool details**: Shows `Read` offset/limit/view range, unparseable tool input length (`unparsed:<n> chars`, for the model's malformed JSON output or a stream truncated by a rate limit/disconnect), `Edit` replace-all state, `Bash` timeout/background/sandbox-disabled state, `BashOutput` target background bash id (`bash:<id>`) with optional filter, `Agent`/`Task` identifiers together with their descriptions and background state, `Grep`/`Glob` output mode/type, ignore-case, only-matching, multiline, glob, head/context/offset limits, delay/reason for `ScheduleWakeup`, URL/prompt summary for `WebFetch`, query/domain filters for `WebSearch`, query/`max_results` for `ToolSearch`, monitor description/timeout/condition/persistent state for `Monitor`, stopped task ID(s) and reason for `TaskStop`, `TaskList` calls, task ID for `TaskGet`, task ID/block/timeout for `TaskOutput`, `Workflow` launch target (workflow name extracted from the inline script's `meta.name` with script size, or the named workflow / script path), `TaskCreate` subject/description/active form, `TaskUpdate` task ID/status/owner/subject/description, `SendMessage` summaries, `SlashCommand` executed command string, legacy `AskUserQuestion` prompts/options when present, Tavily search date filters (`start=2026-08-01` / `end=...`) and domain restrictions (`site=ast-grep.github.io` for a single domain, `site=2 domains` for several, `-site=...` for exclusions), Tavily/Codex MCP model/sandbox/approval details, and library/query details for Context7 MCP tools
-- **Sub-agent stop visibility**: `task_notification` events with `status="stopped"` (e.g. forced via `TaskStop`) are now surfaced in the live monitor; missing usage metrics are omitted instead of being shown as zero
-- **Tool error summary**: When a `tool_result` is `is_error:true`, the live monitor appends a short, single-line summary (truncated to 120 characters, with single-line or multi-line `<tool_use_error>` wrappers stripped) so the cause of a failed tool call is visible without opening the jsonl
-- **Tool result metadata**: Surfaces important top-level `tool_use_result` metadata such as truncated output, applied limits, stale-read hints, `user-modified` markers when Edit/Write detect a concurrent user edit, `stale-recovered` when Edit recovers from stale read state, `memdir-stamped` when Claude Code stamps a memory directory, failure details (`error:` / `message:`), Bash stdout/stderr summaries (`stdout:` / `stderr:`), structured MCP/Codex summaries (`structured:`), successful string or text-block-array MCP result summaries (`result:`), Edit result file paths and structured patch size (`file:<path>`, `patch:<hunks> ... +added/-removed`, `replace_all`), auto-backgrounding, clamped wakeups, persisted output size, return-code interpretation, Agent duration/token/tool counts, `ListAgents` listing counts (`agents:<n>`), sub-agent type (`agent:`), resolved model (`model:`), sub-agent edited line counts (`edits:+added/-removed`), async Agent IDs (`agent-id:`), and Agent IDs resumed by `SendMessage` (`resumed-agent:`), Grep/ToolSearch result counts and mode, WebSearch result counts/search count/duration, WebFetch HTTP status code and response size (`http:200 OK`, `bytes:120.2KB`), Read partial-read line ratios (`lines:<n>/<total>`) or offset ranges (`lines:<start>-<end>/<total>`), and token-cap truncation (`truncated:token-cap`), git commit operations (sha/kind), task counts/task IDs/task types, TaskOutput retrieval status, readable Agent output files, Monitor timeout/persistent state, TaskUpdate status transitions and changed fields beyond status (`updated:<field1>,<field2>`), async Agent launches (`async` when `run_in_background=true`), ScheduleWakeup scheduled time, Skill command names with allowed-tool counts (`allowed-tools:<n>`), and launched workflow names (`workflow:<name>`)
-- **Session header**: Prints one line per session from the `init` event — model, Claude Code version, and permission mode (`ℹ Session <model> (v<version>, <permissionMode>)`). None of these appear anywhere else in the stream: `result.modelUsage` only reveals the models that were billed, so the CLI version and whether the run used `bypassPermissions` were otherwise lost
-- **Observed background metadata**: Shows a background handoff's wait ceiling as `wait-timeout:<duration>`, its working-directory note as `cwd-hint:<summary>`, and permission-rule non-execution as `not-executed:permission-rule`
-- **Observed stream-json edge cases**: Shows assistant-level model fallbacks (`from.model` → `to.model`) and cache-miss diagnostics with affected input-token counts, deduplicating repeated partial messages by message ID; normalizes the broken trailing SGR fragment observed in model fields (for example, `claude-opus-5[1m]` → `claude-opus-5`) across session headers, fallbacks, Agent metadata, and model-usage summaries; suppresses high-frequency `background_tasks_changed` snapshots already represented by task events; keeps visible system/rate-limit notifications on separate lines when they arrive between text or thinking deltas, without adding line breaks for ignored events; treats non-JSON lines (such as `API Error: ...` merged in from stderr by `2>&1`) the same way, closing any open thinking or text line before writing them; shows optional Agent `model` / `isolation` launch settings, marks `isImage:true` tool results as `image`, and counts every `structuredPatch[].lines` entry beginning with `+` or `-` (including added/removed content that itself begins with `++` / `--`)
-- **Logging pipeline safety**: Marks a task failed if `format-stream`, `tee`, or raw jsonl capture fails instead of recording it as completed. A target directory deleted or renamed between scan and execution is reported accurately as `target directory is unavailable` instead of an unrelated logging pipeline failure
-- **Per-model usage**: Displays token usage, cost, cache read/creation tokens, web search counts, and the model's context window / max output limits (e.g. `ctx:1M`, `max_out:64K`) per model in the result summary
-- **VCS state changes**: Renders automatic commits and pushes made by git hooks (`vcs_state_changed`) as `⎇ VCS push (main)`, branch included. A commit or push created during an unattended run is the starting point for tracking what changed afterwards, and pushing to `main` versus a feature branch has a completely different blast radius. The `commands_changed` snapshot (the skill/command catalogue, hundreds of KB per event) is unrelated to what the session did and stays hidden
-- **Session total including subagents**: `result.usage` only accumulates the main loop, so whenever the `modelUsage` totals exceed it, a `📊 total in:<n> out:<n> (thinking:<n>, incl. subagents)` line is added. Real logs show cache_read diverging from `2,110,689` to `220,321,325` — over 100x — so the headline `in/out` alone understates real consumption by orders of magnitude. The subagent-inclusive thinking total comes from `modelUsage[].thinkingTokens`; real logs put it at 1,219,128 against 89,291 for the main loop alone (66% of all output tokens), so omitting it hides the single largest slice of what subagents burned. Sessions without subagents match exactly and the line is omitted
-- **Subagent attribution on tool results**: Tool results from inside a subagent are interleaved with the main loop's output on the same stream — 69% of all completion lines (2,309 of 3,350) in real logs. Each one is tagged with ` @<task>` right after the tool name, taken from the launching `Agent` description, so a screen full of `✓ Bash` stays traceable when 22 subagents run in parallel
-- **Subagent tool calls and text output**: `stream_event` only ever carries the main loop (all 98,061 of them have `parent_tool_use_id: null` in real logs); what a subagent actually ran appears solely in `assistant` events. Skipping those left 44% of completion lines (1,178 of 2,695) as a bare `✓ Bash @<task>` with no record of the command. They are now rendered as `🔧 <Tool> @<task> <detail>` just like the main loop, and a subagent's final report (179 blocks / 363KB in real logs) is folded into a one-line `💬 @<task> <first line>`
-- **Nested subagent depth**: `task_started` lines carry `depth:<n>` when a subagent spawned another subagent. `result.subagent_stats.max_depth` only reports the final aggregate, so without this there is no way to tell *which* task went deep — and nesting is what makes runtime and token spend grow explosively. Background Bash launched by a subagent carries no `spawn_depth` (84 such events in real logs), so it is marked `nested` from `owned_by_subagent` instead
-- **Running token count on progress lines**: `task_progress` lines include `tokens:<n>` from `usage.total_tokens`. Every one of the 1,254 progress events in real logs carries it, routinely in the hundreds of thousands, and `result.usage` only covers the main loop — without it there is no way to see which subagent is burning the window while the run is still going
-- **Subagent type breakdown**: `result.subagent_stats.by_type` is appended as `[Explore:5 general-purpose:4 codex:2]`. Two `codex` agents and five `Explore` agents cost wildly different amounts, which a bare `spawned:12` cannot convey
-- **File edits made through Bash**: Rewrites via `sed -i`, `cargo fmt`, `depup` and friends never go through Edit/Write, so they emit no `filePath` and no `structuredPatch` and leave no trace at all. `tool_use_result.bashEditDiff` is now summarized as `bash-edits:<path> +added/-removed` (or a file count when several changed) — 102 Bash results in real logs carry it, 36 of them with actual changes
-- **Session failure cause**: When `result.is_error` is true, an `error (HTTP 429): <message>` line is shown. In real logs a session that burned 47 USD over 30 minutes ended on a spend-limit error while still reporting `subtype:"success"`; the only hint in the footer was a single `terminal api_error` line, and missing it made the run look successful
-- **Thinking progress dots**: Claude Code redacts thinking bodies, so `thinking_delta` carries an empty body and reports progress only through `estimated_tokens` (an increment, not a running total). One dot is printed per 50 tokens. Counting body bytes alone produced zero dots for all 7,516 real deltas, leaving nothing but empty `💭 ` lines
-- **Thinking token breakdown**: Shows `output_tokens_details.thinking_tokens` as `📊 in:<n> out:<n> (thinking:<n>)`. Real logs put thinking at 10–52% of output tokens, so without the breakdown there is no way to tell what the tokens were spent on
-- **API timing**: Shows API response time, time to first token (`ttft`), time to first stream token (`stream:`, the pure streaming latency excluding queue/retry waits), and time-to-request (`req:<n>ms`) alongside wall-clock duration
-- **Fast mode indicator**: Shows fast mode state when active and reports `fast_mode_disabled_reason` when the provider explains why it is unavailable
-- **Terminal reason & permission denials**: Surfaces non-`completed` `terminal_reason` and denied tool call count/tool names in the result summary
-- **Result metadata**: Displays `usage.service_tier`, `usage.speed`, non-empty inference geo, iteration count, and result origin kind when present
-- **Rate limit alerts**: Displays utilization warnings, rejected request notifications, overage status and overage reset time (shown on warning and rejection events too), and the server-side warning threshold that was crossed (e.g. `warning at 90%`) for `allowed_warning` events; holds back further tasks when the configured threshold is exceeded — permanently for the seven-day window, until the window resets for the five-hour one (if the stop file cannot be created due to ENOSPC/permissions, the failure is surfaced instead of being silently swallowed)
-- **Auto-stop keyed to the windows that actually gate execution**: The stop decision uses the `five_hour` / `seven_day` utilization from `unifiedWindows`, never the monthly overage window. Real logs carry `rateLimitType:"overage"` / `utilization:1.03` warnings while the five-hour window sits at 13%, and comparing that number against the threshold used to stop every task. The stop line now names the window it acted on, prints **that window's own** reset time, and appends the measured values as `[5h 13% / 7d 54%]`; overage warnings are shown as `(overage, no auto-stop)` without stopping anything
-- **Limit-aware result classification**: Treats limit-reached results — clock times including minutes such as `resets 2:30am`, and messages such as `You've hit your session limit` or `You've hit your org's monthly spend limit` — as rate limits rather than retryable provider errors, since retrying cannot clear them
-- **Dated reset times**: Reset times that fall on a later day are shown as `MM/DD HH:MM`, since `seven_day` and overage windows can reset up to a month out and a bare clock time reads as "later today"
-- **Transient connection errors retried**: Connection-level failures without an HTTP status (e.g. `API Error: Connection closed mid-response`) are classified as retryable rather than permanent, so the worker moves on to the next target instead of stopping (the target is reprocessed on the next run)
-- **Subagent failure reasons**: When a subagent fails or is killed, the underlying cause (API error, etc.) is shown alongside the notification
-- **API retry visibility**: Shows retry attempts with error details during transient failures
-- **Collision-safe logs**: Per-task logs are numbered to avoid overwrite when display names collide
-- **Prompt files**: Prompts can be `.md` files or inline strings
-- **Skip processed targets**: Automatically skips already-processed directories; configurable skip duration
-- **Resume interrupted sessions**: A Claude Code task cut off by a rate limit (`You've hit your session limit · resets 2:30pm`) no longer starts over. Its session ID is saved to `resume.json`, and the next run that picks the same repository with the same agent continues that session with `claude --resume` and a continuation prompt, so re-running the same command is enough. Resumable targets go first, a run started before the five-hour window resets waits for the reset, and a session Claude Code has already deleted falls back to a fresh start within the same task ([details](#resuming-interrupted-sessions))
-- **Concurrent-safe state**: Parallel workers update `state.json` with atomic rename under a stable sidecar lock file; malformed or unreadable existing state aborts the update without overwriting previously recorded history
-- **Dry run**: Preview execution plan without running commands
+- **Deadline-aware scheduling**: Picks the agent whose reset deadline is closest, stops starting new tasks when the reset time arrives, and waits for the running tasks to finish
+- **Parallel runs in tmux**: Runs several prompts at once in split panes with a progress monitor; workers close their own panes when the queue is empty, and detaching leaves the run going
+- **Repository discovery**: Scans directories for git repositories from several `[[scan]]` sources, keeps those whose remote owner matches your username, and processes each directory once
+- **Processing order**: Puts public repositories ahead of private ones, orders each group least-recently-modified first, and skips targets processed recently (`skip_within`)
+- **Interactive target picker**: `-i` / `--interactive` opens a TUI where you choose which repositories to process and in what order
+- **Claude Code, Codex CLI and custom agents**: Adds the flags an unattended run needs, such as stream-json output and a disallowed `AskUserQuestion` for Claude Code and `approval_policy=never` for Codex CLI
+- **Real reset times from ai-usage**: Optionally reads each account's reset time and utilization from `ai-usage --json`, falling back to the fixed weekly schedule
+- **Multiple accounts**: Expands one agent across accounts (`claude-work` / `claude-home`), each with its own environment and history, and `dedup_scope` lets one account continue where another stopped
+- **Rate-limit aware**: Stops for good when the weekly window reaches `rate_limit_threshold`, but only pauses until the reset when the five-hour window does; the monthly overage window never stops a run
+- **Resume interrupted sessions**: Continues a Claude Code session cut off by a rate limit with `claude --resume` on the next run instead of starting over
+- **Readable live monitor**: Renders Claude Code's stream-json as readable lines — tool calls with their key arguments, subagent activity, hook feedback, thinking and token usage, cost per model, and why a session failed
+- **Safe state and logs**: Updates `state.json` atomically under a lock, numbers per-task logs so they never overwrite each other, and marks a task failed when its log pipeline breaks
+- **Dry run**: `-n` / `--dry-run` previews the plan, showing environment assignments and credential options in the commands as `<redacted>`
 
 ## Requirements
 
-- **OS**: macOS
 - **tmux**: Required for split-pane execution
-- **Rust**: 1.88+ (for building from source)
-- **gh CLI**: Required for repository visibility detection
 - **Claude Code** and/or **Codex CLI**: At least one agent must be installed
+- **gh CLI**: Required for repository visibility detection
+- **ai-usage** (optional): Needed only for the [ai-usage integration](docs/configuration.md#ai-usage-integration-optional)
 
 ## Installation
 
-### Homebrew (macOS/Linux)
+<!-- standard:install:start -->
+### Homebrew (macOS)
 
 ```bash
 brew install owayo/token-burn/token-burn
 ```
 
+### Cargo
+
+Requires Rust 1.98 or later.
+
+```bash
+cargo install --git https://github.com/owayo/token-burn --locked
+```
+
+### From GitHub Releases
+
+Download the archive for your platform from [Releases](https://github.com/owayo/token-burn/releases/latest), extract it, and put `token-burn` on your `PATH`. Each release also includes `SHA256SUMS` for checking the downloads.
+
+| Platform | Archive |
+|---|---|
+| macOS (Intel) | `token-burn-x86_64-apple-darwin.tar.gz` |
+| macOS (Apple Silicon) | `token-burn-aarch64-apple-darwin.tar.gz` |
+
+On macOS, if you downloaded the archive with a browser, remove the quarantine attribute before running it: `xattr -d com.apple.quarantine token-burn`.
+
 ### From Source
+
+Requires [mise](https://mise.jdx.dev/) (the Rust toolchain is pinned in `mise.toml`).
 
 ```bash
 git clone https://github.com/owayo/token-burn.git
@@ -129,393 +94,116 @@ cd token-burn
 make install
 ```
 
-### From GitHub Releases
+`make install` installs to `/usr/local/bin`. Set `INSTALL_PATH` to change it (for example `make install INSTALL_PATH="$HOME/.local/bin"`).
+<!-- standard:install:end -->
 
-Download the latest binary from [Releases](https://github.com/owayo/token-burn/releases).
+## Quickstart
 
-#### macOS (Apple Silicon)
+Create the config file and the default prompts (`~/.config/token-burn/config.toml` and `prompts/` next to it):
 
 ```bash
-curl -L https://github.com/owayo/token-burn/releases/latest/download/token-burn-aarch64-apple-darwin.tar.gz | tar xz
-sudo mv token-burn /usr/local/bin/
+token-burn init
 ```
 
-#### macOS (Intel)
+Edit `config.toml`: set `base_dirs` and `username` in `[[scan]]`, and the `command` and reset schedule of each agent in `[[agents]]`. Then check the reset times and preview the plan before the first run:
 
 ```bash
-curl -L https://github.com/owayo/token-burn/releases/latest/download/token-burn-x86_64-apple-darwin.tar.gz | tar xz
-sudo mv token-burn /usr/local/bin/
+token-burn status
+token-burn run -n
 ```
 
 ## Usage
 
-### Quick Start
-
 ```bash
-# Initialize config file and default prompt
-token-burn init
+# Run token consumption (up to `limit` targets)
+token-burn run
 
-# Check agent reset status
-token-burn status
+# Choose the targets and their order in a TUI first
+token-burn run -i
 
-# Preview execution plan
-token-burn run -n
-
-# List all target directories in processing order (without `--limit`)
-token-burn list
-
-# Run only specific repositories
+# Run only specific repositories (scan and skip rules are bypassed)
 token-burn run ~/GitHub/repo-a ./repo-b
 
-# Run token consumption
-token-burn run
+# List every target in processing order without running anything
+token-burn list
+
+# Remove report directories older than three days
+token-burn clean --older-than 3d
 ```
 
-### Commands
+When the reset time arrives, token-burn stops starting new tasks and waits for the running ones to finish:
 
-| Command | Description |
-|---------|-------------|
-| `run` | Execute token consumption (default) |
-| `list` | List target directories in processing order (ignores `--limit`, does not execute) |
-| `status` | Show agent reset status |
-| `init` | Initialize config file and prompt templates |
-| `clean` | Clean up old report directories |
+<p align="center"><img src="docs/images/deadline.png" width="800" alt="Deadline reached — waiting for tasks to finish"></p>
 
-### Options
+More detail:
 
-| Option | Short | Description |
-|--------|-------|-------------|
-| `--config <PATH>` | `-c` | Config file path (default: `~/.config/token-burn/config.toml`) |
-| `--agent <NAME>` | | Force specific agent |
-| `--dry-run` | `-n` | Preview without executing |
-| `--fresh` | | Ignore saved state — both the processed history and saved interrupted sessions — and process all targets from scratch |
-| `--no-resume` | | Start every target in a new session, ignoring saved interrupted sessions (processed targets are still skipped) |
-| `--limit <N>` | `-l` | Maximum number of targets to process (`N >= 1`) |
-| `--no-limit` | | Process all targets without limit |
-| `--workers <N>` | `-w` | Number of concurrent workers (`N >= 1`, overrides `parallelism`) |
-| `--interactive` | `-i` | Pick the targets and their execution order in a TUI before running (`run` only, requires a TTY) |
-| `--public-only` | | Process only repositories detected as public |
-| `--dedup-scope <SCOPE>` | | How widely processed-target history is shared: `global` / `provider` / `agent` (overrides `dedup_scope`) |
-| `--help` | `-h` | Show help |
-| `--version` | `-V` | Show version |
-
-`--no-resume` ignores [saved interrupted sessions](#resuming-interrupted-sessions) for a single run while processed targets are still skipped. A target with a saved session starts a new session instead, and the saved session is discarded right before that new session starts — from then on its context is older than the repository. New interruptions during the run are still saved. `--fresh` goes further and ignores both the processed history and the saved sessions.
-
-`--dedup-scope` overrides the configured [`dedup_scope`](#sharing-processed-target-history-across-agents) for a single run. Use `--dedup-scope agent` to opt out of sharing and let this account re-visit repositories another account already processed.
-
-`--workers` overrides the configured `parallelism` for a single run. The number of workers that actually start is capped by the number of tasks, and the effective value is shown as `Workers:` in the execution plan (visible with `--dry-run`).
-
-`--interactive` opens a picker before the run. Every candidate is listed — not only the first `limit` — with the first `limit` rows pre-selected, so pressing Enter runs exactly what a non-interactive run would. Keys: `↑↓` / `j` `k` to move, `Space` to toggle, `J` / `K` (or `Shift+↑↓`) to move a row and change the order, `a` / `n` to select all or none, `g` / `G` for top and bottom, `Enter` to run, `q` / `Esc` to cancel. The number shown on each selected row is the order workers will process it in, and rows that will resume an interrupted session are marked with `↻`. It needs a real terminal, so it errors out when stdin or stdout is redirected; combine it with `--dry-run` to review the plan without executing.
-
-`init` also accepts `--force` (`-f`) to overwrite existing files without confirmation.
-
-`clean` accepts `--older-than` to override the configured `cleanup_after` duration (e.g., `--older-than 3d`).
-
-When you pass one or more `PATH` arguments to `run`, scan discovery and state-based skipping are bypassed for those directories. Equivalent paths such as `repo` and `./repo` are normalized and deduplicated, so the same directory is never executed twice in a single run. Saved interrupted sessions still apply, so after a rate limit, re-running the same `token-burn run PATH...` continues the interrupted session.
+- [CLI reference](docs/cli-reference.md): every command and option
+- [Usage details](docs/usage.md): processing order, resuming interrupted sessions, the tmux runtime, logs and state
+- [Rate limits](docs/rate-limits.md): when a run stops and when it only pauses
+- [Live monitor](docs/monitor.md): what the worker and monitor panes show
 
 ## Configuration
 
-Default config location: `~/.config/token-burn/config.toml`
+Default config location: `~/.config/token-burn/config.toml` (pass `-c` / `--config` to use another file). `state.json` (processed targets) and `resume.json` (interrupted sessions) are kept in the same directory.
 
-Run `token-burn init` to generate a config template.
-
-### Settings
+A minimal config with one agent and one scan source:
 
 ```toml
 [settings]
 parallelism = 3
-skip_within = "7d"    # optional
-```
+skip_within = "1d"
+limit = 10
 
-| Field | Description | Example |
-|-------|-------------|---------|
-| `parallelism` | Number of concurrent tasks (`>= 1`, overridable per run with `--workers`) | `3` |
-| `skip_within` | Skip directories processed within this duration | `"7d"`, `"24h"`, `"1d12h"` |
-| `cleanup_after` | Auto-delete report directories older than this duration | `"7d"` (default) |
-| `report_dir` | Directory to save execution logs (relative paths are resolved against the current working directory) | `~/Documents/token-burn` (default) |
-| `limit` | Maximum number of targets to process per run (`>= 1`) | `10` (default) |
-| `rate_limit_threshold` | Hold back new tasks when the five-hour / seven-day window utilization reaches this percentage (`1-100`). A seven-day window stops the run permanently; a five-hour window only pauses until it resets. The monthly overage window never triggers either | `95` (default) |
-| `dedup_scope` | How widely processed-target history is shared (`global` / `provider` / `agent`) | `agent` (default) |
-| `resume_interrupted` | Save a Claude Code session cut off by a rate limit and continue it on the next run instead of starting over. `false` turns this off: interrupted sessions are neither saved nor resumed. See [Resuming interrupted sessions](#resuming-interrupted-sessions) | `true` (default) |
+[prompts]
+default = "prompts/default.md"
 
-`skip_within` and `cleanup_after` accept duration strings using `d` (days), `h` (hours), `m` (minutes), and `s` (seconds). Invalid or unrepresentable values are rejected when the config file is loaded. If `skip_within` is omitted, directories processed since the previous reset are skipped. A representable duration that still exceeds the date-time range cannot panic: `skip_within` falls back to the previous-reset cutoff with a warning, while cleanup returns an error. Use `--fresh` to ignore saved state entirely — both the processed history and saved interrupted sessions.
-
-`rate_limit_threshold` is enforced on two paths. During a task, Claude Code's stream-json `rate_limit_event` is monitored in real time and new tasks are held back once the threshold is exceeded. In addition, when [ai-usage integration](#ai-usage-integration-optional) is enabled, after each task completes the agent's real utilization is re-checked against this threshold using the matching `(profile, provider)` pair's `weekly` and `five_hour` `used_percent` values; this applies to both `claude` and `codex` agents (the latter previously had no real-time monitoring).
-
-Both paths decide **how** to hold back by the period of the window that crossed the threshold. A weekly window shares its period with the run's deadline, so it stops the run permanently. A short window — `five_hour`, or a 24-hour window reported as `kind:"daily"` — only pauses until that window resets; a worker whose resume time has passed simply continues with the next task. The period comes from `kind`, never from the slot name, because providers do report a 24-hour window in the `five_hour` slot. A pause falls back to a permanent stop when the reset time is missing, implausible (further ahead than one period of that window), or later than the run's deadline.
-
-State is stored in `<config-dir>/state.json` (same directory as the active config file). Updates are written to a same-directory temporary file and atomically swapped into place with `rename`, while a stable sidecar lock file such as `.state.json.lock` serializes parallel workers. If the existing file contains malformed JSON, the update fails without replacing it, preserving the original data for recovery instead of silently discarding processed-target history. Within each agent, entries are written most-recently-processed first (ties broken by ascending path), so the newest activity stays at the top of the file. With the default config path, this is `~/.config/token-burn/state.json`. Sessions interrupted by a rate limit are saved separately in `resume.json` in the same directory; see [Resuming interrupted sessions](#resuming-interrupted-sessions).
-
-#### Sharing processed-target history across agents
-
-`state.json` records history under the expanded agent name, so by default a repository processed by one account is still pending for every other account. When you run the same CLI under two accounts, the second run starts over from the same repositories instead of continuing where the first left off. `dedup_scope` controls how widely that history is consulted:
-
-| Value | Which history is consulted when deciding to skip |
-|-------|--------------------------------------------------|
-| `global` | Every agent, including names that only exist in `state.json` (renamed or removed agents). One account continues where another stopped |
-| `provider` | Agents sharing the same `provider` (e.g. `codex` accounts share with each other, but not with `claude`). Agents without a `provider` (an empty or whitespace-only value counts as unset), and names absent from the config, consult only their own history |
-| `agent` | Only the running agent (default; previous behavior) |
-
-Writes are unaffected: completion is always recorded under the agent that actually ran it, so `state.json` keeps the full per-account history and its schema is unchanged. Only the *read* side widens.
-
-`global` and `provider` require `skip_within`. The cutoff used when `skip_within` is omitted is the running agent's own previous reset time, which is agent-specific — applying it to another agent's history would make the skip window depend on which agent you happened to launch. Configs that ask for a shared scope without `skip_within` are rejected at load time.
-
-Pass `--dedup-scope <global|provider|agent>` to override the configured value for a single run — use `--dedup-scope agent` when you deliberately want a second account to re-visit repositories another account already covered. Skips are reported with the scope, the window, and which agents' records caused them:
-
-```
-  Skipped: 8 targets (already processed; scope: global, window: 2d)
-    by agent: codex=5, codex-alt=2, claude=1
-```
-
-### Agents
-
-```toml
 [[agents]]
 name = "claude"
 command = ["claude", "--dangerously-skip-permissions", "--model", "opus"]
 reset_weekday = "monday"
 reset_time = "09:00"
 timezone = "Asia/Tokyo"
-prompt = "prompts/test-coverage.md"  # optional
 
-[[agents]]
-name = "codex"
-command = ["codex", "exec", "--full-auto", "-c", "model='gpt-5.3-codex'", "-c", "model_reasoning_effort='xhigh'"]
-reset_weekday = "thursday"
-reset_time = "09:00"
-timezone = "Asia/Tokyo"
-# prompt = "prompts/codex.md"
-```
-
-| Field | Description | Example |
-|-------|-------------|---------|
-| `name` | Agent identifier | `"claude"` |
-| `command` | Command and arguments | `["claude"]` |
-| `provider` | Provider name used to match `(profile, provider)` against `ai-usage --json` output. Required when ai-usage integration is enabled for the agent | `"claude"` |
-| `env` | Environment variables applied when launching the agent (optional). Keys must match `[A-Za-z_][A-Za-z0-9_]*`; values are `~`-expanded. Merged with (and overridden by) a profile's `env` | `{ CLAUDE_CONFIG_DIR = "~/.config/claude-home" }` |
-| `reset_weekday` | Reset day of week | `"monday"` |
-| `reset_time` | Reset time (HH:MM) | `"09:00"` |
-| `timezone` | IANA timezone | `"Asia/Tokyo"` |
-| `prompt` | Agent-specific prompt (optional) | `"prompts/test-coverage.md"` |
-
-`name` must not be empty and must be unique after profile expansion — the expanded name doubles as the `state.json` key, the report directory name, and the `--agent` selector, so a duplicate makes the second agent unreachable and silently merges the two agents' processed history. `command` must contain at least one element, and the first element must be a non-empty executable name. `prompt` overrides the global `[prompts].default` for this agent; target-level `prompt` takes highest priority.
-
-`reset_weekday`, `reset_time`, and `timezone` are normally required. They may be omitted only when ai-usage integration is enabled for the agent **and** the effective `fallback` is not `fixed`, since in that case the fixed-schedule calculation is never used. Otherwise they are still required as the fallback schedule. See [ai-usage integration (optional)](#ai-usage-integration-optional).
-
-**Prompt priority**: `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default`
-
-**Claude auto-injected flags**: When the executable is `claude`, the following flags are enforced: `-p`, `--verbose`, `--output-format stream-json`, `--include-partial-messages`, and `--disallowedTools=AskUserQuestion`. Missing flags are appended automatically, an existing `--output-format` value is normalized to `stream-json` (including `--output-format=...` form), and an existing `--disallowedTools` / `--disallowed-tools` list is normalized and extended with `AskUserQuestion` when needed. The logging flags are required for proper log capture and progress monitoring; `AskUserQuestion` is denied so unattended token-burn jobs cannot stop on an interactive question. You do not need to include them in your config.
-
-**Claude auto-injected environment**: `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` is added to the Claude process environment by default. Without it, `claude -p` waits at most 600s for background tasks (backgrounded subagents / workflows) after the main turn ends, then kills them ("Background tasks still running after 600s; terminating.") and reports success even though the work never finished. `0` waits indefinitely so background agents can complete and re-drive the main loop. Set the variable explicitly in the agent or profile `env` to override (an empty string unsets it, restoring Claude's default ceiling).
-
-`reset_weekday` accepts: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday` (or short forms: `mon` `tue` `wed` `thu` `fri` `sat` `sun`)
-
-### ai-usage integration (optional)
-
-By default, each agent's reset deadline is computed from its fixed `reset_weekday` / `reset_time` / `timezone`. The optional `[ai_usage]` integration instead derives reset times from real usage data reported by an external `ai-usage --json` tool (from the selected window's `resets_at`). The fixed-schedule calculation is kept as a fallback, so token-burn never silently loses a deadline when live data is unavailable.
-
-The integration also lets you expand a single agent across multiple accounts (profiles). For example, a `claude` agent referencing `["work", "home"]` expands into two agents, `claude-work` and `claude-home`, each launched with its own environment and tracked under its own key in `state.json`. A profile referenced alone keeps the agent's own name (e.g. a `codex` agent referencing only `["home"]` stays `codex`); the `<agent>-<profile>` suffix is added only when two or more profiles are referenced. This lets you define each account as a separate agent — handy when accounts launch via different wrapper commands — without redundant names, and keeps `state.json` keys stable.
-
-```toml
-[ai_usage]                # optional. If omitted or enabled = false, only the fixed weekday calculation is used
-enabled = true
-command = ["ai-usage", "--json"]   # default
-window = "weekly"         # weekly | five_hour | nearest — window used to compute the deadline (default: weekly)
-fallback = "fixed"        # fixed | skip | error — what to do when resolution fails (default: fixed)
-state_window = "weekly"   # weekly | selected — window used for the processed-target cutoff (default: weekly)
-
-[[ai_usage.profiles]]
-name = "work"             # internal reference name (used in the expanded name <agent>-<name>)
-profile = "Work"          # matched against the "profile" field of ai-usage --json output (case-sensitive)
-env = { CLAUDE_CONFIG_DIR = "~/.config/claude-work" }  # env applied when launching this account (~-expanded)
-
-[[ai_usage.profiles]]
-name = "home"
-profile = "Home"
-env = { CLAUDE_CONFIG_DIR = "~/.config/claude-home" }
-
-[[agents]]
-name = "claude"
-provider = "claude"       # used to match (profile, provider) against ai-usage output. Required when ai-usage is enabled
-command = ["claude"]
-# env = { ... }           # optional base env; overridden by a profile's env on key collisions
-reset_weekday = "monday"  # optional when ai-usage is enabled and fallback != fixed; required otherwise (used as fallback)
-reset_time = "09:00"
-timezone = "Asia/Tokyo"
-[agents.ai_usage]
-profiles = ["work", "home"]   # profile names to reference; multiple names expand into per-account agents
-# window = "weekly"           # optional: override the global [ai_usage].window for this agent
-# fallback = "fixed"          # optional: override the global [ai_usage].fallback for this agent
-```
-
-#### `[ai_usage]` (global)
-
-| Field | Description | Default |
-|-------|-------------|---------|
-| `enabled` | Enable the integration. When omitted or `false`, only the fixed weekday calculation is used | `false` |
-| `command` | Command and arguments used to query usage data (must emit JSON) | `["ai-usage", "--json"]` |
-| `window` | Window whose `resets_at` is used to compute the deadline: `weekly`, `five_hour`, or `nearest` | `weekly` |
-| `fallback` | Behavior when resolution fails: `fixed`, `skip`, or `error` | `fixed` |
-| `state_window` | Window used for the processed-target cutoff: `weekly` or `selected` | `weekly` |
-
-#### `[[ai_usage.profiles]]`
-
-| Field | Description |
-|-------|-------------|
-| `name` | Internal reference name. Used in the expanded agent name `<agent>-<name>` and referenced from `[agents.ai_usage].profiles` |
-| `profile` | Value matched against the `profile` field of `ai-usage --json` output (case-sensitive) |
-| `env` | Environment variables applied when launching this account. Keys must match `[A-Za-z_][A-Za-z0-9_]*`; values are `~`-expanded. Merged into (and override) the agent's `env` |
-
-#### `[agents.ai_usage]` (per agent)
-
-| Field | Description |
-|-------|-------------|
-| `profiles` | Profile names (from `[[ai_usage.profiles]].name`) this agent uses. Multiple names expand the agent into one instance per account |
-| `window` | Optional override of the global `[ai_usage].window` for this agent |
-| `fallback` | Optional override of the global `[ai_usage].fallback` for this agent |
-
-#### Behavior
-
-- At run time, each agent is expanded across its referenced profiles. For example, `claude` with `["work", "home"]` becomes two agents, `claude-work` and `claude-home`, each launched with its profile's `env`.
-- Expanded names are also used as `state.json` keys, so processed-target state is tracked separately per account.
-- `ai-usage --json` is invoked only once per process.
-- The reset time is taken from the `resets_at` value of the selected window (e.g. `weekly`) for the matching `(profile, provider)` pair.
-- The instant from `resets_at` is preserved, then converted to the local fixed offset for status/run display so UTC ai-usage output is shown in the user's local time.
-- When resolution fails — the command is missing or fails, no matching `(profile, provider)` is found, the response reports `ok: false`, or the selected window is null — the configured `fallback` applies:
-  - `fixed`: fall back to the fixed weekday calculation (the schedule source is shown as `fixed fallback: <reason>`).
-  - `skip`: drop the affected agent from the candidate list.
-  - `error`: stop with an error.
-- `status` and `run` display each agent's schedule **source** (`ai-usage (weekly)`, `fixed`, or `fixed fallback`) so token-burn never falls back silently.
-- **Post-task usage gate**: After each task completes, token-burn re-queries `ai-usage --json` and compares the matching `(profile, provider)` pair's `weekly` and `five_hour` `used_percent` against `rate_limit_threshold`. A window at or over the threshold holds back further tasks — permanently for a weekly window, until the window resets for a short one. This applies to both `claude` and `codex` agents, giving `codex` (which has no in-task `rate_limit_event` stream) a real-utilization stop signal.
-- The `ai-usage --json` output is cached with a short TTL (20 seconds) so parallel workers do not each spawn a redundant query. The stop-file creation is idempotent and safe to call concurrently from multiple workers; a pause is updated under an exclusive lock and only ever moves the resume time later.
-- The usage gate is **fail-closed**: if the query fails, or the matching account reports `ok:false` (e.g. ai-usage flags an expired auth), utilization cannot be confirmed, so tasks are stopped to stay on the safe side. When no matching entry is found, or the account is `ok:true` but `used_percent` is missing, execution continues instead, to avoid over-stopping on incomplete data.
-
-### Auto-scan (multiple sources)
-
-```toml
 [[scan]]
 base_dirs = ["~/GitHub"]
 username = "yourname"
-public_first = true
-exclude = ["archived-project"]
-
-[[scan]]
-base_dirs = ["~/git"]
-username = "yourname"
-recursive = true
-public_first = false
 ```
 
-| Field | Description | Default |
-|-------|-------------|---------|
-| `base_dirs` | Directories to scan for git repositories | (required) |
-| `username` | Filter repos whose remote URL owner matches this username | (none — all repos included) |
-| `public_first` | Group public repositories ahead of private ones in the processing order. Applied when **any** `[[scan]]` enables it; if every scan sets `false` (or the config has no `[[scan]]`), visibility does not affect the order | `true` |
-| `recursive` | Recurse into subdirectories to find nested git repositories | `false` |
-| `exclude` | Directory names to skip during scan | `[]` |
+Prompt values ending with `.md` are read as files relative to the config directory. **Prompt priority**: `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default`
 
-When `username` is set, visibility lookup uses the repository name parsed from each repository's `origin` remote URL (case-insensitive), so local directory names can differ from remote repository names.
-
-Owner and repository names are extracted from the last two segments of the remote URL path, so GitLab subgroup URLs such as `git@gitlab.example.com:group/subgroup/repo.git` resolve to `subgroup` as the owner and `repo` as the repository name.
-
-When `username` is not set, repositories are included even if they do not have an `origin` remote. In that case visibility remains `Unknown`.
-
-Symlinks are skipped during directory scanning to prevent infinite recursion from circular links.
-
-Directories that cannot be read — for example a subdirectory without read permission — are skipped with a warning and the scan continues, matching how missing `base_dirs` and symlinks are handled. A single unreadable subdirectory no longer aborts `run` / `list` before any repository is processed.
-
-If multiple `[[scan]]` entries discover the same repository directory, scan results are deduplicated by directory path so the same repository is not executed twice in a single run.
-
-Directory paths are normalized to absolute paths before deduplication and state tracking, so equivalent relative paths such as `repo` and `./repo` are treated as the same target.
-
-The same normalization and deduplication rule also applies when `token-burn run PATH...` is used to force specific directories.
-
-### Prompts
-
-Prompt values ending with `.md` are read as file paths. Relative paths resolve from the config directory.
-
-```toml
-[prompts]
-default = "prompts/default.md"
-# resume = "prompts/resume.md"   # optional: continuation prompt sent when resuming an interrupted session
-```
-
-`resume` (optional) is the continuation prompt sent when [resuming an interrupted session](#resuming-interrupted-sessions). It is resolved the same way as `default`, and a built-in English prompt is used when it is omitted. Only this prompt is sent on resume: the original instructions are already in the session's history.
-
-### Explicit targets (merged with scan results)
-
-```toml
-[[targets]]
-directory = "~/GitHub/important-project"
-prompt = "prompts/test-coverage.md"
-```
-
-| Field | Description |
-|-------|-------------|
-| `directory` | Path to the target directory (required). Must be an existing directory |
-| `prompt` | Prompt override for this target. If omitted, `[prompts].default` is used |
-
-If a target's `directory` matches a scan result, the explicit target takes precedence.
-
-### Processing order
-
-Targets are processed **least-recently-modified first**: the repository whose newest file change is the oldest goes first. `defer` keeps its priority, and visibility groups public repositories ahead of private ones **only when at least one `[[scan]]` sets `public_first = true`**. The reordering happens within those groups, and it is a stable sort, so targets sharing a modification time keep their original order. Repositories whose modification time cannot be determined go last within their group. Targets that will [resume an interrupted session](#resuming-interrupted-sessions) are placed ahead of the modification-time order within their group. `token-burn run PATH...` keeps the order given on the command line.
-
-When every `[[scan]]` sets `public_first = false` (or the config has no `[[scan]]` at all), visibility is left out of the sort key entirely, so the order depends only on `defer` and modification time. This matters together with `limit`: while visibility grouping is active, private repositories are never reached as long as at least `limit` public repositories remain queued.
-
-Without this, the processing order was fixed, so every run took the first `limit` targets from the same list head. The already-processed cutoff (`skip_within`, or the previous reset) is an absolute time window, so once a run falls outside it the whole history is invalidated at once and the same head repositories are picked again — while the tail is never reached.
-
-The order is based on the repository's own last file modification time rather than the recorded processing time, so a run that was cut short by a rate limit (and therefore changed nothing) is not treated as progress. The timestamp comes from the newest mtime among files listed by `git ls-files`, which naturally excludes build artifacts and `.gitignore`d paths while still picking up uncommitted edits. `list` and `run` print it next to each target as `(modified: ...)` so the resulting order can be verified at a glance.
-
-### Resuming interrupted sessions
-
-When a Claude Code task ends because the account hit a rate limit (for example `You've hit your session limit · resets 2:30pm (Asia/Tokyo)`), token-burn saves that session's ID. The next `token-burn run` that picks the same repository with the same agent continues the interrupted session with `claude --resume <session_id>` and a continuation prompt instead of starting the work over:
-
-1. `token-burn run` — a task is cut off by the rate limit. It is still reported as failed, its session ID is saved, and the end-of-run summary says so (`↻ Saved 1 interrupted session — run the same command again to continue it`, with the reset time when known).
-2. Run the same command again: `token-burn run`, or `token-burn run ~/GitHub/my-repo` for a single repository. If the interruption recorded when the five-hour window resets and that time has not come yet, the whole run starts paused until then — the same pause a run uses when the five-hour window fills up, since that window belongs to the account and would reject the other tasks too. It stops instead if waiting would pass the deadline, and the execution plan shows the hold.
-3. The target is listed with a `↻ resume` line (short session ID and when it was rate limited), moved to the front of its group, and continues where the interrupted session stopped.
-
-A saved session is resumed only when all of the following hold. Otherwise the target starts a new session as before, `list` / `run` show why the saved session was not used, and the unused saved session is discarded right before the new session starts. Keeping it would let a later run go back to that older session if the new one ended without being saved (for example on a retryable error).
-
-- Resuming is enabled: neither `--no-resume` nor `--fresh` is given, and `resume_interrupted` is not `false`.
-- The agent's `command` does not pass its own session flags (`--resume` / `-r`, `--continue` / `-c`, `--session-id`, `--fork-session`, `--no-session-persistence`, `--from-pr`). If it does, an added `--resume` would conflict with them, so interrupted sessions of that agent are neither saved nor resumed (a session saved earlier is listed with the reason it is not used).
-- The target's prompt is unchanged since the interruption. Continuing old instructions after you edited them makes no sense.
-- No agent within the current [`dedup_scope`](#sharing-processed-target-history-across-agents) has processed the target since the interruption — with `dedup_scope = "global"`, for example, another account may have finished it in the meantime.
-
-There is no fixed expiry. Claude Code deletes old transcripts according to its own retention settings, so whether a session still exists is found out by resuming it:
-
-| Outcome of the resumed task | Saved session |
-|-----------------------------|---------------|
-| Success | Removed; the target is recorded in `state.json` as usual |
-| Rate-limited again | Saved again with the new interruption time and a cleared failure count, so the next run continues the same session |
-| The session no longer exists | Removed, and a new session starts right away with the original prompt in the same task. That attempt is logged to `<NNNN>_<name>.fresh.jsonl` / `.fresh.log` next to the original log |
-| Any other failure, including a crash that leaves no result | Kept, since failures such as an expired login are not the session's fault. After 3 failed resume attempts it is dropped, and the next run starts fresh |
-| Retryable error or cancellation (Ctrl-C) | Kept unchanged |
-
-The built-in continuation prompt (in English) tells Claude that the previous session was cut off by a rate limit and this one continues it; to check the repository first (`git status`, the current branch, `git worktree list`, uncommitted changes); that subagents and background tasks that were running have stopped, so their results must be verified rather than assumed; not to blindly repeat operations that already completed, such as commits, pushes, and releases; and then to finish the rest of the original instructions. Replace it with [`[prompts].resume`](#prompts).
-
-Only `claude` agents are covered, and only when the task ended on a rate limit. Retryable errors (such as `API Error: Connection closed mid-response`), crashes, cancellations, and logging-pipeline failures still start over on the next run, and Codex sessions are not resumed. Sessions are saved per agent: a transcript lives in that account's `CLAUDE_CONFIG_DIR`, so another account cannot continue it.
-
-Resumable targets are moved to the front of their group. `defer` and `public_first` grouping still come first, but within a group resumable targets go ahead of the least-recently-modified order: an interrupted repository was being modified right up to the interruption, so oldest-first ordering alone would push it to the end, where `limit` could drop it before it is ever resumed. `token-burn run PATH...` keeps the command-line order and still resumes. For a resumed task, the execution plan shows `Resume: <session id>` and the continuation prompt as its prompt, and the `-i` picker marks the row with `↻`.
-
-Saved sessions are stored in `resume.json` next to `state.json` (default `~/.config/token-burn/resume.json`) and updated with the same sidecar lock and atomic rename. They live in a separate file so that `state.json` keeps its format and older token-burn versions can still read it. `--no-resume` ignores saved sessions for one run, and `resume_interrupted = false` turns the feature off entirely.
+Every section — `[settings]`, `[[agents]]`, `[ai_usage]` (real reset times and multiple accounts), `[[scan]]`, `[prompts]`, and `[[targets]]` — is described in [docs/configuration.md](docs/configuration.md).
 
 ## Development
 
+<!-- standard:dev:start -->
+Requires [mise](https://mise.jdx.dev/). Tool versions are pinned in `mise.toml`.
+
 ```bash
-# Build
-make build
-
-# Run tests
-make test
-
-# Run clippy and format check
-make check
-
-# Build release
-make release
+make setup   # Install the toolchain (mise) and dependencies
+make ci      # Run the same checks as CI (no changes)
 ```
+
+| Command | Description |
+|---|---|
+| `make setup` | Install the toolchain (mise) and dependencies |
+| `make build` | Build a debug binary |
+| `make release` | Build a release binary |
+| `make run` | Run the debug binary (arguments via ARGS="...") |
+| `make test` | Run the tests |
+| `make lint` | Run clippy with warnings as errors |
+| `make fmt` | Format the code (rewrites files) |
+| `make fmt-check` | Check the formatting (no changes) |
+| `make check` | Run fmt-check and lint (no changes) |
+| `make ci` | Run the same checks as CI (no changes) |
+| `make install` | Install the release binary to INSTALL_PATH (default /usr/local/bin) |
+| `make uninstall` | Remove the binary from INSTALL_PATH |
+| `make clean` | Remove build artifacts |
+
+Run `make` to list every target. Releases are published from GitHub Actions (**Actions → Release → Run workflow**).
+<!-- standard:dev:end -->
 
 ## License
 
+<!-- standard:license:start -->
 [MIT](LICENSE)
+<!-- standard:license:end -->
