@@ -205,7 +205,8 @@ pub fn mark_completed_atomic(path: &Path, agent_name: &str, directory: &Path) ->
         write_file_atomic(path, serialized.as_bytes())
     })();
 
-    // Rust 1.89 の File::unlock ではなく、MSRV 1.88 で使える fs2 の実装を明示する。
+    // lock_exclusive と対になる fs2 の実装で解除する。Rust 1.89 以降は std の File::unlock が
+    // 同名で先に解決されるため、完全修飾で呼ぶ。
     let _ = fs2::FileExt::unlock(&lock_file);
     result
 }

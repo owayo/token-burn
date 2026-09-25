@@ -1,0 +1,8 @@
+# Toolchain for this repository. Local development (through the Makefile) and CI both treat this
+# file as the source of truth for tool versions.
+
+[tools]
+# List the profile and components explicitly. Otherwise what gets installed depends on rustup's
+# default profile, and the minimal profile on GitHub Actions runners has no rustfmt / clippy, so
+# `make ci` fails there. Only the components the Makefile uses are added on top of minimal.
+rust = { version = "1.98.1", profile = "minimal", components = ["rustfmt", "clippy"] }

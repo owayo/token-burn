@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# Personal mise overrides (the shared tool versions live in mise.toml)
+mise.local.toml
+.mise.local.toml
