@@ -203,7 +203,7 @@ When `username` is not set, repositories are included even if they do not have a
 
 Symlinks are skipped during directory scanning to prevent infinite recursion from circular links.
 
-Directories that cannot be read — for example a subdirectory without read permission — are skipped with a warning and the scan continues, matching how missing `base_dirs` and symlinks are handled. A single unreadable subdirectory no longer aborts `run` / `list` before any repository is processed.
+Directories that cannot be read — for example a subdirectory without read permission — are skipped with a warning and the scan continues, matching how missing `base_dirs` and symlinks are handled. A single unreadable subdirectory does not abort `run` / `list` before any repository is processed.
 
 If multiple `[[scan]]` entries discover the same repository directory, scan results are deduplicated by directory path so the same repository is not executed twice in a single run.
 
