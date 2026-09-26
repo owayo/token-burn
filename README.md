@@ -39,7 +39,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Parallel runs in tmux**: Runs several prompts at once in split panes with a progress monitor; workers close their own panes when the queue is empty, and detaching leaves the run going
 - **Repository discovery**: Scans directories for git repositories from several `[[scan]]` sources, keeps those whose remote owner matches your username, and processes each directory once
 - **Processing order**: Puts public repositories ahead of private ones, orders each group least-recently-modified first, and skips targets processed recently (`skip_within`)
-- **Interactive target picker**: `-i` / `--interactive` opens a TUI where you choose which repositories to process and in what order
+- **Interactive target picker**: `-i` / `--interactive` opens a TUI to choose targets and their order; press `Tab` to change workers, the stop threshold, and dry-run mode
 - **Claude Code, Codex CLI and custom agents**: Adds the flags an unattended run needs, such as stream-json output and a disallowed `AskUserQuestion` for Claude Code and `approval_policy=never` for Codex CLI
 - **Real reset times from ai-usage**: Optionally reads each account's reset time and utilization from `ai-usage --json`, falling back to the fixed weekly schedule
 - **Multiple accounts**: Expands one agent across accounts (`claude-work` / `claude-home`), each with its own environment and history, and `dedup_scope` lets one account continue where another stopped

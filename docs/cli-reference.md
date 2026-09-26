@@ -28,7 +28,7 @@ Every command and option of `token-burn`. The [README](../README.md#usage) shows
 | `--limit <N>` | `-l` | Maximum number of targets to process (`N >= 1`) |
 | `--no-limit` | | Process all targets without limit |
 | `--workers <N>` | `-w` | Number of concurrent workers (`N >= 1`, overrides `parallelism`) |
-| `--interactive` | `-i` | Pick the targets and their execution order in a TUI before running (`run` only, requires a TTY) |
+| `--interactive` | `-i` | Configure targets, execution order, workers, and other run settings in a TUI (`run` only, requires a TTY) |
 | `--public-only` | | Process only repositories detected as public |
 | `--dedup-scope <SCOPE>` | | How widely processed-target history is shared: `global` / `provider` / `agent` (overrides `dedup_scope`) |
 | `--help` | `-h` | Show help |
@@ -41,6 +41,10 @@ Every command and option of `token-burn`. The [README](../README.md#usage) shows
 `--workers` overrides the configured `parallelism` for a single run. The number of workers that actually start is capped by the number of tasks, and the effective value is shown as `Workers:` in the execution plan (visible with `--dry-run`).
 
 `--interactive` opens a picker before the run. Every candidate is listed — not only the first `limit` — with the first `limit` rows pre-selected, so pressing Enter runs exactly what a non-interactive run would. Keys: `↑↓` / `j` `k` to move, `Space` to toggle, `J` / `K` (or `Shift+↑↓`) to move a row and change the order, `a` / `n` to select all or none, `g` / `G` for top and bottom, `Enter` to run, `q` / `Esc` to cancel. The number shown on each selected row is the order workers will process it in, and rows that will resume an interrupted session are marked with `↻`. It needs a real terminal, so it errors out when stdin or stdout is redirected; combine it with `--dry-run` to review the plan without executing.
+
+Press `Tab` (or `Shift+Tab`) to switch to run settings. Use `↑↓` / `j` `k` to choose a field and `←→` / `+` `-` to change workers (at least 1), the usage stop threshold (1–100%), or dry-run mode. `Space` also toggles dry-run mode. Initial values come from CLI options and the configuration file; edits apply only to this run and do not rewrite the file.
+
+In settings, `Tab` / `Enter` / `Esc` returns to the target list. Press `Enter` there to confirm; with dry-run enabled, the action reads `Preview` and only displays the plan. `q` / `Ctrl-C` cancels from either screen.
 
 ## Target paths
 

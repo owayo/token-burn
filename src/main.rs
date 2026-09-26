@@ -108,7 +108,7 @@ struct Cli {
     )]
     workers: Option<usize>,
 
-    /// 実行対象と実行順を TUI で選んでから実行する（run のみ）
+    /// 実行対象・実行順・ワーカー数などを TUI で設定する（run のみ）
     #[arg(short = 'i', long, global = true)]
     interactive: bool,
 
@@ -818,7 +818,11 @@ async fn run(opts: RunOptions) -> Result<()> {
     // 制限適用: CLIオプションが設定値を上書き
     let limit = limit_override.unwrap_or(config.settings.limit);
     // ワーカー数: CLI オプションが設定値を上書き（TUI のヘッダーにも出す）
-    let parallelism = workers_override.unwrap_or(config.settings.parallelism);
+    let mut run_settings = tui::RunSettings {
+        workers: workers_override.unwrap_or(config.settings.parallelism),
+        rate_limit_threshold: config.settings.rate_limit_threshold,
+        dry_run,
+    };
 
     let (targets, truncated) = if interactive && !targets.is_empty() {
         // TUI では候補を limit で切らず、先頭 limit 件を初期選択にして全候補を見せる。
@@ -829,10 +833,13 @@ async fn run(opts: RunOptions) -> Result<()> {
             agent_name: sched.agent_name.clone(),
             reset_in: display::format_duration(sched.time_until_reset),
             schedule_source: sched.source.label().to_string(),
-            workers: parallelism,
+            settings: run_settings,
         };
         match tui::select_targets(targets, &modified, &resumable, limit, &ctx)? {
-            tui::Outcome::Confirmed(selected) => (selected, 0),
+            tui::Outcome::Confirmed { targets, settings } => {
+                run_settings = settings;
+                (targets, 0)
+            }
             tui::Outcome::Cancelled => {
                 println!("{}", "Cancelled - nothing was executed.".yellow());
                 return Ok(());
@@ -883,9 +890,10 @@ async fn run(opts: RunOptions) -> Result<()> {
         .map(|g| g.command.clone());
     let resume_options = resume_options(&config, agent, resumes)?;
     let plan = executor::build_plan(agent, targets, ai_usage_command, resume_options);
-    executor::print_plan(&plan, parallelism);
+    executor::print_plan(&plan, run_settings.workers);
+    println!("  Stop threshold: {}%", run_settings.rate_limit_threshold);
 
-    if dry_run {
+    if run_settings.dry_run {
         println!(
             "{}",
             "Dry run mode - no commands will be executed.".yellow()
@@ -902,12 +910,12 @@ async fn run(opts: RunOptions) -> Result<()> {
     let report_dir = resolve_report_dir(&config.settings);
     executor::execute_plan_tmux(
         plan,
-        parallelism,
+        run_settings.workers,
         time_until_reset,
         &state_file,
         &reset_info,
         &report_dir,
-        config.settings.rate_limit_threshold,
+        run_settings.rate_limit_threshold,
     )?;
 
     // 古いレポートディレクトリを自動クリーンアップ

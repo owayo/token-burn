@@ -42,7 +42,15 @@ pub struct RunContext {
     pub reset_in: String,
     /// スケジュールの導出元（`ScheduleSource::label`）。
     pub schedule_source: String,
+    pub settings: RunSettings,
+}
+
+/// CLI / config を初期値に、今回の実行だけ変更する設定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSettings {
     pub workers: usize,
+    pub rate_limit_threshold: u8,
+    pub dry_run: bool,
 }
 
 /// キー入力を処理した結果。
@@ -60,7 +68,10 @@ pub enum KeyOutcome {
 #[derive(Debug)]
 pub enum Outcome {
     /// 実行対象（Space で選択した順番）。
-    Confirmed(Vec<ResolvedTarget>),
+    Confirmed {
+        targets: Vec<ResolvedTarget>,
+        settings: RunSettings,
+    },
     Cancelled,
 }
 
@@ -70,6 +81,9 @@ pub struct SelectorState {
     cursor: usize,
     /// フッターに出す一時メッセージ（選択 0 件で決定しようとした等）。
     notice: Option<String>,
+    settings: RunSettings,
+    settings_open: bool,
+    settings_cursor: usize,
 }
 
 impl SelectorState {
@@ -81,6 +95,7 @@ impl SelectorState {
         modified: &HashMap<PathBuf, DateTime<Utc>>,
         resumable: &HashSet<PathBuf>,
         initial_selected: usize,
+        settings: RunSettings,
     ) -> Self {
         let items = targets
             .into_iter()
@@ -96,6 +111,9 @@ impl SelectorState {
             items,
             cursor: 0,
             notice: None,
+            settings,
+            settings_open: false,
+            settings_cursor: 0,
         }
     }
 
@@ -145,6 +163,14 @@ impl SelectorState {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.settings_open = !self.settings_open;
+            return KeyOutcome::Continue;
+        }
+        if self.settings_open {
+            return self.on_settings_key(key);
+        }
+
         match key.code {
             KeyCode::Char('c' | 'C') if ctrl => KeyOutcome::Cancel,
             KeyCode::Esc | KeyCode::Char('q') => KeyOutcome::Cancel,
@@ -169,6 +195,59 @@ impl SelectorState {
             KeyCode::Char('a') => self.set_all(true),
             KeyCode::Char('n') => self.set_all(false),
             _ => KeyOutcome::Continue,
+        }
+    }
+
+    fn on_settings_key(&mut self, key: KeyEvent) -> KeyOutcome {
+        match key.code {
+            KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return KeyOutcome::Cancel;
+            }
+            KeyCode::Char('q') => return KeyOutcome::Cancel,
+            KeyCode::Enter | KeyCode::Esc => self.settings_open = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.settings_cursor = self.settings_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.settings_cursor = (self.settings_cursor + 1).min(2);
+            }
+            KeyCode::Left | KeyCode::Char('-' | 'h') => self.adjust_setting(false),
+            KeyCode::Right | KeyCode::Char('+' | '=' | 'l') => self.adjust_setting(true),
+            KeyCode::Char(' ') if self.settings_cursor == 2 => {
+                self.settings.dry_run = !self.settings.dry_run;
+            }
+            _ => {}
+        }
+        KeyOutcome::Continue
+    }
+
+    fn adjust_setting(&mut self, increase: bool) {
+        match self.settings_cursor {
+            0 => {
+                self.settings.workers = if increase {
+                    self.settings.workers.saturating_add(1)
+                } else {
+                    self.settings.workers.saturating_sub(1).max(1)
+                };
+            }
+            1 => {
+                self.settings.rate_limit_threshold = if increase {
+                    self.settings
+                        .rate_limit_threshold
+                        .saturating_add(1)
+                        .min(100)
+                } else {
+                    self.settings.rate_limit_threshold.saturating_sub(1).max(1)
+                };
+            }
+            _ => self.settings.dry_run = !self.settings.dry_run,
+        }
+    }
+
+    fn into_outcome(self) -> Outcome {
+        Outcome::Confirmed {
+            settings: self.settings,
+            targets: self.into_selected_targets(),
         }
     }
 
@@ -301,7 +380,8 @@ pub fn select_targets(
         "--interactive requires a terminal; stdin and stdout must both be a TTY"
     );
 
-    let mut state = SelectorState::new(targets, modified, resumable, initial_selected);
+    let mut state =
+        SelectorState::new(targets, modified, resumable, initial_selected, ctx.settings);
     // ratatui::init() は raw mode / alternate screen へ入り、panic hook も差し替えて
     // パニック時に端末を戻す。復元漏れは直後に起動する tmux の表示を壊すため、
     // ループのエラーは持ち帰って restore() の後に伝搬する。
@@ -310,7 +390,7 @@ pub fn select_targets(
     ratatui::restore();
 
     match result? {
-        KeyOutcome::Confirm => Ok(Outcome::Confirmed(state.into_selected_targets())),
+        KeyOutcome::Confirm => Ok(state.into_outcome()),
         _ => Ok(Outcome::Cancelled),
     }
 }
@@ -338,13 +418,39 @@ fn event_loop(
 
 fn draw(frame: &mut Frame, state: &SelectorState, ctx: &RunContext, list_state: &mut ListState) {
     let [header_area, list_area, footer_area] = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Min(3),
-        Constraint::Length(3),
+        Constraint::Length(4),
     ])
     .areas(frame.area());
 
     frame.render_widget(header(state, ctx), header_area);
+
+    if state.settings_open {
+        let rows = vec![
+            ListItem::new(format!("Workers: {}  (minimum 1)", state.settings.workers)),
+            ListItem::new(format!(
+                "Stop threshold: {}%  (1-100%)",
+                state.settings.rate_limit_threshold
+            )),
+            ListItem::new(format!(
+                "Dry run: {}",
+                if state.settings.dry_run {
+                    "on (preview only)"
+                } else {
+                    "off (execute)"
+                }
+            )),
+        ];
+        let list = List::new(rows)
+            .block(Block::bordered().title(" Run settings - this run only "))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("▶ ");
+        let mut settings_list = ListState::default().with_selected(Some(state.settings_cursor));
+        frame.render_stateful_widget(list, list_area, &mut settings_list);
+        frame.render_widget(footer(state), footer_area);
+        return;
+    }
 
     // パスは残り幅に合わせて縮める。固定列（マーク・実行順・可視性・名前・更新日時）と
     // 枠・選択記号の分を引いた残りを割り当て、狭い端末でも列がずれないようにする。
@@ -390,8 +496,16 @@ fn header(state: &SelectorState, ctx: &RunContext) -> Paragraph<'static> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!(" / {} candidates", state.items().len()), dim),
-            Span::styled(format!("   Workers: {}", ctx.workers), dim),
         ]),
+        Line::from(vec![Span::styled(
+            format!(
+                " Workers: {}   Stop: {}%   Dry run: {}   [Tab] Settings",
+                state.settings.workers,
+                state.settings.rate_limit_threshold,
+                if state.settings.dry_run { "on" } else { "off" }
+            ),
+            Style::default().fg(Color::Cyan),
+        )]),
     ];
     // 引き継ぎのある候補が 1 件でもあるときだけ、行頭の `↻` の意味を示す。
     let resumable = state.resumable_count();
@@ -426,14 +540,25 @@ fn resume_style() -> Style {
 
 fn footer(state: &SelectorState) -> Paragraph<'static> {
     let text = match state.notice() {
-        Some(notice) => Line::from(Span::styled(
+        Some(notice) => vec![Line::from(Span::styled(
             format!(" {notice}"),
             Style::default().fg(Color::Yellow),
-        )),
-        None => Line::from(Span::styled(
-            " [Enter] Run   [Space] Toggle   [J/K] Move row   [j/k ↑↓] Move   [a] All   [n] None   [g/G] Top/Bottom   [Esc] Cancel",
-            Style::default().add_modifier(Modifier::DIM),
-        )),
+        ))],
+        None if state.settings_open => vec![
+            Line::from(" [↑↓/j/k] Field   [←→/+/-] Change   [Space] Toggle dry run"),
+            Line::from(" [Tab/Enter/Esc] Back to targets   [q/Ctrl-C] Cancel"),
+        ],
+        None => vec![
+            Line::from(format!(
+                " [Enter] {}   [Tab] Settings   [Space] Toggle   [J/K] Move row",
+                if state.settings.dry_run {
+                    "Preview"
+                } else {
+                    "Run"
+                }
+            )),
+            Line::from(" [j/k ↑↓] Move   [a/n] All/None   [g/G] Top/Bottom   [Esc/q] Cancel"),
+        ],
     };
     Paragraph::new(text).block(Block::bordered())
 }
@@ -587,6 +712,13 @@ fn display_path(path: &Path, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn settings() -> RunSettings {
+        RunSettings {
+            workers: 2,
+            rate_limit_threshold: 95,
+            dry_run: false,
+        }
+    }
     use super::*;
 
     fn target(name: &str) -> ResolvedTarget {
@@ -601,7 +733,13 @@ mod tests {
 
     fn state_with(count: usize, initial_selected: usize) -> SelectorState {
         let targets = (0..count).map(|i| target(&format!("r{i}"))).collect();
-        SelectorState::new(targets, &HashMap::new(), &HashSet::new(), initial_selected)
+        SelectorState::new(
+            targets,
+            &HashMap::new(),
+            &HashSet::new(),
+            initial_selected,
+            settings(),
+        )
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -626,6 +764,162 @@ mod tests {
             .into_iter()
             .map(|t| t.display_name)
             .collect()
+    }
+
+    #[test]
+    fn settings_are_preserved_until_edited_and_returned_with_targets() {
+        let initial = RunSettings {
+            workers: 7,
+            rate_limit_threshold: 82,
+            dry_run: true,
+        };
+        let mut state = SelectorState::new(
+            vec![target("first"), target("second")],
+            &HashMap::new(),
+            &HashSet::new(),
+            2,
+            initial,
+        );
+        assert_eq!(state.settings, initial);
+        state.on_key(press(KeyCode::Char('J')));
+        state.on_key(press(KeyCode::Tab));
+        state.on_key(press(KeyCode::Right));
+        state.on_key(press(KeyCode::Down));
+        state.on_key(press(KeyCode::Left));
+        state.on_key(press(KeyCode::Down));
+        state.on_key(press(KeyCode::Char(' ')));
+        // 設定画面で Enter を押しても実行しない。
+        assert_eq!(state.on_key(press(KeyCode::Enter)), KeyOutcome::Continue);
+        assert!(!state.settings_open);
+        assert_eq!(state.on_key(press(KeyCode::Enter)), KeyOutcome::Confirm);
+        let Outcome::Confirmed { targets, settings } = state.into_outcome() else {
+            panic!("expected confirmation")
+        };
+        assert_eq!(
+            settings,
+            RunSettings {
+                workers: 8,
+                rate_limit_threshold: 81,
+                dry_run: false
+            }
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| t.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+    }
+
+    #[test]
+    fn settings_navigation_preserves_target_selection_and_cursor() {
+        let mut state = state_with(3, 2);
+        state.on_key(press(KeyCode::Down));
+        state.on_key(press(KeyCode::Tab));
+        for code in [
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::Char(' '),
+            KeyCode::Char('a'),
+            KeyCode::Char('n'),
+            KeyCode::Char('J'),
+        ] {
+            state.on_key(press(code));
+        }
+        state.on_key(press(KeyCode::BackTab));
+        assert!(!state.settings_open);
+        assert_eq!(state.cursor(), 1);
+        assert_eq!(names(&state), vec!["r0", "r1", "r2"]);
+        assert_eq!(selected_names(state), vec!["r0", "r1"]);
+    }
+
+    #[test]
+    fn settings_respect_numeric_bounds() {
+        let mut state = state_with(1, 1);
+        state.on_key(press(KeyCode::Tab));
+        state.settings.workers = 1;
+        state.on_key(press(KeyCode::Char('-')));
+        assert_eq!(state.settings.workers, 1);
+        state.settings.workers = usize::MAX;
+        state.on_key(press(KeyCode::Char('+')));
+        assert_eq!(state.settings.workers, usize::MAX);
+        state.on_key(press(KeyCode::Down));
+        state.settings.rate_limit_threshold = 1;
+        state.on_key(press(KeyCode::Left));
+        assert_eq!(state.settings.rate_limit_threshold, 1);
+        state.settings.rate_limit_threshold = 100;
+        state.on_key(press(KeyCode::Right));
+        assert_eq!(state.settings.rate_limit_threshold, 100);
+    }
+
+    #[test]
+    fn settings_cancel_and_release_events_do_not_confirm() {
+        for key in [
+            press(KeyCode::Char('q')),
+            press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut state = state_with(1, 1);
+            state.on_key(press(KeyCode::Tab));
+            assert_eq!(state.on_key(key), KeyOutcome::Cancel);
+        }
+        let mut state = state_with(1, 0);
+        state.on_key(press(KeyCode::Tab));
+        let mut key = press(KeyCode::Right);
+        key.kind = KeyEventKind::Release;
+        state.on_key(key);
+        assert_eq!(state.settings, settings());
+        state.on_key(press(KeyCode::Esc));
+        assert!(!state.settings_open);
+        assert_eq!(state.on_key(press(KeyCode::Enter)), KeyOutcome::Continue);
+        assert!(state.notice().is_some());
+    }
+
+    #[test]
+    fn screen_shows_edited_values_and_preview_action() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = state_with(2, 2);
+        let ctx = RunContext {
+            agent_name: "test".into(),
+            reset_in: "1h".into(),
+            schedule_source: "fixed".into(),
+            settings: settings(),
+        };
+        state.on_key(press(KeyCode::Tab));
+        state.on_key(press(KeyCode::Right));
+        state.on_key(press(KeyCode::Down));
+        state.on_key(press(KeyCode::Left));
+        state.on_key(press(KeyCode::Down));
+        state.on_key(press(KeyCode::Char(' ')));
+        // 標準的な端末と狭い端末の両方で、値と主要操作が読めること。
+        for width in [64, 80] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            let mut list_state = ListState::default();
+            for settings_open in [true, false] {
+                state.settings_open = settings_open;
+                terminal
+                    .draw(|frame| draw(frame, &state, &ctx, &mut list_state))
+                    .unwrap();
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(text.contains("Workers: 3"), "{text}");
+                assert!(text.contains("Stop: 94%"), "{text}");
+                assert!(text.contains("Dry run: on"), "{text}");
+                assert!(
+                    text.contains(if settings_open {
+                        "Back to targets"
+                    } else {
+                        "[Enter] Preview"
+                    }),
+                    "{text}"
+                );
+            }
+        }
     }
 
     /// 初期状態は既存のソート順のまま、先頭 limit 件だけが選択済み。
@@ -919,7 +1213,8 @@ mod tests {
     /// 空リストでも操作でパニックしない（呼び出し側が弾くが、状態側も落ちない）。
     #[test]
     fn empty_list_survives_every_key() {
-        let mut state = SelectorState::new(Vec::new(), &HashMap::new(), &HashSet::new(), 5);
+        let mut state =
+            SelectorState::new(Vec::new(), &HashMap::new(), &HashSet::new(), 5, settings());
 
         for code in [
             KeyCode::Up,
@@ -1004,10 +1299,10 @@ mod tests {
             agent_name: "claude".to_string(),
             reset_in: "1d".to_string(),
             schedule_source: "fixed".to_string(),
-            workers: 2,
+            settings: settings(),
         };
         let render = |state: &SelectorState| {
-            let area = Rect::new(0, 0, 120, 4);
+            let area = Rect::new(0, 0, 120, 5);
             let mut buf = Buffer::empty(area);
             header(state, &ctx).render(area, &mut buf);
             (0..area.height)
@@ -1022,7 +1317,7 @@ mod tests {
 
         let targets: Vec<_> = (0..3).map(|i| target(&format!("r{i}"))).collect();
         let resumable = HashSet::from([PathBuf::from("/repos/r1")]);
-        let state = SelectorState::new(targets.clone(), &HashMap::new(), &resumable, 3);
+        let state = SelectorState::new(targets.clone(), &HashMap::new(), &resumable, 3, settings());
         assert_eq!(state.resumable_count(), 1);
         let text = render(&state);
         assert!(
@@ -1030,7 +1325,7 @@ mod tests {
             "{text}"
         );
 
-        let state = SelectorState::new(targets, &HashMap::new(), &HashSet::new(), 3);
+        let state = SelectorState::new(targets, &HashMap::new(), &HashSet::new(), 3, settings());
         assert!(!render(&state).contains('↻'));
     }
 
@@ -1115,7 +1410,7 @@ mod tests {
             agent_name: "claude".to_string(),
             reset_in: "1d".to_string(),
             schedule_source: "fixed".to_string(),
-            workers: 2,
+            settings: settings(),
         };
 
         let error = select_targets(
@@ -1140,7 +1435,7 @@ mod tests {
             agent_name: "claude".to_string(),
             reset_in: "1d".to_string(),
             schedule_source: "fixed".to_string(),
-            workers: 2,
+            settings: settings(),
         };
 
         let error = select_targets(Vec::new(), &HashMap::new(), &HashSet::new(), 1, &ctx)
