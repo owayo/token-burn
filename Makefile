@@ -76,14 +76,11 @@ ci: check test ## Run the same checks as CI (no changes)
 # Replace the binary through a temporary file and a rename instead of copying over it. macOS
 # caches the code signature check per inode, so a binary copied over one that is running (or ran
 # a moment ago) is killed with SIGKILL right after it starts (exit 137). The temporary file sits
-# in the same directory so that the rename swaps the inode. The binary is re-signed ad hoc before
-# the rename (codesign exists only on macOS), keeping the identifier of the installed name.
+# in the same directory so that the rename swaps the inode. The binary is not re-signed: the linker
+# already signs it ad hoc, and a fixed identifier would not keep permissions across versions.
 install: release ## Install the release binary to INSTALL_PATH (default /usr/local/bin)
 	@mkdir -p "$(INSTALL_PATH)"
 	cp "target/release/$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"
-	@if command -v codesign >/dev/null 2>&1; then \
-		codesign --force --sign - --identifier "$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"; \
-	fi
 	mv -f "$(INSTALL_PATH)/$(BINARY_NAME).new" "$(INSTALL_PATH)/$(BINARY_NAME)"
 
 uninstall: ## Remove the binary from INSTALL_PATH
