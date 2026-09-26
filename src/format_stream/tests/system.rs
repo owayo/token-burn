@@ -13,6 +13,26 @@ fn render(json: &str) -> String {
 }
 
 #[test]
+fn compact_boundary_shows_the_actual_token_reduction() {
+    // 実ログの自動圧縮イベントと同じフィールド構造。
+    let out = render(
+        r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":967397,"post_tokens":17174,"cumulative_dropped_tokens":950223,"duration_ms":97065}}"#,
+    );
+    assert!(out.contains("Context compacted (auto)"));
+    assert!(out.contains("967,397 \u{2192} 17,174 tokens"));
+    assert!(out.contains("97.1s"));
+    assert!(!out.contains("950,223"), "累積値を今回分と誤表示しない");
+}
+
+#[test]
+fn compact_boundary_without_measurements_is_silent() {
+    let out = render(
+        r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto"}}"#,
+    );
+    assert!(out.is_empty());
+}
+
+#[test]
 fn hook_success_without_output_is_silent() {
     // 成功し出力も無いフックはノイズになるため非表示。
     // 実データ例: {"subtype":"hook_response","hook_name":"PostToolUse",

@@ -1,19 +1,21 @@
-//! `system` イベント（サブエージェント進捗・通知・完了通知・API リトライ・モデル
-//! フォールバック・フック診断）の表示を担うモジュール。`handle_system_event` は
+//! `system` イベント（サブエージェント進捗・通知・完了通知・文脈圧縮・API リトライ・
+//! モデルフォールバック・フック診断）の表示を担うモジュール。`handle_system_event` は
 //! subtype ごとに `write_*` ヘルパーへディスパッチする薄い入口。
 
 use anyhow::Result;
 use std::io::Write;
 
 use crate::format_stream::util::{
-    first_non_empty_string, format_number, normalize_model_name, truncate_inline, truncate_str,
+    first_non_empty_string, format_millis_as_seconds, format_number, normalize_model_name,
+    truncate_inline, truncate_str,
 };
 
-/// system イベントのうち、サブエージェント進捗・通知・完了通知を表示する。
+/// 表示対象の system イベントを subtype ごとの処理へ振り分ける。
 pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
     let subtype = v["subtype"].as_str().unwrap_or("");
     match subtype {
         "init" => write_session_init(v, out)?,
+        "compact_boundary" => write_compact_boundary(v, out)?,
         "task_started" => write_task_started(v, out)?,
         "task_progress" => write_task_progress(v, out)?,
         "task_notification" => write_task_notification(v, out)?,
@@ -45,6 +47,47 @@ pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -
         }
         _ => {} // hook_started 等は無視
     }
+    Ok(())
+}
+
+/// 文脈圧縮で減ったトークン数と所要時間を表示する。
+///
+/// 実ログの `compact_metadata` は圧縮前後のトークン数を持つ。これを表示しないと、
+/// 長時間実行で文脈が大きく変わった時点を整形済みログから追えない。
+fn write_compact_boundary(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    let metadata = &v["compact_metadata"];
+    let mut attrs = Vec::new();
+    match (
+        metadata["pre_tokens"].as_u64(),
+        metadata["post_tokens"].as_u64(),
+    ) {
+        (Some(pre), Some(post)) => attrs.push(format!(
+            "{} \u{2192} {} tokens",
+            format_number(pre),
+            format_number(post)
+        )),
+        (Some(pre), None) => attrs.push(format!("before:{} tokens", format_number(pre))),
+        (None, Some(post)) => attrs.push(format!("after:{} tokens", format_number(post))),
+        (None, None) => {}
+    }
+    if let Some(ms) = metadata["duration_ms"].as_u64() {
+        attrs.push(format_millis_as_seconds(ms));
+    }
+    if attrs.is_empty() {
+        return Ok(());
+    }
+    let trigger = metadata["trigger"].as_str().unwrap_or("");
+    let trigger = if trigger.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", truncate_inline(trigger, 20))
+    };
+    writeln!(
+        out,
+        "\x1b[2m  \u{1f5dc} Context compacted{}: {}\x1b[0m",
+        trigger,
+        attrs.join(", ")
+    )?;
     Ok(())
 }
 

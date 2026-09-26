@@ -142,7 +142,7 @@ pause file は `resume_at` / `window` / `reason` を 1 行 1 キーの平文で�
 - pause file が壊れて読めない場合は恒久停止（fail-closed）。読めないまま走り続けると、止めるべき場面で走ってしまいます。`resume_at` は正の epoch であることも検証します（負値を「期限切れ」と読むと即座に続行してしまう）。
 - 待つのは**残 pending がある場合だけ**です。取るものが無いワーカーを待たせると、空のペインがリセット時刻まで居座ります。
 
-**一時停止から再開する直前だけ、実データで使用率を確かめ直します**（`--revalidate` に渡す `usage-gate`。ai-usage 連携が無ければ省略）。待機の根拠は停止時点の観測なので、これが無いと状況が変わっていても 1 件は開始してしまいます。逆に毎 claim で ai-usage を叩くのは無駄なので、一時停止を抜けた場合に限ります。再検証が新しい pause を書けばそれに従って待ち直し、起動に失敗したり非ゼロ終了した場合は恒久停止へ倒します（使用率を確認できないまま走らせない）。**再開が確定したら、期限切れの pause file は削除します。** claim はタスクごとに別プロセスなので、`resume_at` を過ぎた pause file を残すと以後の claim が毎回「一時停止から再開した」と判定し、タスクごとに再検証（ai-usage 起動）が走り続けます。削除は control ロックの下で読み直してから行い、まだ未来を指す pause は消しません（待機中の別ワーカーが延長を読む根拠のため）。ai-usage 出力のキャッシュは TTL 切れの瞬間に並列ワーカーが揃って到達しても 1 回しか取得しないよう、ロックを取ってから TTL を再確認します。
+**一時停止から再開する直前だけ、実データで使用率を確かめ直します**（`--revalidate` に渡す `usage-gate`。ai-usage 連携が無ければ省略）。待機の根拠は停止時点の観測なので、これが無いと状況が変わっていても 1 件は開始してしまいます。逆に毎 claim で ai-usage を叩くのは無駄なので、一時停止を抜けた場合に限ります。再検証が新しい pause を書けばそれに従って待ち直し、延長された時刻を過ぎた際にも再検証します。起動に失敗したり非ゼロ終了した場合は恒久停止へ倒し、stop file を書けなくてもそのワーカー自身は止めます（使用率を確認できないまま走らせない）。**再開が確定したら、期限切れの pause file は削除します。** claim はタスクごとに別プロセスなので、`resume_at` を過ぎた pause file を残すと以後の claim が毎回「一時停止から再開した」と判定し、タスクごとに再検証（ai-usage 起動）が走り続けます。削除は control ロックの下で読み直してから行い、まだ未来を指す pause は消しません（待機中の別ワーカーが延長を読む根拠のため）。ai-usage 出力のキャッシュは TTL 切れの瞬間に並列ワーカーが揃って到達しても 1 回しか取得しないよう、ロックを取ってから TTL を再確認します。
 
 一時停止中のワーカーは生存しており `worker-done-*` を作りません。モニターの早期停止判定（`WORKERS_DONE >= WORKER_COUNT`）は待機中のワーカーを終了と数えないため、待機がそのまま「停止」と誤報告されることはありません。
 
@@ -340,6 +340,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 `format-stream` は以下の stream-json イベントを処理します:
 - テキスト応答のストリーミング表示
 - セッション開始（`system` / `init`）のモデル・CLI バージョン・権限モードを 1 行表示（`ℹ Session <model> (v<version>, <permissionMode>)`）。これらは他のどのイベントにも現れず、`result.modelUsage` からは実際に課金されたモデルしか分からないため、CLI バージョンと `bypassPermissions` で走ったかどうかが完全に失われていた。セッションにつき 1 行のみ。実ログの `init.model` 等に混入する `claude-opus-5[1m]` のような壊れた末尾 SGR 断片はモデル表示の全経路で除去する
+- 文脈圧縮（`system` / `compact_boundary`）の発生時に、`compact_metadata.pre_tokens` / `post_tokens` と `duration_ms` を 1 行で表示する。実際の JSONL には圧縮前約 96 万トークンから数万トークンへ減ったイベントがあり、表示しないと長時間実行中に文脈が変わった時点を追えない。`cumulative_dropped_tokens` は累積値なので今回の削減量としては表示しない
 - 思考ブロック（`thinking`）のプログレスインジケーター。Claude Code は思考本文を伏せるため `thinking_delta` の `thinking` は空文字で届き、進捗は `estimated_tokens`（累積ではなく**増分**。実データは 50 / 100 / 150 単位で、1 ブロック合計 100〜500 程度）にだけ入る。50 トークンごとにドットを 1 つ出す。本文のバイト長だけを見ていた頃は実データ 7,516 件すべてでドットが 0 個になり、中身のない `💭 ` 行だけが並んでいた。本文が返る形式のために 100 バイトごとのカウントも残すが、情報源（推定トークン / 本文バイト）はブロック単位で最初に観測できた方に固定する（両方を加算するとドットが二重計上される）。ブロック終端に届く `estimated_tokens: null` かつ本文なしのデルタ（実データで 1,284 件）は進捗を報せないので、思考行を開かない
 - 長時間ツールの `tool_progress` を経過時間付き（例: `Bash running (1m 30s)`）で表示
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`（小文字 `bash` を含む）/`BashOutput`/`Agent`/`Task`/`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`/`TaskStop`/`TaskOutput`/`Workflow`/`TeamCreate`/`Skill`/`SlashCommand`/`TodoWrite`/`Monitor`/`Grep`/`Glob`/`ScheduleWakeup`/`WebFetch`/`WebSearch`/`ToolSearch`/`SendMessage`/`AskUserQuestion`/Context7・Tavily・Codex MCP 等）の詳細表示と差分出力

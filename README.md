@@ -43,9 +43,9 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Claude Code, Codex CLI and custom agents**: Adds the flags an unattended run needs, such as stream-json output and a disallowed `AskUserQuestion` for Claude Code and `approval_policy=never` for Codex CLI
 - **Real reset times from ai-usage**: Optionally reads each account's reset time and utilization from `ai-usage --json`, falling back to the fixed weekly schedule
 - **Multiple accounts**: Expands one agent across accounts (`claude-work` / `claude-home`), each with its own environment and history, and `dedup_scope` lets one account continue where another stopped
-- **Rate-limit aware**: Stops for good when the weekly window reaches `rate_limit_threshold`, but only pauses until the reset when the five-hour window does; the monthly overage window never stops a run
+- **Rate-limit aware**: Stops for good when the weekly window reaches `rate_limit_threshold`, but pauses until the reset when the five-hour window does; workers recheck usage after every extended pause before taking a task, and the monthly overage window never stops a run
 - **Resume interrupted sessions**: Continues a Claude Code session cut off by a rate limit with `claude --resume` on the next run instead of starting over
-- **Readable live monitor**: Renders Claude Code's stream-json as readable lines — tool calls with their key arguments, subagent activity, hook feedback, thinking and token usage, cost per model, and why a session failed
+- **Readable live monitor**: Renders Claude Code's stream-json as readable lines — tool calls with their key arguments, subagent activity, hook feedback, context compaction, thinking and token usage, cost per model, and why a session failed
 - **Safe state and logs**: Updates `state.json` atomically under a lock, numbers per-task logs so they never overwrite each other, and marks a task failed when its log pipeline breaks
 - **Dry run**: `-n` / `--dry-run` previews the plan, showing environment assignments and credential options in the commands as `<redacted>`
 

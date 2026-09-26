@@ -452,8 +452,8 @@ pub fn now_epoch() -> i64 {
 enum GateOutcome {
     /// 停止シグナルが無く、そのまま進んでよい。
     Proceed,
-    /// 一時停止を抜けた直後。再開前の再検証はこの場合だけ行う。
-    Resumed,
+    /// 一時停止を抜けた直後。値は今回の再開時刻で、延長後の再検証に使う。
+    Resumed(i64),
     /// 恒久停止。ワーカーはループを抜ける。
     Stop,
 }
@@ -516,18 +516,20 @@ pub async fn run_gate_claim(
         return Ok(ClaimOutcome::Empty);
     }
     let pause_file = pause_path_for(stop_file);
-    let mut revalidated = false;
+    let mut revalidated_resume_at = None;
 
     loop {
         match wait_for_gate(stop_file, &pause_file, deadline_epoch).await? {
             GateOutcome::Stop => return Ok(ClaimOutcome::Stopped),
             GateOutcome::Proceed => {}
-            GateOutcome::Resumed => {
+            GateOutcome::Resumed(resume_at) => {
                 // 一時停止を抜けた直後だけ、実データで裏を取ってから開始する。
-                // 1 回で足りる（再検証が新しい pause を書けば次の周回で待ち直す）。
-                if let Some(cmd) = revalidate.filter(|_| !revalidated) {
-                    revalidated = true;
-                    run_revalidation(cmd, stop_file);
+                // 再検証が一時停止を延長した場合は、次の再開時刻にも確認する。
+                if let Some(cmd) = revalidate.filter(|_| revalidated_resume_at != Some(resume_at)) {
+                    revalidated_resume_at = Some(resume_at);
+                    if !run_revalidation(cmd, stop_file) {
+                        return Ok(ClaimOutcome::Stopped);
+                    }
                     continue;
                 }
                 // 再開が確定したので、期限切れの一時停止状態を片付ける。残したままだと
@@ -638,14 +640,14 @@ fn clear_expired_pause(pause_file: &Path) {
 
 /// 一時停止から再開する直前の再検証コマンドを実行する。
 ///
-/// 失敗は握り潰す。`usage-gate` は自分で stop / pause を書くため、直後の判定で結果を
-/// 読み取れる。ここでエラーにすると、再検証の起動に失敗しただけでワーカーが止まる。
+/// 成功したときだけ `true` を返す。失敗時は stop file の作成も試みるが、作成に
+/// 失敗しても呼び出し元のワーカーは止める。
 ///
 /// 子の stdout は捨てる。`gate-claim` の stdout は claim 番号専用で、ワーカーの
 /// `CLAIMED=$(... gate-claim ...)` へ直結している。子が 1 行でも stdout へ書くと
 /// それが claim 番号に連結され、タスクスクリプト名が壊れて claim 済みのタスクが
 /// マーカーも残さず失われる。診断は stderr に出るのでワーカーペインからは見える。
-fn run_revalidation(cmd: &str, stop_file: &Path) {
+fn run_revalidation(cmd: &str, stop_file: &Path) -> bool {
     eprintln!("\x1b[33m  \u{21bb} 再開前に使用率を再確認します\x1b[0m");
     match std::process::Command::new("sh")
         .arg("-c")
@@ -653,16 +655,18 @@ fn run_revalidation(cmd: &str, stop_file: &Path) {
         .stdout(std::process::Stdio::null())
         .status()
     {
-        Ok(status) if status.success() => {}
+        Ok(status) if status.success() => true,
         Ok(status) => {
             // usage-gate は fail-closed で非ゼロ終了する。停止シグナルは既に書かれて
             // いるはずだが、書けていない場合に備えてこちらでも恒久停止へ倒す。
             eprintln!("gate-claim: revalidation exited with {status}");
             let _ = write_stop(stop_file, "revalidation failed before resuming");
+            false
         }
         Err(e) => {
             eprintln!("gate-claim: failed to run revalidation ({e})");
             let _ = write_stop(stop_file, "revalidation could not be started");
+            false
         }
     }
 }
@@ -707,7 +711,7 @@ async fn wait_for_gate(
                 Ok(Some(latest)) if latest.resume_at > target => {
                     target = latest.resume_at;
                 }
-                Ok(_) => return Ok(GateOutcome::Resumed),
+                Ok(_) => return Ok(GateOutcome::Resumed(target)),
                 Err(outcome) => return Ok(outcome),
             }
         }
@@ -1296,6 +1300,42 @@ mod tests {
             ClaimOutcome::Stopped
         );
         assert!(queue.join("pending-0001").exists(), "claim してはいけない");
+    }
+
+    #[tokio::test]
+    async fn gate_revalidates_again_after_a_pause_is_extended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = queue_with(tmp.path(), 1);
+        let stop = tmp.path().join("stop");
+        let pause_file = pause_path_for(&stop);
+        let probe = tmp.path().join("revalidated-once");
+        pause_at(&pause_file, now_epoch() - 60);
+        // 1 回目は pause を延長し、2 回目は再検証失敗として停止する。
+        // 2 回目を省くと、枠がまだ使えないのに pending が claim される。
+        let cmd = format!(
+            "if [ -e '{probe}' ]; then exit 3; fi; touch '{probe}'; printf 'resume_at=%s\\nwindow=five_hour\\nreason=still over\\n' {} > '{pause}'",
+            now_epoch() + 2,
+            probe = probe.display(),
+            pause = pause_file.display()
+        );
+
+        assert_eq!(
+            run_gate_claim(&stop, &queue, None, Some(&cmd))
+                .await
+                .unwrap(),
+            ClaimOutcome::Stopped
+        );
+        assert!(probe.exists());
+        assert!(stop.exists());
+        assert!(queue.join("pending-0001").exists());
+    }
+
+    #[test]
+    fn failed_revalidation_stops_the_worker_even_if_stop_file_cannot_be_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stop = tmp.path().join("missing-parent/stop");
+        assert!(!run_revalidation("exit 3", &stop));
+        assert!(!stop.exists());
     }
 
     #[tokio::test]
