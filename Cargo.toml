@@ -1,6 +1,6 @@
 [package]
 name = "token-burn"
-version = "26.6.102"
+version = "26.9.100"
 edition = "2024"
 rust-version = "1.98"
 description = "CLI tool to consume AI coding assistant tokens before weekly reset"
