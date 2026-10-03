@@ -176,6 +176,19 @@ fn process_result_hides_session_total_without_subagents() {
     assert!(!clean.contains("incl. subagents"), "{clean}");
 }
 
+/// 複数結果では modelUsage が累計、result.usage は結果ごとの値になる。
+#[test]
+fn later_result_does_not_mistake_earlier_main_tokens_for_subagents() {
+    let input = [
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":100,"output_tokens":1000},"modelUsage":{"claude-opus-5":{"costUSD":1.0,"inputTokens":100,"outputTokens":1000}}}"#,
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":20,"output_tokens":200},"modelUsage":{"claude-opus-5":{"costUSD":1.2,"inputTokens":120,"outputTokens":1200}}}"#,
+    ]
+    .join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert_eq!(clean.matches("incl. subagents").count(), 0, "{clean}");
+    assert!(clean.contains("in:20 out:200"), "{clean}");
+}
+
 #[test]
 fn process_result_sums_session_total_across_models() {
     // modelUsage が複数モデルを含む場合も総計を合算する。

@@ -246,9 +246,11 @@ fn write_session_total(
             total_thinking.saturating_add(usage["thinkingTokens"].as_u64().unwrap_or(0));
     }
 
-    // メインループ分と一致する（＝サブエージェントを使っていない）場合は重複表示になる。
-    if total_output <= summary.usage.output_tokens
-        && total_input <= summary.usage.total_input_tokens()
+    // modelUsage は複数 result を通じた累計、result.usage は今回のターン分。
+    // 今回分だけと比べると、サブエージェントが 0 件でも 2 件目以降を
+    // 「incl. subagents」と誤表示するため、メインループ側も累積して比べる。
+    if total_output <= summary.cumulative_main_output_tokens
+        && total_input <= summary.cumulative_main_input_tokens
     {
         return Ok(());
     }

@@ -1,13 +1,14 @@
 //! ストリーミング処理中に集約する状態（セッション要約・トークン使用量）を保持する
 //! モジュール。`StreamState` は 1 行の処理に必要な可変参照をまとめた束。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::format_stream::blocks::ContentBlockState;
 
 pub(crate) struct StreamState<'a> {
     pub(crate) blocks: &'a mut HashMap<usize, ContentBlockState>,
     pub(crate) tool_id_map: &'a mut HashMap<String, String>,
+    pub(crate) streamed_message_ids: &'a mut HashSet<String>,
     pub(crate) summary: &'a mut StreamSummary,
 }
 
@@ -19,6 +20,9 @@ pub(crate) struct StreamSummary {
     pub(crate) message_id: Option<String>,
     pub(crate) stop_reason: Option<String>,
     pub(crate) usage: UsageSummary,
+    /// 各 `result.usage` はその結果のターン分だけなので、比較用に累積する。
+    pub(crate) cumulative_main_input_tokens: u64,
+    pub(crate) cumulative_main_output_tokens: u64,
 }
 
 impl StreamSummary {
@@ -61,6 +65,14 @@ impl StreamSummary {
         if let Some(stop_reason) = value.get("stop_reason").and_then(|v| v.as_str()) {
             self.stop_reason = Some(stop_reason.to_string());
         }
+        let mut result_usage = UsageSummary::default();
+        result_usage.merge_from_value(value.get("usage"));
+        self.cumulative_main_input_tokens = self
+            .cumulative_main_input_tokens
+            .saturating_add(result_usage.total_input_tokens());
+        self.cumulative_main_output_tokens = self
+            .cumulative_main_output_tokens
+            .saturating_add(result_usage.output_tokens);
         self.usage.merge_from_value(value.get("usage"));
     }
 }

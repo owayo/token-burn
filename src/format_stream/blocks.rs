@@ -170,19 +170,7 @@ pub(crate) fn finalize_block(out: &mut impl Write, block: ContentBlockState) -> 
             } else {
                 block.tool_name.as_str()
             };
-            let detail = extract_tool_detail(tool_name, &block.tool_input);
-            if detail.is_empty() {
-                writeln!(out, "\x1b[36m\u{1f527} {}\x1b[0m", tool_name)?;
-            } else {
-                writeln!(
-                    out,
-                    "\x1b[36m\u{1f527} {}\x1b[0m \x1b[2m{}\x1b[0m",
-                    tool_name, detail
-                )?;
-            }
-            if let Some(diff) = format_tool_diff(tool_name, &block.tool_input) {
-                write!(out, "{}", diff)?;
-            }
+            write_tool_use(out, tool_name, &block.tool_input, "")?;
         }
         BlockKind::Text => {
             // テキストデルタは改行なしで逐次書き出すため、ブロック終了時に
@@ -195,6 +183,29 @@ pub(crate) fn finalize_block(out: &mut impl Write, block: ContentBlockState) -> 
         BlockKind::Unknown => {}
     }
 
+    Ok(())
+}
+
+/// ストリームと `assistant` 補完経路で同じツール行・差分を出す。
+pub(crate) fn write_tool_use(
+    out: &mut impl Write,
+    tool_name: &str,
+    input_json: &str,
+    owner: &str,
+) -> Result<()> {
+    let detail = extract_tool_detail(tool_name, input_json);
+    if detail.is_empty() {
+        writeln!(out, "\x1b[36m\u{1f527} {}{}\x1b[0m", tool_name, owner)?;
+    } else {
+        writeln!(
+            out,
+            "\x1b[36m\u{1f527} {}{}\x1b[0m \x1b[2m{}\x1b[0m",
+            tool_name, owner, detail
+        )?;
+    }
+    if let Some(diff) = format_tool_diff(tool_name, input_json) {
+        write!(out, "{}", diff)?;
+    }
     Ok(())
 }
 

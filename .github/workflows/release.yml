@@ -282,7 +282,7 @@ jobs:
             echo "::warning::GitHub returned no asset digests; skipped the SHA-256 comparison"
           fi
 
-  # ---- Homebrew ------------------------------------------------------------------------------
+  # ---- Homebrew 用 formula の更新 -------------------------------------------------------------
   # tap (homebrew-token-burn) の formula を、この版の添付の tar.gz を直接指す形に書き直す。tap は別の
   # リポジトリなので GITHUB_TOKEN では push できず、GitHub App のトークンを使う (App の Client ID は
   # Variables の APP_CLIENT_ID、秘密鍵は Secrets の PRIVATE_KEY)。

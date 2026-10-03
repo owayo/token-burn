@@ -570,9 +570,10 @@ pub async fn run_gate_claim(
             let target = queue_dir.join(format!("claimed-{index}"));
             match std::fs::rename(&pending, &target) {
                 Ok(()) => Ok(Some(ClaimOutcome::Claimed(index))),
-                // 別ワーカーに先を越された（ロックがあるので通常は起きないが、
-                // 外部から触られた場合に備えて claim 失敗は「取れなかった」に倒す）。
-                Err(_) => Ok(None),
+                // 外部から pending を消された場合だけ待ち直す。権限異常などまで
+                // 競合として扱うと、同じ失敗をデッドラインまで繰り返してしまう。
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("failed to claim {}", pending.display())),
             }
         })?;
 
@@ -607,7 +608,11 @@ fn next_pending(queue_dir: &Path) -> Result<Option<PathBuf>> {
         }
     };
     let mut best: Option<PathBuf> = None;
-    for entry in entries.flatten() {
+    for entry in entries {
+        // 列挙途中の I/O エラーを空キューと取り違えると、pending が残ったまま
+        // ワーカーが正常終了してしまう。
+        let entry =
+            entry.with_context(|| format!("failed to enumerate {}", queue_dir.display()))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !name.starts_with("pending-") {
@@ -1040,6 +1045,23 @@ mod tests {
             run_gate_claim(&stop, &queue, None, None).await.unwrap(),
             ClaimOutcome::Claimed("0002".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn gate_reports_rename_error_instead_of_retrying_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = queue_with(tmp.path(), 1);
+        let stop = tmp.path().join("stop");
+        // ファイルを同名のディレクトリへ rename できない状態を作る。
+        std::fs::create_dir(queue.join("claimed-0001")).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            run_gate_claim(&stop, &queue, None, None),
+        )
+        .await
+        .expect("claim エラーを待ち直し続けてはいけない");
+        assert!(result.unwrap_err().to_string().contains("failed to claim"));
+        assert!(queue.join("pending-0001").exists());
     }
 
     #[tokio::test]

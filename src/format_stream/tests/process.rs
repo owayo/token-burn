@@ -1669,10 +1669,56 @@ fn subagent_text_is_summarized_into_one_line() {
 /// メインループの text は `stream_event` で逐次出ているので、ここでは出さない。
 #[test]
 fn main_loop_assistant_text_is_not_echoed() {
-    let input = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"メインループの応答"}]}}"#;
-    let clean = strip_ansi(&run_process(input));
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"メインループの応答"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"メインループの応答"}]}}"#,
+    ]
+    .join("\n");
+    let clean = strip_ansi(&run_process(&input));
     assert!(!clean.contains('\u{1f4ac}'), "{clean}");
-    assert!(!clean.contains("メインループの応答"), "{clean}");
+    assert_eq!(clean.matches("メインループの応答").count(), 1, "{clean}");
+}
+
+/// API リトライ後は通常のメインループでも `message_start` が欠けることがある。
+#[test]
+fn unstreamed_main_message_keeps_text_tool_and_diff() {
+    let text_event = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"修正を適用します。"}]}}"#;
+    let tool_event = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"tool_use","id":"tool_1","name":"Edit","input":{"file_path":"/tmp/example.rs","old_string":"before","new_string":"after"}}]}}"#;
+    let input = [text_event, text_event, tool_event, tool_event].join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert_eq!(clean.matches("修正を適用します。").count(), 1, "{clean}");
+    assert_eq!(clean.matches("🔧 Edit").count(), 1, "{clean}");
+    assert!(clean.contains("/tmp/example.rs"), "{clean}");
+    assert!(clean.contains("- before"), "{clean}");
+    assert!(clean.contains("+ after"), "{clean}");
+}
+
+/// 実ログではトップレベルの API エラーに `stream_event` が無く、従来は本文が消えていた。
+#[test]
+fn main_loop_api_error_message_is_shown_once() {
+    let event = r#"{"type":"assistant","is_api_error_message":true,"error":"rate_limit","uuid":"event_1","message":{"id":"msg_1","content":[{"type":"text","text":"You've hit your session limit · resets 2:30pm"}]}}"#;
+    let clean = strip_ansi(&run_process(&[event, event].join("\n")));
+    assert_eq!(
+        clean
+            .matches("API error: You've hit your session limit")
+            .count(),
+        1
+    );
+    assert!(clean.contains("resets 2:30pm"), "{clean}");
+}
+
+#[test]
+fn subagent_api_error_is_marked_as_error_instead_of_regular_text() {
+    let input = r#"{"type":"assistant","is_api_error_message":true,"error":"rate_limit","parent_tool_use_id":"parent_1","task_description":"調査","message":{"id":"msg_1","content":[{"type":"text","text":"Session limit reached"}]}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.contains("API error @調査: Session limit reached"),
+        "{clean}"
+    );
+    assert!(!clean.contains("💬"), "{clean}");
 }
 
 /// 帰属情報が無い（＝サブエージェントと判別できない）assistant は従来どおり素通し。

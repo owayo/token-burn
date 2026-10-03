@@ -19,6 +19,9 @@ pub(crate) fn handle_stream_event(
     match event_type {
         "message_start" => {
             finalize_open_blocks(out, state.blocks)?;
+            if let Some(id) = event["message"]["id"].as_str() {
+                state.streamed_message_ids.insert(id.to_string());
+            }
             state.summary.update_from_message(&event["message"]);
         }
         "content_block_start" => {

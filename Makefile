@@ -1,24 +1,23 @@
-# Development tasks for token-burn. Run `make` with no arguments to list the targets.
+# token-burn の開発タスク。引数なしの `make` でターゲット一覧を表示する。
 #
-# Tool versions are pinned in mise.toml. When mise is available, every tool runs through
-# `mise exec --`, so the pinned versions are used even when mise is not activated in the shell
-# (for example when make is started from an IDE or a GUI). SYSTEM_TOOLS=1 uses the tools on PATH
-# instead (the versions are then not guaranteed).
+# ツールの版は mise.toml で固定する。mise があればすべて `mise exec --` 経由で実行し、
+# IDE や GUI から起動してシェルで mise が有効でなくても固定版を使う。
+# SYSTEM_TOOLS=1 は PATH 上のツールを使う（版は保証しない）。
 #
-# Only GNU Make 3.81 features are used (the make that ships with macOS):
-# no .ONESHELL, .SHELLFLAGS, $(file ...) or !=.
+# macOS 標準の GNU Make 3.81 で使える機能に限る。
+# .ONESHELL、.SHELLFLAGS、$(file ...)、!= は使わない。
 
 .DEFAULT_GOAL := help
 
 BINARY_NAME := token-burn
 INSTALL_PATH ?= /usr/local/bin
-# Cargo.lock is committed, so resolve dependencies exactly as CI does
+# Cargo.lock をコミットするため、CI と同じ依存関係に固定して解決する。
 CARGO_FLAGS ?= --locked
 
-# ---- Toolchain ------------------------------------------------------------------
-# Look for mise on PATH, then in the usual install locations (make started from a GUI may not
-# inherit the shell's PATH). Override with make MISE=/path/to/mise.
-# To try the behavior without mise, empty the candidates with MISE_CANDIDATES=.
+# ---- ツールチェーン --------------------------------------------------------------
+# まず PATH、次に通常のインストール先から mise を探す。GUI 起動の make は
+# シェルの PATH を継承しない場合がある。make MISE=/path/to/mise で上書きできる。
+# mise が無い場合の動作確認では MISE_CANDIDATES= で候補を空にする。
 MISE_CANDIDATES ?= $(HOME)/.local/bin/mise /opt/homebrew/bin/mise /usr/local/bin/mise
 ifeq ($(SYSTEM_TOOLS),1)
 RUN :=
@@ -36,13 +35,13 @@ endif
 
 .PHONY: help setup build release run test lint fmt fmt-check check ci install uninstall clean
 
-## Setup
+## 準備
 
 setup: ## Install the toolchain (mise) and dependencies
 	@if [ -n "$(MISE)" ]; then "$(MISE)" install; fi
 	$(RUN) cargo fetch $(CARGO_FLAGS)
 
-## Build
+## ビルド
 
 build: ## Build a debug binary
 	$(RUN) cargo build $(CARGO_FLAGS)
@@ -53,7 +52,7 @@ release: ## Build a release binary
 run: ## Run the debug binary (arguments via ARGS="...")
 	$(RUN) cargo run $(CARGO_FLAGS) -- $(ARGS)
 
-## Checks
+## 検査
 
 test: ## Run the tests
 	$(RUN) cargo test $(CARGO_FLAGS)
@@ -71,13 +70,13 @@ check: fmt-check lint ## Run fmt-check and lint (no changes)
 
 ci: check test ## Run the same checks as CI (no changes)
 
-## Install
+## インストール
 
-# Replace the binary through a temporary file and a rename instead of copying over it. macOS
-# caches the code signature check per inode, so a binary copied over one that is running (or ran
-# a moment ago) is killed with SIGKILL right after it starts (exit 137). The temporary file sits
-# in the same directory so that the rename swaps the inode. The binary is not re-signed: the linker
-# already signs it ad hoc, and a fixed identifier would not keep permissions across versions.
+# 実行ファイルは直接上書きせず、同じディレクトリの一時ファイルから rename で置き換える。
+# macOS はコード署名の検査結果を inode ごとにキャッシュする。実行中または直前に実行した
+# バイナリを上書きすると、起動直後に SIGKILL（終了コード 137）で落ちる。
+# リンカーが既に ad hoc 署名を付けるため、再署名は不要。固定識別子を付けても
+# バージョンをまたいで権限が維持されるわけではない。
 install: release ## Install the release binary to INSTALL_PATH (default /usr/local/bin)
 	@mkdir -p "$(INSTALL_PATH)"
 	cp "target/release/$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"
@@ -89,7 +88,7 @@ uninstall: ## Remove the binary from INSTALL_PATH
 clean: ## Remove build artifacts
 	$(RUN) cargo clean
 
-## Help
+## ヘルプ
 
 help: ## Show this help
 	@echo "Development tasks for $(BINARY_NAME)"

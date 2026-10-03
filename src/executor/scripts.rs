@@ -859,6 +859,7 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "QUEUE_DIR={queue_dir}\n",
             "TASK_DIR={task_dir}\n",
             "WORKER_ABORT=0\n",
+            "WORKER_FINISHED=0\n",
             "\n",
             "while true; do\n",
             // 停止判定と claim を 1 コマンドにまとめる。判定と `mv` をシェル側で 2 段に
@@ -871,6 +872,10 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "    if [ $CLAIM_RC -eq 10 ]; then\n",
             "      printf '\\033]2;Worker {w} stopped\\033\\\\'\n",
             "      echo '━━━ Stopped ━━━'\n",
+            "    elif [ $CLAIM_RC -eq 20 ]; then\n",
+            "      WORKER_FINISHED=1\n",
+            "    else\n",
+            "      echo \"━━━ Gate claim failed (exit $CLAIM_RC) — stopping worker ━━━\"\n",
             "    fi\n",
             "    break\n",
             "  fi\n",
@@ -907,8 +912,13 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "{gate_line}",
             "done\n",
             "\n",
-            "printf '\\033]2;Worker {w} done\\033\\\\'\n",
-            "echo '━━━ All tasks completed ━━━'\n",
+            "if [ \"$WORKER_FINISHED\" = 1 ]; then\n",
+            "  printf '\\033]2;Worker {w} done\\033\\\\'\n",
+            "  echo '━━━ All tasks completed ━━━'\n",
+            "else\n",
+            "  printf '\\033]2;Worker {w} stopped\\033\\\\'\n",
+            "  echo '━━━ Worker stopped ━━━'\n",
+            "fi\n",
             "touch {worker_done}\n",
             // 全タスク完了後はキャンセル trap を外してから抜ける。残したまま exit すると、
             // 終了間際に届いた INT/TERM で handle_cancel だけが走り、処理するタスクが無いのに
@@ -2459,7 +2469,10 @@ mod tests {
     ///
     /// `gate_claim_cmd` は claim した番号を stdout へ出し、終了コードで分岐する
     /// `token-burn gate-claim` の代役（テストでは実バイナリを呼べないためスタブを使う）。
-    fn run_worker_script(gate_claim_cmd: &str, task_count: usize) -> (tempfile::TempDir, String) {
+    fn run_worker_script(
+        gate_claim_cmd: &str,
+        task_count: usize,
+    ) -> (tempfile::TempDir, String, String) {
         let tmp = tempfile::TempDir::new().unwrap();
         let queue = tmp.path().join("queue");
         let tasks = tmp.path().join("tasks");
@@ -2501,7 +2514,11 @@ mod tests {
             "worker script must exit cleanly: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        (tmp, listing)
+        (
+            tmp,
+            listing,
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
     }
 
     /// N 件を順に claim して、その後 20（pending 無し）を返すスタブ。
@@ -2514,15 +2531,26 @@ mod tests {
     #[test]
     fn worker_script_runs_the_tasks_the_gate_hands_it() {
         // ゲートが番号を返す限りタスクを処理し、pending が尽きたら（20）静かに終わる。
-        let (_tmp, markers) = run_worker_script(&claim_stub(2), 2);
+        let (_tmp, markers, output) = run_worker_script(&claim_stub(2), 2);
         assert_eq!(markers, "done-1,done-2,worker-done-0");
+        assert!(output.contains("All tasks completed"), "{output}");
     }
 
     #[test]
     fn worker_script_stops_when_the_gate_reports_a_permanent_stop() {
         // 恒久停止（10）ではタスクを 1 件も処理せず、ワーカー終了マーカーだけを残す。
-        let (_tmp, markers) = run_worker_script("exit 10", 2);
+        let (_tmp, markers, output) = run_worker_script("exit 10", 2);
         assert_eq!(markers, "worker-done-0");
+        assert!(!output.contains("All tasks completed"), "{output}");
+    }
+
+    #[test]
+    fn worker_script_reports_gate_failure_without_claiming_a_task() {
+        let (tmp, markers, output) = run_worker_script("exit 1", 1);
+        assert_eq!(markers, "worker-done-0");
+        assert!(tmp.path().join("queue/pending-0001").exists());
+        assert!(output.contains("Gate claim failed (exit 1)"), "{output}");
+        assert!(!output.contains("All tasks completed"), "{output}");
     }
 
     #[test]

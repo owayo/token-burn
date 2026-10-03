@@ -60,6 +60,7 @@ fn process(
     let mut signal_failed = false;
     let mut tool_id_map: HashMap<String, String> = HashMap::new();
     let mut shown_notices = std::collections::HashSet::new();
+    let mut streamed_message_ids = std::collections::HashSet::new();
     let mut blocks: HashMap<usize, ContentBlockState> = HashMap::new();
     let mut summary = StreamSummary::default();
     let mut raw_writer = match raw_output {
@@ -114,6 +115,7 @@ fn process(
                     &mut StreamState {
                         blocks: &mut blocks,
                         tool_id_map: &mut tool_id_map,
+                        streamed_message_ids: &mut streamed_message_ids,
                         summary: &mut summary,
                     },
                 )?;
@@ -125,6 +127,7 @@ fn process(
                     &mut tool_id_map,
                     &mut shown_notices,
                     &mut blocks,
+                    &streamed_message_ids,
                 )?;
             }
             "user" => {
