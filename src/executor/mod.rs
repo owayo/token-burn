@@ -248,9 +248,9 @@ pub fn build_plan(
 }
 
 /// 同期パスで ai-usage を起動し、`timeout` を超えたら SIGKILL してキルする。
-/// tokio ランタイムに依存せず std::process::Command と try_wait ポーリングで実現する。
+/// 専用スレッドの tokio ランタイムで待つため、同期・非同期どちらの呼び出し元でも使える。
 ///
-/// 成功時は raw stdout を返す。stdout/stderr は別スレッドで並行に drain するため、
+/// 成功時は raw stdout を返す。stdout/stderr は非同期 I/O で並行に読むため、
 /// 出力サイズがパイプバッファを超えてもデッドロックしない。非ゼロ終了・spawn 失敗・
 /// タイムアウトはエラー。呼び出し側で fail-soft（キャッシュ初期化スキップ）にする。
 ///
@@ -266,80 +266,106 @@ fn spawn_ai_usage_sync_with_timeout(
     timeout: Duration,
 ) -> Result<Vec<u8>> {
     anyhow::ensure!(!command.is_empty(), "ai_usage.command is empty");
-    let mut builder = std::process::Command::new(&command[0]);
-    builder.args(&command[1..]);
-    for (key, value) in env {
-        if value.is_empty() {
-            builder.env_remove(key);
-        } else {
-            builder.env(key, value);
-        }
-    }
-    let mut child = builder
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn ai-usage command: {}",
-                crate::display::format_command(command)
-            )
-        })?;
-
-    // stdout/stderr は必ず別スレッドで並行に drain する。子の終了を待ってから読むと、
-    // 出力がパイプバッファ（macOS では 16KB 程度）を超えたとき子の write(2) がブロックして
-    // 終了できず、try_wait が永遠に None を返してタイムアウトまでハングするデッドロックに
-    // 陥る（大きな stdout や stderr へのログ出力で発生）。読み取りを終了監視から分離する。
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let stdout_handle = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        if let Some(s) = stdout.as_mut() {
-            let _ = s.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        if let Some(s) = stderr.as_mut() {
-            let _ = s.read_to_end(&mut buf);
-        }
-        buf
-    });
-
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(status) => {
-                // 子は終了済みでパイプは EOF に達するため、join はブロックせず全出力を回収できる。
-                let stdout_buf = stdout_handle.join().unwrap_or_default();
-                let stderr_buf = stderr_handle.join().unwrap_or_default();
-                if !status.success() {
-                    let stderr = String::from_utf8_lossy(&stderr_buf);
-                    anyhow::bail!("ai-usage exited with {}: {}", status, stderr.trim());
-                }
-                return Ok(stdout_buf);
-            }
-            None => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // kill でパイプが閉じ drain スレッドは EOF で終了する。join してリークを防ぐ。
-                    let _ = stdout_handle.join();
-                    let _ = stderr_handle.join();
-                    anyhow::bail!(
-                        "ai-usage timed out after {}s: {}",
-                        timeout.as_secs(),
-                        crate::display::format_command(command)
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
+    // 呼び出し元が tokio のランタイム内でも使えるよう、専用スレッドで非同期 I/O を動かす。
+    // 子の終了と stdout/stderr の EOF をまとめて期限内に待ち、読み取りスレッドの join を避ける。
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| -> Result<Vec<u8>> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to create ai-usage runtime")?;
+                runtime.block_on(async {
+                    use tokio::io::AsyncReadExt;
+                    let mut builder = tokio::process::Command::new(&command[0]);
+                    builder.args(&command[1..]);
+                    for (key, value) in env {
+                        if value.is_empty() {
+                            builder.env_remove(key);
+                        } else {
+                            builder.env(key, value);
+                        }
+                    }
+                    // ラッパーが孫プロセスを起動しても、タイムアウト時にまとめて終了させる。
+                    #[cfg(unix)]
+                    builder.process_group(0);
+                    let mut child = builder
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .kill_on_drop(true)
+                        .spawn()
+                        .with_context(|| {
+                            format!(
+                                "failed to spawn ai-usage command: {}",
+                                display::format_command(command)
+                            )
+                        })?;
+                    #[cfg(unix)]
+                    let group_pid = child.id();
+                    let mut stdout = child
+                        .stdout
+                        .take()
+                        .context("ai-usage stdout is not piped")?;
+                    let mut stderr = child
+                        .stderr
+                        .take()
+                        .context("ai-usage stderr is not piped")?;
+                    let output = tokio::time::timeout(timeout, async {
+                        tokio::try_join!(
+                            child.wait(),
+                            async {
+                                let mut bytes = Vec::new();
+                                stdout.read_to_end(&mut bytes).await?;
+                                Ok(bytes)
+                            },
+                            async {
+                                let mut bytes = Vec::new();
+                                stderr.read_to_end(&mut bytes).await?;
+                                Ok(bytes)
+                            },
+                        )
+                    })
+                    .await;
+                    match output {
+                        Ok(Ok((status, stdout, stderr))) => {
+                            if !status.success() {
+                                anyhow::bail!(
+                                    "ai-usage exited with {}: {}",
+                                    status,
+                                    String::from_utf8_lossy(&stderr).trim()
+                                );
+                            }
+                            Ok(stdout)
+                        }
+                        failure => {
+                            #[cfg(unix)]
+                            if let Some(pid) = group_pid {
+                                // pid は process_group(0) で作った自分の子のグループ ID。負値でグループ全体を指定する。
+                                unsafe {
+                                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                                }
+                            }
+                            // 直接の子も必ず回収する。既に終了している場合の kill エラーは無視できる。
+                            let _ = child.kill().await;
+                            match failure {
+                                Ok(Err(error)) => {
+                                    Err(error).context("failed to collect ai-usage output")
+                                }
+                                Err(_) => anyhow::bail!(
+                                    "ai-usage timed out after {}s: {}",
+                                    timeout.as_secs_f64(),
+                                    display::format_command(command)
+                                ),
+                                Ok(Ok(_)) => unreachable!(),
+                            }
+                        }
+                    }
+                })
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("ai-usage startup thread panicked"))?
+    })
 }
 
 /// 指定したパスのファイルに実行ビットを付与する。
@@ -427,15 +453,6 @@ pub fn print_plan(plan: &ExecutionPlan, parallelism: usize) {
     println!();
 }
 
-/// 実行用の一時ディレクトリを、必ず自分が作った空のディレクトリとして用意する。
-///
-/// 旧実装は `let _ = remove_dir_all(...)` で削除失敗を握り潰していたため、
-/// 消せなかったディレクトリをそのまま再利用していた。`temp_dir()` が共有の
-/// `/tmp` になる環境（Linux。macOS は `TMPDIR` がユーザーごと）では、
-/// 他ユーザーが先に `/tmp/token-burn` を作っておくと sticky bit により削除が
-/// 失敗する一方 `create_dir_all` は成功するため、他人の所有ディレクトリへ
-/// ワーカースクリプトやプロンプトを書き込んでしまう。削除失敗は
-/// （存在しない場合を除き）エラーとして扱い、作成後は所有者のみアクセス可にする。
 /// tmux の shell-command 引数として渡すスクリプトパスを組み立てる。
 ///
 /// tmux は `new-session` / `split-window` の shell-command を **`sh -c` 経由**で実行する
@@ -449,6 +466,15 @@ fn tmux_script_arg(path: &std::path::Path) -> String {
     shell_escape(&path.to_string_lossy())
 }
 
+/// 実行用の一時ディレクトリを、必ず自分が作った空のディレクトリとして用意する。
+///
+/// 旧実装は `let _ = remove_dir_all(...)` で削除失敗を握り潰していたため、
+/// 消せなかったディレクトリをそのまま再利用していた。`temp_dir()` が共有の
+/// `/tmp` になる環境（Linux。macOS は `TMPDIR` がユーザーごと）では、
+/// 他ユーザーが先に `/tmp/token-burn` を作っておくと sticky bit により削除が
+/// 失敗する一方 `create_dir_all` は成功するため、他人の所有ディレクトリへ
+/// ワーカースクリプトやプロンプトを書き込んでしまう。削除失敗は
+/// （存在しない場合を除き）エラーとして扱い、作成後は所有者のみアクセス可にする。
 fn prepare_run_tmp_dir(tmp_dir: &std::path::Path) -> Result<()> {
     match std::fs::remove_dir_all(tmp_dir) {
         Ok(()) => {}
@@ -472,7 +498,7 @@ fn prepare_run_tmp_dir(tmp_dir: &std::path::Path) -> Result<()> {
 pub fn execute_plan_tmux(
     plan: ExecutionPlan,
     parallelism: usize,
-    deadline: Duration,
+    deadline_epoch: i64,
     state_file: &std::path::Path,
     reset_info: &str,
     report_dir: &std::path::Path,
@@ -495,6 +521,8 @@ pub fn execute_plan_tmux(
     // された」と誤判定して最終集計を出さずに終わる。
     // `new-session -s` は新しい名前の指定であってターゲットではないので素の名前を渡す。
     let session_target = format!("={session}");
+    // ウィンドウ・ペイン対象では末尾の : が必要。無いとウィンドウ名として解釈される。
+    let window_target = format!("{session_target}:");
 
     // 既存セッションがあれば終了
     let _ = std::process::Command::new("tmux")
@@ -653,7 +681,6 @@ pub fn execute_plan_tmux(
     // 一時停止中（5 時間枠のように待てば回復する枠での停止）は再開時刻まで待つ。
     // デッドラインは相対秒ではなく絶対 epoch で渡す。ワーカーは別プロセスで、しかも
     // 待機を挟むため、相対値だと基準時刻がプロセスごとにずれる。
-    let deadline_epoch = chrono::Utc::now().timestamp() + deadline.as_secs() as i64;
     let mut gate_claim_cmd = format!(
         "{} gate-claim --stop-file {} --queue-dir {} --deadline-epoch {}",
         shell_escape(&exe_path.to_string_lossy()),
@@ -686,13 +713,13 @@ pub fn execute_plan_tmux(
 
     // 左ペイン用モニタースクリプトを生成
     let monitor_path = tmp_dir.join("monitor.sh");
-    let command_str = plan.agent.command.join(" ");
+    let command_str = display::format_command(&plan.agent.command);
     let monitor_script = generate_monitor_script(
         &plan.agent.name,
         &command_str,
         reset_info,
         total,
-        deadline.as_secs(),
+        deadline_epoch,
         &marker_dir,
         session,
         worker_count,
@@ -735,7 +762,14 @@ pub fn execute_plan_tmux(
         // ワーカー用のペイン分割より先に置く。設定できなくても実行そのものは完走するため、
         // ここは失敗しても止めず、ペインが残り得ることだけ警告する。
         let remain_on_exit_off = std::process::Command::new("tmux")
-            .args(["set-option", "-w", "-t", session, "remain-on-exit", "off"])
+            .args([
+                "set-option",
+                "-w",
+                "-t",
+                &window_target,
+                "remain-on-exit",
+                "off",
+            ])
             .status();
         if !remain_on_exit_off.is_ok_and(|status| status.success()) {
             eprintln!(
@@ -750,7 +784,7 @@ pub fn execute_plan_tmux(
                 "split-window",
                 "-h",
                 "-t",
-                session,
+                &window_target,
                 &tmux_script_arg(&script_paths[0]),
             ])
             .status()
@@ -769,7 +803,7 @@ pub fn execute_plan_tmux(
                     "split-window",
                     "-v",
                     "-t",
-                    &format!("{}:.right", session),
+                    &format!("{}:.right", session_target),
                     &tmux_script_arg(script),
                 ])
                 .status()
@@ -797,31 +831,43 @@ pub fn execute_plan_tmux(
 
     // 右側ペインのサイズを均等化
     let _ = std::process::Command::new("tmux")
-        .args(["select-layout", "-t", session, "main-vertical"])
+        .args(["select-layout", "-t", &window_target, "main-vertical"])
         .status();
 
     // 左ペイン（モニター）の幅を約30%に設定
     let _ = std::process::Command::new("tmux")
-        .args(["resize-pane", "-t", &format!("{}:.0", session), "-x", "35%"])
+        .args([
+            "resize-pane",
+            "-t",
+            &format!("{}:.0", session_target),
+            "-x",
+            "35%",
+        ])
         .status();
 
     // スクロールバックとマウスサポートを有効化
     let _ = std::process::Command::new("tmux")
-        .args(["set-option", "-t", session, "history-limit", "50000"])
+        .args(["set-option", "-t", &window_target, "history-limit", "50000"])
         .status();
     let _ = std::process::Command::new("tmux")
-        .args(["set-option", "-t", session, "mouse", "on"])
+        .args(["set-option", "-t", &window_target, "mouse", "on"])
         .status();
 
     // ペインボーダータイトルを有効化
     let _ = std::process::Command::new("tmux")
-        .args(["set-option", "-t", session, "pane-border-status", "top"])
+        .args([
+            "set-option",
+            "-t",
+            &window_target,
+            "pane-border-status",
+            "top",
+        ])
         .status();
     let _ = std::process::Command::new("tmux")
         .args([
             "set-option",
             "-t",
-            session,
+            &window_target,
             "pane-border-format",
             " #{pane_title} ",
         ])
@@ -829,14 +875,19 @@ pub fn execute_plan_tmux(
 
     // モニターペインにフォーカス
     let _ = std::process::Command::new("tmux")
-        .args(["select-pane", "-t", &format!("{}:.0", session)])
+        .args(["select-pane", "-t", &format!("{}:.0", session_target)])
         .status();
 
     println!(
         "{} {} (deadline: {})",
         "Attached to tmux session:".bold(),
         session.cyan(),
-        display::format_duration(deadline).red()
+        display::format_duration(Duration::from_secs(
+            deadline_epoch
+                .saturating_sub(crate::rate_control::now_epoch())
+                .max(0) as u64
+        ))
+        .red()
     );
     println!(
         "  {}",
@@ -845,7 +896,7 @@ pub fn execute_plan_tmux(
 
     // セッションに接続（終了またはkillされるまでブロック）
     std::process::Command::new("tmux")
-        .args(["attach-session", "-t", session])
+        .args(["attach-session", "-t", &session_target])
         .status()
         .context("Failed to attach to tmux session")?;
 
@@ -862,7 +913,11 @@ pub fn execute_plan_tmux(
             "Detached from tmux session:".bold(),
             session.cyan()
         );
-        println!("  {} tmux attach -t {}", "Reattach:".dimmed(), session);
+        println!(
+            "  {} tmux attach -t {}",
+            "Reattach:".dimmed(),
+            session_target
+        );
         println!(
             "  {} {}",
             "Runtime files kept:".dimmed(),
@@ -1159,6 +1214,37 @@ mod tests {
         assert_eq!(bytes, b"hello world");
     }
 
+    #[test]
+    fn spawn_ai_usage_sync_times_out_if_descendant_keeps_pipe_open() {
+        // 親だけが正常終了しても、孫が stdout/stderr を持っていれば全出力は確定しない。
+        let result = spawn_ai_usage_sync_with_timeout(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "sleep 3 & printf done; exit 0".into(),
+            ],
+            &Default::default(),
+            Duration::from_millis(200),
+        );
+        assert!(result.is_err(), "EOF 待ちもタイムアウトの対象にする");
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn spawn_ai_usage_sync_kills_descendant_on_timeout() {
+        let start = std::time::Instant::now();
+        let result = spawn_ai_usage_sync_with_timeout(
+            &["sh".into(), "-c".into(), "sleep 3 & wait".into()],
+            &Default::default(),
+            Duration::from_millis(200),
+        );
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "孫の終了まで待ってはいけない"
+        );
+    }
+
     /// 設定の env は「空文字の値は unset」という規約（シェル側は `env -u KEY`）で扱う。
     /// `envs()` へ素通しすると空文字がそのまま子へ渡り、`CLAUDE_CONFIG_DIR=""` を
     /// 「既定に戻す」つもりで書いた profile で ai-usage が cwd 相対の設定ディレクトリを
@@ -1217,8 +1303,8 @@ mod tests {
 
     #[test]
     fn spawn_ai_usage_sync_handles_output_larger_than_pipe_buffer() {
-        // stdout がパイプバッファ（macOS で ~16KB）を大きく超えても、別スレッドで並行に
-        // drain するためデッドロックせず全出力を返す。旧実装（子の終了後にまとめて読む）では
+        // stdout がパイプバッファ（macOS で ~16KB）を大きく超えても、非同期 I/O で並行に
+        // 読むためデッドロックせず全出力を返す。旧実装（子の終了後にまとめて読む）では
         // 子が write(2) でブロックして終了できず、タイムアウトまでハングする回帰を検知する。
         let size = 100_000;
         let result = spawn_ai_usage_sync_with_timeout(

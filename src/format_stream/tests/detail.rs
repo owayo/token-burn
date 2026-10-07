@@ -261,7 +261,7 @@ fn extract_tool_detail_edit_inplace_replacement_counts_changed_lines() {
 fn extract_tool_detail_truncates_long_values() {
     let long_path = format!(r#"{{"file_path":"{}"}}"#, "a".repeat(200));
     let result = extract_tool_detail("Read", &long_path);
-    assert!(result.len() <= 103); // 100 + "..."
+    assert!(result.len() <= 103); // 本文 100 バイトと省略記号の 3 バイト
     assert!(result.ends_with("..."));
 }
 

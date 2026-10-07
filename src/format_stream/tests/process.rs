@@ -3,6 +3,27 @@
 use super::*;
 
 #[test]
+fn permission_denied_does_not_join_an_open_thinking_line() {
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"調査中"}}}"#,
+        r#"{"type":"system","subtype":"permission_denied","tool_name":"Bash","decision_reason":"Permission prompts are not available in this context"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"続行"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ].join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    let denial = clean
+        .lines()
+        .find(|line| line.contains("Permission denied"))
+        .expect("権限拒否を表示する");
+    assert!(!denial.contains('💭'), "{clean}");
+    assert!(
+        clean.lines().filter(|line| line.contains('💭')).count() >= 2,
+        "{clean}"
+    );
+}
+
+#[test]
 fn process_text_only_response() {
     // 思考ブロックなしの単純なテキスト応答（例: "say hello"）
     let input = [

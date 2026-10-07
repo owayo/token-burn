@@ -902,16 +902,13 @@ async fn run(opts: RunOptions) -> Result<()> {
     }
 
     let reset_info = sched.next_reset.format("%Y/%m/%d %H:%M").to_string();
-    // デッドラインは起動時の残り時間ではなく、実行直前の現在時刻から引き直す。
-    // TUI での選択は人手なので分単位で止まり、スキャン（gh CLI / git ls-files）にも
-    // 時間がかかる。起動時の値をそのまま渡すと、そこに費やした分だけモニターの
-    // デッドラインが後ろへずれ、実際のリセット後まで新規タスクを開始してしまう。
-    let time_until_reset = remaining_until(sched.next_reset);
+    // スキャン・TUI・起動時のキャッシュ取得にかかった時間で期限がずれないよう、
+    // 残り秒数ではなく、解決したリセット時刻をそのまま全ワーカーとモニターへ渡す。
     let report_dir = resolve_report_dir(&config.settings);
     executor::execute_plan_tmux(
         plan,
         run_settings.workers,
-        time_until_reset,
+        sched.next_reset.timestamp(),
         &state_file,
         &reset_info,
         &report_dir,
@@ -1032,16 +1029,6 @@ fn resolve_force_paths(
 /// 処理済みカットオフ (`skip_within` / 前回リセット) は絶対時刻の窓なので、窓をまたいだ
 /// 時点で処理済み履歴が一斉に無効化される。ターゲット順が固定のままだと、そのたびに
 /// リストの先頭 `limit` 件だけが再処理され、末尾のリポジトリには永遠に到達しない。
-/// 指定時刻までの残り時間。すでに過ぎている場合は 0（デッドライン到達扱い）。
-///
-/// `AgentSchedule::time_until_reset` は起動時のスナップショットなので、スキャンや TUI 操作に
-/// かかった時間の分だけ実際より長くなる。実行直前にここで引き直す。
-fn remaining_until(reset: DateTime<chrono::FixedOffset>) -> std::time::Duration {
-    (reset - chrono::Local::now().fixed_offset())
-        .to_std()
-        .unwrap_or(std::time::Duration::ZERO)
-}
-
 /// 最終ファイル変更日時が古い順に並べ替えることで、カットオフが切れても前回処理した分は
 /// 後ろへ回り、放置されているリポジトリから消化される。
 ///

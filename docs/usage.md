@@ -52,17 +52,21 @@ Saved sessions are stored in `resume.json` next to `state.json` (default `~/.con
 - **Detach-safe tmux runtime**: Keeps worker scripts and queues when you detach, so background tasks continue safely until the tmux session ends
 - **Failure-safe tmux startup**: Removes the partially created session and temporary runtime directory if pane construction fails
 
+Workers and the monitor share the original reset timestamp. Scanning, TUI interaction, and startup usage collection cannot extend the deadline. Every tmux attachment, pane split, option change, and session check uses an exact session-name match.
+
 What the monitor pane and the worker panes show is described in [monitor.md](monitor.md).
 
 ## Dry run
 
 - **Dry run**: Preview execution plan without running commands
-- **Credential-safe command display**: Redacts environment assignments and common credential option values as `<redacted>` in dry-run plans and ai-usage startup errors while executing the original values unchanged. Only `KEY=VALUE` pairs that precede the executable (the `env FOO=1 cmd` prefix) count as environment assignments — subcommand options such as `codex -c model='gpt-5.3-codex'` or the auto-injected `-c approval_policy=never` stay visible, since hiding them would defeat the point of a dry run
+- **Credential-safe command display**: Redacts environment assignments and common credential option values as `<redacted>` in dry-run plans, the tmux monitor, and ai-usage startup errors while executing the original values unchanged. Only `KEY=VALUE` pairs that precede the executable (the `env FOO=1 cmd` prefix) count as environment assignments — subcommand options such as `codex -c model='gpt-5.3-codex'` or the auto-injected `-c approval_policy=never` stay visible, since hiding them would defeat the point of a dry run. Assignments after options such as `env -u KEY` are also redacted; `env -S` / `--split-string` arguments are redacted in full
 
 ## Logs and state
 
+- **Classification failures**: An abnormal classifier exit records a failure even if the AI command exited successfully
 - **Collision-safe logs**: Per-task logs are numbered to avoid overwrite when display names collide
 - **Logging pipeline safety**: Marks a task failed if `format-stream`, `tee`, or raw jsonl capture fails instead of recording it as completed. A target directory deleted or renamed between scan and execution is reported accurately as `target directory is unavailable` instead of an unrelated logging pipeline failure
+- **Interrupted-session persistence**: Saves resume information and updates failed-resume counts before publishing completion markers, so automatic session teardown cannot interrupt those writes
 - **Concurrent-safe state**: Parallel workers update `state.json` with atomic rename under a stable sidecar lock file; malformed or unreadable existing state aborts the update without overwriting previously recorded history
 
 Logs are written under `report_dir` (default `~/Documents/token-burn`), and report directories older than `cleanup_after` are deleted automatically; see [Settings](configuration.md#settings).

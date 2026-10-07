@@ -424,9 +424,8 @@ pub fn write_stop(stop_file: &Path, reason: &str) -> std::io::Result<bool> {
     write_stop_unlocked(stop_file, reason)
 }
 
-/// ロックを取らずに stop file を作成する。呼び出し側が既に control ロックを保持して
-/// いる場合（同一プロセスからの再取得は `flock` の意味論上ブロックしないが、意図を
-/// 明示するため経路を分ける）に使う。
+/// ロックを取らずに stop file を作成する。呼び出し側で control ロックを取得して使う。
+/// 同一プロセスでも別の open で取り直すと待機し得るため、ここでは再取得しない。
 fn write_stop_unlocked(stop_file: &Path, reason: &str) -> std::io::Result<bool> {
     match OpenOptions::new()
         .write(true)

@@ -90,6 +90,8 @@ CI (`.github/workflows/ci.yml`) の quality ジョブは Linux と macOS で `ma
 
 実行ファイルが `codex` の場合、無人実行で承認待ちにより停止しないよう `-c approval_policy=never` を実行ファイル直後に自動付与します（`codex -c approval_policy=never exec ...`）。`codex exec` には `--ask-for-approval` フラグが無い（0.136.0）ため、サブコマンドのオプション表面に依存しない top-level の config override として挿入します。`--sandbox`（サンドボックス）とは独立した軸のため、サンドボックス指定の有無に関わらず付与します。ユーザーが承認方針を明示済みの場合（`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）は上書きしません。
 
+`provider = "codex"` のコマンドに通常の `env` 前置きがある場合は、オプションと代入を保ち、内側の実行ファイルの直後へ承認方針を挿入します。`env --` の区切りも Codex の `--` と混同せず、内側で指定済みの承認方針を尊重します。
+
 ### ai-usage 連携
 
 `[ai_usage]` を設定すると、各エージェントのリセット時刻を `ai-usage --json` の実データ（`weekly.resets_at` 等）から自動取得します。`[ai_usage]` が無い、または `enabled = false` の場合は従来どおり `reset_weekday` / `reset_time` / `timezone` による曜日ベースの固定計算のみで動作します（後方互換）。
@@ -104,9 +106,11 @@ CI (`.github/workflows/ci.yml`) の quality ジョブは Linux と macOS で `ma
 
 リセット時刻は `DateTime<FixedOffset>` で保持します。ai-usage の `resets_at`（RFC3339、オフセット付き）は瞬間を保ったまま実行環境のローカル固定オフセットへ変換し、固定計算（タイムゾーンのオフセット）と同じ型で統一します。UTC で返る ai-usage 出力も `status` / `run` ではユーザーのローカル時刻として表示されます。`status` と `run` は各エージェントのスケジュールの導出元（`ai-usage (weekly)` / `fixed` / `fixed fallback: <理由>`）を表示し、ai-usage が静かに固定計算へ戻ることはありません。
 
-ドライランの実行計画、および ai-usage コマンドの起動失敗・タイムアウトエラーにコマンド列を表示するときは、環境変数代入と一般的な認証オプションの値を `<redacted>` に置き換えます。実際の子プロセスには元の引数を渡し、表示のために実行内容を変更しません。
+ドライランの実行計画、tmux モニター、および ai-usage コマンドの起動失敗・タイムアウトエラーにコマンド列を表示するときは、環境変数代入と一般的な認証オプションの値を `<redacted>` に置き換えます。実際の子プロセスには元の引数を渡し、表示のために実行内容を変更しません。
 
 環境変数代入として伏せるのは、**実行ファイルより前に並ぶ `KEY=VALUE`**（`env FOO=1 cmd` の前置き）だけです。実行ファイル以降の `key=value` はサブコマンドのオプション値で、既定 config の `codex -c model='gpt-5.3-codex' -c model_reasoning_effort='xhigh'` や自動注入の `-c approval_policy=never` が該当します。位置を見ずに伏せると、ドライランの目的（何がどう起動されるかの確認）そのものが果たせません（モデル・reasoning effort・承認方針が丸ごと `<redacted>` になっていました）。`--api-key=...` のような認証系オプションの `KEY=VALUE` 形式は、位置に関わらず伏せます。
+
+`env -u KEY` / `--unset` / `-C` / `--chdir` / `-P` などのオプションとその値は実行ファイルではありません。その後の `KEY=VALUE` も前置きの環境変数として伏せます。`env -S` / `--split-string` は認証値を含む複数の引数を 1 個へ収められるため、シェル文字列を再解釈せず表示用の値全体を伏せます。通常の実行ファイル直後の `mode=value` のような引数は環境変数扱いしません。
 
 ### 停止の 2 種類（一時停止 pause / 恒久停止 stop）
 
@@ -225,9 +229,10 @@ ai-usage 連携が有効なとき、`rate_limit_threshold`（%）は 2 経路で
 | リトライ可能エラー / キャンセル | 3 / — | 変更しない |
 
 - `mark` は `state.json` を先に書き、エントリはその後で消します。逆順だと、エントリを消した直後に落ちたときに処理済み記録も再開情報も残らず、完了済みのターゲットを次の実行でまた最初から処理します。`state.json` を先に書いておけば、消し損ねたエントリは「`interrupted_at` より新しい処理済み記録がある」条件で使われなくなるだけなので、削除の失敗は警告にとどめます。`mark` は session ID を問わずそのエージェント・ディレクトリのエントリを消し、`resume.json` が無ければ何もしません（ロックファイルも作らない。`codex` など再開と無関係なエージェントの `mark` でも呼ばれるため）。
+- 再開情報の保存と失敗回数の更新は `failed-N` を作る前に完了させます。モニターは全タスクのマーカーを確認するとセッションを閉じるため、先にマーカーを作ると保存中のワーカーが終了し、中断セッションを失います。
 - 再びレート制限なら `failed_resumes` を 0 へ戻します。上限まで走れたこと自体が、そのセッションを続けられる証拠だからです。
 - 3 回で捨てるのは、壊れた transcript のように二度と続けられないセッションを、実行のたびに再開しては失敗し続けるのを防ぐためです。1 回で捨てないのは、認証切れのようにセッションと無関係な原因でも失敗するためです。リトライ可能エラーとキャンセルは、そのセッションを続けられるかどうかについて何も示さないので数えません。
-- `result` を出さずに非ゼロ終了した再開（`classify-result` は 0 のまま `CMD_EXIT` だけが非ゼロ。タスクスクリプトの `*)` 分岐）も失敗として数えます。transcript の読み込みで落ち続けるセッションは `result` を残さないため、分類 1 だけを数えていると上限に届かず、エントリが永久に残って実行のたびに再開しては落ちます。
+- `result` を出さずに非ゼロ終了した再開（`classify-result` は 0 のまま `CMD_EXIT` だけが非ゼロ。タスクスクリプトの `0)` 分岐）も失敗として数えます。transcript の読み込みで落ち続けるセッションは `result` を残さないため、分類 1 だけを数えていると上限に届かず、エントリが永久に残って実行のたびに再開しては落ちます。
 - セッションが消えていると、Claude Code は `No conversation found with session ID: <id>` を出し、exit 1 と共に `subtype:"error_during_execution"`・`num_turns:0`・`errors:[...]` の `result`（`result` 文字列は無い）を出します（Claude Code 2.1.280 で実測）。`classify-result` はこの形（`subtype` が `error_during_execution` で、かつ `errors[]` のいずれかが `No conversation found with session ID` を含む）に限って **4 = 再開不能（resume unavailable）** を返し、レート制限の判定より先に見ます。通常の失敗（1）に落とすと `failed_resumes` を数えるだけになり、エントリが捨てられるまで何も起きない再開を 3 回繰り返します。形で絞るのは、任意のエラー文で判定すると、本当に失敗したタスクを「まだ始まっていない」と見なして新しいセッションで二重に実行してしまうためです（`result` 本文に同じ文言があるだけのものや、起動時の別のエラーは 1 のまま）。
 - 新しいセッションは次の実行を待たずに同じタスクの中で始めます。次の実行がすることはまさに新しいセッションでの開始なので、今やれば実行 1 回ぶん早く済みます。失敗した再開は 1 ターンも進んでいない（`num_turns:0`）ので二重実行にもなりません。この 2 回目の試行は元の `<NNNN>_<name>.jsonl` / `.log` の隣の `<NNNN>_<name>.fresh.jsonl` / `<NNNN>_<name>.fresh.log` に書き、その結末は通常のタスクと同じに扱います（マーカーも 2 回目の結果で決まり、レート制限なら新しいセッションを保存する）。ログを試行ごとに分けるのは、分類も `session_id` の抽出も jsonl の最後の `result` を読むためです。同じ jsonl へ追記すると、新しいセッションが `result` を出さずに終わったとき（クラッシュ等）に再開失敗側の `result` を読んでしまい、上書きすれば再開に失敗した記録が消えます。キャンセルで 2 回目へ切り替えなかった場合と、再開しないタスクで万一 4 が返った場合は失敗として扱います。
 
@@ -327,6 +332,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - 各タスクは `queue_dir/pending-<idx>` と `tasks/task-<idx>.sh` として事前に書き出される
 - ワーカーは `token-burn gate-claim` に停止判定と claim をまとめて任せ、返ってきた番号の `task-<idx>.sh` を `source` で実行する。claim は同ロック下で `pending-<idx>` → `claimed-<idx>` の rename として行われる。停止判定と claim をシェル側で 2 段に分けていた頃は、その隙間に停止が発行されるとタスクが余計に開始されていた（前述「ワーカーのゲートと claim」）
 - 各タスクを `source` する前にワーカーループ先頭で `CANCELLED` フラグを 0 にリセットする。直前タスクの実行中に SIGINT/SIGTERM を受けて `CANCELLED=1` が立ったまま成功・早期 return しても、後続タスクの通常エラーを誤って `Cancelled` 判定しエラー記録を欠落させるのを防ぐ
+- `classify-result` が 0〜4 以外で終了した場合は、AI コマンドが正常終了していても分類失敗として記録し、`mark` を呼びません。結果を確認できないタスクを成功扱いするのを防ぎます。
 - タスクがエラー終了してもワーカーは `exec sleep infinity` せず、即座に次の `pending-*` を取りに行く
 - ワーカーは claim できる pending が尽きるまで処理を続ける。空キューは「全タスク完了」、停止・ゲート失敗は「停止」と表示し、いずれも `worker-done-<w>` を作成して終了する。終了するとそのペインは閉じるため、画面には走行中のワーカーだけが残る
 - 全タスクの処理が済むか全ワーカーが終了すると、モニターは集計とログパスを表示してからセッションを閉じ、token-burn を終了する（Ctrl-C 待ちはしない）
@@ -343,6 +349,8 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - セッション開始（`system` / `init`）のモデル・CLI バージョン・権限モードを 1 行表示（`ℹ Session <model> (v<version>, <permissionMode>)`）。これらは他のどのイベントにも現れず、`result.modelUsage` からは実際に課金されたモデルしか分からないため、CLI バージョンと `bypassPermissions` で走ったかどうかが完全に失われていた。セッションにつき 1 行のみ。実ログの `init.model` 等に混入する `claude-opus-5[1m]` のような壊れた末尾 SGR 断片はモデル表示の全経路で除去する
 - 文脈圧縮（`system` / `compact_boundary`）の発生時に、`compact_metadata.pre_tokens` / `post_tokens` と `duration_ms` を 1 行で表示する。実際の JSONL には圧縮前約 96 万トークンから数万トークンへ減ったイベントがあり、表示しないと長時間実行中に文脈が変わった時点を追えない。`cumulative_dropped_tokens` は累積値なので今回の削減量としては表示しない
 - 思考ブロック（`thinking`）のプログレスインジケーター。Claude Code は思考本文を伏せるため `thinking_delta` の `thinking` は空文字で届き、進捗は `estimated_tokens`（累積ではなく**増分**。実データは 50 / 100 / 150 単位で、1 ブロック合計 100〜500 程度）にだけ入る。50 トークンごとにドットを 1 つ出す。本文のバイト長だけを見ていた頃は実データ 7,516 件すべてでドットが 0 個になり、中身のない `💭 ` 行だけが並んでいた。本文が返る形式のために 100 バイトごとのカウントも残すが、情報源（推定トークン / 本文バイト）はブロック単位で最初に観測できた方に固定する（両方を加算するとドットが二重計上される）。ブロック終端に届く `estimated_tokens: null` かつ本文なしのデルタ（実データで 1,284 件）は進捗を報せないので、思考行を開かない
+- `system` / `permission_denied` のツール名、Agent ID、判定種別と拒否理由を独立した警告行へ表示。拒否理由は `decision_reason` を優先し、空なら `message` を使う。改行を除去し、長い文字列は Unicode を壊さず省略する
+- `tool_use_result.contentNotInModelContext` が boolean の `true` のときだけ完了行に `not-in-context` を表示する。実ログでは 57 件あり、ツールの成功とモデルへの結果の取り込みを区別するために必要
 - 長時間ツールの `tool_progress` を経過時間付き（例: `Bash running (1m 30s)`）で表示
 - ツール使用（`Read`/`Edit`/`Write`/`Bash`（小文字 `bash` を含む）/`BashOutput`/`Agent`/`Task`/`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`/`TaskStop`/`TaskOutput`/`Workflow`/`TeamCreate`/`Skill`/`SlashCommand`/`TodoWrite`/`Monitor`/`Grep`/`Glob`/`ScheduleWakeup`/`WebFetch`/`WebSearch`/`ToolSearch`/`SendMessage`/`AskUserQuestion`/Context7・Tavily・Codex MCP 等）の詳細表示と差分出力
 - サブエージェント内部のツール使用（`🔧 <ツール名> @<タスク名> <詳細>`）とテキスト出力（`💬 @<タスク名> <先頭 1 行>`）。`stream_event` はメインループ専用で、実データ 98,061 件すべてが `parent_tool_use_id: null` だった。サブエージェントのツール使用とテキストは `assistant` イベントにしか現れないため、ここを素通りしていた頃はツール完了行の 44%（1,178 / 2,695 件）が `✓ Bash @<タスク名>` だけになり、何のコマンドを打ったのかがログから完全に消えていた（`tool_id_map` への登録はしていたのでツール名だけは解決できていたが、`input` は `finalize_block` → `extract_tool_detail` を通るストリーム経路にしか繋がっていなかった）。サブエージェントの最終レポート（実データで 179 ブロック / 363KB）も同様に失われる（`task_notification.summary` は 60 文字に切られ、`✓ Agent` の完了行はメタデータを持つため `tool_result_string_summary` のフォールバックにも乗らない）。メインループの assistant イベントは通常 `stream_event` の再送なので重複表示しない。ただし API リトライ後に `message_start` と content block を伴わない応答が実在するため、ストリームで見た message ID が無い通常応答は本文・ツール行・Edit 差分を `assistant` から補う。判定は「帰属（`task_description` / `subagent_type`）があり、かつ `parent_tool_use_id` が非 null」で行う。`--include-partial-messages` は同一 message id の assistant を複数回送るため、ツール使用 id とテキスト内容で重複排除する。Edit の差分はメインループと同じく出す（実データのサブエージェント Edit は 7 セッションで 3 件しかなく出力量は増えない一方、変更内容は他のどの行にも現れない）
@@ -471,7 +479,7 @@ remote URL の owner / repo 抽出は末尾 2 セグメントを採用するた�
 - `Tab` / `Shift+Tab` で実行設定へ切り替え、ワーカー数（1 以上）・停止閾値（1〜100%）・ドライランを変更できます。CLI / config の実効値を `RunSettings` で渡し、`SelectorState` が編集後の値を持ち、`Outcome::Confirmed` で対象と設定をまとめて返します。ヘッダー・実行計画・実行処理は同じ確定値を使い、config は書き換えません。設定画面の Enter / Esc は対象へ戻るだけで、実行は対象画面の Enter（ドライランなら Preview）で確定します。設定の上下・Space 操作では対象の選択と順序を変更しません
 - 列幅は**表示幅（端末セル数、`unicode-width`）**で数えます（`truncate_chars` / `pad_end` / `display_path`）。`format!("{:<width$}")` はバイト幅で数えるため日本語を含むリポジトリ名で列がずれますが、char 数で数えても揃いません。ratatui は `unicode-width` でレイアウトするため、East Asian Wide 文字（1 文字 2 セル）を含む名前では char 数基準だと 1 文字ごとに 1 セルずつ後続の列が右へずれ、狭いペインでは行末がリスト枠で切り落とされます。パスはホームを `~` に畳んだうえで**先頭**を `…` で落とします（末尾にリポジトリ名が来るため、切るなら前を捨てる方が識別しやすい）
 
-TUI での選択は人手なので分単位で止まります。そのため `execute_plan_tmux` に渡すデッドラインは、起動時の `sched.time_until_reset` ではなく確定直前の現在時刻から `remaining_until` (`main.rs`) で引き直します。起動時の値をそのまま渡すと、選択やスキャン（gh CLI / `git ls-files`）に費やした分だけモニターのデッドラインが後ろへずれ、実際のリセット後まで新規タスクを開始してしまいます。
+`execute_plan_tmux` へは `sched.next_reset.timestamp()` を絶対 Unix epoch として渡し、全ワーカーの `gate-claim --deadline-epoch` とモニターの `END` に同じ値を設定します。スキャン、TUI の操作、起動時のキャッシュ取得にかかった時間を足してはいけません。相対秒数から tmux 起動時に作り直すと、実際のリセット後まで新規タスクを開始してしまいます。
 
 ## 実装上の注意点
 
@@ -485,14 +493,14 @@ TUI での選択は人手なので分単位で止まります。そのため `ex
 - `ai-usage --json` の枠データは `kind`（`five_hour` / `daily` / `weekly` / `monthly`）を読み、そこから `state_cutoff` の周期を導きます。スロット名（`weekly` / `five_hour`）と実際の枠長は一致しません。実データでは antigravity が `five_hour` スロットに `kind:"daily"`（24 時間枠）を、pixellab が `weekly` スロットに `kind:"monthly"`（月次枠）を返します。スロット名で決め打ちすると 24 時間枠を 5 時間として扱い、`state_cutoff`（= 直前の枠の開始点）が未来へ飛んで `filter_by_state` の `last >= cutoff` が恒偽になり、処理済みフィルタが黙って無効化されます（毎回同じ先頭ターゲットだけを再処理し続ける）。未知の `kind` はスロット名の既定周期へ落とします。
 - `scanner` から `git` を起動する箇所は `run_git_capture` に集約し、パスを `OsStr` のまま渡します。`to_string_lossy()` は不正な UTF-8 バイトを U+FFFD へ置換するため、非 UTF-8 のディレクトリ名では存在しないパスを git に渡すことになり、`username` 指定時はそのリポジトリが黙って対象から消えます。`git` 自体が PATH に無い場合は 1 プロセスにつき 1 回だけ警告します（黙って `None` にすると全リポジトリが対象外になって `No targets found` だけが出て、原因の手掛かりがゼロになる）。
 
-- リセット日時計算 (`schedule.rs`) は `naive_local()` をベースに行います。`DateTime::date_naive()` は UTC 日付を返すため、`weekday()` のローカル曜日と整合させるためにローカルタイムゾーンの日付を基準とします。Asia/Tokyo のような UTC+N のタイムゾーンで深夜帯（UTC 前日）に実行しても曜日がずれない設計です。
+- リセット日時計算 (`schedule.rs`) は `naive_local()` をベースに行います。`DateTime::date_naive()` もローカル日付を返し、UTC 日付は `naive_utc().date()` で取得します。`weekday()` とローカル日付を整合させ、Asia/Tokyo の深夜帯（UTC 前日）でも曜日がずれないようにします。
 - リセット時刻が DST（夏時間）遷移に重なる場合も `resolve_local_datetime` (`schedule.rs`) で解決します。曖昧な時刻（秋の繰り戻しで 2 回出現する時刻）は早い方を採用し、存在しない時刻（春の繰り上げでスキップされる時刻）は遷移直後の最初の有効な瞬間にフォールバックします。`from_local_datetime().earliest()` は存在しない時刻に対して `None` を返すため、`America/New_York` の `02:30` のように DST ギャップへ重なるリセット時刻だと、設定読み込みは成功するのに `status` / `run` が実行時に毎回失敗していました。これを防ぐ実装です。
 - 状態ファイル (`state.json`) の書き込みは「同一ディレクトリのテンポラリファイル (`.state.json.tmp.<PID>.<nanos>`) に書き出し → `rename` で本体に置き換える」 atomic rename パターンで行います。排他ロックは `state.json` 本体ではなく sidecar の `.state.json.lock` に取ります。本体をロックすると `rename` 後にロック対象 inode が古くなり、別ワーカーが新しい `state.json` を同時ロックできて更新を失うためです。`write_all` 途中の ENOSPC やプロセスクラッシュでも本体が壊れず、書き込み失敗時はテンポラリファイルを掃除します（次回起動時に残骸が積み重ならない）。ロック取得後に既存の JSON が壊れていた場合や、権限・I/O エラーで読み取れない場合は、空状態として上書きせず更新をエラーで中断し、原本と処理済み履歴を保全します。読み取り側の `State::load` も同じ方針で、存在しない場合のみ空状態として扱い、権限・I/O エラーはエラーとして伝搬します（JSON 破損時のみ警告を出して空状態で続行）。ここを空状態へ潰すと `filter_by_state` が全ターゲットを未処理と判断して消化済みリポジトリを再実行しクォータを二重消費するうえ、`token-burn mark` 側は書き込みで正しくエラーになるため `state.json` が更新されず、次回以降も同じ状態が再現して延々と同じターゲットを処理し続けます。`resume.json` の書き込みも同じ方式（sidecar の `.resume.json.lock`）ですが、計画時の読み込みだけは壊れていても警告して空として扱います（前述「中断セッションの再開（resume）」）。
 - tmux ワーカー / モニター起動前の `chmod +x` は終了コードを検証します。`output()` の戻り値だけ確認する旧実装では `chmod` が非ゼロで終了しても無視されてしまい、`permission denied` が tmux ペイン内で初めて顕在化していました。
 - tmux セッション作成後にペイン分割・ワーカー起動が失敗した場合は、そのセッションを kill して一時実行ディレクトリを削除します。セッションだけ作成されて後続コマンドが失敗すると、従来は孤立セッションと `/tmp/token-burn` 配下の実行資産が残っていました。
-- `kill-session` / `has-session` のセッション指定は `=` を付けた**厳密一致ターゲット**（`-t =token-burn`）で行います。tmux の `-t` は「完全一致 → 前方一致 → fnmatch」の順に解決するため、素の `token-burn` は目的のセッションが存在しないとき `token-burn-notes` のような無関係なセッションへ当たります（実測で確認）。起動時の「既存セッションがあれば終了」がそれを掴むと**ユーザーの別セッションを黙って破壊し**、`attach-session` 後の生存確認が掴むと「デタッチされた」と誤判定して最終集計を出さずに終わります。モニタースクリプトの `finish_session` / 強制終了も同じ理由で `-t "=$SESSION"` を使います。`new-session -s` は新しい名前の指定であってターゲットではないため素の名前を渡します。`split-window` / `select-pane` / `set-option` などはセッション作成後にしか走らず、完全一致が最優先で解決されるため素の名前のままです。
+- tmux のセッション対象はすべて `=` 付きの厳密一致（`-t =token-burn`、ウィンドウは `=token-burn:`、ペインは `=token-burn:.0` 等）にします。終了・生存確認だけでなく、接続、分割、レイアウト、設定も同じです。起動直後にモニターが終了すると、素の名前は `token-burn-notes` などの無関係なセッションへ前方一致してしまいます。モニターの終了処理も `-t "=$SESSION"` を使います。`new-session -s` はターゲットではなく新しい名前の指定なので素の名前を渡します。
 - 起動時キャッシュ初期化で ai-usage を同期起動する `spawn_ai_usage_sync_with_timeout` (`executor/mod.rs`) は、env を「空文字の値は unset」という設定側の規約（シェル経路の `env_prefix_parts` が `env -u KEY` へ変換するのと同じ意味）で適用します。`Command::envs()` へ素通しすると空文字がそのまま子プロセスへ渡り、`CLAUDE_CONFIG_DIR = ""` を「既定に戻す」つもりで書いた profile で ai-usage が cwd 相対の設定ディレクトリを見に行って別アカウントの使用率を拾います。この結果は起動時キャッシュ（`ai-usage-cache.json`）として usage-gate と共有されるため、誤った使用率で停止判定が走ります。
-- 起動時キャッシュ初期化で ai-usage を同期起動する `spawn_ai_usage_sync_with_timeout` (`executor/mod.rs`) は、子プロセスの stdout/stderr を**別スレッドで並行に drain** します。子の終了を待ってからまとめて読む実装では、出力がパイプバッファ（macOS では 16KB 程度）を超えたとき子の `write(2)` がブロックして終了できず、`try_wait` が永遠に `None` を返してタイムアウトまでハングするデッドロックに陥ります（大きな JSON や stderr へのログ出力で発生）。読み取りを終了監視から分離することでこれを防ぎます。
+- 起動時キャッシュ初期化の `spawn_ai_usage_sync_with_timeout` は専用スレッドの tokio ランタイムで stdout/stderr を並行に読み、子の終了と両パイプの EOF をまとめて 30 秒以内に待ちます。子が終了しても孫がパイプを保持すると EOF は届かないため、子の終了後に無期限の `join` をしてはいけません。Unix では独立したプロセスグループを作り、タイムアウトや読み取りエラー時はグループ全体を終了して直接の子を回収します。非同期読み取りのキャンセルにより EOF 待ちも打ち切れ、パイプ容量を超える出力もデッドロックせず回収できます。
 - `format-stream` の `truncate_str` は「返却文字列の char 数を `max` 以下に保つ」契約を満たします。省略記号 `"..."` を付ける余地が無い `max <= 3` の場合は先頭から `max` 文字までで切り詰めます（実コードの呼び出しサイトは最小でも 30 程度のため、契約強化に伴う表示変更はありません）。
 - 同じ `truncate_str` は**改行（LF / CR）を空白へ畳んでから**切り詰めます。呼び出し元はすべて「1 行の中へ埋め込む」用途ですが、実データの Bash `command` はヒアドキュメントや複数行スクリプトで改行を含み、2,797 件中 284 件が先頭 60 文字以内で改行していました。そのまま埋め込むと 1 行のはずのツール行が複数行へ割れ、`\x1b[2m` を開いたまま改行して閉じる `\x1b[0m` が最終行にしか出ません（実ログの整形結果で 145 件）。このモジュールは `break_open_line` まで作り込んで「1 イベント 1 行」を守っているので、切り詰め側でも行を割らないことを保証します。`task_notification` の `summary` のように別のフィールドが複数行になる場合も同じ経路で守られます。
 - 合成 user メッセージの hook feedback を切り出す `split_hook_feedback` は、`to_lowercase()` した文字列のバイト位置を元文字列へ流用しません。小文字化はバイト長を保存せず、`İ`(U+0130, 2 バイト) は 3 バイトへ伸び、`K`(U+212A KELVIN SIGN, 3 バイト) は 1 バイトへ縮むため、伸びた側では範囲外スライス、縮んだ側では非文字境界スライスで **panic** します。マーカーは純 ASCII なので、元文字列上で ASCII の大文字小文字だけ無視して探す（`find_ascii_case_insensitive`）と位置が常に正しく、UTF-8 では ASCII バイトが多バイト列の内部に現れないため結果は必ず文字境界になります。`format-stream` はパイプ中段なので、panic はパイプを閉じて上流の `claude` を SIGPIPE で道連れにし、数時間の実行を巻き添えにします。

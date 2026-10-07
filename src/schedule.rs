@@ -67,9 +67,9 @@ impl UsageWindow {
 /// 曜日 + 時刻 + タイムゾーンから次回リセットを固定計算する。
 /// `reset_weekday` / `reset_time` / `timezone` が揃っている必要がある。
 ///
-/// リセット日時計算は `naive_local()` をベースに行う。`DateTime::date_naive()` は
-/// UTC 日付を返すため、`weekday()` のローカル曜日と整合させるためにローカルタイム
-/// ゾーンの日付を基準とする。DST 遷移は `resolve_local_datetime` で吸収する。
+/// リセット日時計算は `naive_local()` をベースに行い、`weekday()` と同じタイムゾーンの
+/// 日付を使う。`date_naive()` もローカル日付を返すが、`naive_utc().date()` は UTC 日付の
+/// ため、日付境界では曜日がずれる。DST 遷移は `resolve_local_datetime` で吸収する。
 pub fn calculate_fixed_reset(agent: &RuntimeAgent) -> Result<AgentSchedule> {
     let tz_str = agent.timezone.as_deref().ok_or_else(|| {
         anyhow::anyhow!("Agent '{}' has no timezone for fixed schedule", agent.name)

@@ -3,6 +3,39 @@
 use super::*;
 
 #[test]
+fn tool_result_metadata_marks_content_excluded_from_model_context() {
+    let value = serde_json::json!({"contentNotInModelContext": true});
+    assert_eq!(tool_result_metadata(&value), "not-in-context");
+}
+
+#[test]
+fn tool_result_metadata_does_not_infer_excluded_content_from_other_values() {
+    for value in [
+        serde_json::json!({}),
+        serde_json::json!({"contentNotInModelContext": false}),
+        serde_json::json!({"contentNotInModelContext": null}),
+        serde_json::json!({"contentNotInModelContext": "true"}),
+    ] {
+        assert_eq!(tool_result_metadata(&value), "");
+    }
+}
+
+#[test]
+fn process_tool_result_keeps_excluded_context_marker_on_completion_line() {
+    let input = [
+        r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"tool_use","id":"tool_1","name":"Edit","input":{}}]}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool_1","content":"Updated"}]},"tool_use_result":{"contentNotInModelContext":true}}"#,
+    ].join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert!(
+        clean
+            .lines()
+            .any(|line| line.contains("✓ Edit") && line.contains("not-in-context")),
+        "{clean}"
+    );
+}
+
+#[test]
 fn process_tool_result_error() {
     // is_error=true の tool_result
     let input = [

@@ -87,6 +87,15 @@ fn append_outcome_metadata(
     {
         attrs.push("interrupted".to_string());
     }
+    // 実出力は保存されていても、モデルの文脈へ渡されていない場合がある。
+    // 完了マークだけではモデルがその内容を読めたように見えるため、明示されたときだけ示す。
+    if obj
+        .get("contentNotInModelContext")
+        .and_then(|value| value.as_bool())
+        == Some(true)
+    {
+        attrs.push("not-in-context".to_string());
+    }
     // 結果が画像の場合、テキスト内容が表示されない理由を示すマーカーを出す
     // （実データでは Bash 結果等に isImage:false が常設されるため true のときだけ表示）。
     if obj

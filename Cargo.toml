@@ -34,3 +34,6 @@ tempfile = "3.27.0"
 lto = true
 codegen-units = 1
 strip = true
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.190"

@@ -116,7 +116,7 @@ pub(crate) fn handle_stream_event(
                         block.tool_input.push_str(json);
                     }
                 }
-                _ => {} // signature_delta etc
+                _ => {} // signature_delta など表示しない差分
             }
         }
         "content_block_stop" => {
@@ -132,7 +132,7 @@ pub(crate) fn handle_stream_event(
             state.summary.update_from_message_delta(event);
         }
         "message_stop" => finalize_open_blocks(out, state.blocks)?,
-        _ => {} // message_start, message_delta
+        _ => {} // 未対応のイベントは無視する
     }
 
     Ok(())

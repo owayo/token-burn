@@ -1129,7 +1129,7 @@ mod tests {
     #[test]
     fn deselect_compacts_orders_and_reselect_appends() {
         let mut state = state_with(3, 3);
-        state.on_key(press(KeyCode::Down)); // r1
+        state.on_key(press(KeyCode::Down)); // r1 へ移動
         state.on_key(press(KeyCode::Char(' ')));
 
         assert_eq!(order_numbers(state.items()), vec![Some(1), None, Some(2)]);

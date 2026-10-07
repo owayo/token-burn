@@ -21,6 +21,7 @@ pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -
         "task_notification" => write_task_notification(v, out)?,
         "task_updated" => write_task_updated(v, out)?,
         "notification" => write_notification(v, out)?,
+        "permission_denied" => write_permission_denied(v, out)?,
         "api_retry" => write_api_retry(v, out)?,
         "model_refusal_fallback" => write_model_refusal_fallback(v, out)?,
         "hook_progress" | "hook_response" => {
@@ -354,6 +355,42 @@ fn write_task_updated(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
         }
         _ => {}
     }
+    Ok(())
+}
+
+/// 権限拒否のツール名・帰属・理由を、長い定型の案内より優先して表示する。
+///
+/// ツール完了のエラー本文にも拒否は出るが、無人実行で承認できなかった等の
+/// 構造化された理由はこのイベントだけにある。任意フィールドが欠けても拒否は表示する。
+fn write_permission_denied(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    let tool = first_non_empty_string(v, &["tool_name"]);
+    let tool = if tool.is_empty() { "?" } else { tool };
+    let agent = first_non_empty_string(v, &["agent_id"]);
+    let agent = if agent.is_empty() {
+        String::new()
+    } else {
+        format!(" @{}", truncate_inline(agent, 40))
+    };
+    let kind = first_non_empty_string(v, &["decision_reason_type"]);
+    let kind = if kind.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", truncate_inline(kind, 30))
+    };
+    let reason = first_non_empty_string(v, &["decision_reason", "message"]);
+    let reason = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", truncate_inline(reason, 120))
+    };
+    writeln!(
+        out,
+        "\x1b[33m  \u{26a0} Permission denied: {}{}{}{}\x1b[0m",
+        truncate_inline(tool, 40),
+        agent,
+        kind,
+        reason,
+    )?;
     Ok(())
 }
 

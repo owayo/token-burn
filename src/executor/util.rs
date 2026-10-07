@@ -67,7 +67,7 @@ fn strip_ansi(s: &str) -> String {
                     // introducer( ( ) * + - . / )＋終端バイトの 2 文字構成のため、
                     // introducer だけ捨てると終端バイト(例: B)が通常文字として漏れる。
                     // 両方スキップする。
-                    chars.next(); // introducer
+                    chars.next(); // 文字集合指定の開始文字
                     chars.next(); // 終端バイト
                 }
                 Some(_) => {

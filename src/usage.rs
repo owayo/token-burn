@@ -512,7 +512,6 @@ fn write_cache_atomic(cache_file: &Path, content: &[u8]) {
     }
 }
 
-/// stop_file を冪等に作成する。新規作成できたら true、既存なら false。
 /// usage-gate の閾値判定に渡す枠ごとの観測値を組み立てる。
 ///
 /// 周期はスロット名ではなく `kind`（`five_hour` / `daily` / `weekly` / `monthly`）から
@@ -536,6 +535,7 @@ fn gate_observations(acc: &AiUsageAccount) -> Vec<WindowObservation> {
     .collect()
 }
 
+/// stop_file を冪等に作成する。新規作成できたら true、既存または作成失敗なら false。
 fn write_stop_file(stop_file: &Path, reason: &str) -> bool {
     // 実装は `rate_control::write_stop` へ寄せる。ここに複製を持つと、停止発行を
     // claim と同じロックで直列化する等の変更が片方だけに入って再発する。

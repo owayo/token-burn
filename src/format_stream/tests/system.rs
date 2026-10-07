@@ -13,6 +13,60 @@ fn render(json: &str) -> String {
 }
 
 #[test]
+fn permission_denied_shows_the_structured_reason_and_agent() {
+    // ツール完了のエラー本文には、無人実行で承認できなかった理由が含まれない。
+    let out = render(
+        r#"{"type":"system","subtype":"permission_denied","tool_name":"Bash","tool_use_id":"tool_1","agent_id":"agent_1","decision_reason_type":"asyncAgent","decision_reason":"Permission prompts are not available in this context","message":"Permission to use Bash has been denied. Long guidance follows."}"#,
+    );
+    assert!(out.contains("Permission denied: Bash @agent_1 (asyncAgent)"));
+    assert!(out.contains("Permission prompts are not available in this context"));
+    assert!(!out.contains("Long guidance"));
+    assert_eq!(out.lines().count(), 1);
+}
+
+#[test]
+fn permission_denied_falls_back_to_message_when_reason_is_blank() {
+    let out = render(
+        r#"{"type":"system","subtype":"permission_denied","tool_name":"Edit","decision_reason":" \n ","message":"The edit was denied"}"#,
+    );
+    assert!(out.contains("Permission denied: Edit: The edit was denied"));
+    assert!(!out.contains('@'));
+}
+
+#[test]
+fn permission_denied_without_optional_fields_still_reports_the_denial() {
+    let out = render(r#"{"type":"system","subtype":"permission_denied"}"#);
+    assert!(out.contains("Permission denied: ?"));
+    assert!(!out.contains("null"));
+}
+
+#[test]
+fn permission_denied_normalizes_and_bounds_each_field() {
+    let value = serde_json::json!({
+        "type": "system",
+        "subtype": "permission_denied",
+        "tool_name": "Bash\r\ncommand",
+        "agent_id": "調査\nエージェント",
+        "decision_reason_type": "rule\nmatch",
+        "decision_reason": "理由\n".repeat(200),
+    });
+    let out = render(&value.to_string());
+    assert!(out.contains("Bash command @調査 エージェント (rule match)"));
+    assert!(out.contains("..."));
+    assert_eq!(out.lines().count(), 1);
+    assert!(out.chars().count() < 240);
+}
+
+#[test]
+fn permission_denied_ignores_non_string_optional_fields() {
+    let out = render(
+        r#"{"type":"system","subtype":"permission_denied","tool_name":false,"agent_id":42,"decision_reason_type":[],"decision_reason":{},"message":null}"#,
+    );
+    assert!(out.contains("Permission denied: ?"));
+    assert!(!out.contains('@'));
+}
+
+#[test]
 fn compact_boundary_shows_the_actual_token_reduction() {
     // 実ログの自動圧縮イベントと同じフィールド構造。
     let out = render(

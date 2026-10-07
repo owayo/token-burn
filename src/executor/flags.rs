@@ -142,13 +142,47 @@ fn ensure_claude_required_flags(agent: &mut RuntimeAgent) {
 /// `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）は
 /// その意図を尊重し、何も付与しない。
 fn ensure_codex_unattended_flags(command: &mut Vec<String>) {
-    if has_codex_approval_override(command) {
+    let executable = env_command_index(command);
+    if has_codex_approval_override(&command[executable..]) {
         return;
     }
-    // 実行ファイル（command[0]）の直後に top-level config override を挿入する。
-    let insert_at = command.len().min(1);
+    // env のオプションや代入を保ち、内側の実行ファイル直後に挿入する。
+    let insert_at = command.len().min(executable + 1);
     command.insert(insert_at, CODEX_APPROVAL_OVERRIDE.to_string());
     command.insert(insert_at, "-c".to_string());
+}
+
+/// env の前置きがある場合、実行ファイルが独立した引数になっている位置を返す。
+fn env_command_index(command: &[String]) -> usize {
+    if command_basename(command) != "env" {
+        return 0;
+    }
+    let mut idx = 1;
+    let mut options = true;
+    while let Some(arg) = command.get(idx) {
+        if options && arg == "--" {
+            idx += 1;
+            options = false;
+        } else if options && matches!(arg.as_str(), "-u" | "--unset" | "-C" | "--chdir" | "-P") {
+            idx += 2;
+        } else if options && (arg.starts_with("-S") || arg.starts_with("--split-string")) {
+            // split-string 内の実行ファイルは独立した引数ではない。既存の扱いを維持する。
+            return 0;
+        } else if options && arg.starts_with('-') {
+            idx += 1;
+        } else if arg.split_once('=').is_some_and(|(key, _)| {
+            !key.is_empty()
+                && key.bytes().enumerate().all(|(i, b)| {
+                    b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())
+                })
+        }) {
+            options = false;
+            idx += 1;
+        } else {
+            return idx;
+        }
+    }
+    0
 }
 
 /// ユーザーが codex の承認方針を明示済みかを判定する。
@@ -683,6 +717,46 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn codex_flags_follow_executable_inside_env_prefix() {
+        for prefix in [
+            vec!["env", "-u", "OLD_TOKEN", "TOKEN=value"],
+            vec!["/usr/bin/env", "--unset=OLD_TOKEN", "TOKEN=value"],
+            vec!["env", "-C", "/tmp", "TOKEN=value"],
+            vec!["env", "--", "TOKEN=value"],
+        ] {
+            let mut command: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+            command.extend(["codex", "exec"].map(String::from));
+            ensure_codex_unattended_flags(&mut command);
+            assert_eq!(&command[..prefix.len()], &prefix);
+            assert_eq!(
+                &command[prefix.len()..],
+                &["codex", "-c", "approval_policy=never", "exec"]
+            );
+            let once = command.clone();
+            ensure_codex_unattended_flags(&mut command);
+            assert_eq!(command, once);
+        }
+    }
+
+    #[test]
+    fn codex_flags_respect_explicit_policy_after_env_delimiter() {
+        let mut command = [
+            "env",
+            "--",
+            "TOKEN=value",
+            "codex",
+            "-a",
+            "on-request",
+            "exec",
+        ]
+        .map(String::from)
+        .to_vec();
+        let original = command.clone();
+        ensure_codex_unattended_flags(&mut command);
+        assert_eq!(command, original);
     }
 
     #[test]

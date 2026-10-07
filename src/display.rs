@@ -20,7 +20,11 @@ pub fn format_command(command: &[String]) -> String {
     // 既定 config の `codex -c model='gpt-5.3-codex'` や自動注入の `-c approval_policy=never`
     // が該当する。これらまで伏せると、ドライランの目的（何が起動されるかの確認）そのものが
     // 果たせない（モデル・reasoning effort・承認方針が丸ごと `<redacted>` になる）。
-    let mut in_env_prefix = true;
+    let mut in_env_prefix = command.first().is_some_and(|arg| {
+        std::path::Path::new(arg).file_name() == Some(std::ffi::OsStr::new("env"))
+    });
+    let mut env_options = true;
+    let mut env_option_value = false;
 
     for (index, arg) in command.iter().enumerate() {
         if index == 0 {
@@ -33,6 +37,47 @@ pub fn format_command(command: &[String]) -> String {
             continue;
         }
 
+        // `env -u KEY TOKEN=... cmd` の -u とその値は、実行ファイルではない。
+        // ここで前置き区間を終えると、それ以降の認証情報が表示へ漏れる。
+        if in_env_prefix && env_options {
+            if env_option_value {
+                rendered.push(arg.clone());
+                env_option_value = false;
+                continue;
+            }
+            if arg == "--" {
+                rendered.push(arg.clone());
+                env_options = false;
+                continue;
+            }
+            // -S は引数 1 個の中へコマンドと認証オプションまで収められる。
+            // シェル文字列を再解釈せず、この表示用引数全体を伏せる。
+            if arg == "-S" || arg == "--split-string" {
+                rendered.push(arg.clone());
+                redact_next = true;
+                in_env_prefix = false;
+                continue;
+            }
+            if arg.starts_with("--split-string=") || arg.starts_with("-S") {
+                let prefix = if arg.starts_with("--split-string=") {
+                    "--split-string="
+                } else {
+                    "-S"
+                };
+                rendered.push(format!("{prefix}{REDACTED_COMMAND_VALUE}"));
+                in_env_prefix = false;
+                continue;
+            }
+            if arg.starts_with('-')
+                && !is_sensitive_option(arg.split_once('=').map_or(arg.as_str(), |(key, _)| key))
+            {
+                env_option_value =
+                    matches!(arg.as_str(), "-u" | "--unset" | "-C" | "--chdir" | "-P");
+                rendered.push(arg.clone());
+                continue;
+            }
+        }
+
         match arg.split_once('=') {
             // 認証系オプションの `--key=value` 形式は位置に関わらず伏せる。
             Some((key, _)) if is_sensitive_option(key) => {
@@ -41,6 +86,7 @@ pub fn format_command(command: &[String]) -> String {
             }
             Some((key, _)) if in_env_prefix && is_env_key(key) => {
                 rendered.push(format!("{key}={REDACTED_COMMAND_VALUE}"));
+                env_options = false;
                 continue;
             }
             _ => {}
@@ -193,6 +239,57 @@ mod tests {
             format_command(&command),
             "env API_TOKEN=<redacted> ai-usage --json"
         );
+    }
+
+    #[test]
+    fn format_command_redacts_env_assignments_after_unset_options() {
+        for prefix in [
+            vec!["env", "-u", "OLD_TOKEN"],
+            vec!["/usr/bin/env", "--unset", "OLD_TOKEN"],
+            vec!["env", "--unset=OLD_TOKEN"],
+            vec!["env", "-uOLD_TOKEN"],
+            vec!["env", "-i", "--"],
+            vec!["env", "-C", "/tmp"],
+            vec!["env", "--chdir", "/tmp"],
+            vec!["env", "-P", "/usr/bin"],
+        ] {
+            let mut command: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+            command
+                .extend(["API_TOKEN=top-secret", "codex", "-c", "model=example"].map(String::from));
+            let rendered = format_command(&command);
+            assert!(!rendered.contains("top-secret"), "{rendered}");
+            assert!(
+                rendered.contains("API_TOKEN=<redacted> codex -c model=example"),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_command_keeps_key_value_argument_after_the_executable() {
+        let command = ["client", "mode=example"].map(String::from);
+        assert_eq!(format_command(&command), "client mode=example");
+    }
+
+    #[test]
+    fn format_command_redacts_env_split_string_without_interpreting_it() {
+        for args in [
+            vec!["env", "-S", "client --api-key=top-secret"],
+            vec!["env", "--split-string", "client --token top-secret"],
+            vec!["env", "--split-string=client --password=top-secret"],
+            vec!["env", "-Sclient --secret=top-secret"],
+        ] {
+            let command: Vec<String> = args.into_iter().map(String::from).collect();
+            let rendered = format_command(&command);
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(!rendered.contains("top-secret"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn format_command_redacts_credentials_even_in_invalid_env_options() {
+        let command = ["env", "--token=top-secret"].map(String::from);
+        assert_eq!(format_command(&command), "env --token=<redacted>");
     }
 
     /// 実行ファイル以降の `key=value` はサブコマンドのオプション値なので伏せない。

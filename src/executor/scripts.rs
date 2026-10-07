@@ -13,7 +13,7 @@ pub(super) fn generate_monitor_script(
     command_str: &str,
     reset_info: &str,
     total: usize,
-    deadline_secs: u64,
+    deadline_epoch: i64,
     marker_dir: &std::path::Path,
     session: &str,
     worker_count: usize,
@@ -56,7 +56,7 @@ AGENT={agent}
 COMMAND={command}
 RESET={reset}
 TOTAL={total}
-DEADLINE={deadline}
+END={deadline}
 MARKER_DIR={marker_dir}
 SESSION={session}
 WORKER_COUNT={worker_count}
@@ -221,8 +221,6 @@ printf '\033]2;token-burn\033\\'
 printf '\033[?7l'
 tput civis 2>/dev/null
 
-END=$(($(date +%s) + DEADLINE))
-
 fetch_usage
 LAST_USAGE=$(date +%s)
 render
@@ -381,7 +379,7 @@ done
         command = command_escaped,
         reset = reset_escaped,
         total = total,
-        deadline = deadline_secs,
+        deadline = deadline_epoch,
         marker_dir = marker_dir_escaped,
         worker_count = worker_count,
         stop_file = stop_file_escaped,
@@ -663,9 +661,10 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "  2)\n",
                 // 後続タスクが誤って「Cancelled」と判定されないよう、ここでフラグを必ずリセットする
                 "    CANCELLED=0\n",
-                "    touch {failed}\n",
                 "    echo '━━━ Rate limited - not marking as completed ━━━'\n",
                 "{save_line}",
+                // モニターがマーカーを見て終了する前に再開情報を保存し終える。
+                "    touch {failed}\n",
                 "    ;;\n",
                 "  3)\n",
                 // 後続タスクが誤って「Cancelled」と判定されないよう、ここでフラグを必ずリセットする
@@ -685,12 +684,12 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "      echo '━━━ Cancelled ━━━'\n",
                 "    else\n",
                 "      printf '%s%s\\n' {prefix} \"$CLASSIFIED\" > {error}\n",
-                "      touch {failed}\n",
                 "      echo '━━━ Error - continuing ━━━'\n",
                 "{fail_line}",
+                "      touch {failed}\n",
                 "    fi\n",
                 "    ;;\n",
-                "  *)\n",
+                "  0)\n",
                 "    if [ \"$CMD_EXIT\" -ne 0 ]; then\n",
                 "      if [ $CANCELLED -eq 1 ]; then\n",
                 "        CANCELLED=0\n",
@@ -699,9 +698,9 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "      else\n",
                 "        ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
                 "        printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
-                "        touch {failed}\n",
                 "        echo '━━━ Error - continuing ━━━'\n",
                 "{crash_fail_line}",
+                "        touch {failed}\n",
                 "      fi\n",
                 "    elif {mark}; then\n",
                 "      touch {done}\n",
@@ -711,6 +710,18 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "      touch {failed}\n",
                 "      echo '━━━ Error - state update failed ━━━'\n",
                 "    fi\n",
+                "    ;;\n",
+                "  *)\n",
+                // 分類プロセスのクラッシュ等を、AI コマンドの正常終了だけで成功扱いしない。
+                "    if [ $CANCELLED -eq 1 ]; then\n",
+                "      CANCELLED=0\n",
+                "      echo '━━━ Cancelled ━━━'\n",
+                "    else\n",
+                "      printf '%sclassification failed (exit %s)\\n' {prefix} \"$CLASS_CODE\" > {error}\n",
+                "      echo \"━━━ Error - classification failed (exit $CLASS_CODE) ━━━\"\n",
+                "{fail_line}",
+                "    fi\n",
+                "    touch {failed}\n",
                 "    ;;\n",
                 "esac\n",
             ),
@@ -2829,14 +2840,18 @@ mod tests {
                     "case \"$1\" in\n",
                     "  format-stream) tee \"$3\" ;;\n",
                     "  classify-result)\n",
+                    "    if grep -q CLASSIFIER_CRASH \"$2\"; then exit 101; fi\n",
                     "    if grep -q NOT_FOUND \"$2\"; then echo 'No conversation found'; exit 4; fi\n",
                     "    if grep -q RATE \"$2\"; then exit 2; fi\n",
                     "    if grep -q FAIL \"$2\"; then echo boom; exit 1; fi\n",
                     "    exit 0 ;;\n",
-                    "  *) echo \"$*\" >> {calls} ;;\n",
+                    "  *)\n",
+                    "    if [ \"$1\" = resume-entry ] && [ -e {failed} ]; then echo premature-marker >> {calls}; fi\n",
+                    "    echo \"$*\" >> {calls} ;;\n",
                     "esac\n",
                 ),
                 calls = shell_escape(&calls.to_string_lossy()),
+                failed = shell_escape(&markers.join("failed-1").to_string_lossy()),
             ),
         )
         .unwrap();
@@ -2907,6 +2922,31 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// モニターは完了マーカーを見てセッションを閉じる。永続化中にマーカーが見えてはならない。
+    #[test]
+    fn resumed_task_persists_outcome_before_completion_marker() {
+        for outcome in ["RATE", "FAIL", "CRASH"] {
+            let (tmp, calls, _) = run_resumed_task(outcome, "unused");
+            assert!(calls.contains("resume-entry"), "永続化が必要: {outcome}");
+            assert!(
+                !calls.contains("premature-marker"),
+                "保存前に完了している: {calls}"
+            );
+            assert!(marker_names(&tmp).contains(&"failed-1".to_string()));
+        }
+    }
+
+    #[test]
+    fn classifier_crash_does_not_mark_successful_command_completed() {
+        let (tmp, calls, _) = run_resumed_task("CLASSIFIER_CRASH", "unused");
+        assert!(
+            !calls.lines().any(|line| line.starts_with("mark ")),
+            "分類できていないタスクを完了扱いにしてはいけない"
+        );
+        assert!(calls.contains("resume-entry fail"));
+        assert!(marker_names(&tmp).contains(&"failed-1".to_string()));
     }
 
     #[test]
