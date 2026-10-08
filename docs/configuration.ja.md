@@ -61,7 +61,7 @@ prompt = "prompts/test-coverage.md"  # 任意
 
 [[agents]]
 name = "codex"
-command = ["codex", "exec", "--full-auto", "-c", "model='gpt-5.3-codex'", "-c", "model_reasoning_effort='xhigh'"]
+command = ["codex", "exec", "--sandbox", "workspace-write", "-c", "model='gpt-5.3-codex'", "-c", "model_reasoning_effort='xhigh'"]
 reset_weekday = "thursday"
 reset_time = "09:00"
 timezone = "Asia/Tokyo"
