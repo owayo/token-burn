@@ -51,6 +51,7 @@ Saved sessions are stored in `resume.json` next to `state.json` (default `~/.con
 - **Self-closing run**: Workers close their own pane as soon as they run out of tasks, and the monitor tears down the tmux session once everything is processed — no Ctrl-C needed. The final tally and log path are reprinted on the terminal you started from
 - **Detach-safe tmux runtime**: Keeps worker scripts and queues when you detach, so background tasks continue safely until the tmux session ends
 - **Failure-safe tmux startup**: Removes the partially created session and temporary runtime directory if pane construction fails
+- **No terminal flow control in tmux panes**: The worker and monitor panes turn off XON/XOFF (`stty -ixon`). With it on, a stray Ctrl-S stops a pane's output until a key is pressed: in a worker pane it blocks the log pipeline and then the agent writing into it, and in the monitor pane it freezes the display and the automatic shutdown. Either way it looks exactly like a hung run. Scroll back with tmux copy mode instead
 
 Workers and the monitor share the original reset timestamp. Scanning, TUI interaction, and startup usage collection cannot extend the deadline. Every tmux attachment, pane split, option change, and session check uses an exact session-name match.
 

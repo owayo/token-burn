@@ -220,6 +220,11 @@ trap 'RESIZED=1' WINCH
 printf '\033]2;token-burn\033\\'
 printf '\033[?7l'
 tput civis 2>/dev/null
+# モニターペインは tmux が既定でフォーカスするペイン。端末の IXON（XON/XOFF フロー制御）が
+# 有効だと、誤って押された ^S（XOFF）で出力が止まり、再描画だけでなく全タスク完了後の
+# 自動終了（finish_session の kill-session）まで、何かキーを押すまで進まなくなる。
+# ワーカーペインと同じく無効にする。
+stty -ixon 2>/dev/null || true
 
 fetch_usage
 LAST_USAGE=$(date +%s)
@@ -866,6 +871,13 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "  if [ -n \"$CURRENT_FAILED_MARKER\" ]; then touch \"$CURRENT_FAILED_MARKER\"; fi\n",
             "}}\n",
             "trap handle_cancel INT TERM\n",
+            // ワーカーペインは無人で動く。端末の IXON（XON/XOFF フロー制御）が有効だと、誤って
+            // 押された ^S（XOFF）でペインへの出力が止まり、tee が書き込みでブロックし、やがて
+            // エージェント自身の出力も詰まって処理全体が止まる。macOS 既定の `ixany` では任意の
+            // キーで再開するため、「止まっていたが Enter を連打したら進んだ」という報告と符合する。
+            // 出力を遡って読むには tmux のコピーモードがあり、^S で止める必要は無い。stdin が
+            // 端末でない場合（テスト等）は stty が失敗するだけなので無視する。
+            "stty -ixon 2>/dev/null || true\n",
             "\n",
             "QUEUE_DIR={queue_dir}\n",
             "TASK_DIR={task_dir}\n",
@@ -1288,6 +1300,27 @@ mod tests {
         assert!(script.contains("worker-done-0"));
         // 停止シグナル対応
         assert!(script.contains("trap handle_cancel INT TERM"));
+    }
+
+    #[test]
+    fn build_worker_script_disables_xon_xoff_flow_control() {
+        // 誤って押された ^S（XOFF）でペインの出力が止まり、tee とエージェントが書き込みで
+        // 詰まるのを防ぐ。エージェントの種類に依らず、最初のタスクを始める前に切る。
+        let tmp = std::path::PathBuf::from("/tmp/burn");
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &tmp.join("queue"),
+            task_dir: &tmp.join("tasks"),
+            marker_dir: &tmp.join("markers"),
+            gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
+            usage_gate_cmd: None,
+        });
+        let stty = script
+            .find("\nstty -ixon 2>/dev/null || true\n")
+            .unwrap_or_else(|| panic!("IXON を無効化すべき: {script}"));
+        let trap = script.find("trap handle_cancel INT TERM").unwrap();
+        let loop_start = script.find("while true; do").unwrap();
+        assert!(trap < stty && stty < loop_start, "{script}");
     }
 
     #[test]
@@ -1739,6 +1772,32 @@ mod tests {
                 statusline.is_some()
             );
         }
+    }
+
+    /// モニターペインでも XON/XOFF を切る。^S で出力が止まると再描画と自動終了まで止まるため、
+    /// メインループに入る前に無効にしておく。
+    #[test]
+    fn generate_monitor_script_disables_xon_xoff_before_the_loop() {
+        let script = generate_monitor_script(
+            "codex",
+            "codex exec --json",
+            "2026/02/24 09:00",
+            3,
+            3600,
+            std::path::Path::new("/tmp/markers"),
+            "token-burn",
+            2,
+            std::path::Path::new("/tmp/stop"),
+            std::path::Path::new("/tmp/report"),
+            None,
+            None,
+            None,
+        );
+        let stty = script
+            .find("\nstty -ixon 2>/dev/null || true\n")
+            .expect("monitor must disable XON/XOFF");
+        let loop_start = script.find("\nwhile true; do\n").expect("main loop");
+        assert!(stty < loop_start, "{script}");
     }
 
     #[test]
