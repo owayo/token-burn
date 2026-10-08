@@ -66,7 +66,7 @@ What the monitor pane and the worker panes show is described in [monitor.md](mon
 
 - **Classification failures**: An abnormal classifier exit records a failure even if the AI command exited successfully
 - **Collision-safe logs**: Per-task logs are numbered to avoid overwrite when display names collide
-- **Logging pipeline safety**: Marks a task failed if `format-stream`, `tee`, or raw jsonl capture fails instead of recording it as completed. A target directory deleted or renamed between scan and execution is reported accurately as `target directory is unavailable` instead of an unrelated logging pipeline failure
+- **Logging pipeline safety**: Marks a task failed if `format-stream` / `format-codex`, `tee`, or raw jsonl capture fails instead of recording it as completed. A target directory deleted or renamed between scan and execution is reported accurately as `target directory is unavailable` instead of an unrelated logging pipeline failure
 - **Interrupted-session persistence**: Saves resume information and updates failed-resume counts before publishing completion markers, so automatic session teardown cannot interrupt those writes
 - **Concurrent-safe state**: Parallel workers update `state.json` with atomic rename under a stable sidecar lock file; malformed or unreadable existing state aborts the update without overwriting previously recorded history
 

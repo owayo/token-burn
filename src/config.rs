@@ -113,6 +113,24 @@ pub struct Agent {
     pub prompt: Option<String>,
     /// ai-usage 連携設定（参照する profile、window/fallback 上書き）。
     pub ai_usage: Option<AgentAiUsage>,
+    /// codex の出力の扱い（`auto` | `json` | `human`。省略時は `auto`）。
+    /// 書いたかどうかを区別するため Option で持つ（codex 以外に書くと設定読み込み時にエラー）。
+    pub codex_output: Option<CodexOutput>,
+}
+
+/// codex エージェントの出力の扱い（`[[agents]]` の `codex_output`）。
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexOutput {
+    /// command に `codex exec`（別名 `e`）を見つけられれば `--json` を付けて整形し、
+    /// 見つからなければ従来どおり人間向けの出力をそのまま流す（デフォルト）。
+    #[default]
+    Auto,
+    /// 出力を codex の JSONL として整形する。`exec` を見つけられれば `--json` を付け、
+    /// 見つからなくても JSONL を出すものとして扱う（自分で `exec --json` を足すラッパー向け）。
+    Json,
+    /// `--json` を付けず、人間向けの出力をそのまま流す。
+    Human,
 }
 
 /// ai-usage --json 連携のグローバル設定（`[ai_usage]`）。
@@ -224,6 +242,8 @@ pub struct RuntimeAgent {
     pub fallback: UsageFallback,
     /// 適用する window 方針。
     pub window: UsageWindowPolicy,
+    /// codex の出力の扱い（codex 以外のエージェントでは使わない）。
+    pub codex_output: CodexOutput,
 }
 
 /// RuntimeAgent に紐づく ai-usage 照合情報。
@@ -382,6 +402,18 @@ impl Config {
                     anyhow::bail!("Agent '{}' has invalid env key: {}", agent.name, k);
                 }
             }
+            // codex_output は codex の起動のしかたを決める設定なので、codex 以外に書かれて
+            // いたら黙って無視せずエラーにする。効かない設定が残ると、効いていると誤解した
+            // まま運用される。判定は実行時のフラグ付与と同じ規則（agent_runs_cli）で行い、
+            // 「検証は通ったのに実行時には codex 扱いされない」食い違いを作らない。
+            if agent.codex_output.is_some()
+                && !agent_runs_cli(agent.provider.as_deref(), &agent.command, "codex")
+            {
+                anyhow::bail!(
+                    "Agent '{}' sets codex_output, but it is not a codex agent (set provider = \"codex\", or remove codex_output)",
+                    agent.name
+                );
+            }
 
             let uses_ai_usage = self.agent_uses_ai_usage(agent);
             if uses_ai_usage
@@ -496,6 +528,7 @@ impl Config {
                     ai_usage: None,
                     fallback,
                     window,
+                    codex_output: agent.codex_output.unwrap_or_default(),
                 });
                 continue;
             }
@@ -570,6 +603,7 @@ impl Config {
                     }),
                     fallback,
                     window,
+                    codex_output: agent.codex_output.unwrap_or_default(),
                 });
             }
         }
@@ -620,6 +654,40 @@ fn is_valid_env_key(k: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// command の先頭要素（実行ファイル）の basename（拡張子なし）を返す。
+/// 空 command やパス解決不能な場合は空文字列を返す。
+pub(crate) fn command_basename(command: &[String]) -> &str {
+    let Some(first) = command.first() else {
+        return "";
+    };
+    Path::new(first.as_str())
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+}
+
+/// command の先頭要素が `cli` の実行ファイル（ラッパースクリプト含む）かを判定する。
+/// ファイル名（basename）が `cli` そのもの、または `cli-` / `cli_` で始まる場合に true
+/// （`codex-wrapper.sh` / `claude_custom` 等）。`my-codex-fork` のように途中に含むだけでは一致しない。
+pub(crate) fn command_is_cli(command: &[String], cli: &str) -> bool {
+    let basename = command_basename(command);
+    basename
+        .strip_prefix(cli)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '_']))
+}
+
+/// エージェントが `cli`（"claude" / "codex"）かを判定する。provider が明示されていればそれを
+/// 優先し（大文字小文字は区別しない）、無ければ実行ファイル名から推論する。
+///
+/// 実行時のフラグ付与（`executor::flags`）と、設定読み込み時の `codex_output` の検証が同じ規則を
+/// 使うためにここへ置く。両者が食い違うと、検証を通った設定が実行時に黙って無視される。
+pub(crate) fn agent_runs_cli(provider: Option<&str>, command: &[String], cli: &str) -> bool {
+    match provider {
+        Some(p) => p.eq_ignore_ascii_case(cli),
+        None => command_is_cli(command, cli),
+    }
 }
 
 fn validate_optional_duration(field_name: &str, value: Option<&str>) -> Result<()> {
@@ -1493,5 +1561,164 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "claude-home");
         assert_eq!(agents[0].ai_usage.as_ref().unwrap().profile, "Home");
+    }
+
+    fn command(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn command_is_cli_detects_bare_executables_and_wrappers() {
+        assert!(command_is_cli(&command(&["claude"]), "claude"));
+        assert!(command_is_cli(&command(&["claude", "-p"]), "claude"));
+        assert!(command_is_cli(
+            &command(&["/opt/tools/claude-wrapper.sh"]),
+            "claude"
+        ));
+        assert!(command_is_cli(
+            &command(&["./claude-wrapper.sh", "-p"]),
+            "claude"
+        ));
+        assert!(command_is_cli(&command(&["claude-code.sh"]), "claude"));
+        assert!(command_is_cli(&command(&["claude_custom"]), "claude"));
+        assert!(command_is_cli(&command(&["codex", "exec"]), "codex"));
+        assert!(command_is_cli(
+            &command(&["/opt/tools/codex-wrapper.sh"]),
+            "codex"
+        ));
+        assert!(command_is_cli(&command(&["codex_custom"]), "codex"));
+    }
+
+    #[test]
+    fn command_is_cli_rejects_other_executables() {
+        assert!(!command_is_cli(&command(&["codex"]), "claude"));
+        assert!(!command_is_cli(&command(&["my-claude-fork"]), "claude"));
+        assert!(!command_is_cli(&command(&["claudette"]), "claude"));
+        assert!(!command_is_cli(&[], "claude"));
+        assert!(!command_is_cli(&command(&["claude"]), "codex"));
+        assert!(!command_is_cli(&command(&["my-codex-fork"]), "codex"));
+        // env の前置きは見ない（provider を明示すれば codex として扱われる）
+        assert!(!command_is_cli(&command(&["env", "codex"]), "codex"));
+        assert!(!command_is_cli(&[], "codex"));
+    }
+
+    #[test]
+    fn agent_runs_cli_prefers_explicit_provider() {
+        let wrapper = command(&["/opt/bin/run-agent.sh"]);
+        assert!(agent_runs_cli(Some("codex"), &wrapper, "codex"));
+        assert!(agent_runs_cli(Some("Codex"), &wrapper, "codex"));
+        // provider が明示されていれば実行ファイル名より優先する
+        assert!(!agent_runs_cli(
+            Some("claude"),
+            &command(&["codex"]),
+            "codex"
+        ));
+        assert!(agent_runs_cli(None, &command(&["codex"]), "codex"));
+        assert!(!agent_runs_cli(None, &wrapper, "codex"));
+    }
+
+    /// codex_output は TOML の小文字表記でパースでき、省略時は未指定（None）として残る。
+    /// 未指定と `auto` を区別するのは、codex 以外に「書いた」ことを検出するため。
+    #[test]
+    fn codex_output_parses_from_toml() {
+        let parse = |extra: &str| -> Agent {
+            toml::from_str(&format!("name = \"codex\"\ncommand = [\"codex\"]\n{extra}"))
+                .expect("parse")
+        };
+        assert_eq!(parse("").codex_output, None);
+        assert_eq!(
+            parse("codex_output = \"auto\"").codex_output,
+            Some(CodexOutput::Auto)
+        );
+        assert_eq!(
+            parse("codex_output = \"json\"").codex_output,
+            Some(CodexOutput::Json)
+        );
+        assert_eq!(
+            parse("codex_output = \"human\"").codex_output,
+            Some(CodexOutput::Human)
+        );
+    }
+
+    #[test]
+    fn codex_output_rejects_unknown_values() {
+        let err = toml::from_str::<Agent>(
+            "name = \"codex\"\ncommand = [\"codex\"]\ncodex_output = \"verbose\"",
+        )
+        .expect_err("未知の値は拒否されるべき");
+        let message = err.to_string();
+        assert!(message.contains("verbose"), "{message}");
+        assert!(message.contains("human"), "選べる値を示すべき: {message}");
+    }
+
+    /// 効かない設定を黙って無視しない。codex 以外に codex_output を書いたら読み込み時に弾く。
+    #[test]
+    fn validate_rejects_codex_output_on_non_codex_agents() {
+        for (provider, executable) in [
+            (Some("claude"), "codex"),
+            (Some("antigravity"), "/opt/bin/codex-wrapper.sh"),
+            (None, "claude"),
+            (None, "aider"),
+            // provider 無しでは env の前置きの先までは見ない（実行時の判定と同じ）
+            (None, "env"),
+        ] {
+            let mut config = base_config();
+            config.agents[0].provider = provider.map(String::from);
+            config.agents[0].command = vec![executable.to_string(), "exec".to_string()];
+            config.agents[0].codex_output = Some(CodexOutput::Json);
+
+            let err = config
+                .validate()
+                .expect_err("codex 以外の codex_output は拒否されるべき");
+            let message = err.to_string();
+            assert!(
+                message.contains("codex_output") && message.contains("not a codex agent"),
+                "{provider:?} {executable}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_codex_output_on_codex_agents() {
+        for (provider, executable) in [
+            (Some("codex"), "/opt/bin/run-agent.sh"),
+            (Some("CODEX"), "codex"),
+            (None, "codex"),
+            (None, "/opt/bin/codex-wrapper.sh"),
+        ] {
+            let mut config = base_config();
+            config.agents[0].provider = provider.map(String::from);
+            config.agents[0].command = vec![executable.to_string(), "exec".to_string()];
+            config.agents[0].codex_output = Some(CodexOutput::Human);
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("{provider:?} {executable}: {e}"));
+        }
+    }
+
+    /// 省略時は auto。ai-usage の profile 展開の有無に関わらず RuntimeAgent へ引き継ぐ。
+    #[test]
+    fn expand_runtime_agents_propagates_codex_output() {
+        let mut config = base_config();
+        config.agents[0].provider = Some("codex".to_string());
+        config.agents[0].command = vec!["codex".to_string(), "exec".to_string()];
+        let agents = config.expand_runtime_agents().unwrap();
+        assert_eq!(agents[0].codex_output, CodexOutput::Auto);
+
+        config.agents[0].codex_output = Some(CodexOutput::Human);
+        let agents = config.expand_runtime_agents().unwrap();
+        assert_eq!(agents[0].codex_output, CodexOutput::Human);
+
+        config.agents[0].ai_usage = Some(agent_ai_usage(vec!["work", "home"], None));
+        config.ai_usage = Some(ai_usage_global(
+            true,
+            vec![("work", "Work"), ("home", "Home")],
+        ));
+        let agents = config.expand_runtime_agents().unwrap();
+        assert_eq!(agents.len(), 2);
+        assert!(
+            agents.iter().all(|a| a.codex_output == CodexOutput::Human),
+            "profile 展開後の全エージェントへ引き継ぐ"
+        );
     }
 }

@@ -78,6 +78,7 @@ timezone = "Asia/Tokyo"
 | `reset_time` | Reset time (HH:MM) | `"09:00"` |
 | `timezone` | IANA timezone | `"Asia/Tokyo"` |
 | `prompt` | Agent-specific prompt (optional) | `"prompts/test-coverage.md"` |
+| `codex_output` | How a Codex agent's output is shown (optional, Codex agents only): `auto` (default), `json`, or `human`. See below | `"auto"` |
 
 `name` must not be empty and must be unique after profile expansion — the expanded name doubles as the `state.json` key, the report directory name, and the `--agent` selector, so a duplicate makes the second agent unreachable and silently merges the two agents' processed history. `command` must contain at least one element, and the first element must be a non-empty executable name. `prompt` overrides the global `[prompts].default` for this agent; target-level `prompt` takes highest priority.
 
@@ -88,6 +89,18 @@ timezone = "Asia/Tokyo"
 **Claude auto-injected flags**: When the executable is `claude`, the following flags are enforced: `-p`, `--verbose`, `--output-format stream-json`, `--include-partial-messages`, and `--disallowedTools=AskUserQuestion`. Missing flags are appended automatically, an existing `--output-format` value is normalized to `stream-json` (including `--output-format=...` form), and an existing `--disallowedTools` / `--disallowed-tools` list is normalized and extended with `AskUserQuestion` when needed. The logging flags are required for proper log capture and progress monitoring; `AskUserQuestion` is denied so unattended token-burn jobs cannot stop on an interactive question. You do not need to include them in your config.
 
 **Claude auto-injected environment**: `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` is added to the Claude process environment by default. Without it, `claude -p` waits at most 600s for background tasks (backgrounded subagents / workflows) after the main turn ends, then kills them ("Background tasks still running after 600s; terminating.") and reports success even though the work never finished. `0` waits indefinitely so background agents can complete and re-drive the main loop. Set the variable explicitly in the agent or profile `env` to override (an empty string unsets it, restoring Claude's default ceiling).
+
+**Codex auto-injected flags**: When the agent is Codex (`provider = "codex"`, or an executable named `codex` / `codex-*` / `codex_*`), `-c approval_policy=never` is inserted right after the executable so an unattended run never waits for approval, unless you already set an approval policy (`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`). Codex is started with standard input from `/dev/null`, so nothing typed into a worker pane can reach it.
+
+**Codex output (`codex_output`)**: Codex's human-readable output reprints the whole diff of the turn after every file change, which buries the pane and the log (126MB of a 141MB log in a 9-hour task). By default token-burn therefore runs `codex exec --json` and renders the events itself; see [monitor.md](monitor.md#codex-cli).
+
+| Value | Behavior |
+|-------|----------|
+| `auto` (default) | When the first subcommand after the executable and its options is `exec` (or its alias `e`), inserts `--json` right after it (unless `--json` is already there) and formats the events. Otherwise, for example a wrapper that adds `exec` itself, keeps the human-readable output |
+| `json` | Same insertion when `exec` is found. When it is not, inserts nothing and still formats the output as JSON events — use this for a wrapper that already emits them |
+| `human` | Inserts nothing and keeps Codex's own human-readable output, as before |
+
+`codex_output` on an agent that is not a Codex agent is a configuration error rather than being silently ignored.
 
 `reset_weekday` accepts: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday` (or short forms: `mon` `tue` `wed` `thu` `fri` `sat` `sun`)
 

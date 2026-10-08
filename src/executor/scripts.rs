@@ -5,6 +5,7 @@ use crate::resume::ResumeEntry;
 use crate::scanner::ResolvedTarget;
 
 use super::AI_USAGE_MONITOR_TIMEOUT_SECS;
+use super::OutputPipeline;
 use super::util::task_log_base;
 
 #[allow(clippy::too_many_arguments)]
@@ -409,7 +410,8 @@ pub(super) struct TaskCtx<'a> {
     pub(super) state_file: &'a Path,
     pub(super) stop_file: &'a Path,
     pub(super) rate_limit_threshold: u8,
-    pub(super) is_claude: bool,
+    /// エージェントの stdin と出力の扱い（`build_plan` がフラグの付与と同時に決めたもの）。
+    pub(super) output: OutputPipeline,
     /// レート制限で中断したらセッションを保存し、次回の実行で再開できるようにする。
     pub(super) save_interrupted: bool,
     /// 保存済みの中断セッションを再開するタスクなら、その記録と継続プロンプト。
@@ -518,7 +520,8 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
         shell_escape(&ctx.state_file.to_string_lossy()),
     );
 
-    if ctx.is_claude {
+    let is_claude = ctx.output == OutputPipeline::ClaudeStreamJson;
+    if is_claude {
         let attempt = ClaudeAttempt {
             tb: &tb_cmd,
             stop_file: &stop_file_escaped,
@@ -602,28 +605,68 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             }
         }
     } else {
-        script += &format!("{cmd_str} 2>&1 | tee {log_file}\n");
-        script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
-        script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
-        script += "TEE_EXIT=${PIPE_STATUS[1]}\n";
-        script += "CURRENT_FAILED_MARKER=\"\"\n";
-        script += &format!(
-            concat!(
-                "if [ \"$TEE_EXIT\" -ne 0 ]; then\n",
-                "  printf '%slogging pipeline failed (tee=%s)\\n' {prefix} \"$TEE_EXIT\" > {error}\n",
-                "  touch {failed}\n",
-                "  echo '━━━ Error - logging pipeline failed ━━━'\n",
-                "  echo ''\n",
-                "  return 0\n",
-                "fi\n",
-            ),
-            prefix = error_prefix,
-            error = error_file,
-            failed = failed_marker,
-        );
+        // codex は stdin を /dev/null にして起動する。無人実行なので、codex が stdin を読む経路に
+        // 入っても（プロンプトを stdin から読む場合など）ペインのキー入力を待って止まったり、
+        // ペインに打たれたキー入力を読んだりせず、即座に EOF を受け取るようにする。codex exec は
+        // stdin が TTY でないと stdin を読んでプロンプトへ `<stdin>` ブロックとして足すが、
+        // /dev/null なら何も足されない（stderr に `Reading additional input from stdin...` と
+        // 出るだけ）。claude とその他のエージェントは従来どおりペインの TTY を stdin に持つ。
+        let stdin = if ctx.output.closes_stdin() {
+            " </dev/null"
+        } else {
+            ""
+        };
+        if ctx.output == OutputPipeline::CodexJson {
+            // `codex exec --json` の JSONL を format-codex で整形してペインとログへ出し、生の
+            // JSONL は claude と同じく `<NNNN>_<name>.jsonl` に残す。整形器は生ログか出力を
+            // 書けないと 1 で終わる（入力は最後まで読むので codex は巻き添えにならない）。
+            // claude と同じく、ログ・整形のパイプラインが壊れたタスクを成功扱いしない。
+            script += &format!(
+                "{cmd_str}{stdin} 2>&1 | {tb_cmd} format-codex --raw-output {jsonl_file} 2>&1 | tee {log_file}\n"
+            );
+            script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
+            script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
+            script += "FORMAT_EXIT=${PIPE_STATUS[1]}\n";
+            script += "TEE_EXIT=${PIPE_STATUS[2]}\n";
+            script += "CURRENT_FAILED_MARKER=\"\"\n";
+            script += &format!(
+                concat!(
+                    "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ]; then\n",
+                    "  printf '%slogging pipeline failed (format=%s tee=%s)\\n' {prefix} \"$FORMAT_EXIT\" \"$TEE_EXIT\" > {error}\n",
+                    "  touch {failed}\n",
+                    "  echo '━━━ Error - logging pipeline failed ━━━'\n",
+                    "  echo ''\n",
+                    "  return 0\n",
+                    "fi\n",
+                ),
+                prefix = error_prefix,
+                error = error_file,
+                failed = failed_marker,
+            );
+        } else {
+            script += &format!("{cmd_str}{stdin} 2>&1 | tee {log_file}\n");
+            script += "PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n";
+            script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
+            script += "TEE_EXIT=${PIPE_STATUS[1]}\n";
+            script += "CURRENT_FAILED_MARKER=\"\"\n";
+            script += &format!(
+                concat!(
+                    "if [ \"$TEE_EXIT\" -ne 0 ]; then\n",
+                    "  printf '%slogging pipeline failed (tee=%s)\\n' {prefix} \"$TEE_EXIT\" > {error}\n",
+                    "  touch {failed}\n",
+                    "  echo '━━━ Error - logging pipeline failed ━━━'\n",
+                    "  echo ''\n",
+                    "  return 0\n",
+                    "fi\n",
+                ),
+                prefix = error_prefix,
+                error = error_file,
+                failed = failed_marker,
+            );
+        }
     }
 
-    if ctx.is_claude {
+    if is_claude {
         // レート制限で中断したセッションを保存し、次回の実行で続きから再開できるようにする。
         // 保存に失敗しても次回が新規セッションになるだけなので、ワーカーは止めない。
         // プロンプトは元の指示（再開時も ctx.prompt_file は元のプロンプト）のハッシュを残す。
@@ -1136,7 +1179,7 @@ mod tests {
         agent: &'a RuntimeAgent,
         task: &'a ResolvedTarget,
         tmp: &'a std::path::Path,
-        is_claude: bool,
+        output: OutputPipeline,
     ) -> TaskCtx<'a> {
         TaskCtx {
             idx,
@@ -1150,8 +1193,8 @@ mod tests {
             state_file: std::path::Path::new("/tmp/state.json"),
             stop_file: std::path::Path::new("/tmp/stop"),
             rate_limit_threshold: 95,
-            is_claude,
-            save_interrupted: is_claude,
+            output,
+            save_interrupted: output == OutputPipeline::ClaudeStreamJson,
             resume: None,
             discard_session: None,
         }
@@ -1172,7 +1215,7 @@ mod tests {
             defer: false,
         };
         let tmp = std::path::PathBuf::from("/tmp");
-        let ctx = task_ctx_for_test(7, &agent, &task, &tmp, true);
+        let ctx = task_ctx_for_test(7, &agent, &task, &tmp, OutputPipeline::ClaudeStreamJson);
         let script = build_task_script(&ctx);
 
         // キュー方式ではエラー時にワーカーを止めない
@@ -1220,7 +1263,7 @@ mod tests {
             defer: false,
         };
         let tmp = std::path::PathBuf::from("/tmp");
-        let ctx = task_ctx_for_test(1, &agent, &task, &tmp, true);
+        let ctx = task_ctx_for_test(1, &agent, &task, &tmp, OutputPipeline::ClaudeStreamJson);
         let script = build_task_script(&ctx);
 
         // CLASS_CODE=2 (レート制限) ブランチで CANCELLED をリセットすること
@@ -1250,27 +1293,102 @@ mod tests {
 
     #[test]
     fn build_task_script_for_non_claude_skips_classify() {
-        let agent = RuntimeAgent {
-            name: "codex".to_string(),
-            command: vec!["codex".to_string(), "exec".to_string()],
-            ..Default::default()
-        };
-        let task = ResolvedTarget {
-            directory: std::path::PathBuf::from("/tmp/repo"),
-            display_name: "repo".to_string(),
-            prompt: "review".to_string(),
-            visibility: Visibility::Public,
-            defer: false,
-        };
+        // claude でも codex でもないエージェントは従来どおり: stdin はペインの TTY のまま、
+        // 出力は tee で素通しし、結果は終了コードで判定する。
+        let agent = agent_for_test("aider", &["aider", "--yes"]);
+        let task = target_for_test("/tmp/repo");
         let tmp = std::path::PathBuf::from("/tmp");
-        let ctx = task_ctx_for_test(2, &agent, &task, &tmp, false);
+        let ctx = task_ctx_for_test(2, &agent, &task, &tmp, OutputPipeline::Raw);
         let script = build_task_script(&ctx);
 
+        assert!(
+            script.contains(
+                "'aider' '--yes' \"$(cat '/tmp/prompt.txt')\" 2>&1 | tee '/tmp/0002_repo.log'\n"
+            ),
+            "{script}"
+        );
+        assert!(
+            !script.contains("</dev/null"),
+            "codex 以外は stdin を変えない: {script}"
+        );
+        assert!(!script.contains("format-codex"), "{script}");
         assert!(!script.contains("classify-result"));
         assert!(!script.contains("exec sleep infinity"));
         assert!(script.contains("Error - continuing"));
         assert!(script.contains("TEE_EXIT=${PIPE_STATUS[1]}"));
         assert!(script.contains("logging pipeline failed"));
+    }
+
+    #[test]
+    fn build_task_script_for_codex_json_formats_with_format_codex() {
+        let agent = agent_for_test(
+            "codex",
+            &["codex", "-c", "approval_policy=never", "exec", "--json"],
+        );
+        let task = target_for_test("/tmp/repo");
+        let tmp = std::path::PathBuf::from("/tmp");
+        let ctx = task_ctx_for_test(2, &agent, &task, &tmp, OutputPipeline::CodexJson);
+        let script = build_task_script(&ctx);
+
+        // stdin は /dev/null、JSONL は format-codex で整形し、生の JSONL は .jsonl に残す
+        assert!(
+            script.contains(concat!(
+                "'codex' '-c' 'approval_policy=never' 'exec' '--json' \"$(cat '/tmp/prompt.txt')\" </dev/null 2>&1",
+                " | '/usr/local/bin/token-burn' format-codex --raw-output '/tmp/0002_repo.jsonl' 2>&1",
+                " | tee '/tmp/0002_repo.log'\n",
+            )),
+            "{script}"
+        );
+        assert!(script.contains("PIPE_STATUS=(\"${PIPESTATUS[@]}\")\n"));
+        assert!(script.contains("CMD_EXIT=${PIPE_STATUS[0]}\n"));
+        assert!(script.contains("FORMAT_EXIT=${PIPE_STATUS[1]}\n"));
+        assert!(script.contains("TEE_EXIT=${PIPE_STATUS[2]}\n"));
+        // 整形・保存のどちらが壊れても成功扱いしない
+        assert!(
+            script.contains(
+                "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ]; then\n  printf '%slogging pipeline failed (format=%s tee=%s)\\n' '[repo] ' \"$FORMAT_EXIT\" \"$TEE_EXIT\" > '/tmp/error-2'\n  touch '/tmp/failed-2'\n  echo '━━━ Error - logging pipeline failed ━━━'\n  echo ''\n  return 0\nfi\n"
+            ),
+            "{script}"
+        );
+        // codex は stream-json の分類を持たないので、結果は終了コードで判定して mark する
+        assert!(!script.contains("classify-result"), "{script}");
+        assert!(!script.contains("format-stream"), "{script}");
+        assert!(!script.contains("resume-entry"), "{script}");
+        assert!(
+            script.contains("if [ \"$CMD_EXIT\" -ne 0 ]; then"),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "elif '/usr/local/bin/token-burn' mark 'codex' '/tmp/repo' '/tmp/state.json'; then\n  touch '/tmp/done-2'"
+            ),
+            "{script}"
+        );
+        // 整形の検査はコマンドの終了コードによる判定より前
+        let format_check = script.find("FORMAT_EXIT\" -ne 0").unwrap();
+        let exit_check = script.find("if [ \"$CMD_EXIT\" -ne 0 ]").unwrap();
+        assert!(format_check < exit_check, "{script}");
+        assert_valid_bash(&script, "codex json task script");
+    }
+
+    #[test]
+    fn build_task_script_for_codex_raw_closes_stdin_without_formatting() {
+        let agent = agent_for_test("codex", &["/opt/bin/codex-wrapper.sh"]);
+        let task = target_for_test("/tmp/repo");
+        let tmp = std::path::PathBuf::from("/tmp");
+        let ctx = task_ctx_for_test(3, &agent, &task, &tmp, OutputPipeline::CodexRaw);
+        let script = build_task_script(&ctx);
+
+        assert!(
+            script.contains(
+                "'/opt/bin/codex-wrapper.sh' \"$(cat '/tmp/prompt.txt')\" </dev/null 2>&1 | tee '/tmp/0003_repo.log'\n"
+            ),
+            "{script}"
+        );
+        assert!(script.contains("TEE_EXIT=${PIPE_STATUS[1]}"), "{script}");
+        assert!(!script.contains("format-codex"), "{script}");
+        assert!(!script.contains("FORMAT_EXIT"), "{script}");
+        assert_valid_bash(&script, "codex raw task script");
     }
 
     #[test]
@@ -2383,7 +2501,7 @@ mod tests {
         let agent = agent_for_test("claude", &["claude", "-p"]);
         let task = target_for_test("/tmp/repo");
         let tmp = std::path::PathBuf::from("/tmp");
-        let ctx = task_ctx_for_test(3, &agent, &task, &tmp, true);
+        let ctx = task_ctx_for_test(3, &agent, &task, &tmp, OutputPipeline::ClaudeStreamJson);
         let script = build_task_script(&ctx);
 
         assert!(
@@ -2412,28 +2530,38 @@ mod tests {
 
     #[test]
     fn build_task_script_guards_cd_failure_for_non_claude() {
-        // 非 claude（codex 等）の 2 要素パイプラインでも同じガードが必要。
+        // 非 claude（codex 等）のパイプラインでも同じガードが必要。cd が失敗した場合に
+        // PIPESTATUS の要素数が変わる問題は、format-codex を挟む 3 要素でも素通しの 2 要素でも同じ。
         let agent = agent_for_test("codex", &["codex", "exec"]);
         let task = target_for_test("/tmp/repo");
         let tmp = std::path::PathBuf::from("/tmp");
-        let ctx = task_ctx_for_test(4, &agent, &task, &tmp, false);
-        let script = build_task_script(&ctx);
+        for output in [
+            OutputPipeline::CodexJson,
+            OutputPipeline::CodexRaw,
+            OutputPipeline::Raw,
+        ] {
+            let ctx = task_ctx_for_test(4, &agent, &task, &tmp, output);
+            let script = build_task_script(&ctx);
 
-        assert!(
-            script.contains("cd '/tmp/repo' || {"),
-            "cd はガード付きの独立文であるべき: {script}"
-        );
-        assert!(
-            !script.contains("cd '/tmp/repo' &&"),
-            "cd をパイプラインへ && で連結してはいけない: {script}"
-        );
-        assert!(script.contains("target directory is unavailable"));
-        assert!(script.contains("touch '/tmp/failed-4'"));
-        let cd_idx = script
-            .find("cd '/tmp/repo' || {")
-            .expect("cd guard missing");
-        let pipe_idx = script.find("| tee ").expect("pipeline missing");
-        assert!(cd_idx < pipe_idx, "cd ガードはパイプラインの手前に出すべき");
+            assert!(
+                script.contains("cd '/tmp/repo' || {"),
+                "cd はガード付きの独立文であるべき ({output:?}): {script}"
+            );
+            assert!(
+                !script.contains("cd '/tmp/repo' &&"),
+                "cd をパイプラインへ && で連結してはいけない ({output:?}): {script}"
+            );
+            assert!(script.contains("target directory is unavailable"));
+            assert!(script.contains("touch '/tmp/failed-4'"));
+            let cd_idx = script
+                .find("cd '/tmp/repo' || {")
+                .expect("cd guard missing");
+            let pipe_idx = script.find("| tee ").expect("pipeline missing");
+            assert!(
+                cd_idx < pipe_idx,
+                "cd ガードはパイプラインの手前に出すべき ({output:?})"
+            );
+        }
     }
 
     #[test]
@@ -2443,7 +2571,7 @@ mod tests {
         let agent = agent_for_test("claude", &["claude", "-p"]);
         let task = target_for_test("/tmp/re po's dir");
         let tmp = std::path::PathBuf::from("/tmp");
-        let ctx = task_ctx_for_test(5, &agent, &task, &tmp, true);
+        let ctx = task_ctx_for_test(5, &agent, &task, &tmp, OutputPipeline::ClaudeStreamJson);
         let script = build_task_script(&ctx);
 
         assert!(
@@ -2455,18 +2583,23 @@ mod tests {
 
     #[test]
     fn build_task_script_is_valid_bash() {
-        // cd ガードを差し込んだ後も、claude / 非 claude 双方のタスクスクリプトが
+        // cd ガードを差し込んだ後も、すべての出力パイプラインのタスクスクリプトが
         // bash 構文として妥当であること（ワーカーは source して実行する）。
         let claude = agent_for_test("claude", &["claude", "-p"]);
-        let codex = agent_for_test("codex", &["codex", "exec"]);
+        let codex = agent_for_test("codex", &["codex", "exec", "--json"]);
+        let other = agent_for_test("aider", &["aider", "--yes"]);
         let task = target_for_test("/tmp/repo");
         let tmp = std::path::PathBuf::from("/tmp");
 
-        for (agent, is_claude, label) in [(&claude, true, "claude"), (&codex, false, "non-claude")]
-        {
-            let ctx = task_ctx_for_test(1, agent, &task, &tmp, is_claude);
+        for (agent, output) in [
+            (&claude, OutputPipeline::ClaudeStreamJson),
+            (&codex, OutputPipeline::CodexJson),
+            (&codex, OutputPipeline::CodexRaw),
+            (&other, OutputPipeline::Raw),
+        ] {
+            let ctx = task_ctx_for_test(1, agent, &task, &tmp, output);
             let script = build_task_script(&ctx);
-            assert_valid_bash(&script, label);
+            assert_valid_bash(&script, &format!("{output:?}"));
         }
     }
 
@@ -2733,7 +2866,13 @@ mod tests {
         let agent = agent_for_test("claude", &["claude", "-p"]);
         let task = target_for_test("/tmp/repo");
         let tmp = std::path::PathBuf::from("/tmp");
-        let script = build_task_script(&task_ctx_for_test(1, &agent, &task, &tmp, true));
+        let script = build_task_script(&task_ctx_for_test(
+            1,
+            &agent,
+            &task,
+            &tmp,
+            OutputPipeline::ClaudeStreamJson,
+        ));
 
         // レート制限の分岐で、分類した jsonl と元のプロンプトを渡して保存する
         let case2 = script.find("  2)\n").expect("case 2 missing");
@@ -2763,7 +2902,7 @@ mod tests {
         let agent = agent_for_test("claude", &["claude", "-p"]);
         let task = target_for_test("/tmp/repo");
         let tmp = std::path::PathBuf::from("/tmp");
-        let mut ctx = task_ctx_for_test(2, &agent, &task, &tmp, true);
+        let mut ctx = task_ctx_for_test(2, &agent, &task, &tmp, OutputPipeline::ClaudeStreamJson);
         ctx.discard_session = Some(SESSION);
         let script = build_task_script(&ctx);
 
@@ -2779,7 +2918,13 @@ mod tests {
         assert_valid_bash(&script, "fresh start script");
 
         // 破棄する記録が無ければ何も足さない
-        let plain = build_task_script(&task_ctx_for_test(2, &agent, &task, &tmp, true));
+        let plain = build_task_script(&task_ctx_for_test(
+            2,
+            &agent,
+            &task,
+            &tmp,
+            OutputPipeline::ClaudeStreamJson,
+        ));
         assert!(!plain.contains("resume-entry forget"), "{plain}");
     }
 
@@ -2788,7 +2933,7 @@ mod tests {
         let agent = agent_for_test("claude", &["claude", "-p"]);
         let task = target_for_test("/tmp/repo");
         let tmp = std::path::PathBuf::from("/tmp");
-        let mut ctx = task_ctx_for_test(1, &agent, &task, &tmp, true);
+        let mut ctx = task_ctx_for_test(1, &agent, &task, &tmp, OutputPipeline::ClaudeStreamJson);
         ctx.save_interrupted = false;
         let script = build_task_script(&ctx);
         assert!(!script.contains("resume-entry"), "{script}");
@@ -2800,7 +2945,7 @@ mod tests {
         let task = target_for_test("/tmp/repo");
         let tmp = std::path::PathBuf::from("/tmp");
         let entry = saved_session();
-        let mut ctx = task_ctx_for_test(4, &agent, &task, &tmp, true);
+        let mut ctx = task_ctx_for_test(4, &agent, &task, &tmp, OutputPipeline::ClaudeStreamJson);
         ctx.resume = Some(TaskResume {
             entry: &entry,
             prompt_file: std::path::Path::new("/tmp/resume-prompt.txt"),
@@ -2946,7 +3091,7 @@ mod tests {
             state_file: &state_file,
             stop_file: &stop_file,
             rate_limit_threshold: 95,
-            is_claude: true,
+            output: OutputPipeline::ClaudeStreamJson,
             save_interrupted: true,
             resume: Some(TaskResume {
                 entry: &entry,
@@ -3109,5 +3254,171 @@ mod tests {
             "{calls}"
         );
         assert_eq!(marker_names(&tmp), vec!["error-1", "failed-1"]);
+    }
+
+    // ─────────── codex（format-codex の整形と stdin の /dev/null） ───────────
+
+    /// claude 以外のタスクスクリプトを偽のエージェント / token-burn で実際に走らせる。
+    ///
+    /// 偽のエージェントは stdin を読み切って `stdin.log` に残し、JSONL を 1 行出して正常終了する。
+    /// 偽の token-burn は format-codex で生ログを保存して `format_exit` で終わり、それ以外（mark）の
+    /// 呼び出しを `calls.log` に残す。ワーカーのシェルの stdin には、ペインに打たれたキー入力の
+    /// 代わりの文字列を流し込む。
+    fn run_agent_task(
+        output: OutputPipeline,
+        format_exit: u8,
+    ) -> (tempfile::TempDir, String, String) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = root.join("repo");
+        let run_dir = root.join("run");
+        let markers = root.join("markers");
+        for dir in [&repo, &run_dir, &markers] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let calls = root.join("calls.log");
+        let stdin_log = root.join("stdin.log");
+        let agent_exe = root.join("codex");
+        std::fs::write(
+            &agent_exe,
+            format!(
+                concat!(
+                    "#!/bin/bash\n",
+                    "cat > {stdin_log}\n",
+                    "printf '%s\\n' '{{\"type\":\"thread.started\"}}'\n",
+                ),
+                stdin_log = shell_escape(&stdin_log.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        let tb = root.join("token-burn");
+        std::fs::write(
+            &tb,
+            format!(
+                concat!(
+                    "#!/bin/bash\n",
+                    "case \"$1\" in\n",
+                    "  format-codex) tee \"$3\"; exit {format_exit} ;;\n",
+                    "  *) echo \"$*\" >> {calls} ;;\n",
+                    "esac\n",
+                ),
+                format_exit = format_exit,
+                calls = shell_escape(&calls.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        for exe in [&agent_exe, &tb] {
+            std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let prompt_file = root.join("prompt-1.txt");
+        std::fs::write(&prompt_file, "original prompt").unwrap();
+
+        let agent = agent_for_test("codex", &[&agent_exe.to_string_lossy(), "exec"]);
+        let task = ResolvedTarget {
+            directory: repo.clone(),
+            display_name: "repo".to_string(),
+            prompt: "original prompt".to_string(),
+            visibility: Visibility::Public,
+            defer: false,
+        };
+        let state_file = root.join("state.json");
+        let stop_file = root.join("stop");
+        let script = build_task_script(&TaskCtx {
+            idx: 1,
+            total: 1,
+            task: &task,
+            agent: &agent,
+            prompt_file: &prompt_file,
+            run_dir: &run_dir,
+            marker_dir: &markers,
+            exe_path: &tb,
+            state_file: &state_file,
+            stop_file: &stop_file,
+            rate_limit_threshold: 95,
+            output,
+            save_interrupted: false,
+            resume: None,
+            discard_session: None,
+        });
+        let script_path = root.join("task.sh");
+        std::fs::write(&script_path, &script).unwrap();
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "CANCELLED=0; source {}",
+                shell_escape(&script_path.to_string_lossy())
+            ))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // stdin を読まないまま終わった場合の EPIPE は無視してよい（読まなかったこと自体が結果）。
+        let _ = child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"keys typed into the pane\n");
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "task script must finish: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        let stdin_seen = std::fs::read_to_string(&stdin_log).unwrap();
+        (tmp, calls, stdin_seen)
+    }
+
+    #[test]
+    fn codex_json_task_formats_output_and_marks_success() {
+        if !bash_available() {
+            return;
+        }
+        let (tmp, calls, stdin_seen) = run_agent_task(OutputPipeline::CodexJson, 0);
+        assert_eq!(stdin_seen, "", "codex にペインのキー入力を渡してはいけない");
+        assert!(calls.starts_with("mark codex "), "{calls}");
+        assert_eq!(marker_names(&tmp), vec!["done-1"]);
+        // 生の JSONL は .jsonl に、整形後の出力は .log に残る
+        let raw = std::fs::read_to_string(tmp.path().join("run/0001_repo.jsonl")).unwrap();
+        assert_eq!(raw, "{\"type\":\"thread.started\"}\n");
+        let log = std::fs::read_to_string(tmp.path().join("run/0001_repo.log")).unwrap();
+        assert!(log.contains("thread.started"), "{log}");
+    }
+
+    #[test]
+    fn codex_json_task_fails_when_the_formatter_fails() {
+        if !bash_available() {
+            return;
+        }
+        // 整形器が生ログや出力を書けなかった場合（exit 1）は、codex が成功していても
+        // 成功扱いせず、次回の実行で処理し直せるよう state.json に記録しない。
+        let (tmp, calls, _) = run_agent_task(OutputPipeline::CodexJson, 1);
+        assert!(!calls.contains("mark"), "{calls}");
+        assert_eq!(marker_names(&tmp), vec!["error-1", "failed-1"]);
+        let error = std::fs::read_to_string(tmp.path().join("markers/error-1")).unwrap();
+        assert_eq!(error, "[repo] logging pipeline failed (format=1 tee=0)\n");
+    }
+
+    #[test]
+    fn codex_raw_task_closes_stdin_but_other_agents_keep_it() {
+        if !bash_available() {
+            return;
+        }
+        let (tmp, calls, stdin_seen) = run_agent_task(OutputPipeline::CodexRaw, 0);
+        assert_eq!(stdin_seen, "", "codex にペインのキー入力を渡してはいけない");
+        assert!(calls.starts_with("mark codex "), "{calls}");
+        assert_eq!(marker_names(&tmp), vec!["done-1"]);
+        assert!(
+            !tmp.path().join("run/0001_repo.jsonl").exists(),
+            "素通しでは生ログを別に作らない"
+        );
+
+        // codex 以外は従来どおり stdin を引き継ぐ（同じハーネスでキー入力が届くことを確かめる）
+        let (_tmp, _, stdin_seen) = run_agent_task(OutputPipeline::Raw, 0);
+        assert_eq!(stdin_seen, "keys typed into the pane\n");
     }
 }

@@ -84,7 +84,7 @@ CI (`.github/workflows/ci.yml`) の quality ジョブは Linux と macOS で `ma
 - `[settings]` - 並列実行数、スキップ期間、レポート設定、ターゲット上限、処理済み履歴の共有範囲、中断セッションの保存・再開（`resume_interrupted`）
 - `[prompts]` - デフォルトプロンプト（`default`）、中断セッションを再開するときの継続プロンプト（`resume`、任意）
 - `[ai_usage]` - ai-usage --json 連携設定（任意。enabled / window / fallback / state_window / `[[ai_usage.profiles]]`）
-- `[[agents]]` - エージェント定義（command, provider, env, リセットスケジュール, prompt, ai_usage 連携）
+- `[[agents]]` - エージェント定義（command, provider, env, リセットスケジュール, prompt, ai_usage 連携, codex の出力の扱い `codex_output`）
 - `[[scan]]` - ディレクトリ自動スキャン設定
 - `[[targets]]` - 個別ターゲット（任意）
 
@@ -97,6 +97,12 @@ CI (`.github/workflows/ci.yml`) の quality ジョブは Linux と macOS で `ma
 実行ファイルが `codex` の場合、無人実行で承認待ちにより停止しないよう `-c approval_policy=never` を実行ファイル直後に自動付与します（`codex -c approval_policy=never exec ...`）。`codex exec` には `--ask-for-approval` フラグが無い（0.136.0）ため、サブコマンドのオプション表面に依存しない top-level の config override として挿入します。`--sandbox`（サンドボックス）とは独立した軸のため、サンドボックス指定の有無に関わらず付与します。ユーザーが承認方針を明示済みの場合（`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）は上書きしません。
 
 `provider = "codex"` のコマンドに通常の `env` 前置きがある場合は、オプションと代入を保ち、内側の実行ファイルの直後へ承認方針を挿入します。`env --` の区切りも Codex の `--` と混同せず、内側で指定済みの承認方針を尊重します。
+
+codex エージェントは既定で `codex exec --json` として起動し、イベントを `token-burn format-codex` で整形します（後述「codex の出力（format-codex）」）。`--json` は `exec`（別名 `e`）の直後に挿入します。`exec` の位置は、env の前置きと付与済みの承認方針を読み飛ばし、値を取る top-level オプション（`-c` / `-m` / `-p` / `-s` / `-a` / `-C` / `-i` / `--enable` / `--disable` / `--local-provider` / `--add-dir` / `--remote` / `--remote-auth-token-env` と各長形式）を値ごと飛ばして、最初の位置引数として探します。`--` 以降は探しません。`--json`（旧名 `--experimental-json`）が既にあれば足しません。`exec resume ...` でも `exec` の直後に置いた `--json` が効くことと、`e` が `exec` の別名であることは codex-cli 0.161.0 で確認済みです。`[[agents]]` の `codex_output`（`auto` | `json` | `human`、省略時 `auto`）で扱いを変えられます。`auto` は `exec` が見つかったときだけ整形し、見つからない構成（`exec` をラッパー自身が足す等）は従来どおり素通しします。JSONL でない出力を整形器へ流すと読めなくなるためです。`json` は `exec` が見つからなくても整形し（JSONL を出すというユーザーの申告に従う）、`human` は何も足さず素通しします。codex 以外のエージェントに `codex_output` を書くと設定読み込み時にエラーにします。効かない設定が黙って残ると、効いていると誤解したまま運用されるためです。codex かどうかの判定は、実行時のフラグ付与と同じ `config::agent_runs_cli` を使います（両者が食い違うと、検証を通った設定が実行時に無視される）。
+
+付与したフラグと出力の処理は必ず対応させます。`ensure_required_flags` が `OutputPipeline`（`ClaudeStreamJson` / `CodexJson` / `CodexRaw` / `Raw`）を返し、`build_plan` が `ExecutionPlan.output` に保存して `TaskCtx.output` へ渡します（`--json` を付けたのに素通しする、付けていないのに整形する、を起こさないため）。ドライランの実行計画には codex のときだけ `Output:` 行（`codex JSON events → format-codex` / `raw (...)`）を出します。command だけでは整形されるかどうかが読み取れないためです。
+
+codex の stdin は `/dev/null` にします（`CodexJson` と `CodexRaw` の両方。claude とその他のエージェントは従来どおりペインの TTY）。無人実行なので、codex が stdin を読む経路に入ってもペインのキー入力を待って止まったり、ペインで打たれたキーを読んだりせず、即座に EOF を受け取るようにします。codex exec は stdin が TTY でないと stdin を読んでプロンプトへ `<stdin>` ブロックとして足しますが、`/dev/null` なら何も足されず、stderr に `Reading additional input from stdin...` と出るだけです（codex-cli 0.161.0 で、rollout に記録されたユーザーメッセージがプロンプトと一致することを確認済み）。
 
 ### ai-usage 連携
 
@@ -280,9 +286,21 @@ statusline コマンドは usage-gate / 起動時キャッシュ初期化と同�
 
 自動終了するとモニターが最後に描いた集計は tmux ごと画面から消えるため、`execute_plan_tmux` は `attach-session` から戻った後（一時ディレクトリの削除より前）に `marker_dir` の `done-*` / `failed-*` / `retry-*` を `collect_run_summary` で数え直し、同じ文言（`✅ All N/N tasks completed` / `⚠ Completed: ...` / `⏹ Stopped: ...`）を呼び出し元の端末へ出します。`worker-done-*` は `done-` 始まりではないためタスク件数には混ざりません。集計に失敗しても 0 件として続行します（実行結果の記録自体は `state.json` が持つため）。デタッチ（`tmux has-session` が成功）時はタスクが走行中なので集計は出しません。
 
-`claude` エージェントのみ出力を `.jsonl` + `format-stream` パイプラインで処理します。`codex` 等の他エージェントは `.log` に直接出力します。
+`claude` エージェントは出力を `.jsonl` + `format-stream`、`codex` エージェント（`--json` で起動したもの）は `.jsonl` + `format-codex` のパイプラインで処理します。それ以外（`codex_output = "human"` の codex や、`exec` が見つからず素通しにした codex を含む）は `.log` に直接出力します。
 
-`claude` エージェントでは、`format-stream` / `tee` / raw jsonl 保存のいずれかが失敗した場合、または jsonl が空の場合、そのタスクは `failed-N` として扱い、`state.json` には記録しません。ログ・分類パイプラインが壊れたタスクを成功扱いしないためです。非 `claude` エージェントでも `tee` が失敗した場合は `failed-N` として扱います。
+`claude` エージェントでは、`format-stream` / `tee` / raw jsonl 保存のいずれかが失敗した場合、または jsonl が空の場合、そのタスクは `failed-N` として扱い、`state.json` には記録しません。ログ・分類パイプラインが壊れたタスクを成功扱いしないためです。codex の `--json` 実行でも、`format-codex`（生 jsonl の保存か表示の書き込みに失敗すると 1 で終わる）か `tee` が失敗したら `failed-N` にします。codex には結果の分類が無いので、空の jsonl は検査せず、その後は終了コードで判定します。素通しのエージェントでも `tee` が失敗した場合は `failed-N` として扱います。
+
+### codex の出力（format-codex）
+
+codex の人間向けの出力は、ファイルを変更するコマンドやパッチのたびに、ターン開始からの累積 unified diff（`diff --git a//abs/path ...`）を丸ごと出し直します。実ログ（codex-cli 0.160.1、9 時間 15 分の 1 タスク）では 141MB のログのうち 126MB（89%）がこの diff で、1 回あたり中央値 117KB・最大 520KB、1,009 回出ていました。1 ターンが何時間も続くと累積 diff は単調に肥大し、79 桁 × 40 行のペインには常に diff の末尾しか映らないため、コマンドが進んでいても止まって見えます。`codex exec --json` の JSONL には累積 diff が含まれず（`file_change` はパスと種別だけ）、hook の行も出ないため、これを token-burn 側で整形します。人間向けの出力の体裁（直前の hook 行や `a//` の絶対パス）を頼りに diff ブロックだけを畳む案は、`git diff` を実行したコマンド出力と区別できず codex の版で壊れるので採りませんでした。
+
+- **表示**: コマンドは開始時に `🔧 $ <コマンド>`、終了時に `✓ $ <コマンド> (12.3s) → <出力の最終行>`。失敗時は `✗ exit <code> $ <コマンド> (<経過>)` と出力の末尾 3 行。`item.updated` は途中までの `aggregated_output` を丸ごと載せて何度も届くので表示しません（人間向け出力の累積 diff と同じ問題になる）。経過時間は item id ごとに開始を受け取った時刻から測ります（JSON に所要時間が無いため）。開始を見ていなければ経過時間は出しません。`/bin/zsh -lc '...'` のようなシェルの包みとクォートは表示でだけ外します（シェルが sh / bash / zsh、フラグが `-c` / `-lc` のときだけ。shlex 形式の断片の連結 `'echo '"'"'hi'"'"''` も外す）。ファイル変更は完了時に 1 件 1 行（`📝 update src/engine.rs`）で、カレントディレクトリ（＝対象リポジトリ）の中は相対、外は絶対パスです。その他に `agent_message`（`💬`、全文）、`reasoning`（1 行に畳む）、`mcp_tool_call`、`web_search`、`todo_list`（進捗か次の項目が変わったときだけ）、`collab_tool_call`、`error`、`turn.completed` の使用量（`📊 in:<n> (cached:<n>) out:<n> (reasoning:<n>) [HH:MM:SS]`）、`turn.failed`（`❌`）を出します。知らないイベントや item は種別だけ出します（黙って捨てると、版で増えたことに気付けない）。
+- **ハートビート**: codex は文脈の圧縮中や xhigh の推論中に何も出力しません。実ログの rollout では 9 時間で 3〜6.5 分の空白が 10 回（計 41 分）あり、中身は ContextCompaction と推論でした。イベントが 2 分届かないと `⏳ No codex events for 2m 00s [HH:MM:SS]` を出し、以後 2 分ごとに繰り返します。実行中のコマンドがあれば最も長く走っているものを ` — running: $ <コマンド> (<経過>)` と添えます。原因は推測で書きません（ネットワーク待ちなど別の停滞もあり得る）。ターンが終わったら実行中の扱いを捨てます。完了イベントを伴わず中断されたコマンドを、以後のハートビートが「実行中」と出し続けないためです。読み取りと表示を 2 スレッドに分け、表示側が `recv_timeout(1s)` で起きて判定します。表示の書き込みはすべて表示側で行うので、行が混ざりません。
+- **生ログ**: 受け取ったバイト列をそのまま（不正な UTF-8 も置換せず）`<NNNN>_<name>.jsonl` へ書き、1 行ごとに flush します（キャンセルで打ち切られても失わない）。表示だけ U+FFFD に置換します。`2>&1` で合流した stderr の行も含む混在ログです。
+- **入力は EOF まで読み切る**: 生ログやペインへ書けなくなっても、壊れた側への書き込みだけを止めて読み続け、最後に 1 で終わります。途中で抜けるとパイプが閉じ、上流の codex が SIGPIPE で落ちて数時間の作業を巻き添えにします。警告は `eprintln!` を使わず stderr へ書き、書けなくても panic しません。
+- **制御文字**: コマンド出力やエージェントの文章のエスケープシーケンス（CSI / OSC など）と C0・C1 制御文字は表示から除きます。素通しするとペインの表示が崩れたり、OSC でタイトルを書き換えられたりします。JSON として読めない行（stderr）は 2,000 文字で切ります。巨大な JSON 行を書いている途中に stderr が割り込むと、壊れた行が数百 KB のまま流れ、累積 diff と同じ問題が戻るためです。
+
+ユーザーが「10:30 少し前は動いていなかった、Enter を連打したら進んだ」と報告した時間帯、rollout ではエージェントに 45 秒を超える空白が無く、止まっていたのは表示の経路でした。ペインの TTY は macOS 既定の `ixon ixany` で、XOFF（^S）が入ると tee の書き込みが止まり、任意のキーで再開します。原因は断定できませんが同じ症状を起こすため、ワーカーとモニターのペインでは XON/XOFF を切ります（後述「並列実行モデル」）。
 
 `claude` エージェントのタスク完了後は `token-burn classify-result <jsonl>` により jsonl 最終 `result` イベントの `is_error` / `api_error_status` を解析して分類し、終了コード（**0 = 成功 / 1 = 失敗 / 2 = レート制限 / 3 = リトライ可能 / 4 = 再開不能**）で返します。
 

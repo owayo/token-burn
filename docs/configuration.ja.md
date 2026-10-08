@@ -78,6 +78,7 @@ timezone = "Asia/Tokyo"
 | `reset_time` | リセット時刻（HH:MM） | `"09:00"` |
 | `timezone` | IANAタイムゾーン | `"Asia/Tokyo"` |
 | `prompt` | エージェント固有プロンプト（任意） | `"prompts/test-coverage.md"` |
+| `codex_output` | Codex エージェントの出力の扱い（任意。Codex エージェント専用）。`auto`（既定）/ `json` / `human`。後述 | `"auto"` |
 
 `name` は空文字不可で、profile 展開後の名前が全体で一意である必要があります。展開名は `state.json` のキー・レポートディレクトリ名・`--agent` の指定子を兼ねるため、重複すると 2 件目のエージェントを選べなくなり、2 つのエージェントの処理済み履歴が黙って混ざります。`command` は1要素以上を指定し、先頭要素には空でない実行ファイル名を指定してください。`prompt` を指定するとグローバルの `[prompts].default` の代わりに使われます。ターゲット固有の `prompt` が最優先です。
 
@@ -88,6 +89,18 @@ timezone = "Asia/Tokyo"
 **Claude 必須フラグの自動付与**: コマンドの実行ファイルが `claude` の場合、ログ出力と進捗モニタリングに必要な `-p`、`--verbose`、`--output-format stream-json`、`--include-partial-messages` と、対話回答待ちを防ぐ `--disallowedTools=AskUserQuestion` が必ず有効化されます。未指定フラグは自動追加され、既存の `--output-format` 値（`--output-format=...` 形式を含む）は `stream-json` に正規化されます。既存の `--disallowedTools` / `--disallowed-tools` がある場合は、必要に応じて equals 形式へ正規化して `AskUserQuestion` を追記します。設定ファイルへの記述は不要です。
 
 **Claude 環境変数の自動付与**: Claude プロセスの環境にはデフォルトで `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` が追加されます。これが無いと `claude -p` はメインターン終了後にバックグラウンドタスク（background 起動のサブエージェント / ワークフロー）を最大 600 秒しか待たず、"Background tasks still running after 600s; terminating." と共に全タスクを強制終了し、仕事が未完のまま成功として報告されます。`0` は無期限待機を意味し、バックグラウンドエージェントの完了通知でメインループが再開して完走できるようになります。agent / profile の `env` で明示すれば上書きできます（空文字を指定すると unset され、Claude 既定の 600 秒に戻ります）。
+
+**Codex 必須フラグの自動付与**: エージェントが Codex（`provider = "codex"`、または実行ファイル名が `codex` / `codex-*` / `codex_*`）の場合、無人実行が承認待ちで止まらないよう `-c approval_policy=never` を実行ファイルの直後に挿入します。承認方針を指定済み（`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）なら挿入しません。Codex の標準入力は `/dev/null` にするため、ワーカーのペインで打ったキーが Codex へ届くことはありません。
+
+**Codex の出力（`codex_output`）**: Codex の人間向けの出力は、ファイルを変更するたびにターン全体の diff を出し直し、ペインとログを埋め尽くします（9 時間のタスクで 141MB のログのうち 126MB）。そのため既定では `codex exec --json` で起動し、イベントを token-burn が整形します（[monitor.ja.md](monitor.ja.md#codex-cli) を参照）。
+
+| 値 | 挙動 |
+|----|------|
+| `auto`（既定） | 実行ファイルとそのオプションの後の最初のサブコマンドが `exec`（別名 `e`）なら、その直後に `--json` を挿入して（既にあれば挿入しない）イベントを整形する。見つからない場合（`exec` をラッパー自身が付ける構成など）は人間向けの出力のまま |
+| `json` | `exec` が見つかれば同じく挿入する。見つからなくても挿入はせず、出力を JSON イベントとして整形する。JSON を出すラッパー向け |
+| `human` | 何も挿入せず、従来どおり Codex 自身の人間向けの出力のままにする |
+
+Codex 以外のエージェントに `codex_output` を書くと、黙って無視せず設定エラーにします。
 
 `reset_weekday` に指定可能な値: `monday` `tuesday` `wednesday` `thursday` `friday` `saturday` `sunday`（短縮形: `mon` `tue` `wed` `thu` `fri` `sat` `sun`）
 

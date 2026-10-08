@@ -1,4 +1,6 @@
-use crate::config::RuntimeAgent;
+use crate::config::{CodexOutput, RuntimeAgent, agent_runs_cli, command_basename};
+
+use super::OutputPipeline;
 
 const CLAUDE_BLOCKED_INTERACTIVE_TOOL: &str = "AskUserQuestion";
 /// `claude -p` はメインターン終了後にバックグラウンドタスク（Agent
@@ -12,57 +14,57 @@ pub(super) const CLAUDE_PRINT_BG_WAIT_ENV: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEI
 /// `codex exec` には `--ask-for-approval` フラグが無い（0.136.0）ため、サブコマンドの
 /// オプション表面に依存しない top-level の `-c approval_policy=never` を使う。
 const CODEX_APPROVAL_OVERRIDE: &str = "approval_policy=never";
-
-/// command の先頭要素（実行ファイル）の basename（拡張子なし）を返す。
-/// 空 command やパス解決不能な場合は空文字列を返す。
-fn command_basename(command: &[String]) -> &str {
-    let Some(first) = command.first() else {
-        return "";
-    };
-    std::path::Path::new(first.as_str())
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-}
-
-/// command の先頭要素が claude 実行ファイル（ラッパースクリプト含む）かを判定する。
-/// ファイル名（basename）が "claude" そのもの、または "claude-" / "claude_" で始まる場合に true。
-fn is_claude_command(command: &[String]) -> bool {
-    let basename = command_basename(command);
-    basename == "claude" || basename.starts_with("claude-") || basename.starts_with("claude_")
-}
-
-/// command の先頭要素が codex 実行ファイル（ラッパースクリプト含む）かを判定する。
-/// ファイル名（basename）が "codex" そのもの、または "codex-" / "codex_" で始まる場合に true。
-fn is_codex_command(command: &[String]) -> bool {
-    let basename = command_basename(command);
-    basename == "codex" || basename.starts_with("codex-") || basename.starts_with("codex_")
-}
+/// codex の top-level オプションのうち値を取るもの（codex-cli 0.161.0 の `codex --help` で確認）。
+///
+/// サブコマンドを探すとき、これらの値（`-p exec` のプロファイル名など）を位置引数と取り違えない
+/// よう、オプションと値をまとめて読み飛ばす。`-i` / `--image` は複数の値を取り得るが 1 つとして
+/// 扱う（`-i a.png,b.png` のカンマ区切りなら正しく読める）。読み違えてもサブコマンドが見つからない
+/// だけで、`codex_output = "auto"` は従来どおりの素通しへ倒れる。
+const CODEX_VALUE_OPTIONS: [&str; 20] = [
+    "-c",
+    "--config",
+    "-m",
+    "--model",
+    "-p",
+    "--profile",
+    "-s",
+    "--sandbox",
+    "-a",
+    "--ask-for-approval",
+    "-C",
+    "--cd",
+    "-i",
+    "--image",
+    "--enable",
+    "--disable",
+    "--local-provider",
+    "--add-dir",
+    "--remote",
+    "--remote-auth-token-env",
+];
 
 /// provider が明示されていればそれを優先し、無ければ実行ファイル名から推論する。
 pub(super) fn agent_is_claude(agent: &RuntimeAgent) -> bool {
-    match agent.provider.as_deref() {
-        Some(p) => p.eq_ignore_ascii_case("claude"),
-        None => is_claude_command(&agent.command),
-    }
+    agent_runs_cli(agent.provider.as_deref(), &agent.command, "claude")
 }
 
 /// RuntimeAgent が codex provider かを判定する。
 fn agent_is_codex(agent: &RuntimeAgent) -> bool {
-    match agent.provider.as_deref() {
-        Some(p) => p.eq_ignore_ascii_case("codex"),
-        None => is_codex_command(&agent.command),
-    }
+    agent_runs_cli(agent.provider.as_deref(), &agent.command, "codex")
 }
 
-/// 既知エージェントに必要なフラグを自動付与する。
+/// 既知エージェントに必要なフラグを自動付与し、タスクの出力の処理方法を返す。
 /// provider（または実行ファイル名）が `claude` か `codex` かを判定し、それぞれの
-/// 無人実行に必要なフラグを付与する。いずれにも該当しない場合は何もしない。
-pub(super) fn ensure_required_flags(agent: &mut RuntimeAgent) {
+/// 無人実行に必要なフラグを付与する。いずれにも該当しない場合は何もせず、出力は素通しにする。
+pub(super) fn ensure_required_flags(agent: &mut RuntimeAgent) -> OutputPipeline {
     if agent_is_claude(agent) {
         ensure_claude_required_flags(agent);
+        OutputPipeline::ClaudeStreamJson
     } else if agent_is_codex(agent) {
         ensure_codex_unattended_flags(&mut agent.command);
+        ensure_codex_output_flags(&mut agent.command, agent.codex_output)
+    } else {
+        OutputPipeline::Raw
     }
 }
 
@@ -249,6 +251,62 @@ fn is_approval_policy_override(value: &str) -> bool {
     value
         .split_once('=')
         .is_some_and(|(key, _)| key == "approval_policy")
+}
+
+/// codex の出力モードに応じて `--json` を付与し、タスクの出力の処理方法を返す。
+///
+/// 人間向けの出力は、ファイルを変更するたびにそのターンの累積 diff 全体を出し直す
+/// （実測で 141MB のログのうち 126MB、1 回あたり 100〜500KB）。ペインが常に diff の末尾を
+/// 映して止まって見えるため、`codex exec --json` の JSONL を `format-codex` で整形する。
+///
+/// `--json` は `exec` サブコマンドの直後に挿入する。`exec resume ...` でも `exec` の直後に
+/// 置けば受け付けられ、`e` は `exec` の別名。既に `--json`（旧名 `--experimental-json`）が
+/// あれば二重に付けない。
+fn ensure_codex_output_flags(command: &mut Vec<String>, mode: CodexOutput) -> OutputPipeline {
+    if mode == CodexOutput::Human {
+        return OutputPipeline::CodexRaw;
+    }
+    match codex_exec_index(command) {
+        Some(exec) => {
+            let has_json = command[exec + 1..]
+                .iter()
+                .take_while(|arg| arg.as_str() != "--")
+                .any(|arg| arg == "--json" || arg == "--experimental-json");
+            if !has_json {
+                command.insert(exec + 1, "--json".to_string());
+            }
+            OutputPipeline::CodexJson
+        }
+        // `exec` を見つけられない（サブコマンドを自分で足すラッパー等）。`json` は「JSONL を出す」
+        // というユーザーの申告に従って整形する。`auto` は出力の形が分からないので、従来どおり
+        // 何も足さずに素通しする（JSONL でない出力を整形器へ流すと読めなくなる）。
+        None if mode == CodexOutput::Json => OutputPipeline::CodexJson,
+        None => OutputPipeline::CodexRaw,
+    }
+}
+
+/// command の中の codex の `exec` サブコマンド（別名 `e`）の位置を返す。見つからなければ `None`。
+///
+/// 実行ファイルより後ろを codex の argv として読み、最初の位置引数をサブコマンドとみなす。
+/// env の前置きは読み飛ばす。値を取る top-level オプション（[`CODEX_VALUE_OPTIONS`]）は値ごと
+/// 飛ばし、`--opt=value` や `-mVALUE` のような結合形式を含むそれ以外の `-…` は 1 要素として
+/// 飛ばす。`--` 以降は位置引数なのでサブコマンドではない（clap も `--` の後ろをサブコマンドと
+/// して解釈しない）。単独の `-` は clap と同じく位置引数として扱う。
+fn codex_exec_index(command: &[String]) -> Option<usize> {
+    let mut idx = env_command_index(command) + 1;
+    while let Some(arg) = command.get(idx) {
+        if arg == "--" {
+            return None;
+        }
+        if CODEX_VALUE_OPTIONS.contains(&arg.as_str()) {
+            idx += 2;
+        } else if arg.starts_with('-') && arg != "-" {
+            idx += 1;
+        } else {
+            return matches!(arg.as_str(), "exec" | "e").then_some(idx);
+        }
+    }
+    None
 }
 
 fn ensure_disallowed_tool(command: &mut Vec<String>, tool: &str) {
@@ -617,7 +675,7 @@ mod tests {
             ..Default::default()
         };
         ensure_required_flags(&mut agent);
-        // 実行ファイル直後に top-level config override が挿入される
+        // 実行ファイル直後に top-level config override が、exec 直後に --json が挿入される
         assert_eq!(
             agent.command,
             vec![
@@ -625,64 +683,269 @@ mod tests {
                 "-c".to_string(),
                 "approval_policy=never".to_string(),
                 "exec".to_string(),
+                "--json".to_string(),
             ]
         );
     }
 
     #[test]
     fn ensure_required_flags_ignores_unknown_agent() {
-        // claude でも codex でもないエージェントは一切変更しない
+        // claude でも codex でもないエージェントは一切変更せず、出力も素通しにする
         let mut agent = RuntimeAgent {
             name: "aider".to_string(),
             command: vec!["aider".to_string(), "--yes".to_string()],
             ..Default::default()
         };
         let original = agent.command.clone();
-        ensure_required_flags(&mut agent);
+        assert_eq!(ensure_required_flags(&mut agent), OutputPipeline::Raw);
         assert_eq!(agent.command, original);
     }
 
     #[test]
-    fn is_claude_command_detects_bare_claude() {
-        assert!(is_claude_command(&["claude".to_string()]));
-        assert!(is_claude_command(&["claude".to_string(), "-p".to_string()]));
+    fn ensure_required_flags_selects_the_claude_pipeline() {
+        let mut agent = make_agent(vec!["claude"]);
+        assert_eq!(
+            ensure_required_flags(&mut agent),
+            OutputPipeline::ClaudeStreamJson
+        );
+    }
+
+    // ─────────── codex の出力（codex_output と --json の付与） ───────────
+
+    fn codex_agent(command: &[&str], mode: CodexOutput) -> RuntimeAgent {
+        RuntimeAgent {
+            name: "codex".to_string(),
+            provider: Some("codex".to_string()),
+            command: command.iter().map(|s| s.to_string()).collect(),
+            codex_output: mode,
+            ..Default::default()
+        }
+    }
+
+    /// 実運用の構成（provider = "codex" のラッパースクリプトで exec を渡す）。承認方針は
+    /// 実行ファイルの直後、--json は exec の直後に入り、既存の引数の順序は変わらない。
+    #[test]
+    fn codex_wrapper_with_exec_gets_json_right_after_exec() {
+        let mut agent = codex_agent(
+            &[
+                "/opt/bin/codex-wrapper.sh",
+                "exec",
+                "--sandbox",
+                "danger-full-access",
+                "-c",
+                "model='gpt-6.1-sol'",
+                "-c",
+                "model_reasoning_effort='xhigh'",
+            ],
+            CodexOutput::Auto,
+        );
+        assert_eq!(ensure_required_flags(&mut agent), OutputPipeline::CodexJson);
+        assert_eq!(
+            agent.command,
+            [
+                "/opt/bin/codex-wrapper.sh",
+                "-c",
+                "approval_policy=never",
+                "exec",
+                "--json",
+                "--sandbox",
+                "danger-full-access",
+                "-c",
+                "model='gpt-6.1-sol'",
+                "-c",
+                "model_reasoning_effort='xhigh'",
+            ]
+        );
+        // 2 回適用しても増えない（approval_policy も --json も既存として検出される）
+        let once = agent.command.clone();
+        ensure_required_flags(&mut agent);
+        assert_eq!(agent.command, once);
     }
 
     #[test]
-    fn is_claude_command_detects_wrapper_script() {
-        assert!(is_claude_command(&[
-            "/opt/tools/claude-wrapper.sh".to_string()
-        ]));
-        assert!(is_claude_command(&[
-            "./claude-wrapper.sh".to_string(),
-            "-p".to_string(),
-        ]));
-        assert!(is_claude_command(&["claude-code.sh".to_string()]));
-        assert!(is_claude_command(&["claude_custom".to_string()]));
+    fn codex_exec_alias_e_gets_json() {
+        let mut agent = codex_agent(&["codex", "e", "--skip-git-repo-check"], CodexOutput::Auto);
+        assert_eq!(ensure_required_flags(&mut agent), OutputPipeline::CodexJson);
+        assert_eq!(
+            agent.command,
+            [
+                "codex",
+                "-c",
+                "approval_policy=never",
+                "e",
+                "--json",
+                "--skip-git-repo-check"
+            ]
+        );
     }
 
     #[test]
-    fn is_claude_command_rejects_non_claude() {
-        assert!(!is_claude_command(&["codex".to_string()]));
-        assert!(!is_claude_command(&["my-claude-fork".to_string()]));
-        assert!(!is_claude_command(&[]));
+    fn codex_json_follows_exec_inside_env_prefix() {
+        let mut agent = codex_agent(
+            &["env", "-u", "OLD_TOKEN", "TOKEN=value", "codex", "exec"],
+            CodexOutput::Auto,
+        );
+        assert_eq!(ensure_required_flags(&mut agent), OutputPipeline::CodexJson);
+        assert_eq!(
+            agent.command,
+            [
+                "env",
+                "-u",
+                "OLD_TOKEN",
+                "TOKEN=value",
+                "codex",
+                "-c",
+                "approval_policy=never",
+                "exec",
+                "--json",
+            ]
+        );
+    }
+
+    /// exec より前の top-level オプションは値ごと読み飛ばす。値（ここではプロファイル名 `exec`）を
+    /// サブコマンドと取り違えない。`--opt=value` と `-mVALUE` は 1 要素で、未知の `--flag` は値を取らない。
+    #[test]
+    fn codex_exec_is_found_after_global_options_and_their_values() {
+        let mut command: Vec<String> = [
+            "codex",
+            "-p",
+            "exec",
+            "--model=gpt-6.1-sol",
+            "-mgpt-6.1-sol",
+            "--oss",
+            "-C",
+            "/tmp/repo",
+            "--add-dir",
+            "/tmp/shared",
+            "--enable",
+            "web_search",
+            "--remote",
+            "ws://127.0.0.1:1",
+            "-a",
+            "never",
+            "exec",
+            "review this",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(codex_exec_index(&command), Some(16));
+        assert_eq!(
+            ensure_codex_output_flags(&mut command, CodexOutput::Auto),
+            OutputPipeline::CodexJson
+        );
+        assert_eq!(&command[16..], ["exec", "--json", "review this"]);
     }
 
     #[test]
-    fn is_codex_command_detects_bare_and_wrapper() {
-        assert!(is_codex_command(&["codex".to_string()]));
-        assert!(is_codex_command(&["codex".to_string(), "exec".to_string()]));
-        assert!(is_codex_command(&[
-            "/opt/tools/codex-wrapper.sh".to_string()
-        ]));
-        assert!(is_codex_command(&["codex_custom".to_string()]));
+    fn codex_existing_json_flag_is_not_duplicated() {
+        for flag in ["--json", "--experimental-json"] {
+            let mut command: Vec<String> = ["codex", "exec", "--sandbox", "read-only", flag]
+                .map(String::from)
+                .to_vec();
+            let original = command.clone();
+            assert_eq!(
+                ensure_codex_output_flags(&mut command, CodexOutput::Auto),
+                OutputPipeline::CodexJson,
+                "{flag}"
+            );
+            assert_eq!(command, original, "{flag} を二重に付けてはいけない");
+        }
     }
 
     #[test]
-    fn is_codex_command_rejects_non_codex() {
-        assert!(!is_codex_command(&["claude".to_string()]));
-        assert!(!is_codex_command(&["my-codex-fork".to_string()]));
-        assert!(!is_codex_command(&[]));
+    fn codex_exec_resume_gets_json_right_after_exec() {
+        let mut command: Vec<String> = ["codex", "exec", "resume", "--last"]
+            .map(String::from)
+            .to_vec();
+        ensure_codex_output_flags(&mut command, CodexOutput::Auto);
+        assert_eq!(command, ["codex", "exec", "--json", "resume", "--last"]);
+    }
+
+    /// `--` 以降は位置引数。そこに `exec` や `--json` があってもサブコマンドや既存フラグとは扱わない。
+    #[test]
+    fn codex_double_dash_ends_the_option_scan() {
+        // `--` の後ろの exec はプロンプトの一部（サブコマンドではない）
+        let mut command: Vec<String> = ["codex", "--", "exec"].map(String::from).to_vec();
+        let original = command.clone();
+        assert_eq!(
+            ensure_codex_output_flags(&mut command, CodexOutput::Auto),
+            OutputPipeline::CodexRaw
+        );
+        assert_eq!(command, original);
+
+        // exec の後ろでも、`--` より後ろの `--json` はプロンプトの文字列
+        let mut command: Vec<String> = ["codex", "exec", "--", "--json"].map(String::from).to_vec();
+        assert_eq!(
+            ensure_codex_output_flags(&mut command, CodexOutput::Auto),
+            OutputPipeline::CodexJson
+        );
+        assert_eq!(command, ["codex", "exec", "--json", "--", "--json"]);
+    }
+
+    /// exec を渡さないラッパー（中でサブコマンドを足すもの）は出力の形が分からないので、
+    /// `auto` では何も足さずに従来どおり素通しする。
+    #[test]
+    fn codex_wrapper_without_exec_stays_raw_in_auto_mode() {
+        for command in [
+            vec!["/opt/bin/codex-wrapper.sh"],
+            vec!["/opt/bin/codex-wrapper.sh", "--sandbox", "read-only"],
+            // 最初の位置引数が exec 以外（プロンプトや別のサブコマンド）
+            vec!["codex", "review"],
+            vec!["codex", "-", "exec"],
+        ] {
+            let mut agent = codex_agent(&command, CodexOutput::Auto);
+            assert_eq!(
+                ensure_required_flags(&mut agent),
+                OutputPipeline::CodexRaw,
+                "{command:?}"
+            );
+            assert!(
+                !agent.command.iter().any(|arg| arg == "--json"),
+                "{:?}",
+                agent.command
+            );
+        }
+    }
+
+    /// `json` は exec を見つけられなくても JSONL を出すというユーザーの申告に従う（何も足さない）。
+    #[test]
+    fn codex_json_mode_trusts_the_command_without_exec() {
+        let mut agent = codex_agent(&["/opt/bin/codex-json.sh"], CodexOutput::Json);
+        assert_eq!(ensure_required_flags(&mut agent), OutputPipeline::CodexJson);
+        assert_eq!(
+            agent.command,
+            ["/opt/bin/codex-json.sh", "-c", "approval_policy=never"]
+        );
+
+        // exec を見つけられれば auto と同じく --json を付ける
+        let mut agent = codex_agent(&["codex", "exec"], CodexOutput::Json);
+        assert_eq!(ensure_required_flags(&mut agent), OutputPipeline::CodexJson);
+        assert!(
+            agent
+                .command
+                .ends_with(&["exec".to_string(), "--json".to_string()])
+        );
+    }
+
+    #[test]
+    fn codex_human_mode_never_adds_json() {
+        let mut agent = codex_agent(&["codex", "exec"], CodexOutput::Human);
+        assert_eq!(ensure_required_flags(&mut agent), OutputPipeline::CodexRaw);
+        assert_eq!(
+            agent.command,
+            ["codex", "-c", "approval_policy=never", "exec"]
+        );
+    }
+
+    /// provider 未設定でも実行ファイル名が codex なら codex として扱う（従来の推論と同じ）。
+    #[test]
+    fn codex_is_inferred_from_the_executable_name_without_provider() {
+        let mut agent = RuntimeAgent {
+            name: "codex".to_string(),
+            command: vec!["codex".to_string(), "exec".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(ensure_required_flags(&mut agent), OutputPipeline::CodexJson);
     }
 
     #[test]

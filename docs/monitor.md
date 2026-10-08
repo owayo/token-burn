@@ -1,6 +1,6 @@
 # Live monitor
 
-What token-burn shows while it runs. Each worker pane renders Claude Code's stream-json output as readable lines, and the monitor pane shows the progress of the whole run. The tmux layout itself is described in [usage.md](usage.md#running-in-tmux).
+What token-burn shows while it runs. Each worker pane renders Claude Code's stream-json output or Codex CLI's JSON events as readable lines, and the monitor pane shows the progress of the whole run. The tmux layout itself is described in [usage.md](usage.md#running-in-tmux).
 
 ## Monitor pane
 
@@ -55,5 +55,17 @@ Startup cache collection also has a 30-second timeout, covering both child exit 
 - **System notification visibility**: Shows Claude Code system notifications such as stop-hook errors, plus hook diagnostics when `hook_progress` / `hook_response` include stderr or output
 - **Hook feedback visibility**: When a Stop hook exits 2 or times out, Claude Code feeds its output back to the model as a synthetic user message (`isSynthetic`) that appears in neither `hook_response` nor `notification`. Messages whose first line is `<Event> hook feedback:` are rendered as `⚠ Hook feedback (Stop): ⏱ Stop hook timed out after 120s: cargo`. In unattended runs the Stop hook is what performs the automatic commit/push, so dropping this leaves no way to explain why the work finished but nothing was committed. Skill body injections (`Base directory for this skill: ...`) arrive as the same synthetic message but stay hidden — they carry the whole SKILL.md and duplicate the `Skill` tool line
 - **API retry visibility**: Shows retry attempts with error details during transient failures
+
+## Codex CLI
+
+token-burn starts `codex exec` with `--json` and renders its events with `token-burn format-codex`. The raw events are saved next to the log as `<NNNN>_<name>.jsonl`.
+
+- **No cumulative diff**: Codex's human-readable output reprints the whole diff of the turn after every file change. In a 9-hour task this was 126MB of a 141MB log, 100–500KB each time, and the pane only ever showed the tail of a diff, so the run looked frozen while it was working. Each changed file is now one line (`📝 update src/engine.rs`); review the changes themselves with `git diff` in the repository
+- **Commands**: `🔧 $ <command>` when a command starts, and `✓ $ <command> (12.3s) → <last output line>` or `✗ exit 2 $ <command> (14.9s)` followed by the last three output lines when it ends. The `/bin/zsh -lc '…'` wrapper is left out of the display only
+- **Silence heartbeat**: Codex prints nothing while it compacts the context or reasons at a high effort; a real 9-hour task had 10 silences of 3–6.5 minutes. After 2 minutes without any event a `⏳ No codex events for 2m 00s [10:18:03]` line appears, then one every 2 minutes, naming the command still running if there is one. The line says only that no event arrived; it does not guess why
+- **Other events**: Agent messages (`💬`), token usage per turn (`📊 in:<n> (cached:<n>) out:<n>`), turn failures and errors (`❌`), MCP tool calls, web searches, plan progress, and subagent calls
+- **Robust capture**: The raw events are saved byte for byte, invalid UTF-8 included, and the formatter keeps reading to the end even when it can no longer write the log or the pane, so codex is never cut off by a broken pipe. Either failure marks the task failed
+
+Set `codex_output = "human"` on the agent to keep Codex's own human-readable output instead; see [Agents](configuration.md#agents).
 
 Rate-limit warnings and stops are covered in [rate-limits.md](rate-limits.md).

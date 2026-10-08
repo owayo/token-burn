@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::config::RuntimeAgent;
+use crate::config::{CodexOutput, RuntimeAgent};
 use crate::display;
 use crate::resume::ResumeEntry;
 use crate::scanner::{ResolvedTarget, Visibility};
@@ -36,6 +36,47 @@ pub struct ExecutionPlan {
     pub tasks: Vec<ResolvedTarget>,
     pub usage_gate: Option<UsageGateConfig>,
     pub resume: ResumePlan,
+    /// タスクの出力の処理方法。command へのフラグ付与と同時に 1 度だけ決める。
+    pub output: OutputPipeline,
+}
+
+/// タスクスクリプトが組み立てるパイプラインの形（stdin と出力の扱い）。
+///
+/// 付与したフラグと出力の処理は対応していなければならない（`--json` を付けたのに素通しする、
+/// 付けていないのに JSONL として整形する、を起こさない）ため、フラグを付与する
+/// `ensure_required_flags` が返し、`build_plan` が計画に保存する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputPipeline {
+    /// claude の stream-json を `format-stream` で整形し、`classify-result` で結果を分類する。
+    ClaudeStreamJson,
+    /// `codex exec --json` の JSONL を `format-codex` で整形する。stdin は /dev/null。
+    CodexJson,
+    /// codex の人間向けの出力をそのままログへ流す（`codex_output = "human"`、または
+    /// `exec` を見つけられないラッパー）。stdin は /dev/null。
+    CodexRaw,
+    /// その他のエージェント。出力をそのままログへ流し、stdin はペインの TTY のまま（従来どおり）。
+    Raw,
+}
+
+impl OutputPipeline {
+    /// エージェントの stdin を /dev/null にするか（codex のみ。理由は `build_task_script` 参照）。
+    fn closes_stdin(self) -> bool {
+        matches!(self, OutputPipeline::CodexJson | OutputPipeline::CodexRaw)
+    }
+
+    /// 実行計画に出す出力の扱い（codex のみ。command だけでは読み取れないため）。
+    fn plan_label(self, codex_output: CodexOutput) -> Option<&'static str> {
+        match self {
+            OutputPipeline::CodexJson => Some("codex JSON events → format-codex"),
+            OutputPipeline::CodexRaw if codex_output == CodexOutput::Human => {
+                Some("raw (codex_output = \"human\")")
+            }
+            OutputPipeline::CodexRaw => Some(
+                "raw (no `exec` subcommand found; set codex_output = \"json\" if the command prints codex JSONL)",
+            ),
+            OutputPipeline::ClaudeStreamJson | OutputPipeline::Raw => None,
+        }
+    }
 }
 
 /// 中断セッションの再開に関する計画。
@@ -213,7 +254,7 @@ pub fn build_plan(
     // claude 専用のデフォルト env（CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS）を
     // ai-usage 起動にまで持ち込まないよう、注入前に取得する。
     let gate_env = agent.env.clone();
-    ensure_required_flags(&mut agent);
+    let output = ensure_required_flags(&mut agent);
     // ai-usage 連携 agent かつグローバルで ai-usage が有効なときだけゲートを設定する。
     let usage_gate = match (agent.ai_usage.as_ref(), ai_usage_command) {
         (Some(rt), Some(command)) => Some(UsageGateConfig {
@@ -226,7 +267,7 @@ pub fn build_plan(
     };
     // 再開するのは計画に残ったタスクだけ（limit や TUI で外れたターゲットは待機の根拠にも
     // しない）。claude 以外は分類パイプラインが無いので、渡されても再開しない。
-    let is_claude = agent_is_claude(&agent);
+    let is_claude = output == OutputPipeline::ClaudeStreamJson;
     let planned = |dir: &PathBuf| is_claude && targets.iter().any(|t| &t.directory == dir);
     let mut sessions = resume.sessions;
     sessions.retain(|dir, _| planned(dir));
@@ -244,6 +285,7 @@ pub fn build_plan(
             prompt: resume.prompt,
             hold_until,
         },
+        output,
     }
 }
 
@@ -390,6 +432,11 @@ pub fn print_plan(plan: &ExecutionPlan, parallelism: usize) {
         "Command: {}",
         crate::display::format_command(&plan.agent.command).dimmed()
     );
+    // codex の出力を整形するのか素通しするのかは command だけでは分からない（ラッパーが
+    // exec を渡さないと素通しになる）。ドライランの時点で確かめられるようにする。
+    if let Some(label) = plan.output.plan_label(plan.agent.codex_output) {
+        println!("Output: {}", label.dimmed());
+    }
     println!("Tasks: {}", plan.tasks.len());
     // 実際に起動するワーカー数は execute_plan_tmux と同じ算出（タスク数で頭打ち）。
     // 指定値がそのまま使われないケースをドライランの時点で見えるようにする。
@@ -556,7 +603,6 @@ pub fn execute_plan_tmux(
     let exe_path =
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("token-burn"));
     let stop_file = tmp_dir.join("stop");
-    let is_claude = agent_is_claude(&plan.agent);
 
     // 継続プロンプトは全タスク共通なので 1 ファイルにまとめる。
     let resume_prompt_file = tmp_dir.join("resume-prompt.txt");
@@ -610,7 +656,7 @@ pub fn execute_plan_tmux(
             state_file,
             stop_file: &stop_file,
             rate_limit_threshold,
-            is_claude,
+            output: plan.output,
             save_interrupted: plan.resume.save_interrupted,
             resume,
             discard_session: plan.resume.discard.get(&task.directory).map(String::as_str),
@@ -1348,6 +1394,78 @@ mod tests {
                 .command
                 .contains(&"--disallowedTools=AskUserQuestion".to_string())
         );
+        assert_eq!(plan.output, OutputPipeline::ClaudeStreamJson);
+    }
+
+    /// 出力の処理方法は付与したフラグと対応する（--json を付けたら整形、付けなければ素通し）。
+    #[test]
+    fn build_plan_resolves_the_output_pipeline_with_the_flags() {
+        let plan_for = |provider: Option<&str>, command: &[&str], mode: CodexOutput| {
+            let agent = RuntimeAgent {
+                name: "agent".to_string(),
+                provider: provider.map(String::from),
+                command: command.iter().map(|s| s.to_string()).collect(),
+                codex_output: mode,
+                ..Default::default()
+            };
+            build_plan(
+                &agent,
+                vec![repo_target("/tmp/repo")],
+                None,
+                ResumeOptions::default(),
+            )
+        };
+
+        let plan = plan_for(None, &["codex", "exec"], CodexOutput::Auto);
+        assert_eq!(plan.output, OutputPipeline::CodexJson);
+        assert_eq!(
+            plan.agent.command,
+            ["codex", "-c", "approval_policy=never", "exec", "--json"]
+        );
+
+        let plan = plan_for(
+            Some("codex"),
+            &["/opt/bin/codex-wrapper.sh"],
+            CodexOutput::Auto,
+        );
+        assert_eq!(plan.output, OutputPipeline::CodexRaw);
+        assert!(!plan.agent.command.iter().any(|arg| arg == "--json"));
+
+        let plan = plan_for(None, &["codex", "exec"], CodexOutput::Human);
+        assert_eq!(plan.output, OutputPipeline::CodexRaw);
+        assert!(!plan.agent.command.iter().any(|arg| arg == "--json"));
+
+        let plan = plan_for(None, &["aider", "--yes"], CodexOutput::Auto);
+        assert_eq!(plan.output, OutputPipeline::Raw);
+        assert_eq!(plan.agent.command, ["aider", "--yes"]);
+    }
+
+    /// 実行計画には codex の出力の扱いだけを出す。claude とその他は従来の表示のまま。
+    #[test]
+    fn plan_label_explains_codex_output_only() {
+        assert_eq!(
+            OutputPipeline::CodexJson.plan_label(CodexOutput::Auto),
+            Some("codex JSON events → format-codex")
+        );
+        assert_eq!(
+            OutputPipeline::CodexRaw.plan_label(CodexOutput::Human),
+            Some("raw (codex_output = \"human\")")
+        );
+        // exec を見つけられずに素通しになった場合は、整形させる方法を案内する
+        let auto = OutputPipeline::CodexRaw
+            .plan_label(CodexOutput::Auto)
+            .expect("label");
+        assert!(auto.contains("codex_output = \"json\""), "{auto}");
+        assert_eq!(
+            OutputPipeline::ClaudeStreamJson.plan_label(CodexOutput::Auto),
+            None
+        );
+        assert_eq!(OutputPipeline::Raw.plan_label(CodexOutput::Auto), None);
+        // stdin を閉じるのは codex だけ
+        assert!(OutputPipeline::CodexJson.closes_stdin());
+        assert!(OutputPipeline::CodexRaw.closes_stdin());
+        assert!(!OutputPipeline::ClaudeStreamJson.closes_stdin());
+        assert!(!OutputPipeline::Raw.closes_stdin());
     }
 
     fn saved_session(retry_after: Option<DateTime<FixedOffset>>) -> ResumeEntry {
