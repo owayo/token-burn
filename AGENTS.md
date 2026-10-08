@@ -37,6 +37,12 @@ token-burn/
 │   │   │   ├── metadata.rs # tool_result_metadata
 │   │   │   └── progress.rs # tool_progress の経過時間表示
 │   │   └── tests/          # 機能別に分割した #[cfg(test)] テスト群
+│   ├── format_codex/       # codex exec --json 出力のフォーマッター（累積 diff を出さない・沈黙のハートビート）
+│   │   ├── mod.rs          # pub run（読み取りスレッドが生バイトを保存 → 表示側が整形。入力は EOF まで読み切る）
+│   │   ├── formatter.rs    # CodexFormatter（on_line / on_idle、turn 系イベント、ハートビート）
+│   │   ├── items.rs        # item 種別ごとの表示（command_execution / file_change / agent_message 等）
+│   │   ├── text.rs         # 制御文字の除去・1 行化・コマンドの表示形・経過時間・色
+│   │   └── tests/          # events / text / heartbeat / pipeline
 │   ├── classify.rs         # 完了 jsonl の分類（success / failed / rate-limited / retryable / resume-unavailable）
 │   ├── rate_control.rs     # 枠の周期に応じた停止判定（一時停止 pause / 恒久停止 stop）・pause file・gate-wait
 │   ├── cleanup.rs          # レポートディレクトリの自動クリーンアップ

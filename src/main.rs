@@ -3,6 +3,7 @@ mod cleanup;
 mod config;
 mod display;
 mod executor;
+mod format_codex;
 mod format_stream;
 mod init;
 mod rate_control;
@@ -172,6 +173,13 @@ enum Commands {
         /// レート制限使用率の自動停止閾値（%）
         #[arg(long, default_value_t = 95)]
         threshold: u8,
+    },
+    /// codex exec --json の出力を読みやすいテキストに整形する（ワーカースクリプト専用）
+    #[command(hide = true, name = "format-codex")]
+    FormatCodex {
+        /// 受け取った生の JSONL 入力をそのまま（バイト単位で）保存するパス
+        #[arg(long)]
+        raw_output: Option<PathBuf>,
     },
     /// jsonl を分類して終了コード (0=success,1=failed,2=rate-limited,3=retryable,4=resume-unavailable) を返す（ワーカースクリプト専用）
     #[command(hide = true, name = "classify-result")]
@@ -385,6 +393,13 @@ async fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    if let Commands::FormatCodex { raw_output } = &command {
+        // 生ログか表示の書き込みに失敗した場合だけ 1。どちらの場合も入力は EOF まで
+        // 読み切ってから終了する（途中で抜けるとパイプが閉じ、codex が SIGPIPE で落ちる）。
+        let code = format_codex::run(raw_output.as_deref());
+        std::process::exit(code);
+    }
+
     if let Commands::Mark {
         agent,
         directory,
@@ -520,6 +535,7 @@ async fn main() -> Result<()> {
         Commands::Mark { .. } => unreachable!(),
         Commands::Init { .. } => unreachable!(),
         Commands::FormatStream { .. } => unreachable!(),
+        Commands::FormatCodex { .. } => unreachable!(),
         Commands::ClassifyResult { .. } => unreachable!(),
         Commands::ResumeEntry { .. } => unreachable!(),
         Commands::UsageGate { .. } | Commands::GateClaim { .. } => unreachable!(),

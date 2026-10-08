@@ -14,7 +14,7 @@ mod stream;
 pub(crate) mod system;
 mod tool_result;
 mod tools;
-mod util;
+pub(crate) mod util;
 
 use assistant::handle_assistant_event;
 use blocks::{ContentBlockState, break_open_line, finalize_open_blocks};
