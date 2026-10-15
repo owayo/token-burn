@@ -5,4 +5,4 @@
 # profile と components を明示する。省略すると rustup の既定 profile に依存し、
 # GitHub Actions の minimal profile には rustfmt / clippy が無いため `make ci` が失敗する。
 # minimal に Makefile で使うコンポーネントだけを追加する。
-rust = { version = "1.98.1", profile = "minimal", components = ["rustfmt", "clippy"] }
+rust = { version = "1.99.0", profile = "minimal", components = ["rustfmt", "clippy"] }
