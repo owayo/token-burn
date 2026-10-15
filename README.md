@@ -46,7 +46,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Rate-limit aware**: Stops for good when the weekly window reaches `rate_limit_threshold`, but pauses until the reset when the five-hour window does; workers recheck usage after every extended pause before taking a task, and the monthly overage window never stops a run
 - **Resume interrupted sessions**: Continues a Claude Code session cut off by a rate limit with `claude --resume` on the next run instead of starting over
 - **Readable live monitor**: Renders Claude Code's stream-json as readable lines — including responses missing stream events after an API retry, tool calls and subagent activity, permission denial reasons, results omitted from model context, hook feedback, context compaction, token usage, cost per model, and API errors. Codex CLI's JSON events get one line per command and changed file instead of a cumulative diff reprinted after every edit, plus a heartbeat while Codex is silent
-- **Safe state and logs**: Updates `state.json` atomically under a lock, numbers per-task logs so they never overwrite each other, and marks a task failed when its log pipeline breaks
+- **Safe state and logs**: Updates `state.json` atomically under a lock and numbers per-task logs so they never overwrite each other. If a formatter loses its log or display output, it keeps reading to EOF and marks the task failed; Claude's formatter also continues checking rate limits
 - **Dry run and safe command display**: `-n` / `--dry-run` previews the plan; both the plan and tmux monitor redact environment assignments and credential option values as `<redacted>`
 
 ## Requirements

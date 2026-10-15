@@ -447,9 +447,10 @@ fn write_error_result(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
         .as_u64()
         .map(|status| format!(" (HTTP {status})"))
         .unwrap_or_default();
-    let message = v["result"]
-        .as_str()
-        .map(|message| truncate_inline(message, 160))
+    // 起動時の失敗は result 本文を持たず errors 配列だけを返す。分類と同じ抽出規則を
+    // 使い、セッション不存在などの原因が整形済みログから消えないようにする。
+    let message = crate::classify::result_message(v)
+        .map(|message| truncate_inline(&message, 160))
         .filter(|message| !message.is_empty());
     match message {
         Some(message) => writeln!(out, "\x1b[31m   error{}: {}\x1b[0m", status, message)?,

@@ -71,7 +71,7 @@ fn sanitize_keeps_multibyte_text() {
     assert_eq!(sanitize("日本語のテキスト 🎉"), "日本語のテキスト 🎉");
 }
 
-// --- collapse / one_line ---
+// --- 空白の整理・1 行への整形 ---
 
 #[test]
 fn collapse_joins_lines_and_keeps_inner_spacing() {
@@ -183,7 +183,7 @@ fn display_command_strips_control_characters() {
     );
 }
 
-// --- format_elapsed ---
+// --- 経過時間の表示 ---
 
 #[test]
 fn format_elapsed_uses_tenths_below_a_minute() {
@@ -204,7 +204,7 @@ fn format_elapsed_uses_minutes_and_hours() {
     assert_eq!(format_elapsed(secs(90_061)), "25h 01m");
 }
 
-// --- output_tail_lines ---
+// --- 出力末尾の抽出 ---
 
 #[test]
 fn output_tail_lines_returns_the_last_non_empty_lines_in_order() {

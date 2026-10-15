@@ -21,6 +21,7 @@ token-burn/
 │   │   └── util.rs         # sanitize_filename / task_log_base / strip_ansi / truncate
 │   ├── format_stream/      # claude stream-json出力のフォーマッター（モジュール分割）
 │   │   ├── mod.rs          # pub run / process（JSON行のトップレベル dispatch）
+│   │   ├── output.rs       # 出力障害を保持し、入力を最後まで処理する DrainWriter
 │   │   ├── assistant.rs    # assistant メッセージのモデル切替・キャッシュミス診断
 │   │   ├── state.rs        # StreamState / StreamSummary / UsageSummary
 │   │   ├── blocks.rs       # ContentBlockState・ブロック確定（finalize_block 等）
@@ -513,6 +514,8 @@ remote URL の owner / repo 抽出は末尾 2 セグメントを採用するた�
 
 - レポート出力先 (`resolve_report_dir` / `main.rs`) は設定値を必ず絶対パスへ正規化します（`config::resolve_directory` 経由）。相対パスのまま返すと、レポートディレクトリの作成（`executor` 側。プロセスの cwd で解決）と、そこへ書き込むタスクスクリプトの `tee` / `--raw-output`（対象リポジトリへ `cd` した後で解決）が別ディレクトリを指し、ログのパイプラインが `No such file or directory` で失敗して全ターゲットが `failed-N` になります（`state.json` に 1 件も記録されない）。`report_dir = "reports"` のような素直な設定で踏みます。
 - `format-stream` の入力読み取りは `read_lines_lossy` で行い、不正な UTF-8 バイトは U+FFFD へ置換します。`BufRead::lines()` は非 UTF-8 バイトを含む行に `Err(InvalidData)` を返し、そこで中断すると以降の**正常な JSON も含めて**標準出力と `--raw-output` の両方から失われます。タスクスクリプトは `claude ... 2>&1 | token-burn format-stream ... | tee log` で stderr を同じパイプへ合流させており、stream-json の 1 行は macOS の `PIPE_BUF`（512 バイト）を常に超えるため、stdout の途中に stderr の書き込みが割り込んでマルチバイト文字が分断されるだけで不正な UTF-8 が生じ得ます。中断すると `FORMAT_EXIT != 0` で `failed-N` になるうえ、パイプが閉じて `claude` 本体が SIGPIPE で落ち、表示整形の都合で数時間の実行を巻き添えにします。
+- `format-stream` の生ログと表示先は `output::DrainWriter` で包みます。最初の書き込みエラーを標準エラーへ警告して保持し、以後その出力先への書き込みを捨て、入力は EOF まで処理します。生ログの作成失敗でも同様に読み取りを開始し、書ける出力先とレート制限の検査を維持します。EOF 後は保持したエラーを返しますが、停止シグナルの書き込みも失敗した場合は専用終了コード 11 を優先します。エラーをその場で伝播すると、上流の Claude が SIGPIPE で終了し、後続の停止イベントも検査できません。
+- `format-stream` の失敗結果の本文は `classify::result_message` で抽出します。起動時エラーは `result` 文字列を持たず `errors[]` だけを返す場合があるため、分類器と表示で同じ抽出規則を使います。
 - モニターは 1 周回の先頭で `worker-done-*` を**タスクマーカーより先に**読みます。ワーカーは `done-*` / `failed-*` / `retry-*` を書き切ってから `worker-done-*` を作るため、この順序なら「worker-done は見えているのにそのワーカーのタスクマーカーが見えていない」状態は起こりません。逆順（タスクマーカー → `fetch_usage` で最大 `AI_USAGE_TIMEOUT` 秒ブロック → worker-done）だと、その待ち時間に最後のワーカーが完走した場合に古い `PROCESSED` と新しい `WORKERS_DONE` が組み合わさり、全件成功でも `⏹ Stopped: 9/10 processed` と誤報告します。
 - モニターの ai-usage 再取得スロットル (`LAST_USAGE`) は fetch **完了時刻**を記録します。`fetch_usage` は `run_with_timeout` を 2 回呼ぶため最長 `2*AI_USAGE_TIMEOUT` 秒かかり、開始時刻（ループ先頭の `NOW`）を基準にすると次の周回で即座に条件が成立して間隔を空けずに再取得し続けます。ループ外の初回 `fetch_usage` 直後にも記録し、起動直後の二重取得を防ぎます。
 - `ai-usage --json` の枠データは `kind`（`five_hour` / `daily` / `weekly` / `monthly`）を読み、そこから `state_cutoff` の周期を導きます。スロット名（`weekly` / `five_hour`）と実際の枠長は一致しません。実データでは antigravity が `five_hour` スロットに `kind:"daily"`（24 時間枠）を、pixellab が `weekly` スロットに `kind:"monthly"`（月次枠）を返します。スロット名で決め打ちすると 24 時間枠を 5 時間として扱い、`state_cutoff`（= 直前の枠の開始点）が未来へ飛んで `filter_by_state` の `last >= cutoff` が恒偽になり、処理済みフィルタが黙って無効化されます（毎回同じ先頭ターゲットだけを再処理し続ける）。未知の `kind` はスロット名の既定周期へ落とします。

@@ -709,6 +709,29 @@ fn result_error_without_status_still_shows_message() {
     assert!(!clean.contains("HTTP"), "{clean}");
 }
 
+#[test]
+fn result_startup_failure_shows_errors_without_result_text() {
+    let input = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"errors":["No conversation found with session ID: missing-session","","Additional context\nfor recovery"]}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(
+        clean.contains("error: No conversation found with session ID"),
+        "{clean}"
+    );
+    let error_line = clean.lines().find(|line| line.contains("error:")).unwrap();
+    assert!(
+        error_line.contains("; Additional context for recovery"),
+        "{clean}"
+    );
+}
+
+#[test]
+fn result_startup_errors_do_not_replace_explicit_result_text() {
+    let input = r#"{"type":"result","is_error":true,"result":"Primary failure","errors":["Secondary failure"]}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("error: Primary failure"), "{clean}");
+    assert!(!clean.contains("Secondary failure"), "{clean}");
+}
+
 /// 成功セッションの `result` は最終テキストとして既にストリーム済みなので出さない。
 #[test]
 fn result_success_does_not_repeat_the_final_text() {

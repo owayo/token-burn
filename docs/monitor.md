@@ -10,6 +10,8 @@ Startup cache collection also has a 30-second timeout, covering both child exit 
 
 ## Sessions and results
 
+- **Log and display failures**: `format-stream` warns on stderr and keeps reading to EOF if it cannot create the raw log or write to either output. It continues writing to the working output and checking rate limits, then reports the error after draining input. Failure to write a stop signal takes priority with exit code 11 so the worker stops
+- **Startup error details**: If a failed result has no `result` text, nonempty strings from `errors[]` are joined and displayed, including the reason a resumed session could not be found
 - **Session header**: Prints one line per session from the `init` event — model, Claude Code version, and permission mode (`ℹ Session <model> (v<version>, <permissionMode>)`). None of these appear anywhere else in the stream: `result.modelUsage` only reveals the models that were billed, so the CLI version and whether the run used `bypassPermissions` were otherwise lost
 - **Context compaction**: Shows a `compact_boundary` event with its before/after token counts and duration (for example, `967,397 → 17,174 tokens, 97.1s`). This marks when a long session's context changed; cumulative dropped tokens are not presented as the reduction for a single event
 - **Per-model usage**: Displays token usage, cost, cache read/creation tokens, web search counts, and the model's context window / max output limits (e.g. `ctx:1M`, `max_out:64K`) per model in the result summary

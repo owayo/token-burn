@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, Write};
@@ -7,6 +7,7 @@ use std::path::Path;
 mod assistant;
 mod blocks;
 mod diff;
+mod output;
 mod rate_limit;
 mod result;
 mod state;
@@ -18,6 +19,7 @@ pub(crate) mod util;
 
 use assistant::handle_assistant_event;
 use blocks::{ContentBlockState, break_open_line, finalize_open_blocks};
+use output::{DrainWriter, warn_output_error};
 use rate_limit::handle_rate_limit_event;
 use result::handle_result;
 use state::{StreamState, StreamSummary};
@@ -49,11 +51,12 @@ pub fn run(raw_output: Option<&Path>, stop_file: Option<&Path>, threshold: u8) -
 
 fn process(
     reader: impl BufRead,
-    mut out: impl Write,
+    out: impl Write,
     raw_output: Option<&Path>,
     stop_file: Option<&Path>,
     threshold: u8,
 ) -> Result<bool> {
+    let mut out = DrainWriter::new(out, "formatted output write");
     // 停止シグナルを書けなかった事実。ストリームは最後まで処理してから終了コードで
     // 伝える。ここで即座に打ち切ると、パイプが閉じて実行中の `claude` が SIGPIPE で
     // 落ち、数時間の実行を巻き添えにする。
@@ -63,13 +66,27 @@ fn process(
     let mut streamed_message_ids = std::collections::HashSet::new();
     let mut blocks: HashMap<usize, ContentBlockState> = HashMap::new();
     let mut summary = StreamSummary::default();
-    let mut raw_writer = match raw_output {
-        Some(path) => Some(io::BufWriter::new(File::create(path)?)),
-        None => None,
+    // 生ログを作れなくても表示と停止判定は続ける。障害は入力を読み切ってから返す。
+    let (mut raw_writer, raw_create_error) = match raw_output.map(File::create).transpose() {
+        Ok(file) => (
+            file.map(|file| DrainWriter::new(io::BufWriter::new(file), "raw output write")),
+            None,
+        ),
+        Err(error) => {
+            warn_output_error("raw output creation", &error);
+            (None, Some(error))
+        }
     };
 
+    let mut read_error = None;
     for line in read_lines_lossy(reader) {
-        let line = line?;
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        };
         if let Some(writer) = raw_writer.as_mut() {
             writeln!(writer, "{}", line)?;
         }
@@ -167,6 +184,21 @@ fn process(
     out.flush()?;
     if let Some(writer) = raw_writer.as_mut() {
         writer.flush()?;
+    }
+
+    // 停止シグナルの障害は、通常のログ障害より優先してワーカー全体を止める。
+    if !signal_failed {
+        if let Some(error) = read_error {
+            return Err(error).context("failed to read stream input");
+        }
+        if let Some(error) =
+            raw_create_error.or_else(|| raw_writer.and_then(DrainWriter::into_error))
+        {
+            return Err(error).context("failed to save raw stream output");
+        }
+        if let Some(error) = out.into_error() {
+            return Err(error).context("failed to write formatted stream output");
+        }
     }
 
     Ok(signal_failed)

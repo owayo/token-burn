@@ -16,6 +16,7 @@ use std::io::Cursor;
 mod blocks;
 mod detail;
 mod diff;
+mod io;
 mod metadata;
 mod process;
 mod rate_limit;

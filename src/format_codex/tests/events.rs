@@ -63,7 +63,7 @@ fn every_line_resets_its_color() {
     }
 }
 
-// --- turn / thread / error ---
+// --- ターン・セッション・エラー ---
 
 #[test]
 fn turn_started_prints_nothing() {
@@ -157,7 +157,7 @@ fn unknown_top_level_type_shows_its_name() {
     );
 }
 
-// --- command_execution ---
+// --- コマンド実行 ---
 
 #[test]
 fn command_updated_does_not_print_accumulated_output() {
@@ -273,7 +273,7 @@ fn heredoc_command_is_shown_on_one_line() {
     );
 }
 
-// --- file_change ---
+// --- ファイル変更 ---
 
 #[test]
 fn file_change_lists_each_change_relative_inside_cwd_and_absolute_outside() {
@@ -322,7 +322,7 @@ fn file_change_never_prints_a_diff() {
     assert_eq!(render(&[completed]), "\u{1f4dd} update a.rs\n");
 }
 
-// --- agent_message / reasoning ---
+// --- 応答本文・推論要約 ---
 
 #[test]
 fn agent_message_indents_following_lines_and_keeps_blank_lines() {
@@ -395,7 +395,7 @@ fn reasoning_without_text_or_before_completion_prints_nothing() {
     );
 }
 
-// --- mcp_tool_call / web_search / todo_list / collab_tool_call / error ---
+// --- MCP・検索・計画・サブエージェント・エラー ---
 
 #[test]
 fn mcp_tool_call_started_and_completed() {
