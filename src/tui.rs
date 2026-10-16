@@ -33,6 +33,8 @@ pub struct SelectorItem {
     pub last_modified: Option<DateTime<Utc>>,
     /// レート制限で中断したセッションを引き継いで続きから処理するターゲットか。
     pub resumable: bool,
+    /// 履歴上は処理済み。候補に残し、初期選択からだけ外す。
+    pub processed: bool,
 }
 
 /// 画面ヘッダーに出す実行コンテキスト。
@@ -87,29 +89,44 @@ pub struct SelectorState {
 }
 
 impl SelectorState {
-    /// 既存のソート順（変更が古い順 / defer は後ろ）のまま並べ、先頭 `initial_selected`
-    /// 件を選択済みにする。非対話実行で `limit` 件が処理されるのと同じ初期状態にして、
+    /// 既存のソート順（変更が古い順 / defer は後ろ）のまま並べ、未処理の先頭
+    /// `initial_selected` 件を選択済みにする。非対話実行と同じ初期状態にして、
     /// そのまま Enter を押せば従来と同じ結果になるようにしている。
     pub fn new(
         targets: Vec<ResolvedTarget>,
         modified: &HashMap<PathBuf, DateTime<Utc>>,
         resumable: &HashSet<PathBuf>,
+        processed: &HashSet<PathBuf>,
         initial_selected: usize,
         settings: RunSettings,
     ) -> Self {
-        let items = targets
+        let mut selected_count = 0;
+        let items: Vec<_> = targets
             .into_iter()
-            .enumerate()
-            .map(|(i, target)| SelectorItem {
-                last_modified: modified.get(&target.directory).copied(),
-                selection_order: (i < initial_selected).then_some(i + 1),
-                resumable: resumable.contains(&target.directory),
-                target,
+            .map(|target| {
+                let processed = processed.contains(&target.directory);
+                let selection_order = if !processed && selected_count < initial_selected {
+                    selected_count += 1;
+                    Some(selected_count)
+                } else {
+                    None
+                };
+                SelectorItem {
+                    last_modified: modified.get(&target.directory).copied(),
+                    selection_order,
+                    resumable: resumable.contains(&target.directory),
+                    processed,
+                    target,
+                }
             })
             .collect();
+        let cursor = items
+            .iter()
+            .position(|item| item.selection_order.is_some())
+            .unwrap_or(0);
         Self {
             items,
-            cursor: 0,
+            cursor,
             notice: None,
             settings,
             settings_open: false,
@@ -135,6 +152,10 @@ impl SelectorState {
     /// 中断したセッションを引き継ぐ候補の数。
     pub fn resumable_count(&self) -> usize {
         self.items.iter().filter(|item| item.resumable).count()
+    }
+
+    pub fn processed_count(&self) -> usize {
+        self.items.iter().filter(|item| item.processed).count()
     }
 
     pub fn notice(&self) -> Option<&str> {
@@ -368,6 +389,7 @@ pub fn select_targets(
     targets: Vec<ResolvedTarget>,
     modified: &HashMap<PathBuf, DateTime<Utc>>,
     resumable: &HashSet<PathBuf>,
+    processed: &HashSet<PathBuf>,
     initial_selected: usize,
     ctx: &RunContext,
 ) -> Result<Outcome> {
@@ -380,8 +402,14 @@ pub fn select_targets(
         "--interactive requires a terminal; stdin and stdout must both be a TTY"
     );
 
-    let mut state =
-        SelectorState::new(targets, modified, resumable, initial_selected, ctx.settings);
+    let mut state = SelectorState::new(
+        targets,
+        modified,
+        resumable,
+        processed,
+        initial_selected,
+        ctx.settings,
+    );
     // ratatui::init() は raw mode / alternate screen へ入り、panic hook も差し替えて
     // パニック時に端末を戻す。復元漏れは直後に起動する tmux の表示を壊すため、
     // ループのエラーは持ち帰って restore() の後に伝搬する。
@@ -418,7 +446,7 @@ fn event_loop(
 
 fn draw(frame: &mut Frame, state: &SelectorState, ctx: &RunContext, list_state: &mut ListState) {
     let [header_area, list_area, footer_area] = Layout::vertical([
-        Constraint::Length(5),
+        Constraint::Length(5 + u16::from(state.processed_count() > 0)),
         Constraint::Min(3),
         Constraint::Length(4),
     ])
@@ -509,7 +537,7 @@ fn header(state: &SelectorState, ctx: &RunContext) -> Paragraph<'static> {
     ];
     // 引き継ぎのある候補が 1 件でもあるときだけ、行頭の `↻` の意味を示す。
     let resumable = state.resumable_count();
-    let lines = if resumable > 0 {
+    let mut lines = if resumable > 0 {
         let mut lines = lines;
         lines.push(Line::from(vec![
             Span::styled(" ", dim),
@@ -526,8 +554,22 @@ fn header(state: &SelectorState, ctx: &RunContext) -> Paragraph<'static> {
     } else {
         lines
     };
+    let processed = state.processed_count();
+    if processed > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(" ", dim),
+            Span::styled(PROCESSED_MARK, dim),
+            Span::styled(
+                format!(" = already processed ({processed}); select to run again"),
+                dim,
+            ),
+        ]));
+    }
     Paragraph::new(lines)
 }
+
+/// 履歴上スキップ対象でも、明示的に選択して再実行できる行。
+const PROCESSED_MARK: &str = "✓";
 
 /// 中断したセッションを引き継ぐ行に付ける印（ヘッダーの凡例と同じ記号）。
 const RESUME_MARK: &str = "↻";
@@ -582,6 +624,7 @@ const FIXED_COLUMNS_WIDTH: usize = 4        // "[x] "
     + 5                                     // "  1. "
     + 10                                    // "[UNKNOWN] "
     + 2                                     // 引き継ぎの印 "↻ "
+    + 2                                     // 処理済みの印 "✓ "
     + NAME_WIDTH
     + 2                                     // 名前と更新日時の区切り
     + MODIFIED_WIDTH
@@ -628,11 +671,17 @@ fn row_line(item: &SelectorItem, order: Option<usize>, path_width: usize) -> Lin
     } else {
         Span::raw("  ")
     };
+    let processed = if item.processed {
+        Span::styled(format!("{PROCESSED_MARK} "), dim)
+    } else {
+        Span::raw("  ")
+    };
 
     Line::from(vec![
         Span::styled(format!("{mark} "), mark_style),
         Span::styled(order_text, dim),
         Span::styled(visibility, visibility_style),
+        processed,
         resume,
         Span::raw(name),
         Span::styled(format!("  {modified}"), dim),
@@ -737,6 +786,7 @@ mod tests {
             targets,
             &HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
             initial_selected,
             settings(),
         )
@@ -776,6 +826,7 @@ mod tests {
         let mut state = SelectorState::new(
             vec![target("first"), target("second")],
             &HashMap::new(),
+            &HashSet::new(),
             &HashSet::new(),
             2,
             initial,
@@ -939,6 +990,109 @@ mod tests {
         let state = state_with(3, usize::MAX);
 
         assert_eq!(state.selected_count(), 3);
+    }
+
+    #[test]
+    fn processed_candidates_stay_visible_but_do_not_use_the_initial_limit() {
+        let targets = vec![
+            target("processed-first"),
+            target("pending-first"),
+            target("processed-middle"),
+            target("pending-second"),
+            target("pending-third"),
+        ];
+        let processed = HashSet::from([targets[0].directory.clone(), targets[2].directory.clone()]);
+        let mut state = SelectorState::new(
+            targets,
+            &HashMap::new(),
+            &HashSet::new(),
+            &processed,
+            2,
+            settings(),
+        );
+
+        assert_eq!(state.items().len(), 5);
+        assert_eq!(state.processed_count(), 2);
+        assert_eq!(state.cursor(), 1);
+        assert_eq!(
+            order_numbers(state.items()),
+            vec![None, Some(1), None, Some(2), None]
+        );
+
+        state.on_key(press(KeyCode::Home));
+        state.on_key(press(KeyCode::Char(' ')));
+        assert_eq!(state.on_key(press(KeyCode::Enter)), KeyOutcome::Confirm);
+        assert_eq!(
+            selected_names(state),
+            vec!["pending-first", "pending-second", "processed-first"]
+        );
+    }
+
+    #[test]
+    fn all_processed_candidates_can_be_selected_explicitly() {
+        let targets = vec![target("first"), target("second")];
+        let processed = targets.iter().map(|t| t.directory.clone()).collect();
+        let mut state = SelectorState::new(
+            targets,
+            &HashMap::new(),
+            &HashSet::new(),
+            &processed,
+            usize::MAX,
+            settings(),
+        );
+
+        assert_eq!(state.items().len(), 2);
+        assert_eq!(state.selected_count(), 0);
+        assert_eq!(state.on_key(press(KeyCode::Enter)), KeyOutcome::Continue);
+        assert!(state.notice().is_some());
+
+        state.on_key(press(KeyCode::Char('a')));
+        assert_eq!(state.on_key(press(KeyCode::Enter)), KeyOutcome::Confirm);
+        assert_eq!(selected_names(state), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn screen_explains_processed_and_resumable_candidates_together() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let targets = vec![target("processed-repo"), target("resumable-repo")];
+        let processed = HashSet::from([targets[0].directory.clone()]);
+        let resumable = HashSet::from([targets[1].directory.clone()]);
+        let state = SelectorState::new(
+            targets,
+            &HashMap::new(),
+            &resumable,
+            &processed,
+            2,
+            settings(),
+        );
+        let ctx = RunContext {
+            agent_name: "test".to_string(),
+            reset_in: "1d".to_string(),
+            schedule_source: "fixed".to_string(),
+            settings: settings(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 16)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &state, &ctx, &mut ListState::default()))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("1 / 2 candidates"), "{text}");
+        assert!(
+            text.contains("✓ = already processed (1); select to run again"),
+            "{text}"
+        );
+        assert!(text.contains("↻ = continues the session"), "{text}");
+        assert!(text.contains("processed-repo"), "{text}");
+        assert!(text.contains("resumable-repo"), "{text}");
     }
 
     #[test]
@@ -1213,8 +1367,14 @@ mod tests {
     /// 空リストでも操作でパニックしない（呼び出し側が弾くが、状態側も落ちない）。
     #[test]
     fn empty_list_survives_every_key() {
-        let mut state =
-            SelectorState::new(Vec::new(), &HashMap::new(), &HashSet::new(), 5, settings());
+        let mut state = SelectorState::new(
+            Vec::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            5,
+            settings(),
+        );
 
         for code in [
             KeyCode::Up,
@@ -1239,6 +1399,7 @@ mod tests {
             selection_order: Some(3),
             last_modified: None,
             resumable: false,
+            processed: false,
         };
         let text: String = row_line(&item, Some(3), 40)
             .spans
@@ -1273,6 +1434,7 @@ mod tests {
             selection_order: Some(1),
             last_modified: None,
             resumable: true,
+            processed: false,
         };
         let marked = line_text(&row_line(&item, Some(1), 40));
         assert!(marked.contains("↻ repo-a"), "引き継ぎの印: {marked}");
@@ -1317,7 +1479,14 @@ mod tests {
 
         let targets: Vec<_> = (0..3).map(|i| target(&format!("r{i}"))).collect();
         let resumable = HashSet::from([PathBuf::from("/repos/r1")]);
-        let state = SelectorState::new(targets.clone(), &HashMap::new(), &resumable, 3, settings());
+        let state = SelectorState::new(
+            targets.clone(),
+            &HashMap::new(),
+            &resumable,
+            &HashSet::new(),
+            3,
+            settings(),
+        );
         assert_eq!(state.resumable_count(), 1);
         let text = render(&state);
         assert!(
@@ -1325,7 +1494,14 @@ mod tests {
             "{text}"
         );
 
-        let state = SelectorState::new(targets, &HashMap::new(), &HashSet::new(), 3, settings());
+        let state = SelectorState::new(
+            targets,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            3,
+            settings(),
+        );
         assert!(!render(&state).contains('↻'));
     }
 
@@ -1417,6 +1593,7 @@ mod tests {
             vec![target("r0")],
             &HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
             1,
             &ctx,
         )
@@ -1438,8 +1615,15 @@ mod tests {
             settings: settings(),
         };
 
-        let error = select_targets(Vec::new(), &HashMap::new(), &HashSet::new(), 1, &ctx)
-            .expect_err("候補が空ならエラーになるべき");
+        let error = select_targets(
+            Vec::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            1,
+            &ctx,
+        )
+        .expect_err("候補が空ならエラーになるべき");
 
         assert!(
             error.to_string().contains("No targets"),

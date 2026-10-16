@@ -783,8 +783,9 @@ async fn run(opts: RunOptions) -> Result<()> {
         return Ok(());
     }
 
-    // 保存済み状態でフィルタリング（処理済みディレクトリをスキップ）
-    // force_paths 指定時は状態フィルタリングをスキップ
+    // 対話モードでは処理済みも選べるよう、履歴フィルタ前の候補を保持する。
+    // 履歴の判定結果は TUI の印と初期選択に使い、候補自体は削らない。
+    let interactive_candidates = interactive.then(|| targets.clone());
     let state_file = state::state_path(&config_path);
     let run_state = state::State::load(&state_file)?;
     let (mut targets, skipped) = if fresh || !force_paths.is_empty() {
@@ -800,6 +801,10 @@ async fn run(opts: RunOptions) -> Result<()> {
             dedup_scope,
         )
     };
+
+    if let Some(candidates) = interactive_candidates {
+        targets = candidates;
+    }
 
     // レート制限で中断したセッションのうち、今回再開するものを決める。並べ替えより前に
     // 判定するのは、再開するターゲットを各グループの先頭へ寄せるため。
@@ -841,7 +846,7 @@ async fn run(opts: RunOptions) -> Result<()> {
     };
 
     let (targets, truncated) = if interactive && !targets.is_empty() {
-        // TUI では候補を limit で切らず、先頭 limit 件を初期選択にして全候補を見せる。
+        // TUI では処理済みも含む全候補を見せ、未処理の先頭 limit 件を初期選択する。
         // そのまま決定すれば非対話実行と同じ対象になり、必要なら limit の外側
         // （11 件目以降）も選べる。確定後に limit を再適用すると、選んだのに実行
         // されないターゲットが黙って落ちるため、選択結果をそのまま実行対象にする。
@@ -851,7 +856,14 @@ async fn run(opts: RunOptions) -> Result<()> {
             schedule_source: sched.source.label().to_string(),
             settings: run_settings,
         };
-        match tui::select_targets(targets, &modified, &resumable, limit, &ctx)? {
+        match tui::select_targets(
+            targets,
+            &modified,
+            &resumable,
+            &skipped.directories,
+            limit,
+            &ctx,
+        )? {
             tui::Outcome::Confirmed { targets, settings } => {
                 run_settings = settings;
                 (targets, 0)
@@ -885,9 +897,11 @@ async fn run(opts: RunOptions) -> Result<()> {
         );
     }
 
-    print_skip_summary(&skipped, dedup_scope, &config);
+    if !interactive {
+        print_skip_summary(&skipped, dedup_scope, &config);
+    }
 
-    if public_filtered > 0 || skipped.total > 0 {
+    if public_filtered > 0 || (!interactive && skipped.total > 0) {
         println!();
     }
 
@@ -1206,12 +1220,15 @@ struct SkipSummary {
     total: usize,
     /// スキップ理由になったエージェント展開名 → 件数。
     by_agent: BTreeMap<String, usize>,
+    /// 非対話では除外し、TUI では初期選択から外すディレクトリ。
+    directories: HashSet<PathBuf>,
 }
 
 impl SkipSummary {
-    fn record(&mut self, agent_name: &str) {
+    fn record(&mut self, agent_name: &str, directory: &std::path::Path) {
         self.total += 1;
         *self.by_agent.entry(agent_name.to_string()).or_default() += 1;
+        self.directories.insert(directory.to_path_buf());
     }
 
     /// `codex=5, codex-alt=2` 形式の内訳。件数降順、同数はエージェント名昇順。
@@ -1373,7 +1390,7 @@ fn filter_by_state(
             run_state.last_processed_in_scope(&target.directory, |name| peers.contains(name))
             && last.at >= cutoff
         {
-            skipped.record(&last.agent_name);
+            skipped.record(&last.agent_name, &target.directory);
             continue;
         }
         kept.push(target);
@@ -1552,6 +1569,10 @@ mod tests {
         assert_eq!(skipped.total, 1);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].display_name, "new-repo");
+        assert_eq!(
+            skipped.directories,
+            HashSet::from([PathBuf::from("/tmp/processed-repo")])
+        );
     }
 
     #[test]
@@ -2156,6 +2177,10 @@ mod tests {
         );
         assert_eq!(skipped.total, 1);
         assert_eq!(
+            skipped.directories,
+            HashSet::from([PathBuf::from("/tmp/repo-a")])
+        );
+        assert_eq!(
             skipped.by_agent.get("codex"),
             Some(&1),
             "どのエージェントの記録で弾いたかを残すべき"
@@ -2421,13 +2446,13 @@ mod tests {
     fn skip_summary_breakdown_orders_by_count_then_name() {
         let mut summary = SkipSummary::default();
         for _ in 0..2 {
-            summary.record("zeta");
+            summary.record("zeta", std::path::Path::new("/tmp/zeta"));
         }
         for _ in 0..2 {
-            summary.record("alpha");
+            summary.record("alpha", std::path::Path::new("/tmp/alpha"));
         }
         for _ in 0..5 {
-            summary.record("codex");
+            summary.record("codex", std::path::Path::new("/tmp/codex"));
         }
 
         assert_eq!(summary.total, 9);
