@@ -71,6 +71,8 @@ AI_USAGE_TIMEOUT={ai_usage_timeout}
 STOPPED=0
 PAUSED=0
 LAST_PAUSED=-1
+LAST_PAUSE_RESUME=""
+LAST_PAUSE_WINDOW=""
 PAUSE_RESUME=""
 USAGE_DISPLAY=""
 LAST_USAGE=0
@@ -282,8 +284,11 @@ while true; do
             *) if [ "$PAUSE_RESUME" -gt "$NOW" ]; then PAUSED=1; fi ;;
         esac
     fi
-    if [ "$PAUSED" != "$LAST_PAUSED" ]; then
+    # 一時停止のまま延長された場合も、通知の再開時刻と枠名を更新する。
+    if [ "$PAUSED" != "$LAST_PAUSED" ] || [ "$PAUSE_RESUME" != "$LAST_PAUSE_RESUME" ] || [ "$PAUSE_WINDOW" != "$LAST_PAUSE_WINDOW" ]; then
         LAST_PAUSED=$PAUSED
+        LAST_PAUSE_RESUME=$PAUSE_RESUME
+        LAST_PAUSE_WINDOW=$PAUSE_WINDOW
         NEED_RENDER=1
         if [ $PAUSED -eq 1 ] && [ $STOPPED -eq 0 ]; then
             STATUS_MSG=" ⏸ Paused: $PAUSE_WINDOW window over threshold — resuming at $(format_clock "$PAUSE_RESUME")"
@@ -2271,6 +2276,51 @@ mod tests {
         };
         assert_eq!(read("resume_at"), "1788490232");
         assert_eq!(read("window"), "five_hour");
+    }
+
+    #[test]
+    fn monitor_refreshes_the_pause_notice_when_the_resume_time_changes() {
+        // 実際の生成ブロックを繰り返し実行し、一時停止の延長を画面へ反映することを確かめる。
+        let script = monitor_script_for_test();
+        let init = script.split("restore_terminal()").next().unwrap();
+        let start = script.find("    PAUSED=0\n").unwrap();
+        let end = start + script[start..].find("    # デッドライン到達確認").unwrap();
+        let block = &script[start..end];
+        let tmp = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("bash")
+            .args([
+                "-c",
+                &format!(
+                    r#"{init}
+PAUSE_FILE=$1
+NOW=100
+format_clock() {{ printf '%s' "$1"; }}
+printf 'resume_at=200\nwindow=five_hour\n' > "$PAUSE_FILE"
+{block}
+printf '%s\n' "$STATUS_MSG"
+NEED_RENDER=0
+printf 'resume_at=300\nwindow=daily\n' > "$PAUSE_FILE"
+{block}
+printf '%s\nrender=%s\n' "$STATUS_MSG" "$NEED_RENDER"
+NEED_RENDER=0
+{block}
+printf 'unchanged=%s\n' "$NEED_RENDER"
+"#
+                ),
+                "monitor-test",
+            ])
+            .arg(tmp.path().join("pause"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{:?}", out.stderr);
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(stdout.contains("five_hour window over threshold — resuming at 200"));
+        assert!(
+            stdout.contains("daily window over threshold — resuming at 300"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("render=1"), "{stdout}");
+        assert!(stdout.contains("unchanged=0"), "{stdout}");
     }
 
     #[test]

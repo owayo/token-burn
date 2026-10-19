@@ -1749,3 +1749,42 @@ fn assistant_without_attribution_is_not_treated_as_subagent() {
     let clean = strip_ansi(&run_process(input));
     assert!(!clean.contains('\u{1f527}'), "{clean}");
 }
+#[test]
+fn command_lifecycle_reports_only_cancellation() {
+    // 実ログでは開始・完了とは別に cancelled が届き、result 自体には現れない。
+    let input = [
+        r#"{"type":"command_lifecycle","state":"started","command_uuid":"command-1"}"#,
+        r#"{"type":"command_lifecycle","state":"completed","command_uuid":"command-1"}"#,
+        r#"{"type":"command_lifecycle","state":"started","command_uuid":"command-2"}"#,
+        r#"{"type":"command_lifecycle","state":"cancelled","command_uuid":"command-2"}"#,
+    ]
+    .join("\n");
+    let out = strip_ansi(&run_process(&input));
+    assert_eq!(out.trim(), "⚠ Command cancelled");
+}
+
+#[test]
+fn command_cancellation_closes_an_open_text_line_and_keeps_the_raw_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let raw = tmp.path().join("events.jsonl");
+    let input = concat!(
+        "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Working\"}}}\n",
+        "{\"type\":\"command_lifecycle\",\"state\":\"cancelled\"}\n",
+    );
+    let out = strip_ansi(&run_process_with_raw_log(input, Some(&raw)));
+    assert!(out.contains("Working\n"), "{out:?}");
+    assert!(out.contains("  ⚠ Command cancelled\n"), "{out:?}");
+    assert_eq!(std::fs::read_to_string(raw).unwrap(), input);
+}
+
+#[test]
+fn command_lifecycle_ignores_unknown_or_invalid_states() {
+    let input = [
+        r#"{"type":"command_lifecycle","state":"unknown"}"#,
+        r#"{"type":"command_lifecycle","state":true}"#,
+        r#"{"type":"command_lifecycle","state":null}"#,
+        r#"{"type":"command_lifecycle"}"#,
+    ]
+    .join("\n");
+    assert!(run_process(&input).is_empty());
+}

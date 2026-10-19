@@ -176,6 +176,14 @@ fn process(
                     handle_tool_progress(&v, pending)
                 })?;
             }
+            "command_lifecycle" if v["state"].as_str() == Some("cancelled") => {
+                // 実ログでは result の後にも届くキャンセル通知。開始・完了は既存の
+                // 本文やフッターと重複するので、キャンセルだけを独立した行へ出す。
+                render_out_of_band_event(&mut out, &mut blocks, |pending| {
+                    writeln!(pending, "\x1b[33m  \u{26a0} Command cancelled\x1b[0m")?;
+                    Ok(())
+                })?;
+            }
             _ => {} // message_stop 等
         }
     }

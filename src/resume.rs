@@ -6,7 +6,7 @@
 //! 中断までに積み上げた調査・判断の文脈（実ログでは 95 分・327 ターン）が丸ごと失われ、
 //! 同じ調査をやり直すところからトークンを使っていた。Claude Code の transcript は
 //! アカウントの config dir に残っており、`claude --resume <session_id>` で同じセッション
-//! ID のまま会話を引き継げる（fork しない。stream には新しいイベントだけが流れる）。
+//! ID のまま会話を引き継げる（fork しない。過去の result やタスク通知が再送される場合もある）。
 //!
 //! `state.json` とは別ファイルにする。`state.json` は `#[serde(flatten)]` の
 //! `HashMap<agent, HashMap<dir, time>>` なので、型の違うトップレベルキーを足すと旧バイナリが

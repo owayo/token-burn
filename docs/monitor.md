@@ -10,6 +10,7 @@ Startup cache collection also has a 30-second timeout, covering both child exit 
 
 ## Sessions and results
 
+- **Command cancellation**: Shows `command_lifecycle` with `state:"cancelled"` as `⚠ Command cancelled`, even when it arrives after a result. The notification gets its own line between text or thinking deltas. Start and completion events stay silent; result classification still uses the final `result` event
 - **Log and display failures**: `format-stream` warns on stderr and keeps reading to EOF if it cannot create the raw log or write to either output. It continues writing to the working output and checking rate limits, then reports the error after draining input. Failure to write a stop signal takes priority with exit code 11 so the worker stops
 - **Startup error details**: If a failed result has no `result` text, nonempty strings from `errors[]` are joined and displayed, including the reason a resumed session could not be found
 - **Session header**: Prints one line per session from the `init` event — model, Claude Code version, and permission mode (`ℹ Session <model> (v<version>, <permissionMode>)`). None of these appear anywhere else in the stream: `result.modelUsage` only reveals the models that were billed, so the CLI version and whether the run used `bypassPermissions` were otherwise lost

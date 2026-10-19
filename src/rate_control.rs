@@ -595,7 +595,7 @@ pub async fn run_gate_claim(
     }
 }
 
-/// キューの先頭（辞書順で最小）の `pending-*` を返す。
+/// キューの先頭（実行番号が最小）の `pending-*` を返す。
 ///
 /// ワーカーは番号順に消化するため、対象選択 TUI で確定した並びがそのまま処理順になる。
 fn next_pending(queue_dir: &Path) -> Result<Option<PathBuf>> {
@@ -606,7 +606,7 @@ fn next_pending(queue_dir: &Path) -> Result<Option<PathBuf>> {
             return Err(e).with_context(|| format!("failed to read {}", queue_dir.display()));
         }
     };
-    let mut best: Option<PathBuf> = None;
+    let mut best: Option<(usize, PathBuf)> = None;
     for entry in entries {
         // 列挙途中の I/O エラーを空キューと取り違えると、pending が残ったまま
         // ワーカーが正常終了してしまう。
@@ -614,16 +614,26 @@ fn next_pending(queue_dir: &Path) -> Result<Option<PathBuf>> {
             entry.with_context(|| format!("failed to enumerate {}", queue_dir.display()))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("pending-") {
+        let Some(index) = name.strip_prefix("pending-") else {
             continue;
-        }
+        };
+        // ゼロ埋めは最小 4 桁なので、辞書順だと 10000 が 9999 より先になる。
+        // 壊れた番号は空キュー扱いにせず、claim 前に失敗として伝える。
+        anyhow::ensure!(
+            !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()),
+            "invalid pending task index: {name}"
+        );
+        let number = index
+            .parse::<usize>()
+            .with_context(|| format!("pending task index out of range: {name}"))?;
+        anyhow::ensure!(number > 0, "invalid pending task index: {name}");
         let path = entry.path();
         match &best {
-            Some(current) if current.file_name() <= path.file_name() => {}
-            _ => best = Some(path),
+            Some((current, _)) if *current <= number => {}
+            _ => best = Some((number, path)),
         }
     }
-    Ok(best)
+    Ok(best.map(|(_, path)| path))
 }
 
 /// 再開時刻を過ぎた pause file を削除する。
@@ -690,13 +700,12 @@ async fn wait_for_gate(
     if deadline_reached(deadline_epoch, now_epoch()) {
         return Ok(stop_for_deadline(stop_file, "deadline reached"));
     }
-    let state = match read_pause_for_gate(pause_file, stop_file) {
+    let mut state = match read_pause_for_gate(pause_file, stop_file) {
         Ok(Some(state)) => state,
         Ok(None) => return Ok(GateOutcome::Proceed),
         Err(outcome) => return Ok(outcome),
     };
 
-    let mut target = state.resume_at;
     let mut last_progress = 0i64;
     loop {
         if signal_present(stop_file) {
@@ -709,19 +718,21 @@ async fn wait_for_gate(
                 "deadline reached while paused",
             ));
         }
-        if now >= target {
-            // 再開時刻に達した。待っている間に別ワーカーが延長していないか最後に確認する。
-            match read_pause_for_gate(pause_file, stop_file) {
-                Ok(Some(latest)) if latest.resume_at > target => {
-                    target = latest.resume_at;
-                }
-                Ok(_) => return Ok(GateOutcome::Resumed(target)),
-                Err(outcome) => return Ok(outcome),
+        // 延長は再開時刻を待たず、毎周回確認する。期限越えをすぐ検出し、
+        // 残り時間と停止理由も延長後の観測に揃える。削除されても元の時刻までは待つ。
+        match read_pause_for_gate(pause_file, stop_file) {
+            Ok(Some(latest)) if latest.resume_at > state.resume_at => {
+                state = latest;
             }
+            Ok(_) => {}
+            Err(outcome) => return Ok(outcome),
+        }
+        if now >= state.resume_at {
+            return Ok(GateOutcome::Resumed(state.resume_at));
         }
         // 待ってもデッドラインを越えるなら、待つ意味が無いので恒久停止にする。
         if let Some(deadline) = deadline_epoch
-            && target >= deadline
+            && state.resume_at >= deadline
         {
             eprintln!(
                 "\x1b[31m  \u{26d4} 一時停止の再開時刻がデッドラインを越えるため停止します（{}）\x1b[0m",
@@ -737,7 +748,7 @@ async fn wait_for_gate(
             eprintln!(
                 "\x1b[33m  \u{23f8} {} の枠がリセットされるまで待機中（残り {}）\x1b[0m",
                 state.window,
-                format_remaining(target - now)
+                format_remaining(state.resume_at - now)
             );
         }
         tokio::time::sleep(GATE_POLL_INTERVAL).await;
@@ -823,6 +834,123 @@ fn read_pause_for_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn gate_claim_preserves_numeric_order_across_the_four_digit_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = tmp.path().join("queue");
+        std::fs::create_dir(&queue).unwrap();
+        for index in [9998, 9999, 10000, 10001] {
+            std::fs::write(queue.join(format!("pending-{index:04}")), "").unwrap();
+        }
+        let stop = tmp.path().join("stop");
+        for index in ["9998", "9999", "10000", "10001"] {
+            assert_eq!(
+                run_gate_claim(&stop, &queue, None, None).await.unwrap(),
+                ClaimOutcome::Claimed(index.into())
+            );
+            assert!(queue.join(format!("claimed-{index}")).exists());
+        }
+        assert_eq!(
+            run_gate_claim(&stop, &queue, None, None).await.unwrap(),
+            ClaimOutcome::Empty
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_claim_rejects_invalid_pending_numbers_without_losing_tasks() {
+        for index in ["", "bad", "+1", "-1", "0", &format!("{}0", usize::MAX)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let queue = tmp.path().join("queue");
+            std::fs::create_dir(&queue).unwrap();
+            let pending = queue.join(format!("pending-{index}"));
+            std::fs::write(&pending, "").unwrap();
+            let error = run_gate_claim(&tmp.path().join("stop"), &queue, None, None)
+                .await
+                .expect_err("不正な番号を完了や claim 成功として扱わない");
+            assert!(error.to_string().contains("pending task index"), "{error}");
+            assert!(pending.exists(), "エラー時は pending を移動しない");
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_extension_past_deadline_stops_before_the_original_resume_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stop = tmp.path().join("stop");
+        let pause = pause_path_for(&stop);
+        let now = now_epoch();
+        write_pause(
+            &pause,
+            &PauseState {
+                resume_at: now + 300,
+                window: "five_hour".into(),
+                reason: "five_hour 90% >= threshold 90%".into(),
+            },
+        )
+        .unwrap();
+        let gate = wait_for_gate(&stop, &pause, Some(now + 600));
+        tokio::pin!(gate);
+        // 最初の待機に入るまでポーリングし、経過時間に頼らず別ワーカーの延長を再現する。
+        tokio::select! {
+            biased;
+            result = &mut gate => panic!("待機せず終了した: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+
+        let reason = "request rejected (daily); daily at 42%";
+        write_pause(
+            &pause,
+            &PauseState {
+                resume_at: now + 900,
+                window: "daily".into(),
+                reason: reason.into(),
+            },
+        )
+        .unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), gate)
+            .await
+            .expect("元の再開時刻まで待たず、延長を検出して停止する")
+            .unwrap();
+        assert_eq!(outcome, GateOutcome::Stop);
+        let recorded = std::fs::read_to_string(&stop).unwrap();
+        assert!(recorded.contains(reason), "{recorded}");
+        assert!(!recorded.contains("90%"), "{recorded}");
+    }
+
+    #[tokio::test]
+    async fn pause_corrupted_while_waiting_stops_before_the_resume_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stop = tmp.path().join("stop");
+        let pause = pause_path_for(&stop);
+        write_pause(
+            &pause,
+            &PauseState {
+                resume_at: now_epoch() + 300,
+                window: "five_hour".into(),
+                reason: "waiting for reset".into(),
+            },
+        )
+        .unwrap();
+        let gate = wait_for_gate(&stop, &pause, None);
+        tokio::pin!(gate);
+        tokio::select! {
+            biased;
+            result = &mut gate => panic!("待機せず終了した: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+
+        std::fs::write(&pause, "resume_at=invalid\n").unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), gate)
+            .await
+            .expect("待機中の破損を検出して停止する")
+            .unwrap();
+        assert_eq!(outcome, GateOutcome::Stop);
+        assert!(
+            std::fs::read_to_string(&stop)
+                .unwrap()
+                .contains("unreadable pause state")
+        );
+    }
 
     fn five_hour(pct: f64, reset_at: Option<i64>) -> WindowObservation {
         WindowObservation::new(WindowKind::FIVE_HOUR, "five_hour", pct).with_reset_at(reset_at)
