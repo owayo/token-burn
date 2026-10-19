@@ -36,4 +36,4 @@ codegen-units = 1
 strip = true
 
 [target."cfg(unix)".dependencies]
-libc = "0.2.190"
+libc = "0.2.191"
