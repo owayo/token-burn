@@ -86,7 +86,7 @@ printf '%s\n' "$*" >> "$TB_CALLS"
 case "$1" in
   -V) echo 'tmux 3.6' ;;
   new-session)
-    cp "$TMPDIR/token-burn/monitor.sh" "$TB_CAPTURE/monitor.sh"
+    cp "$TMPDIR/token-burn/monitor.json" "$TB_CAPTURE/monitor.json"
     cp "$TMPDIR/token-burn/worker-0.sh" "$TB_CAPTURE/worker.sh"
     ;;
   has-session) exit 1 ;;
@@ -165,12 +165,29 @@ directory = {target}
 #[test]
 fn startup_delay_does_not_extend_reset_deadline() {
     let (tmp, reset) = prepare_execution();
-    let monitor = std::fs::read_to_string(tmp.path().join("capture/monitor.sh")).unwrap();
+    let monitor: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("capture/monitor.json")).unwrap(),
+    )
+    .unwrap();
     let worker = std::fs::read_to_string(tmp.path().join("capture/worker.sh")).unwrap();
-    assert!(
-        monitor.lines().any(|line| line == format!("END={reset}")),
+    assert_eq!(
+        monitor["deadline_epoch"],
+        serde_json::json!(reset),
         "モニターは元のリセット時刻で止める"
     );
+    // モニターペインは `token-burn monitor` を起動し、起動情報はファイルで渡す。
+    let calls = std::fs::read_to_string(tmp.path().join("capture/tmux.log")).unwrap();
+    let new_session = calls
+        .lines()
+        .find(|line| line.starts_with("new-session"))
+        .unwrap();
+    assert!(
+        new_session.contains(" monitor --manifest "),
+        "{new_session}"
+    );
+    // ディスク容量は使用量のキャッシュとは別に `--disk --json` で取る。
+    let disk = monitor["ai_usage"]["disk"].as_str().unwrap();
+    assert!(disk.ends_with("'--disk' '--json'"), "{disk}");
     assert!(
         worker.contains(&format!("--deadline-epoch {reset}")),
         "起動準備にかかった時間を期限へ加えてはいけない"
@@ -180,7 +197,7 @@ fn startup_delay_does_not_extend_reset_deadline() {
 #[test]
 fn monitor_redacts_authentication_but_keeps_model_settings() {
     let (tmp, _) = prepare_execution();
-    let monitor = std::fs::read_to_string(tmp.path().join("capture/monitor.sh")).unwrap();
+    let monitor = std::fs::read_to_string(tmp.path().join("capture/monitor.json")).unwrap();
     assert!(!monitor.contains("secret-env"));
     assert!(!monitor.contains("secret-option"));
     assert!(monitor.contains("<redacted>"));

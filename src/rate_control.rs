@@ -224,10 +224,10 @@ pub fn evaluate(observations: &[WindowObservation], threshold: u8, now: i64) -> 
 
 /// 一時停止の状態。pause file に `key=value` の行で保存する。
 ///
-/// JSON にしないのは、この状態を読むのがワーカー / usage-gate（Rust）だけでなく
-/// tmux モニターのシェルスクリプトでもあるため。1 行 1 キーの平文なら
-/// `sed -n 's/^resume_at=//p'` で確実に取り出せる。値に改行を含めない正規化は
-/// [`PauseState::to_text`] が行う。
+/// 平文にしたのは、以前は tmux モニターのシェルスクリプトもこれを読んでいたため
+/// （1 行 1 キーなら `sed -n 's/^resume_at=//p'` で確実に取り出せる）。今はワーカー・
+/// usage-gate・モニターのすべてが [`read_pause`] で読むが、書式は変えていない。
+/// 値に改行を含めない正規化は [`PauseState::to_text`] が行う。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PauseState {
     /// 再開してよい時刻（Unix epoch 秒）。
@@ -345,6 +345,27 @@ impl FileLock {
             .with_context(|| format!("failed to lock {}", lock_path.display()))?;
         Ok(Self(lock_file))
     }
+
+    /// `timeout` まで待ってもロックを取れなければ None。
+    pub fn acquire_within(lock_path: &Path, timeout: std::time::Duration) -> Option<Self> {
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .ok()?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if lock_file.try_lock_exclusive().is_ok() {
+                return Some(Self(lock_file));
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for FileLock {
@@ -426,6 +447,21 @@ pub fn write_stop(stop_file: &Path, reason: &str) -> std::io::Result<bool> {
 
 /// ロックを取らずに stop file を作成する。呼び出し側で control ロックを取得して使う。
 /// 同一プロセスでも別の open で取り直すと待機し得るため、ここでは再取得しない。
+/// [`write_stop`] と同じだが、ロックを待つ時間に上限を付ける。
+///
+/// 画面の描画や 2 回目の Ctrl-C の受け付けを止められないモニターが使う。ロックを握る処理は
+/// 本来短いが、握ったプロセスが止まると無期限に待つことになる。期限を過ぎたらロック無しで
+/// 書く（ロックを取れなかった場合と同じ扱い。停止を伝えられない方が危険なため）。
+pub fn write_stop_within(
+    stop_file: &Path,
+    reason: &str,
+    lock_timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    let _guard =
+        FileLock::acquire_within(&pause_lock_path(&pause_path_for(stop_file)), lock_timeout);
+    write_stop_unlocked(stop_file, reason)
+}
+
 fn write_stop_unlocked(stop_file: &Path, reason: &str) -> std::io::Result<bool> {
     match OpenOptions::new()
         .write(true)
@@ -1477,6 +1513,30 @@ mod tests {
         assert!(probe.exists());
         assert!(stop.exists());
         assert!(queue.join("pending-0001").exists());
+    }
+
+    #[test]
+    fn write_stop_within_writes_without_the_lock_once_the_wait_expires() {
+        // ロックを握ったまま止まったプロセスがいても、モニターは期限で待つのをやめて書く。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let _held = FileLock::acquire(&pause_lock_path(&pause_path_for(&stop))).unwrap();
+        let start = std::time::Instant::now();
+        assert!(
+            write_stop_within(
+                &stop,
+                "deadline reached",
+                std::time::Duration::from_millis(100)
+            )
+            .unwrap()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(
+            std::fs::read_to_string(&stop).unwrap(),
+            "deadline reached\n"
+        );
+        // 既にあれば上書きしない（write_stop と同じ）。
+        assert!(!write_stop_within(&stop, "again", std::time::Duration::from_millis(10)).unwrap());
     }
 
     #[test]

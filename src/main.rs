@@ -6,6 +6,7 @@ mod executor;
 mod format_codex;
 mod format_stream;
 mod init;
+mod monitor;
 mod rate_control;
 mod resume;
 mod scanner;
@@ -211,6 +212,13 @@ enum Commands {
         /// 一時停止から再開する直前に実行する再検証コマンド（usage-gate）
         #[arg(long)]
         revalidate: Option<String>,
+    },
+    /// tmux のモニターペインで進捗・使用量・マシン負荷を表示する（execute_plan_tmux 専用）
+    #[command(hide = true)]
+    Monitor {
+        /// 実行用の一時ディレクトリに書かれた起動情報
+        #[arg(long)]
+        manifest: PathBuf,
     },
     /// ai-usage の使用率をチェックし閾値超過なら stop file を作成する（ワーカースクリプト専用）
     #[command(hide = true, name = "usage-gate")]
@@ -458,6 +466,10 @@ async fn main() -> Result<()> {
         std::process::exit(outcome.exit_code());
     }
 
+    if let Commands::Monitor { manifest } = &command {
+        return monitor::run(manifest).await;
+    }
+
     if let Commands::UsageGate {
         profile,
         provider,
@@ -538,7 +550,9 @@ async fn main() -> Result<()> {
         Commands::FormatCodex { .. } => unreachable!(),
         Commands::ClassifyResult { .. } => unreachable!(),
         Commands::ResumeEntry { .. } => unreachable!(),
-        Commands::UsageGate { .. } | Commands::GateClaim { .. } => unreachable!(),
+        Commands::UsageGate { .. } | Commands::GateClaim { .. } | Commands::Monitor { .. } => {
+            unreachable!()
+        }
     }
 
     Ok(())

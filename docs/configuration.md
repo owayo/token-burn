@@ -173,6 +173,7 @@ profiles = ["work", "home"]   # profile names to reference; multiple names expan
 - At run time, each agent is expanded across its referenced profiles. For example, `claude` with `["work", "home"]` becomes two agents, `claude-work` and `claude-home`, each launched with its profile's `env`.
 - Expanded names are also used as `state.json` keys, so processed-target state is tracked separately per account.
 - `ai-usage --json` is invoked only once per process.
+- The tmux monitor pane runs the same command with `--disk` inserted before `--json` every 30 seconds to show free disk space, separately from the usage cache. With an ai-usage that predates `--disk`, the monitor reads the startup disk from the OS instead.
 - The reset time is taken from the `resets_at` value of the selected window (e.g. `weekly`) for the matching `(profile, provider)` pair.
 - The instant from `resets_at` is preserved, then converted to the local fixed offset for status/run display so UTC ai-usage output is shown in the user's local time.
 - When resolution fails — the command is missing or fails, no matching `(profile, provider)` is found, the response reports `ok: false`, or the selected window is null — the configured `fallback` applies:

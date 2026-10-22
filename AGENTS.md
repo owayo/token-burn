@@ -17,8 +17,21 @@ token-burn/
 │   ├── executor/           # プロセス起動・並列実行管理（tokio、モジュール分割）
 │   │   ├── mod.rs          # ExecutionPlan / build_plan / print_plan / execute_plan_tmux / ai-usage 同期起動
 │   │   ├── flags.rs        # claude/codex 判定と必須フラグ・env（CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS 等）の自動注入
-│   │   ├── scripts.rs      # tmux 用シェルスクリプト生成（task/worker/monitor/statusline、shell_escape/env 前置き）
+│   │   ├── scripts.rs      # tmux 用シェルスクリプト生成（task/worker、ai-usage の statusline/refresh/disk コマンド、shell_escape/env 前置き）
 │   │   └── util.rs         # sanitize_filename / task_log_base / strip_ansi / truncate
+│   ├── monitor/            # tmux のモニターペイン（隠しサブコマンド `monitor`。ratatui の常駐プロセス）
+│   │   ├── mod.rs          # pub run（イベントループ。描画に失敗しても停止判定と終了処理は続ける）
+│   │   ├── manifest.rs     # Manifest（execute_plan_tmux が書く起動情報 monitor.json）
+│   │   ├── controller.rs   # マーカー・stop/pause file・デッドラインから停止の発行と終了を決める
+│   │   ├── system.rs       # CPU・メモリ・スワップ・ロードアベレージの計測（差分と換算。どの OS でもテストする）
+│   │   ├── system/         # OS 固有の読み取り: macos.rs（Mach・sysctl）/ linux.rs / procfs.rs（/proc の解析。どの OS でもテスト）/ unix.rs（getloadavg 等）
+│   │   ├── history.rs      # 時間窓つきの時系列と、描画幅への集約
+│   │   ├── load.rs         # 負荷の履歴（直近 5 分）
+│   │   ├── usage.rs        # ai-usage --json のキャッシュ更新と statusline（10 秒ごと）
+│   │   ├── disk.rs         # ディスク容量（ai-usage --disk --json、使えなければ statvfs）
+│   │   ├── process.rs      # 外部コマンドの期限つき起動（プロセスグループごと終了）
+│   │   ├── ansi.rs         # SGR 付き文字列 → ratatui の行
+│   │   └── ui.rs           # 描画（sparkline・ディスクのバー・進捗）
 │   ├── format_stream/      # claude stream-json出力のフォーマッター（モジュール分割）
 │   │   ├── mod.rs          # pub run / process（JSON行のトップレベル dispatch）
 │   │   ├── output.rs       # 出力障害を保持し、入力を最後まで処理する DrainWriter
@@ -60,7 +73,7 @@ token-burn/
 ## 技術スタック
 
 - **Rust** (edition 2024)
-- clap (CLI), serde + toml (設定), chrono + chrono-tz (日時), tokio (非同期), colored (出力), ratatui (対象選択 TUI)
+- clap (CLI), serde + toml (設定), chrono + chrono-tz (日時), tokio (非同期), colored (出力), ratatui (対象選択 TUI・モニターペイン)
 
 ## 開発コマンド
 
@@ -139,7 +152,7 @@ codex の stdin は `/dev/null` にします（`CodexJson` と `CodexRaw` の両
 
 **なぜ分けるか。** 停止シグナルが stop file 1 個（作られたら二度と再開しない）だった頃は、5 時間枠が閾値に触れただけで週次デッドラインまでの実行余力を丸ごと捨てていました。実ログでは 5 時間枠が 90%（閾値ちょうど）に達して停止した数分後にその枠がリセットされ、以降 30 分以上リクエストが通り続けたにもかかわらず、残り 2 タスクが 1 件も実行されないまま終了しています（週次枠は 43%、デッドラインまで 4 時間 52 分残っていた）。
 
-pause file は `resume_at` / `window` / `reason` を 1 行 1 キーの平文で持ちます。JSON にしないのは、これを読むのがワーカー（Rust）だけでなく tmux モニターのシェルスクリプトでもあるためで、平文なら `sed -n 's/^resume_at=//p'` で確実に取り出せます。書き込みは sidecar ロック（`.<pause file>.lock`）の下での read-modify-write ＋ atomic rename で、**既存より再開時刻が遅い場合だけ更新**します（早い時刻での上書きは待つべき時間を縮めてしまう）。ロック対象を本体にしない理由は `state.json` と同じで、rename 後にロック対象の inode が古くなって排他が破れるためです。
+pause file は `resume_at` / `window` / `reason` を 1 行 1 キーの平文で持ちます。平文にしたのは、以前は tmux モニターのシェルスクリプトもこれを読んでいたため（`sed -n 's/^resume_at=//p'` で確実に取り出せる）です。今はワーカーもモニターも Rust の `rate_control::read_pause` で読みますが、書式は変えていません。書き込みは sidecar ロック（`.<pause file>.lock`）の下での read-modify-write ＋ atomic rename で、**既存より再開時刻が遅い場合だけ更新**します（早い時刻での上書きは待つべき時間を縮めてしまう）。ロック対象を本体にしない理由は `state.json` と同じで、rename 後にロック対象の inode が古くなって排他が破れるためです。
 
 **stop file の作成（`rate_control::write_stop`）も同じ sidecar ロックの下で行います。** これが無いと、`gate-claim` がロック内で「停止が無い」ことを確認してから `rename` で claim するまでの隙間に停止が発行され、停止後にタスクが 1 件開始され得ます。ロックを取れなかった場合でも停止シグナル自体は書きます（直列化の取りこぼしより、停止を伝えられないまま走り続ける方が危険なため）。`usage-gate` 側の stop file 作成もこの関数へ寄せており、複製を持つと「停止発行を claim と直列化する」ような変更が片方だけに入って再発します。
 
@@ -164,7 +177,7 @@ pause file は `resume_at` / `window` / `reason` を 1 行 1 キーの平文で�
 
 **一時停止から再開する直前だけ、実データで使用率を確かめ直します**（`--revalidate` に渡す `usage-gate`。ai-usage 連携が無ければ省略）。待機の根拠は停止時点の観測なので、これが無いと状況が変わっていても 1 件は開始してしまいます。逆に毎 claim で ai-usage を叩くのは無駄なので、一時停止を抜けた場合に限ります。再検証が新しい pause を書けばそれに従って待ち直し、延長された時刻を過ぎた際にも再検証します。起動に失敗したり非ゼロ終了した場合は恒久停止へ倒し、stop file を書けなくてもそのワーカー自身は止めます（使用率を確認できないまま走らせない）。**再開が確定したら、期限切れの pause file は削除します。** claim はタスクごとに別プロセスなので、`resume_at` を過ぎた pause file を残すと以後の claim が毎回「一時停止から再開した」と判定し、タスクごとに再検証（ai-usage 起動）が走り続けます。削除は control ロックの下で読み直してから行い、まだ未来を指す pause は消しません（待機中の別ワーカーが延長を読む根拠のため）。ai-usage 出力のキャッシュは TTL 切れの瞬間に並列ワーカーが揃って到達しても 1 回しか取得しないよう、ロックを取ってから TTL を再確認します。
 
-一時停止中のワーカーは生存しており `worker-done-*` を作りません。モニターの早期停止判定（`WORKERS_DONE >= WORKER_COUNT`）は待機中のワーカーを終了と数えないため、待機がそのまま「停止」と誤報告されることはありません。
+一時停止中のワーカーは生存しており `worker-done-*` を作りません。モニターの早期停止判定（終了したワーカー数 ≥ ワーカー数）は待機中のワーカーを終了と数えないため、待機がそのまま「停止」と誤報告されることはありません。
 
 ### 停止シグナルを書けなかった場合
 
@@ -273,23 +286,36 @@ ai-usage 連携が有効なとき、`rate_limit_threshold`（%）は 2 経路で
 
 **スコープ外。** 一時停止が明けた後に中断したタスクを同じ実行の中でキューへ戻して再開すること、`codex` セッションの再開、リトライ可能エラーで終わったセッションの再開は扱いません。
 
-### モニターペインの ai-usage 表示
+### モニターペイン（`token-burn monitor`）
 
-ai-usage 連携が有効なとき、tmux モニターペイン（左）には進捗に加えて `ai-usage --statusline --logos`（各アカウントの 5h / 週次の使用率バー・%・リセット残り）を表示します。**10 秒ごと**にモニター自身が `ai-usage --json` を実行してキャッシュ（`ai-usage-cache.json`）を atomic（`.tmp` に書いてから `mv` で差し替え）に更新し、その直後に `--input <cache>` 付き statusline で描画します。`--input` を介して usage-gate と同じキャッシュを共有するため、長時間タスク中でもモニター表示と並列ワーカーの使用率判定が同じ最新値で同期します（進捗バーは従来どおり毎秒 `\r` 更新）。取得失敗時は直前の表示を保持し（fail-soft）、`tput civis` でカーソルを隠してちらつきを抑えます。モニターは `\033[H\033[J` で全体を再描画する方式のため、エラーは表示済みフラグではなく `error-*` マーカーから毎回再構築して履歴を保ちます。
+tmux の左ペインは、隠しサブコマンド `token-burn monitor --manifest <monitor.json>` が動く常駐プロセスです（`src/monitor/`、ratatui）。`execute_plan_tmux` は起動情報を実行用の一時ディレクトリ（0700）の `monitor.json` に書き、tmux の `new-session` にはこの起動コマンドだけを渡します。起動情報には、エージェント名・表示用コマンド・リセット・タスク数・デッドライン・マーカーと stop file のパス・セッション名・ai-usage のコマンドが入ります。ai-usage のコマンドは env の前置きとクォートを済ませたシェル文字列なので、tmux の shell-command へもう一段埋め込むとクォートが二重になって壊れやすいためです。
 
-statusline コマンドは usage-gate / 起動時キャッシュ初期化と同様に `[ai_usage].command` 全体から組み立てます（出力モードの `--json` を `--statusline --logos --compact --input <cache>` に差し替え、無ければ末尾に追加）。`--compact` はモニターペインの横幅が狭いためゲージ幅を半分にする指定です。さらに末尾へ `--active-profile <profile>` / `--active-provider <provider>` を付け、実行中アカウントの行を強調します（`ai-usage` の既定の active 判定は `.claude.json` の email に依存し、email を持たないアカウントでは効かないため、profile / provider で明示します）。先頭要素だけを使う実装ではないため、`["env", "FOO=1", "ai-usage", "--json"]` のようなラッパー前置き構成でも壊れません。進捗バーは `seq` ではなく算術 `while` ループで描画します（BSD seq の `seq 1 0` が降順で `1 0` を返し、macOS で 0% / 100% 時にバーが 2 文字ずれるのを避けるため）。
+以前のモニターは Rust が生成する bash スクリプトでした。負荷のグラフには計測の履歴を持ち続けるプロセスが要るため、Rust へ移しました。ratatui は前回の画面との差分だけを書き換えるので、毎秒描き直してもちらつきません（bash 版は `\033[H\033[J` で全体を消してから描いていたため、10 秒ごとの再描画に限っていた）。
 
-ワーカーはタスクを消化し切るとそのぶんモニターペインが広がるため、モニターは `trap 'RESIZED=1' WINCH` でペインのリサイズを受けて全体を描き直します。通常の全体再描画は ai-usage の 10 秒間隔取得・`error-*` 件数の変化・状態遷移でしか走らないため、これが無いと旧い幅で折り返した行が残ります。
+画面は上から、見出し（エージェント・コマンド・リセット・タスク数・ワーカー数・ログ）、ai-usage の使用量、マシン負荷（CPU・メモリ・スワップ・ディスク）、エラー、通知、最下行の進捗です。
 
-モニターは一時停止の有無に加え、再開時刻と枠名の変更でも通知を描き直します。`PAUSED` が 1 のまま延長された場合も、上段の再開時刻と下段の残り時間を同じ観測に揃えるためです。
+- **ai-usage の使用量**: ai-usage 連携が有効なときだけ出します。**10 秒ごと**にモニター自身が `ai-usage --json` を実行してキャッシュ（`ai-usage-cache.json`）を置き換え、その直後に `--input <cache>` 付きの statusline で描きます。キャッシュは usage-gate と共有するので、長時間タスク中でもモニターの表示と並列ワーカーの使用率判定が同じ最新値で同期します。置き換えは同じディレクトリの一時ファイルから rename で行い、JSON として読めない出力では置き換えません（壊れたキャッシュを usage-gate が読むと止まるため）。間隔は取得の開始ではなく完了から数えます（取得が間隔より長くかかったときに休みなく取得し続けないため）。取得に失敗したら直前の表示を残します（fail-soft）。statusline の色（SGR）は ratatui のスタイルへ変換し、それ以外のエスケープシーケンスと制御文字は捨てます（ペインのタイトルを書き換える OSC などを素通しさせない）。ペインより長い行は折り返さずに切ります。
+- **CPU とメモリのグラフ**: 1 秒ごとに計測し、直近 5 分を 1 行の sparkline（`▁`〜`█`）で描きます。グラフの列はサンプル 1 個ではなく時間の区間で、5 分をペインの幅で割った区間ごとに平均します（1 列 1 サンプルにすると、幅によって表示する時間が変わる）。縦軸は 0〜100% に固定します（自動で拡大すると 5% の揺れが大きな山に見える）。CPU とメモリのグラフは同じ幅・同じ開始列にそろえ、同じ列が同じ時刻を指すようにします。記録開始前と欠測の区間は空白で、0% は最下段の `▁` なので見分けられます。数値は直近 5 秒の平均です（1 秒ごとの値は振れが大きい）。CPU のグラフは 1 色に固定し、メモリのグラフは逼迫した区間だけ状態の色（warning は黄、critical は赤）にします。逼迫度は色だけで伝えず、`pressure normal` / `WARNING` / `CRITICAL` の文字でも出します。
+- **計測**（`src/monitor/system.rs`。依存は増やさない）: macOS は `libc` の `host_statistics`（CPU の累積 tick）、`host_statistics64`（メモリ・圧縮・スワップアウトの累積ページ数）、`sysctl`（`hw.memsize`、`vm.swapusage`、`kern.memorystatus_vm_pressure_level`）、Linux は `/proc/stat`・`/proc/meminfo`・`/proc/vmstat` を読みます。CPU 使用率は前回の計測との差分で、u32 の tick は巻き戻りを `wrapping_sub` で扱います。メモリ使用量は macOS ではアクティビティモニタの「使用済みメモリ」（internal − purgeable + wired + compressor）、Linux では `MemTotal − MemAvailable` で、ファイルキャッシュを含めません（キャッシュを含めると、余裕がある状態でも 100% 近くに見える）。ページサイズは 4096 に決め打ちしません（Apple Silicon は 16384）。`mach_host_self()` は呼ぶたびに送信権が増えるので、1 回だけ取って `Drop` で解放します。libc 0.2.191 で非推奨か宣言の無い Mach の関数（`mach_host_self` / `mach_port_deallocate` / `host_page_size` など）は、依存を増やさず `system/macos.rs` で宣言します。
+- **計測の間隔は 1 秒より短くしない**: macOS の `host_statistics` / `host_statistics64` は、OS に付属しないプロセスからの呼び出しを、統計の種類ごとに 1 秒の窓あたり数回（実測で 7〜9 回）までしか計算し直さず、それを超えると直前の結果を成功（KERN_SUCCESS）として返します。窓と回数はシステム全体で共有です。1 秒より短い間隔で読むと、エラーにならないまま値が止まり、CPU の差分が 0 になります。モニターは `tokio::time::interval(1s)` に `MissedTickBehavior::Delay` を付けて計測します（既定の Burst は遅れた分を立て続けに呼び直し、この制限に当たる）。
+- **スワップ**: 使用量/総量、直近のスワップアウトの速さ（累積ページ数の差分 × ページサイズ / 経過秒）、macOS では圧縮メモリの量を出します。スワップの使用量が残っているだけでは重さを表さないので、速さを併記します。
+- **ディスク**: ai-usage 連携が有効なら、使用量とは別に **30 秒ごと**に `ai-usage --disk --json` を実行します（`build_disk_cmd` が `[ai_usage].command` の `--json` の前に `--disk` を挿す）。Finder と同じ基準の available / purgeable / free と、ai-usage の設定の `[tui].disk_mounts` のボリュームが出ます。ディスク容量を使用量の JSON とキャッシュに混ぜないのは ai-usage 側の方針です。ai-usage が `--disk` を知らない古い版（clap の使い方の誤りで終了コード 2）か、`schema_version` が 1 でない出力のときは、その実行の残りを OS の `statvfs("/")` に切り替えます。何度試しても変わらないためです。ai-usage 連携が無い構成でも `statvfs` で起動ディスクを出します。`statvfs` ではパージ可能な領域が分からないので内訳に出しません（Finder の「利用可能」と同じ値だと誤解させない）。取得の失敗・応答なしでは直前の値を経過時間付き（`· 3m ago`）で残し、取り外したボリュームとネットワークボリュームの古い値は出しません。バーの配色と内訳の段階は ai-usage の TUI と同じです（使用中は 80/90/95% で黄・橙・赤、パージ可能は灰、空きは暗い灰）。
+- **外部コマンド**（`src/monitor/process.rs`）: ai-usage は `bash -c` で、新しいプロセスグループの先頭として起動します。期限（使用量は 30 秒、ディスクは 10 秒）を過ぎたらグループへ SIGTERM、1 秒後に SIGKILL を送ります。bash の子（ai-usage）やその子まで止めるためで、直接の子だけを殺すと孫が stdout を握ったまま残り、EOF を待つ読み取りが終わりません。SIGKILL の後も終わらない（戻らない I/O で止まっている）プロセスは裏で回収を待ち、その間は次を起動しません（止まったプロセスを増やさない）。取得は別のタスクで行うので、待っている間も停止判定・負荷の計測・描画は止まりません。stderr はペインに出しません（描画を壊すため）。 別のプロセスグループにしたぶん、tmux がペインを閉じたときの SIGHUP はこれらの子に届きません（bash 版では子が同じグループにいたので、ペインと一緒に止まっていた）。そのため起動中のグループを記録し、モニターが終わるとき（全タスク完了・停止・2 回目の Ctrl-C でのセッション終了、外から `kill-session` されたときの SIGHUP）に `process::terminate_all` で TERM、200ms 後に KILL を送ります。終了処理は `std::process::exit` なので、Drop も `kill_on_drop` も動かないためです。
+- **文字幅**: ratatui が数える文字幅（unicode-width）と端末が実際に使うマス数が食い違うと、差分の書き込み位置がずれて表示が崩れます。`⏱ ⏸ ⚠ ⏹` のように East Asian Width が N の絵文字は端末によって 1 マスにも 2 マスにもなるので使わず、常に 2 マスの絵文字（`⏰ 💤 ⏳ ⌛ ⛔ ✅ ❗ 🛑 ❌ 📁`）だけを使います。
+- **狭い・低いペイン**: 進捗の行は件数と失敗の数を先に確保し、バーは余った幅に 10〜20 マスで置きます。10 マスも置けなければバーを省き、さらに狭ければ時刻を短い形（`⏰ 3d01h01m`）にし、最後に件数の括弧を省きます。通知と警告は単語の区切りで折り返し、1 行目の字下げを保ちます（切り捨てると Ctrl-C の案内が読めなくなる）。高さが足りないときは、最下行の進捗 → モニター自身の警告（stop file を書けなかった等）→ 通知 → エラー（少なくとも 1 件と `+N more errors`）→ 本文（見出し・使用量・負荷）の順に行を割り当て、本文は末尾から削ります。
+- **一時停止の通知**: 一時停止の有無に加え、再開時刻と枠名の変更でも通知を描き直します。一時停止のまま延長された場合も、通知の再開時刻と最下行の残り時間を同じ観測にそろえるためです。
+
+statusline コマンドは usage-gate / 起動時キャッシュ初期化と同様に `[ai_usage].command` 全体から組み立てます（出力モードの `--json` を `--statusline --logos --compact --input <cache>` に差し替え、無ければ末尾に追加）。`--compact` はモニターペインの横幅が狭いためゲージ幅を半分にする指定です。さらに末尾へ `--active-profile <profile>` / `--active-provider <provider>` を付け、実行中アカウントの行を強調します（`ai-usage` の既定の active 判定は `.claude.json` の email に依存し、email を持たないアカウントでは効かないため、profile / provider で明示します）。先頭要素だけを使う実装ではないため、`["env", "FOO=1", "ai-usage", "--json"]` のようなラッパー前置き構成でも壊れません。
+
+端末は raw mode（`ratatui::try_init`）で使います。Ctrl-C は SIGINT ではなくキー入力として届くので、入力を読むスレッドが中断として扱います。SIGINT / SIGTERM も同じ扱いです。1 回目の中断は stop file を書いて走行中のタスクを待ちます。停止済みの状態（2 回目、デッドライン後、使用量による停止後）での中断は、待たずにセッションを閉じます。stop file は `rate_control::write_stop_within` で書きます。gate-claim と同じ sidecar ロックを取りますが、待つのは 2 秒までで、過ぎたらロック無しで書きます（ロックを取れなかった場合と同じ扱い）。書き込みは別スレッド（`spawn_blocking`）で行い、ロックを握ったプロセスが止まっていても、描画と 2 回目の Ctrl-C の受け付けを止めません。raw mode では XON/XOFF も無効になるので、^S で出力が止まることもありません。stop file を書けなかった（ENOSPC など）ときは、ワーカーが次のタスクへ進んでしまうため、画面に警告を出し続けます。端末を初期化できない・入力を読むスレッドを起動できない・描画に失敗したときは描画だけをやめ、停止判定とセッションの終了処理は続けます（描画の失敗を理由に実行を止めない）。初期化が raw mode に入った後で失敗した場合と、入力を読めなくなった場合は raw mode を解除します。raw mode のままだと Ctrl-C が SIGINT にならず、キーとしても読まれないためです。
 
 ### 完了時の自動終了
 
-モニターは全タスク完了（`PROCESSED >= TOTAL`）と早期停止（`WORKERS_DONE >= WORKER_COUNT`）のいずれでも集計とログパスを表示した後、`finish_session`（端末状態を復元 → `tmux kill-session` → `exit 0`）でセッションごと閉じて token-burn を終了します。Ctrl-C 待ちはしません。`kill-session` はモニター自身のペインも道連れに殺すため後続の `exit 0` には基本到達しませんが、セッション名の解決に失敗して空振りした場合に取り残されないよう明示的に置いています。`sleep infinity` / `sleep 3600` の待機ループはモニター・ワーカーのどちらにも残しません（回帰防止のためテストで検査しています）。
+モニターは全タスク完了（処理済み ≥ タスク数）と早期停止（終了したワーカー数 ≥ ワーカー数）のいずれでも集計とログパスを描いた後、`close_session`（端末状態を復元 → `tmux kill-session -t =<session>` → `exit(0)`）でセッションごと閉じて token-burn を終了します。Ctrl-C 待ちはしません。`kill-session` はモニター自身のペインも道連れに終了させるため後続の `exit(0)` には基本到達しませんが、セッション名の解決に失敗して空振りした場合に取り残されないよう明示的に置いています。早期停止の判定は「停止済みかどうか」に依存させません。usage-gate が stop file を作れずに止まった場合にも、デッドラインまでモニターが残らないためです。`sleep infinity` / `sleep 3600` の待機ループはワーカーに残しません（回帰防止のためテストで検査しています）。
 
 ワーカーも claim できる pending が尽きたら `worker-done-<w>` を作り、キャンセル trap を外して `exit 0` します。tmux はペインのプロセス終了でペインを閉じるため、完了したワーカーのペインは順次消え、残りのワーカーだけが画面に出ます。ユーザーの `~/.tmux.conf` が `remain-on-exit on` にしていると終了済みペインが "Pane is dead" のまま残ってしまうため、`new-session` 直後（ワーカー用のペイン分割より前、= 最初のタスクが終わる前）にこのセッションに限って `remain-on-exit off` を明示します。
 
-自動終了するとモニターが最後に描いた集計は tmux ごと画面から消えるため、`execute_plan_tmux` は `attach-session` から戻った後（一時ディレクトリの削除より前）に `marker_dir` の `done-*` / `failed-*` / `retry-*` を `collect_run_summary` で数え直し、同じ文言（`✅ All N/N tasks completed` / `⚠ Completed: ...` / `⏹ Stopped: ...`）を呼び出し元の端末へ出します。`worker-done-*` は `done-` 始まりではないためタスク件数には混ざりません。集計に失敗しても 0 件として続行します（実行結果の記録自体は `state.json` が持つため）。デタッチ（`tmux has-session` が成功）時はタスクが走行中なので集計は出しません。
+自動終了するとモニターが最後に描いた集計は tmux ごと画面から消えるため、`execute_plan_tmux` は `attach-session` から戻った後（一時ディレクトリの削除より前）に `marker_dir` の `done-*` / `failed-*` / `retry-*` を `collect_run_summary` で数え直し、同じ文言（`✅ All N/N tasks completed` / `❗ Completed: ...` / `🛑 Stopped: ...`。どちらも `monitor::summary_text`）を呼び出し元の端末へ出します。`worker-done-*` は `done-` 始まりではないためタスク件数には混ざりません。集計に失敗しても 0 件として続行します（実行結果の記録自体は `state.json` が持つため）。デタッチ（`tmux has-session` が成功）時はタスクが走行中なので集計は出しません。
 
 `claude` エージェントは出力を `.jsonl` + `format-stream`、`codex` エージェント（`--json` で起動したもの）は `.jsonl` + `format-codex` のパイプラインで処理します。それ以外（`codex_output = "human"` の codex や、`exec` が見つからず素通しにした codex を含む）は `.log` に直接出力します。
 
@@ -370,7 +396,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - ユーザーが tmux をデタッチした場合、tmux セッションが生存していれば `/tmp/token-burn` は削除しない。ワーカーのキュー・タスクスクリプト・プロンプトファイルを保持し、バックグラウンド実行を継続できるようにする
 - tmux セッション作成後のペイン構築に失敗した場合は、作成途中のセッションを kill して一時実行ディレクトリも削除する
 - レポートディレクトリ名に使うエージェント名は `sanitize_filename` でパス成分を無害化する
-- ワーカーとモニターのスクリプトは冒頭で `stty -ixon 2>/dev/null || true` を実行し、端末の XON/XOFF フロー制御を切る。有効なままだと、誤って押された ^S（XOFF）でペインへの出力が止まり、ワーカーでは `tee` の書き込みが詰まってエージェントの出力まで止まる。モニター（tmux が既定でフォーカスするペイン）では再描画と全タスク完了後の自動終了（`finish_session`）まで止まる。macOS 既定の `ixany` では任意のキーで再開するため、ハングと見分けがつかない。遡って読むには tmux のコピーモードがある。stdin が端末でない場合は stty が失敗するだけなので無視する
+- ワーカーのスクリプトは冒頭で `stty -ixon 2>/dev/null || true` を実行し、端末の XON/XOFF フロー制御を切る。有効なままだと、誤って押された ^S（XOFF）でペインへの出力が止まり、`tee` の書き込みが詰まってエージェントの出力まで止まる。macOS 既定の `ixany` では任意のキーで再開するため、ハングと見分けがつかない。遡って読むには tmux のコピーモードがある。stdin が端末でない場合は stty が失敗するだけなので無視する。モニター（tmux が既定でフォーカスするペイン）は raw mode で動くため、XON/XOFF は端末の初期化で無効になる
 
 結果として、`parallelism` で指定した並列数はタスクが尽きるまで維持されます（一部タスクが失敗しても他ワーカーは止まらない）。エラーは `marker_dir/error-<idx>` にタスク単位で記録されるため、同一ワーカーで複数エラーが起きてもモニターに全て表示されます。
 
@@ -512,37 +538,35 @@ remote URL の owner / repo 抽出は末尾 2 セグメントを採用するた�
 - `Tab` / `Shift+Tab` で実行設定へ切り替え、ワーカー数（1 以上）・停止閾値（1〜100%）・ドライランを変更できます。CLI / config の実効値を `RunSettings` で渡し、`SelectorState` が編集後の値を持ち、`Outcome::Confirmed` で対象と設定をまとめて返します。ヘッダー・実行計画・実行処理は同じ確定値を使い、config は書き換えません。設定画面の Enter / Esc は対象へ戻るだけで、実行は対象画面の Enter（ドライランなら Preview）で確定します。設定の上下・Space 操作では対象の選択と順序を変更しません
 - 列幅は**表示幅（端末セル数、`unicode-width`）**で数えます（`truncate_chars` / `pad_end` / `display_path`）。`format!("{:<width$}")` はバイト幅で数えるため日本語を含むリポジトリ名で列がずれますが、char 数で数えても揃いません。ratatui は `unicode-width` でレイアウトするため、East Asian Wide 文字（1 文字 2 セル）を含む名前では char 数基準だと 1 文字ごとに 1 セルずつ後続の列が右へずれ、狭いペインでは行末がリスト枠で切り落とされます。パスはホームを `~` に畳んだうえで**先頭**を `…` で落とします（末尾にリポジトリ名が来るため、切るなら前を捨てる方が識別しやすい）
 
-`execute_plan_tmux` へは `sched.next_reset.timestamp()` を絶対 Unix epoch として渡し、全ワーカーの `gate-claim --deadline-epoch` とモニターの `END` に同じ値を設定します。スキャン、TUI の操作、起動時のキャッシュ取得にかかった時間を足してはいけません。相対秒数から tmux 起動時に作り直すと、実際のリセット後まで新規タスクを開始してしまいます。
+`execute_plan_tmux` へは `sched.next_reset.timestamp()` を絶対 Unix epoch として渡し、全ワーカーの `gate-claim --deadline-epoch` とモニターの起動情報（`monitor.json` の `deadline_epoch`）に同じ値を設定します。スキャン、TUI の操作、起動時のキャッシュ取得にかかった時間を足してはいけません。相対秒数から tmux 起動時に作り直すと、実際のリセット後まで新規タスクを開始してしまいます。
 
 ## 実装上の注意点
 
-- tmux へ渡すスクリプトパスは `tmux_script_arg`（= `shell_escape`）でクォートします。tmux は `new-session` / `split-window` の shell-command を `sh -c` 経由で実行するため、`std::env::temp_dir()`（= `TMPDIR`）に空白が含まれる環境では未クォートだと `/tmp/tb` を `space` `test/monitor.sh` を引数に起動しようとしてペインが即死します。しかも **tmux 自身は exit 0 を返す**ため直後の `ensure!(status.success())` では検知できず、後続の split-window が「no such session」で失敗して真因と無関係なエラーになります。生成するシェルスクリプトの内側は `shell_escape` 済みで、この tmux 呼び出しだけが取りこぼしでした。
+- tmux へ渡すスクリプトパスは `tmux_script_arg`（= `shell_escape`）でクォートします。tmux は `new-session` / `split-window` の shell-command を `sh -c` 経由で実行するため、`std::env::temp_dir()`（= `TMPDIR`）に空白が含まれる環境では未クォートだと `/tmp/tb` を `space` `test/worker-0.sh` を引数に起動しようとしてペインが即死します。しかも **tmux 自身は exit 0 を返す**ため直後の `ensure!(status.success())` では検知できず、後続の split-window が「no such session」で失敗して真因と無関係なエラーになります。生成するシェルスクリプトの内側は `shell_escape` 済みで、この tmux 呼び出しだけが取りこぼしでした。 モニターの起動コマンド（`<exe> monitor --manifest <path>`）も、実行ファイルと起動情報のパスを同じく `shell_escape` でクォートします。
 - ワーカーは全タスク完了後、`CURRENT_FAILED_MARKER` を空にして `trap - INT TERM` でキャンセル trap を外してから `exit 0` します。trap を残したまま終了すると、解除直前に届いた INT/TERM で `handle_cancel` だけが走り、処理するタスクが無いのに直前タスクの failed マーカーを立て直してしまいます。
 
 - レポート出力先 (`resolve_report_dir` / `main.rs`) は設定値を必ず絶対パスへ正規化します（`config::resolve_directory` 経由）。相対パスのまま返すと、レポートディレクトリの作成（`executor` 側。プロセスの cwd で解決）と、そこへ書き込むタスクスクリプトの `tee` / `--raw-output`（対象リポジトリへ `cd` した後で解決）が別ディレクトリを指し、ログのパイプラインが `No such file or directory` で失敗して全ターゲットが `failed-N` になります（`state.json` に 1 件も記録されない）。`report_dir = "reports"` のような素直な設定で踏みます。
 - `format-stream` の入力読み取りは `read_lines_lossy` で行い、不正な UTF-8 バイトは U+FFFD へ置換します。`BufRead::lines()` は非 UTF-8 バイトを含む行に `Err(InvalidData)` を返し、そこで中断すると以降の**正常な JSON も含めて**標準出力と `--raw-output` の両方から失われます。タスクスクリプトは `claude ... 2>&1 | token-burn format-stream ... | tee log` で stderr を同じパイプへ合流させており、stream-json の 1 行は macOS の `PIPE_BUF`（512 バイト）を常に超えるため、stdout の途中に stderr の書き込みが割り込んでマルチバイト文字が分断されるだけで不正な UTF-8 が生じ得ます。中断すると `FORMAT_EXIT != 0` で `failed-N` になるうえ、パイプが閉じて `claude` 本体が SIGPIPE で落ち、表示整形の都合で数時間の実行を巻き添えにします。
 - `format-stream` の生ログと表示先は `output::DrainWriter` で包みます。最初の書き込みエラーを標準エラーへ警告して保持し、以後その出力先への書き込みを捨て、入力は EOF まで処理します。生ログの作成失敗でも同様に読み取りを開始し、書ける出力先とレート制限の検査を維持します。EOF 後は保持したエラーを返しますが、停止シグナルの書き込みも失敗した場合は専用終了コード 11 を優先します。エラーをその場で伝播すると、上流の Claude が SIGPIPE で終了し、後続の停止イベントも検査できません。
 - `format-stream` の失敗結果の本文は `classify::result_message` で抽出します。起動時エラーは `result` 文字列を持たず `errors[]` だけを返す場合があるため、分類器と表示で同じ抽出規則を使います。
-- モニターは 1 周回の先頭で `worker-done-*` を**タスクマーカーより先に**読みます。ワーカーは `done-*` / `failed-*` / `retry-*` を書き切ってから `worker-done-*` を作るため、この順序なら「worker-done は見えているのにそのワーカーのタスクマーカーが見えていない」状態は起こりません。逆順（タスクマーカー → `fetch_usage` で最大 `AI_USAGE_TIMEOUT` 秒ブロック → worker-done）だと、その待ち時間に最後のワーカーが完走した場合に古い `PROCESSED` と新しい `WORKERS_DONE` が組み合わさり、全件成功でも `⏹ Stopped: 9/10 processed` と誤報告します。
-- モニターの ai-usage 再取得スロットル (`LAST_USAGE`) は fetch **完了時刻**を記録します。`fetch_usage` は `run_with_timeout` を 2 回呼ぶため最長 `2*AI_USAGE_TIMEOUT` 秒かかり、開始時刻（ループ先頭の `NOW`）を基準にすると次の周回で即座に条件が成立して間隔を空けずに再取得し続けます。ループ外の初回 `fetch_usage` 直後にも記録し、起動直後の二重取得を防ぎます。
+- モニターは毎秒の観測で `worker-done-*` を**タスクマーカーより先に**数えます（`controller::read_observation`。ディレクトリを 2 回走査する）。ワーカーは `done-*` / `failed-*` / `retry-*` を書き切ってから `worker-done-*` を作るため、この順序なら「worker-done は見えているのにそのワーカーのタスクマーカーが見えていない」状態は起こりません。1 回の走査で両方を数えると、走査中に作られたファイルが見えるかどうかはディレクトリの並び次第なので、最後のワーカーが走査中に完走した場合に古いタスク件数と新しいワーカー終了数が組み合わさり、全件成功でも `🛑 Stopped: 9/10 processed` と誤報告し得ます（bash 版では、間に ai-usage の取得を挟む逆順で実際に起きていた）。
+- モニターの ai-usage の取得間隔（10 秒）は取得の**完了**から数えます（`monitor::usage` のループは取得を終えてから眠る）。`--json` と statusline の 2 回の起動で最長 60 秒かかるため、開始から数えると、遅い取得のたびに間隔を空けずに再取得し続けます。
 - `ai-usage --json` の枠データは `kind`（`five_hour` / `daily` / `weekly` / `monthly`）を読み、そこから `state_cutoff` の周期を導きます。スロット名（`weekly` / `five_hour`）と実際の枠長は一致しません。実データでは antigravity が `five_hour` スロットに `kind:"daily"`（24 時間枠）を、pixellab が `weekly` スロットに `kind:"monthly"`（月次枠）を返します。スロット名で決め打ちすると 24 時間枠を 5 時間として扱い、`state_cutoff`（= 直前の枠の開始点）が未来へ飛んで `filter_by_state` の `last >= cutoff` が恒偽になり、処理済みフィルタが黙って無効化されます（毎回同じ先頭ターゲットだけを再処理し続ける）。未知の `kind` はスロット名の既定周期へ落とします。
 - `scanner` から `git` を起動する箇所は `run_git_capture` に集約し、パスを `OsStr` のまま渡します。`to_string_lossy()` は不正な UTF-8 バイトを U+FFFD へ置換するため、非 UTF-8 のディレクトリ名では存在しないパスを git に渡すことになり、`username` 指定時はそのリポジトリが黙って対象から消えます。`git` 自体が PATH に無い場合は 1 プロセスにつき 1 回だけ警告します（黙って `None` にすると全リポジトリが対象外になって `No targets found` だけが出て、原因の手掛かりがゼロになる）。
 
 - リセット日時計算 (`schedule.rs`) は `naive_local()` をベースに行います。`DateTime::date_naive()` もローカル日付を返し、UTC 日付は `naive_utc().date()` で取得します。`weekday()` とローカル日付を整合させ、Asia/Tokyo の深夜帯（UTC 前日）でも曜日がずれないようにします。
 - リセット時刻が DST（夏時間）遷移に重なる場合も `resolve_local_datetime` (`schedule.rs`) で解決します。曖昧な時刻（秋の繰り戻しで 2 回出現する時刻）は早い方を採用し、存在しない時刻（春の繰り上げでスキップされる時刻）は遷移直後の最初の有効な瞬間にフォールバックします。`from_local_datetime().earliest()` は存在しない時刻に対して `None` を返すため、`America/New_York` の `02:30` のように DST ギャップへ重なるリセット時刻だと、設定読み込みは成功するのに `status` / `run` が実行時に毎回失敗していました。これを防ぐ実装です。
 - 状態ファイル (`state.json`) の書き込みは「同一ディレクトリのテンポラリファイル (`.state.json.tmp.<PID>.<nanos>`) に書き出し → `rename` で本体に置き換える」 atomic rename パターンで行います。排他ロックは `state.json` 本体ではなく sidecar の `.state.json.lock` に取ります。本体をロックすると `rename` 後にロック対象 inode が古くなり、別ワーカーが新しい `state.json` を同時ロックできて更新を失うためです。`write_all` 途中の ENOSPC やプロセスクラッシュでも本体が壊れず、書き込み失敗時はテンポラリファイルを掃除します（次回起動時に残骸が積み重ならない）。ロック取得後に既存の JSON が壊れていた場合や、権限・I/O エラーで読み取れない場合は、空状態として上書きせず更新をエラーで中断し、原本と処理済み履歴を保全します。読み取り側の `State::load` も同じ方針で、存在しない場合のみ空状態として扱い、権限・I/O エラーはエラーとして伝搬します（JSON 破損時のみ警告を出して空状態で続行）。ここを空状態へ潰すと `filter_by_state` が全ターゲットを未処理と判断して消化済みリポジトリを再実行しクォータを二重消費するうえ、`token-burn mark` 側は書き込みで正しくエラーになるため `state.json` が更新されず、次回以降も同じ状態が再現して延々と同じターゲットを処理し続けます。`resume.json` の書き込みも同じ方式（sidecar の `.resume.json.lock`）ですが、計画時の読み込みだけは壊れていても警告して空として扱います（前述「中断セッションの再開（resume）」）。
-- tmux ワーカー / モニター起動前の `chmod +x` は終了コードを検証します。`output()` の戻り値だけ確認する旧実装では `chmod` が非ゼロで終了しても無視されてしまい、`permission denied` が tmux ペイン内で初めて顕在化していました。
+- tmux ワーカー起動前の `chmod +x` は終了コードを検証します。`output()` の戻り値だけ確認する旧実装では `chmod` が非ゼロで終了しても無視されてしまい、`permission denied` が tmux ペイン内で初めて顕在化していました。
+- モニターが ai-usage を期限付きで起動するときは、子を新しいプロセスグループの先頭にし、期限切れではグループごと終了させます（`monitor::process`）。直接の子（`bash -c`）だけを殺すと、孫の ai-usage が stdout のパイプを握ったまま残り、EOF を待つ読み取りが期限を過ぎても終わりません。bash 版のモニターでは、同じ理由で監視サブシェルの子 `sleep` がコマンド置換のパイプを握り、即座に終わるコマンドでも期限いっぱい固まっていました。
 - tmux セッション作成後にペイン分割・ワーカー起動が失敗した場合は、そのセッションを kill して一時実行ディレクトリを削除します。セッションだけ作成されて後続コマンドが失敗すると、従来は孤立セッションと `/tmp/token-burn` 配下の実行資産が残っていました。
-- tmux のセッション対象はすべて `=` 付きの厳密一致（`-t =token-burn`、ウィンドウは `=token-burn:`、ペインは `=token-burn:.0` 等）にします。終了・生存確認だけでなく、接続、分割、レイアウト、設定も同じです。起動直後にモニターが終了すると、素の名前は `token-burn-notes` などの無関係なセッションへ前方一致してしまいます。モニターの終了処理も `-t "=$SESSION"` を使います。`new-session -s` はターゲットではなく新しい名前の指定なので素の名前を渡します。
+- tmux のセッション対象はすべて `=` 付きの厳密一致（`-t =token-burn`、ウィンドウは `=token-burn:`、ペインは `=token-burn:.0` 等）にします。終了・生存確認だけでなく、接続、分割、レイアウト、設定も同じです。起動直後にモニターが終了すると、素の名前は `token-burn-notes` などの無関係なセッションへ前方一致してしまいます。モニターの終了処理（`close_session` / `force_kill`）も `-t =<session>` を使います。`new-session -s` はターゲットではなく新しい名前の指定なので素の名前を渡します。
 - 起動時キャッシュ初期化で ai-usage を同期起動する `spawn_ai_usage_sync_with_timeout` (`executor/mod.rs`) は、env を「空文字の値は unset」という設定側の規約（シェル経路の `env_prefix_parts` が `env -u KEY` へ変換するのと同じ意味）で適用します。`Command::envs()` へ素通しすると空文字がそのまま子プロセスへ渡り、`CLAUDE_CONFIG_DIR = ""` を「既定に戻す」つもりで書いた profile で ai-usage が cwd 相対の設定ディレクトリを見に行って別アカウントの使用率を拾います。この結果は起動時キャッシュ（`ai-usage-cache.json`）として usage-gate と共有されるため、誤った使用率で停止判定が走ります。
 - 起動時キャッシュ初期化の `spawn_ai_usage_sync_with_timeout` は専用スレッドの tokio ランタイムで stdout/stderr を並行に読み、子の終了と両パイプの EOF をまとめて 30 秒以内に待ちます。子が終了しても孫がパイプを保持すると EOF は届かないため、子の終了後に無期限の `join` をしてはいけません。Unix では独立したプロセスグループを作り、タイムアウトや読み取りエラー時はグループ全体を終了して直接の子を回収します。非同期読み取りのキャンセルにより EOF 待ちも打ち切れ、パイプ容量を超える出力もデッドロックせず回収できます。
 - `format-stream` の `truncate_str` は「返却文字列の char 数を `max` 以下に保つ」契約を満たします。省略記号 `"..."` を付ける余地が無い `max <= 3` の場合は先頭から `max` 文字までで切り詰めます（実コードの呼び出しサイトは最小でも 30 程度のため、契約強化に伴う表示変更はありません）。
 - 同じ `truncate_str` は**改行（LF / CR）を空白へ畳んでから**切り詰めます。呼び出し元はすべて「1 行の中へ埋め込む」用途ですが、実データの Bash `command` はヒアドキュメントや複数行スクリプトで改行を含み、2,797 件中 284 件が先頭 60 文字以内で改行していました。そのまま埋め込むと 1 行のはずのツール行が複数行へ割れ、`\x1b[2m` を開いたまま改行して閉じる `\x1b[0m` が最終行にしか出ません（実ログの整形結果で 145 件）。このモジュールは `break_open_line` まで作り込んで「1 イベント 1 行」を守っているので、切り詰め側でも行を割らないことを保証します。`task_notification` の `summary` のように別のフィールドが複数行になる場合も同じ経路で守られます。
 - 合成 user メッセージの hook feedback を切り出す `split_hook_feedback` は、`to_lowercase()` した文字列のバイト位置を元文字列へ流用しません。小文字化はバイト長を保存せず、`İ`(U+0130, 2 バイト) は 3 バイトへ伸び、`K`(U+212A KELVIN SIGN, 3 バイト) は 1 バイトへ縮むため、伸びた側では範囲外スライス、縮んだ側では非文字境界スライスで **panic** します。マーカーは純 ASCII なので、元文字列上で ASCII の大文字小文字だけ無視して探す（`find_ascii_case_insensitive`）と位置が常に正しく、UTF-8 では ASCII バイトが多バイト列の内部に現れないため結果は必ず文字境界になります。`format-stream` はパイプ中段なので、panic はパイプを閉じて上流の `claude` を SIGPIPE で道連れにし、数時間の実行を巻き添えにします。
 - レポートディレクトリのクリーンアップ (`cleanup.rs`) はシンボリックリンクをスキップします。`Path::is_dir()` はリンクを追跡するため、リンク先のディレクトリを誤って削除しないよう `is_symlink()` で除外します。
-- モニタースクリプトのエラーマーカー走査は `while IFS= read -r ... < <(find ...)` 方式を使用しており、`TMPDIR` のパスに空白が含まれる環境でもワードスプリットが発生しません。エラー内容の表示は `printf '%s'` 経由で行い、ファイル内容を `echo` のダブルクォート内で再解釈しないようにしています。
 - デタッチ実行後のログを整形する `strip_ansi` (`executor/util.rs`) は、charset designation エスケープ（`\x1b(B` = G0 を ASCII 集合に指定、`\x1b(0` = DEC 罫線集合等）を introducer（`( ) * + - . /`）＋終端バイトの 3 バイトとして扱い両方を除去します。introducer だけをスキップする実装では終端バイト（`\x1b(B` の `B` 等）が通常文字としてログに漏れます。その他の 2 バイトエスケープ（`\x1b=` / `\x1b>` / `\x1bM` 等）は従来どおり ESC ＋ 1 文字だけスキップします。
-- モニタースクリプトの `run_with_timeout` (`executor/scripts.rs`) は、監視サブシェルの stdout を必ず `>/dev/null 2>&1` で捨てます。呼び出し側の stdout を継承したままだと、コマンドが即座に終わってもサブシェルの子 `sleep $secs` がコマンド置換のパイプ書き込み端を握ったまま孤児化し（`kill -TERM $wpid` はサブシェル本体しか殺せない）、`new=$(run_with_timeout ...)` が EOF を待って **timeout 秒まるごとブロック**します。ハング対策のはずが、10 秒ごとの ai-usage 取得で毎回 `AI_USAGE_MONITOR_TIMEOUT_SECS`（30 秒）固まり、毎秒更新のはずの進捗バーとデッドライン残り時間が止まっていました（実測: 即終了コマンドに 8 秒指定 → 8 秒）。
-- 同じ `run_with_timeout` の `wait` は**ループで待ち直します**。bash の `wait` は trap を設定したシグナルを受けると 128 超の終了ステータスで即座に返るため、モニターが張っている `trap 'RESIZED=1' WINCH`（ワーカーのペインが閉じるたびに届く）と 10 秒ごとの ai-usage 取得が重なると、(1) 取得済みの JSON を捨てて `rm -f <cache>.tmp` へ落ち、その周回のキャッシュ更新が飛ぶ、(2) `kill -TERM $wpid` は監視サブシェルしか殺さないため ai-usage 本体が削除済み tmp の fd を掴んだまま孤児化する、の 2 つが起きます（実測 rc=156）。`rc <= 128` か、子が既に消えているときだけループを抜けます。statusline 取得側（`new=$(run_with_timeout ...)`）はコマンド置換でサブシェルの trap がリセットされるため元から影響を受けませんが、キャッシュ更新はメインシェルで走るので直撃していました。
 - タスクスクリプトは対象ディレクトリへの `cd` をパイプラインと分けて発行します。`build_shell_command` は `cd` を含めず、`build_task_script` が手前で `cd <dir> || { ...; return 0; }` を出します。`cd X && cmd 2>&1 | format-stream | tee log` と書くと bash は `cd X && (3 要素パイプライン)` と解釈するため、cd 失敗時はパイプラインが実行されず `PIPESTATUS` が cd の 1 要素だけになります。すると `FORMAT_EXIT` / `TEE_EXIT` が空文字に展開されて `[ "" -ne 0 ]` が `integer expression expected` を吐き（ワーカーペインに漏れる）、記録されるエラーも真因と無関係な「logging pipeline failed」になっていました。スキャンから実行までの間に対象リポジトリが削除・リネームされると発生します。
 - 実行用一時ディレクトリの準備は `prepare_run_tmp_dir` (`executor/mod.rs`) が行い、`remove_dir_all` の失敗を（`NotFound` を除き）エラーとして伝播したうえで、作成後に unix では `0o700` を設定します。旧実装の `let _ = remove_dir_all(...)` は削除失敗を握り潰して、消せなかったディレクトリをそのまま再利用していました。`temp_dir()` が共有の `/tmp` になる環境（Linux。macOS は `TMPDIR` がユーザーごと）では、他ユーザーが先に `/tmp/token-burn` を作っておくと sticky bit により削除が失敗する一方 `create_dir_all` は成功するため、他人の所有ディレクトリへワーカースクリプトやプロンプトを書き込んでしまいます。

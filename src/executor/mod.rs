@@ -16,8 +16,8 @@ mod util;
 
 use flags::{agent_is_claude, claude_session_flag, ensure_required_flags};
 use scripts::{
-    TaskCtx, TaskResume, WorkerCtx, build_refresh_cmd, build_statusline_cmd, build_task_script,
-    build_worker_script, env_prefix_parts, generate_monitor_script, shell_escape,
+    TaskCtx, TaskResume, WorkerCtx, build_disk_cmd, build_refresh_cmd, build_statusline_cmd,
+    build_task_script, build_worker_script, env_prefix_parts, shell_escape,
 };
 use util::{sanitize_filename, strip_ansi_from_dir, truncate};
 
@@ -25,11 +25,6 @@ use util::{sanitize_filename, strip_ansi_from_dir, truncate};
 /// これを超えたら子プロセスを SIGKILL してキャッシュ初期化をスキップし、
 /// monitor 起動を進める。tmux 起動前に token-burn 全体が固まるのを防ぐ。
 const AI_USAGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// monitor ペイン内で `eval $AI_USAGE_CMD` / `eval $AI_USAGE_REFRESH_CMD` を包む
-/// タイムアウト（秒）。10 秒ループ内で 1 回でもハングすると進捗バーの `\r` 更新も
-/// 止まって「表示が止まった」ように見えるため、必ずキルする。
-const AI_USAGE_MONITOR_TIMEOUT_SECS: u64 = 30;
 
 pub struct ExecutionPlan {
     pub agent: RuntimeAgent,
@@ -199,22 +194,7 @@ impl RunSummary {
 
     /// モニターペインの完了行と同じ文言を組み立てる。
     fn describe(&self, total: usize) -> String {
-        if self.processed() < total {
-            return format!(
-                "⏹ Stopped: {}/{} processed (fail:{} retry:{})",
-                self.processed(),
-                total,
-                self.failed,
-                self.retry
-            );
-        }
-        if self.failed > 0 || self.retry > 0 {
-            return format!(
-                "⚠ Completed: {} succeeded / {} failed / {} retry",
-                self.done, self.failed, self.retry
-            );
-        }
-        format!("✅ All {}/{} tasks completed", self.done, total)
+        crate::monitor::summary_text(self.done, self.failed, self.retry, total)
     }
 }
 
@@ -692,17 +672,23 @@ pub fn execute_plan_tmux(
         parts.join(" ")
     });
 
-    // monitor ペインに表示する ai-usage statusline コマンド（--input でキャッシュから高速描画）。
-    let usage_statusline_cmd = plan.usage_gate.as_ref().and_then(|g| {
-        build_statusline_cmd(&g.command, &cache_file, &g.env, &g.profile, &g.provider)
+    // モニターペインが使う ai-usage のコマンド（env prefix 付き）。`--json` の出力で
+    // usage-gate と共有するキャッシュを atomic に置き換え、statusline は `--input` でその
+    // キャッシュを読む。ディスク容量は使用量のキャッシュに混ぜず `--disk --json` で別に取る。
+    let monitor_ai_usage = plan.usage_gate.as_ref().and_then(|g| {
+        Some(crate::monitor::AiUsageCommands {
+            refresh: build_refresh_cmd(&g.command, &g.env)?,
+            statusline: build_statusline_cmd(
+                &g.command,
+                &cache_file,
+                &g.env,
+                &g.profile,
+                &g.provider,
+            )?,
+            disk: build_disk_cmd(&g.command, &g.env)?,
+            cache_file: cache_file.clone(),
+        })
     });
-    // monitor の 10 秒ループで使う ai-usage --json コマンド（env prefix 付き）。
-    // 取得結果を `--input` で読む statusline と同じキャッシュファイルへ atomic に
-    // 書き戻すため、usage-gate も含めて表示・判定が同じ値で同期する。
-    let usage_refresh_cmd = plan
-        .usage_gate
-        .as_ref()
-        .and_then(|g| build_refresh_cmd(&g.command, &g.env));
     // 起動時に ai-usage キャッシュを初期化し、monitor 起動直後から statusline を表示できるようにする
     // （以後は usage-gate が各タスク完了時に 20 秒 TTL で更新する）。
     // ai-usage コマンド自体がハングすると tmux 起動前に token-burn 全体が固まるため、
@@ -757,26 +743,29 @@ pub fn execute_plan_tmux(
         script_paths.push(script_path);
     }
 
-    // 左ペイン用モニタースクリプトを生成
-    let monitor_path = tmp_dir.join("monitor.sh");
-    let command_str = display::format_command(&plan.agent.command);
-    let monitor_script = generate_monitor_script(
-        &plan.agent.name,
-        &command_str,
-        reset_info,
+    // 左ペインのモニター（`token-burn monitor`）。起動情報は引数ではなくファイルで渡す
+    // （ai-usage のコマンドはクォート済みのシェル文字列で、tmux の shell-command へもう一段
+    // 埋め込むとクォートが二重になる）。
+    let manifest_path = tmp_dir.join("monitor.json");
+    crate::monitor::Manifest {
+        agent: plan.agent.name.clone(),
+        command: display::format_command(&plan.agent.command),
+        reset: reset_info.to_string(),
         total,
         deadline_epoch,
-        &marker_dir,
-        session,
+        marker_dir: marker_dir.clone(),
+        session: session.to_string(),
         worker_count,
-        &stop_file,
-        &run_dir,
-        usage_statusline_cmd.as_deref(),
-        usage_refresh_cmd.as_deref(),
-        plan.usage_gate.as_ref().map(|_| cache_file.as_path()),
+        stop_file: stop_file.clone(),
+        report_dir: run_dir.clone(),
+        ai_usage: monitor_ai_usage,
+    }
+    .write(&manifest_path)?;
+    let monitor_command = format!(
+        "{} monitor --manifest {}",
+        shell_escape(&exe_path.to_string_lossy()),
+        shell_escape(&manifest_path.to_string_lossy())
     );
-    std::fs::write(&monitor_path, &monitor_script)?;
-    ensure_executable(&monitor_path)?;
 
     // モニター（左ペイン）付き tmux セッションを作成。
     // `.status()?` は tmux の起動失敗しか捕まえない（tmux が non-zero 終了しても Ok）。
@@ -785,13 +774,7 @@ pub fn execute_plan_tmux(
     let mut session_created = false;
     let setup_result = (|| -> Result<()> {
         let new_session_status = std::process::Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                session,
-                &tmux_script_arg(&monitor_path),
-            ])
+            .args(["new-session", "-d", "-s", session, &monitor_command])
             .status()
             .context("Failed to create tmux session")?;
         anyhow::ensure!(
@@ -1149,7 +1132,7 @@ mod tests {
         };
         assert_eq!(
             mixed.describe(10),
-            "⚠ Completed: 8 succeeded / 1 failed / 1 retry"
+            "❗ Completed: 8 succeeded / 1 failed / 1 retry"
         );
         assert!(mixed.has_issues(10));
 
@@ -1160,7 +1143,7 @@ mod tests {
         };
         assert_eq!(
             stopped.describe(10),
-            "⏹ Stopped: 5/10 processed (fail:1 retry:0)"
+            "🛑 Stopped: 5/10 processed (fail:1 retry:0)"
         );
         assert!(stopped.has_issues(10));
     }

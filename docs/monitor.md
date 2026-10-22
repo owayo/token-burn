@@ -4,7 +4,36 @@ What token-burn shows while it runs. Each worker pane renders Claude Code's stre
 
 ## Monitor pane
 
-- **Monitor usage panel**: When ai-usage integration is enabled, the tmux monitor pane shows `ai-usage --statusline --logos` (each account's 5h / weekly utilization bars) refreshed every 10 seconds, rendered from a cached `--input` snapshot alongside the per-second progress bar. Normal refreshes return as soon as the command finishes. Each refresh command has a 30-second timeout; progress redraws wait while a refresh is running
+The monitor pane shows the progress of the whole run along with ai-usage limits, machine load, and free disk space. From top to bottom:
+
+- **Header**: agent, command, reset time, task count, worker count, and log location
+- **AI Usage**: With ai-usage integration, `ai-usage --statusline --logos` (each account's 5h / weekly utilization bars), refreshed every 10 seconds. The monitor updates the cache with `ai-usage --json` and renders it with `--input`, so the pane and the workers' usage checks (usage-gate) see the same values. Each command has a 30-second timeout; a failed refresh keeps the previous display. Progress and load keep updating while a refresh runs
+- **System**: CPU and memory utilization over the last 5 minutes as graphs, plus swap and disk as numbers and bars (see below)
+- **Errors**: why tasks failed. When the pane is too short, the list collapses into `+N more errors`
+- **Notices and progress**: pause and stop notices, the time left until the deadline, the progress bar, and the counts. The progress bar shrinks to fit narrow panes without dropping the counts
+
+The System panel at 70 columns:
+
+```text
+ System · last 5m · 8 CPUs
+  CPU   ▆▇██▇▅▇██▇▆▆▇██▇▅▆██▇▆▆   70%  load 70.9 62.7 73.3
+  Mem   ▅▅▅▅▅▅▅▅▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆   71%  17.0/24.0 GiB · pressure normal
+  Swap  5.9/7.0 GiB · out 1.2 MiB/s · compressed 5.4 GiB
+  Disk  Macintosh HD █████████████████████▒▒▒░  86%  70.8 GB available
+```
+
+| Row | Shows |
+|---|---|
+| `CPU` | Machine-wide utilization. The number is the average of the last 5 seconds; `load` is the 1-, 5-, and 15-minute load average |
+| `Mem` | The share of used memory: Activity Monitor's "Memory Used" on macOS and MemTotal − MemAvailable on Linux, neither counting the file cache. On macOS the row also shows memory pressure (`pressure normal` / `WARNING` / `CRITICAL`), and periods under pressure turn the graph yellow or red |
+| `Swap` | Swap in use and the recent swap-out rate; on macOS also the amount of compressed memory |
+| `Disk` | A bar of used, purgeable, and free space, and the available space (see below) |
+
+With ai-usage integration, the monitor runs `ai-usage --disk --json` every 30 seconds and shows available, free, and purgeable space measured the way Finder does, including the volumes listed in ai-usage's `[tui].disk_mounts`. Without ai-usage integration, or with an ai-usage that predates `--disk`, it reads the startup disk from the OS and leaves out the purgeable part, which the OS does not report. After a failed read, the previous values stay with their age (`3m ago`).
+
+The graphs always cover the last 5 minutes on a fixed 0–100% scale, whatever the pane width. Until 5 minutes have been recorded, their left part stays blank, which keeps it distinct from 0% (the lowest `▁`).
+
+Press Ctrl-C once to stop starting new tasks and wait for the running ones. Pressing it again once the run has stopped closes the session without waiting.
 
 Startup cache collection also has a 30-second timeout, covering both child exit and stdout/stderr EOF. On Unix, timeout cleanup terminates descendants in the same process group. A failed collection produces a warning and leaves subsequent refreshes to the monitor.
 

@@ -37,6 +37,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 
 - **Deadline-aware scheduling**: Picks the agent whose reset deadline is closest, stops starting new tasks when the reset time arrives, and waits for the running tasks to finish
 - **Parallel runs in tmux**: Runs several prompts at once in split panes with a progress monitor; workers close their own panes when the queue is empty, and detaching leaves the run going
+- **Machine load and disk in the monitor**: The monitor pane graphs CPU and memory utilization over the last 5 minutes and shows memory pressure, swap activity, and free disk space, measured the way Finder does when ai-usage supports `--disk`
 - **Repository discovery**: Scans directories for git repositories from several `[[scan]]` sources, keeps those whose remote owner matches your username, and processes each directory once
 - **Processing order**: Puts public repositories ahead of private ones, orders each group least-recently-modified first, and skips targets processed recently (`skip_within`)
 - **Interactive target picker**: `-i` / `--interactive` opens a TUI to choose targets and their order; press `Tab` to change workers, the stop threshold, and dry-run mode
