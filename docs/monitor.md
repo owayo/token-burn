@@ -43,6 +43,8 @@ Startup cache collection also has a 30-second timeout, covering both child exit 
 
 ## Subagents
 
+Status updates include the task description, for example `Task failed (Run the checks): API error`. The formatter matches each update to its start or progress event within the same session. If a log excerpt omits those events, it shows the task ID as `(task:<id>)`; if the ID is also missing, it shows only the status and any error.
+
 - **Sub-agent monitoring**: Real-time start, progress, status updates, and completion notifications for Claude Code team/agent tasks; `task_started` prefers the concrete `subagent_type`, failed notifications include their summary, and `task_updated` with `killed` is highlighted as a failure
 - **Sub-agent result summary**: Displays `result.subagent_stats` totals for spawned/completed/failed/killed/refused agents, background and nested launches, and maximum depth. A successful top-level result is still highlighted when its sub-agents failed
 - **Sub-agent stop visibility**: `task_notification` events with `status="stopped"` (e.g. forced via `TaskStop`) are now surfaced in the live monitor; missing usage metrics are omitted instead of being shown as zero

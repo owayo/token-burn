@@ -8,7 +8,7 @@ use crate::format_stream::system::handle_system_event;
 fn render(json: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(json).unwrap();
     let mut buf = Vec::new();
-    handle_system_event(&v, &mut buf).unwrap();
+    handle_system_event(&v, &mut buf, &mut std::collections::HashMap::new()).unwrap();
     String::from_utf8(buf).unwrap()
 }
 
@@ -287,14 +287,13 @@ fn task_updated_killed_shows_patch_error() {
     assert!(out.contains("stopped by user"), "{out:?}");
 }
 
-/// error が無い失敗 patch は従来どおり状態のみを表示する。
+/// error が無い失敗 patch は対象と状態だけを表示し、空のエラー区切りを付けない。
 #[test]
 fn task_updated_failed_without_error_keeps_short_form() {
     let out = render(
         r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"status":"failed","end_time":1785433765926}}"#,
     );
-    assert!(out.contains("Task failed"), "{out:?}");
-    assert!(!out.contains(':'), "余計な区切りを付けないべき: {out:?}");
+    assert_eq!(super::strip_ansi(&out).trim(), "❌ Task failed (task:a1)");
 }
 
 /// 空文字の error は付けない。
@@ -303,8 +302,7 @@ fn task_updated_failed_with_empty_error_keeps_short_form() {
     let out = render(
         r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"status":"failed","error":""}}"#,
     );
-    assert!(out.contains("Task failed"), "{out:?}");
-    assert!(!out.contains(':'), "{out:?}");
+    assert_eq!(super::strip_ansi(&out).trim(), "❌ Task failed (task:a1)");
 }
 
 /// status を伴わない is_backgrounded patch は「バックグラウンド移行」として表示する。
@@ -442,4 +440,137 @@ fn task_started_without_subagent_owner_is_not_nested() {
     );
     assert!(out.contains("(local_bash)"), "{out:?}");
     assert!(!out.contains("nested"), "{out:?}");
+}
+
+#[test]
+fn task_updates_keep_the_description_of_each_parallel_task() {
+    // 更新には説明が無いため、開始時の ID と突き合わせないと帰属が失われる。
+    let input = [
+        r#"{"type":"system","subtype":"task_started","task_id":"task-a","description":"Alpha task"}"#,
+        r#"{"type":"system","subtype":"task_started","task_id":"task-b","description":"Beta task"}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"task-b","patch":{"status":"failed","error":"execution failed"}}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"task-a","patch":{"status":"completed"}}"#,
+    ].join("\n");
+    let out = super::strip_ansi(&super::run_process(&input));
+    assert!(
+        out.contains("Task failed (Beta task): execution failed"),
+        "{out}"
+    );
+    assert!(out.contains("Task completed (Alpha task)"), "{out}");
+    assert!(!out.contains("Task failed (Alpha task)"), "{out}");
+}
+
+#[test]
+fn task_progress_can_supply_a_missing_start_description() {
+    let input = [
+        r#"{"type":"system","subtype":"task_progress","task_id":"task-a","description":"Run the checks"}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"task-a","patch":{"is_backgrounded":true}}"#,
+    ].join("\n");
+    let out = super::strip_ansi(&super::run_process(&input));
+    assert!(out.contains("Task backgrounded (Run the checks)"), "{out}");
+}
+
+#[test]
+fn task_descriptions_survive_completion_notifications_and_blank_progress() {
+    // 通知後の更新や、説明を持たない進捗でも対応表を消さない。
+    let input = [
+        r#"{"type":"system","subtype":"task_started","task_id":"task-a","description":"Keep this task"}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"task-a","status":"completed"}"#,
+        r#"{"type":"system","subtype":"task_progress","task_id":"task-a","description":" \n "}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"task-a","patch":{"status":"completed"}}"#,
+    ].join("\n");
+    let out = super::strip_ansi(&super::run_process(&input));
+    assert!(out.contains("Task completed (Keep this task)"), "{out}");
+}
+
+#[test]
+fn task_updated_without_a_start_falls_back_to_the_task_id() {
+    let out = render(
+        r#"{"type":"system","subtype":"task_updated","task_id":"task-a","patch":{"status":"killed","error":"API error"}}"#,
+    );
+    assert!(
+        out.contains("Task killed (task:task-a): API error"),
+        "{out}"
+    );
+}
+
+#[test]
+fn task_description_is_normalized_and_bounded() {
+    let input = [
+        serde_json::json!({"type":"system", "subtype":"task_started", "task_id":"task-a", "description":"検査\n".repeat(100)}),
+        serde_json::json!({"type":"system", "subtype":"task_updated", "task_id":"task-a", "patch":{"status":"completed"}}),
+    ].iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let out = super::strip_ansi(&super::run_process(&input));
+    let updated = out
+        .lines()
+        .find(|line| line.contains("Task completed"))
+        .unwrap();
+    assert!(updated.contains("検査 検査"), "{updated}");
+    assert!(updated.ends_with("...)"), "{updated}");
+    assert!(updated.chars().count() < 90, "{updated}");
+}
+
+#[test]
+fn task_tracking_ignores_missing_or_invalid_identifiers() {
+    for id in [
+        serde_json::Value::Null,
+        serde_json::json!(""),
+        serde_json::json!(" \n "),
+        serde_json::json!(42),
+    ] {
+        let input = [
+            serde_json::json!({"type":"system", "subtype":"task_started", "task_id":id, "description":"Unrelated task"}),
+            serde_json::json!({"type":"system", "subtype":"task_updated", "task_id":id, "patch":{"status":"completed"}}),
+        ].iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+        let out = super::strip_ansi(&super::run_process(&input));
+        let updated = out
+            .lines()
+            .find(|line| line.contains("Task completed"))
+            .unwrap();
+        assert_eq!(updated.trim(), "✅ Task completed");
+    }
+}
+
+#[test]
+fn task_progress_does_not_replace_the_start_description() {
+    let input = [
+        r#"{"type":"system","subtype":"task_started","task_id":"task-a","description":"Original task"}"#,
+        r#"{"type":"system","subtype":"task_progress","task_id":"task-a","description":"Changing progress"}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"task-a","patch":{"status":"completed"}}"#,
+    ].join("\n");
+    let out = super::strip_ansi(&super::run_process(&input));
+    assert!(out.contains("Task completed (Original task)"), "{out}");
+    assert!(!out.contains("Task completed (Changing progress)"), "{out}");
+}
+
+#[test]
+fn task_start_replaces_the_description_when_an_id_is_reused() {
+    let input = [
+        r#"{"type":"system","subtype":"task_started","task_id":"task-a","description":"Old task"}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"task-a","patch":{"status":"completed"}}"#,
+        r#"{"type":"system","subtype":"task_started","task_id":"task-a","description":"New task"}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"task-a","patch":{"status":"completed"}}"#,
+    ].join("\n");
+    let out = super::strip_ansi(&super::run_process(&input));
+    assert!(out.contains("Task completed (Old task)"), "{out}");
+    assert!(out.contains("Task completed (New task)"), "{out}");
+}
+
+#[test]
+fn task_descriptions_are_isolated_between_sessions() {
+    let input = [
+        r#"{"type":"system","subtype":"task_started","session_id":"session-a","task_id":"task-a","description":"First session"}"#,
+        r#"{"type":"system","subtype":"task_updated","session_id":"session-b","task_id":"task-a","patch":{"status":"completed"}}"#,
+        r#"{"type":"system","subtype":"task_started","session_id":"session-b","task_id":"task-a","description":"Second session"}"#,
+        r#"{"type":"system","subtype":"task_updated","session_id":"session-a","task_id":"task-a","patch":{"status":"completed"}}"#,
+        r#"{"type":"system","subtype":"task_updated","session_id":"session-b","task_id":"task-a","patch":{"status":"completed"}}"#,
+    ].join("\n");
+    let out = super::strip_ansi(&super::run_process(&input));
+    let updates = out
+        .lines()
+        .filter(|line| line.contains("Task completed"))
+        .collect::<Vec<_>>();
+    assert!(updates[0].ends_with("(task:task-a)"), "{out}");
+    assert!(updates[1].ends_with("(First session)"), "{out}");
+    assert!(updates[2].ends_with("(Second session)"), "{out}");
 }

@@ -62,6 +62,7 @@ fn process(
     // 落ち、数時間の実行を巻き添えにする。
     let mut signal_failed = false;
     let mut tool_id_map: HashMap<String, String> = HashMap::new();
+    let mut task_descriptions = HashMap::new();
     let mut shown_notices = std::collections::HashSet::new();
     let mut streamed_message_ids = std::collections::HashSet::new();
     let mut blocks: HashMap<usize, ContentBlockState> = HashMap::new();
@@ -122,7 +123,7 @@ fn process(
             "system" => {
                 summary.update_from_system(&v);
                 render_out_of_band_event(&mut out, &mut blocks, |pending| {
-                    handle_system_event(&v, pending)
+                    handle_system_event(&v, pending, &mut task_descriptions)
                 })?;
             }
             "stream_event" => {

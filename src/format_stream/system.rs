@@ -3,6 +3,7 @@
 //! subtype ごとに `write_*` ヘルパーへディスパッチする薄い入口。
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::io::Write;
 
 use crate::format_stream::util::{
@@ -10,16 +11,44 @@ use crate::format_stream::util::{
     truncate_inline, truncate_str,
 };
 
+/// セッション ID とタスク ID を組にし、連結ログでも別セッションの説明を混ぜない。
+pub(crate) type TaskDescriptions = HashMap<(String, String), String>;
+
 /// 表示対象の system イベントを subtype ごとの処理へ振り分ける。
-pub(crate) fn handle_system_event(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+pub(crate) fn handle_system_event(
+    v: &serde_json::Value,
+    out: &mut impl Write,
+    task_descriptions: &mut TaskDescriptions,
+) -> Result<()> {
     let subtype = v["subtype"].as_str().unwrap_or("");
+    // 更新イベントには説明が無い。開始・進捗の ID と結び付けて、並列実行中でも
+    // 完了や失敗の対象を追えるようにする。通知後に更新が届くため、対応は保持する。
+    if matches!(subtype, "task_started" | "task_progress")
+        && let Some(id) = v["task_id"].as_str().filter(|id| !id.trim().is_empty())
+        && let Some(description) = v["description"]
+            .as_str()
+            .filter(|description| !description.trim().is_empty())
+    {
+        let key = (
+            v["session_id"].as_str().unwrap_or("").to_string(),
+            id.to_string(),
+        );
+        if subtype == "task_started" {
+            task_descriptions.insert(key, truncate_inline(description, 60));
+        } else {
+            // 進捗の説明は変わることがあるため、開始時の説明が無い場合だけ補う。
+            task_descriptions
+                .entry(key)
+                .or_insert_with(|| truncate_inline(description, 60));
+        }
+    }
     match subtype {
         "init" => write_session_init(v, out)?,
         "compact_boundary" => write_compact_boundary(v, out)?,
         "task_started" => write_task_started(v, out)?,
         "task_progress" => write_task_progress(v, out)?,
         "task_notification" => write_task_notification(v, out)?,
-        "task_updated" => write_task_updated(v, out)?,
+        "task_updated" => write_task_updated(v, out, task_descriptions)?,
         "notification" => write_notification(v, out)?,
         "permission_denied" => write_permission_denied(v, out)?,
         "api_retry" => write_api_retry(v, out)?,
@@ -326,13 +355,31 @@ fn write_task_notification(v: &serde_json::Value, out: &mut impl Write) -> Resul
     Ok(())
 }
 
-/// `task_updated`: patch.status の状態遷移と、失敗時は patch.error を表示する。
-fn write_task_updated(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+/// `task_updated`: 対象タスクの説明、状態遷移、失敗時の原因を表示する。
+fn write_task_updated(
+    v: &serde_json::Value,
+    out: &mut impl Write,
+    task_descriptions: &TaskDescriptions,
+) -> Result<()> {
     let patch = &v["patch"];
     let status = patch["status"].as_str().unwrap_or("");
+    let owner = v["task_id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| {
+            match task_descriptions.get(&(
+                v["session_id"].as_str().unwrap_or("").to_string(),
+                id.to_string(),
+            )) {
+                Some(description) => format!(" ({description})"),
+                // 開始・進捗を含まない抜粋ログでも、更新の対象を識別できるようにする。
+                None => format!(" (task:{})", truncate_inline(id, 40)),
+            }
+        })
+        .unwrap_or_default();
     match status {
         "completed" => {
-            writeln!(out, "\x1b[32m  \u{2705} Task completed\x1b[0m")?;
+            writeln!(out, "\x1b[32m  \u{2705} Task completed{owner}\x1b[0m")?;
         }
         "failed" | "cancelled" | "killed" => {
             // 実データの失敗 patch は原因を error に持つ（例: "Agent terminated early
@@ -343,15 +390,18 @@ fn write_task_updated(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
                 .filter(|reason| !reason.is_empty())
                 .map(|reason| format!(": {}", truncate_inline(reason, 100)))
                 .unwrap_or_default();
-            writeln!(out, "\x1b[31m  \u{274c} Task {}{}\x1b[0m", status, reason)?;
+            writeln!(
+                out,
+                "\x1b[31m  \u{274c} Task {status}{owner}{reason}\x1b[0m"
+            )?;
         }
         status if !status.is_empty() => {
-            writeln!(out, "\x1b[2m  \u{2139} Task {}\x1b[0m", status)?;
+            writeln!(out, "\x1b[2m  \u{2139} Task {status}{owner}\x1b[0m")?;
         }
         // status を伴わない patch もある。バックグラウンド移行はタスクの出力が
         // インラインに出なくなる理由そのものなので、状態変化として表示する。
         _ if patch["is_backgrounded"].as_bool() == Some(true) => {
-            writeln!(out, "\x1b[2m  \u{2139} Task backgrounded\x1b[0m")?;
+            writeln!(out, "\x1b[2m  \u{2139} Task backgrounded{owner}\x1b[0m")?;
         }
         _ => {}
     }
