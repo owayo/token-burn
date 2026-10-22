@@ -7,10 +7,12 @@ What token-burn shows while it runs. Each worker pane renders Claude Code's stre
 The monitor pane shows the progress of the whole run along with ai-usage limits, machine load, and free disk space. From top to bottom:
 
 - **Header**: agent, command, reset time, task count, worker count, and log location
-- **AI Usage**: With ai-usage integration, `ai-usage --statusline --logos` (each account's 5h / weekly utilization bars), refreshed every 10 seconds. The monitor updates the cache with `ai-usage --json` and renders it with `--input`, so the pane and the workers' usage checks (usage-gate) see the same values. Each command has a 30-second timeout; a failed refresh keeps the previous display. Progress and load keep updating while a refresh runs
+- **AI Usage**: With ai-usage integration, `ai-usage --statusline --logos` (each account's 5h / weekly utilization bars), refreshed every 10 seconds. The monitor updates the cache with `ai-usage --json` and renders it with `--input`. This display goes through ai-usage's shared cache (120 seconds by default); the stop decisions (usage-gate) refetch the running account with `--refresh` instead. Each command has a 30-second timeout; a failed refresh keeps the previous display. Progress and load keep updating while a refresh runs
 - **System**: CPU and memory utilization over the last 5 minutes as graphs, plus swap and disk as numbers and bars (see below)
 - **Errors**: why tasks failed. When the pane is too short, the list collapses into `+N more errors`
 - **Notices and progress**: pause and stop notices, the time left until the deadline, the progress bar, and the counts. The progress bar shrinks to fit narrow panes without dropping the counts
+
+While a pause is in effect and ai-usage integration is enabled, the monitor refetches the running account's usage with `--refresh` about every 30 seconds. When it can tell that a manual reset (or anything else) has refilled the window that caused the pause, it lifts the pause and shows a notice that the recovery was confirmed; the workers take their next task without waiting for the estimated resume time (the conditions are in [Rate limits](rate-limits.md#resuming-early-after-a-manual-reset)). With an older ai-usage that does not support `--refresh`, the monitor stops checking, shows a warning, and the workers wait until the estimated time.
 
 The System panel at 70 columns:
 
@@ -39,7 +41,7 @@ Startup cache collection also has a 30-second timeout, covering both child exit 
 
 ## Sessions and results
 
-- **Command cancellation**: Shows `command_lifecycle` with `state:"cancelled"` as `⚠ Command cancelled`, even when it arrives after a result. The notification gets its own line between text or thinking deltas. Start and completion events stay silent; result classification still uses the final `result` event
+- **Command cancellation**: Shows `command_lifecycle` with `state:"cancelled"` as `⚠ Command cancelled`, even when it arrives after a result. The notification gets its own line between text or thinking deltas. Start and completion events stay silent; result classification still uses the final `result` event (skipping trailing results from notification turns that did nothing)
 - **Log and display failures**: `format-stream` warns on stderr and keeps reading to EOF if it cannot create the raw log or write to either output. It continues writing to the working output and checking rate limits, then reports the error after draining input. Failure to write a stop signal takes priority with exit code 11 so the worker stops
 - **Startup error details**: If a failed result has no `result` text, nonempty strings from `errors[]` are joined and displayed, including the reason a resumed session could not be found
 - **Session header**: Prints one line per session from the `init` event — model, Claude Code version, and permission mode (`ℹ Session <model> (v<version>, <permissionMode>)`). None of these appear anywhere else in the stream: `result.modelUsage` only reveals the models that were billed, so the CLI version and whether the run used `bypassPermissions` were otherwise lost

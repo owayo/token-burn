@@ -22,11 +22,42 @@ impl Counts {
     }
 }
 
-/// 読み取った一時停止。
+/// 読み取った一時停止（早期解除されていないもの）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pause {
     pub resume_at: i64,
     pub window: String,
+    /// この一時停止が始まった時刻（`PauseState::since`）。回復の確認の結果が、どの
+    /// 一時停止についてのものかを照合するのに使う。
+    pub since: i64,
+    /// 実データで回復を確かめても早期解除できない理由（[`super::recovery::not_liftable`]）。
+    /// None なら、回復を確かめている構成ではリセットされれば早めに再開できる。
+    pub not_liftable: Option<&'static str>,
+}
+
+#[cfg(test)]
+impl Pause {
+    /// 回復を確かめられる一時停止（テスト用）。
+    pub fn new(resume_at: i64, window: &str) -> Self {
+        Self {
+            resume_at,
+            window: window.into(),
+            since: 0,
+            not_liftable: None,
+        }
+    }
+}
+
+/// 早期解除された一時停止（モニターが実データで回復を確かめて解除したもの）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lift {
+    pub window: String,
+    /// 解除の理由（回復の確認の説明）。
+    pub reason: String,
+    /// 解除した時刻（Unix epoch 秒）。
+    pub lifted_at: i64,
+    /// 元の見積もりの再開時刻。これを過ぎたら解除を知らせる意味は無い。
+    pub resume_at: i64,
 }
 
 /// 1 回の観測。
@@ -38,15 +69,27 @@ pub struct Observation {
     /// error-* の中身（タスク番号順）。
     pub errors: Vec<String>,
     /// 一時停止のファイル。無い・読めない・壊れているときは None（ワーカー側の判定に任せ、
-    /// モニターは「一時停止中」と表示しないだけにする）。
+    /// モニターは「一時停止中」と表示しないだけにする）。早期解除済みのものも入れない
+    /// （何も止めていない）。
     pub pause: Option<Pause>,
+    /// 早期解除済みの一時停止。
+    pub lift: Option<Lift>,
     pub stop_file_exists: bool,
 }
 
 /// ステータス行に出す通知。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
-    Paused { window: String, resume_at: i64 },
+    Paused {
+        window: String,
+        resume_at: i64,
+    },
+    /// 実データで枠の回復を確かめ、一時停止を見積もりより早く解除した。
+    ResumedEarly {
+        window: String,
+        reason: String,
+        lifted_at: i64,
+    },
     Interrupted,
     Deadline,
     UsageLimit,
@@ -93,11 +136,22 @@ pub struct Controller {
     errors: Vec<String>,
     /// 今効いている一時停止（再開時刻が未来のもの）。
     paused: Option<Pause>,
-    /// 一時停止の通知を最後に組み立てたときの (一時停止中か, 再開時刻, 枠名)。延長や枠の
-    /// 入れ替わりを、一時停止中のままでも通知へ反映するために比べる。
-    last_pause: Option<(bool, Option<i64>, String)>,
+    /// 一時停止の通知を最後に組み立てたときの状態。延長・枠の入れ替わり・早期解除を、
+    /// 一時停止中のままでも通知へ反映するために比べる。
+    last_pause: Option<PauseKey>,
     notice: Option<Notice>,
     finished: Option<Finish>,
+}
+
+/// 一時停止の通知を決める観測の要素。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PauseKey {
+    /// 一時停止中か。
+    paused: bool,
+    resume_at: Option<i64>,
+    window: String,
+    /// 知らせている早期解除（解除した時刻）。
+    lifted_at: Option<i64>,
 }
 
 impl Controller {
@@ -132,22 +186,37 @@ impl Controller {
             .as_ref()
             .filter(|pause| pause.resume_at > self.now)
             .cloned();
-        let key = (
-            paused.is_some(),
-            observation.pause.as_ref().map(|pause| pause.resume_at),
-            observation
+        // 早期解除は、元の見積もりの再開時刻までのあいだ知らせる。それを過ぎれば、解除が
+        // 無くても再開していた時刻なので、知らせる意味が無い。
+        let lift = observation
+            .lift
+            .as_ref()
+            .filter(|lift| lift.resume_at > self.now);
+        let key = PauseKey {
+            paused: paused.is_some(),
+            resume_at: observation.pause.as_ref().map(|pause| pause.resume_at),
+            window: observation
                 .pause
                 .as_ref()
                 .map(|pause| pause.window.clone())
                 .unwrap_or_default(),
-        );
+            lifted_at: lift.map(|lift| lift.lifted_at),
+        };
         if self.last_pause.as_ref() != Some(&key) {
             self.last_pause = Some(key);
             if !self.stopped {
-                self.notice = paused.as_ref().map(|pause| Notice::Paused {
-                    window: pause.window.clone(),
-                    resume_at: pause.resume_at,
-                });
+                self.notice = match (&paused, lift) {
+                    (Some(pause), _) => Some(Notice::Paused {
+                        window: pause.window.clone(),
+                        resume_at: pause.resume_at,
+                    }),
+                    (None, Some(lift)) => Some(Notice::ResumedEarly {
+                        window: lift.window.clone(),
+                        reason: lift.reason.clone(),
+                        lifted_at: lift.lifted_at,
+                    }),
+                    (None, None) => None,
+                };
             }
         }
         self.paused = paused;
@@ -207,6 +276,11 @@ impl Controller {
 
     pub fn notice(&self) -> Option<&Notice> {
         self.notice.as_ref()
+    }
+
+    /// 今効いている一時停止。
+    pub fn pause(&self) -> Option<&Pause> {
+        self.paused.as_ref()
     }
 
     pub fn finished(&self) -> Option<Finish> {
@@ -277,24 +351,50 @@ pub fn read_observation(
         .filter(|text| !text.is_empty())
         .collect();
 
-    // 権限異常などで存在を確かめられないときは「ある」側に倒す（gate-claim と同じ）。
-    let stop_file_exists = match std::fs::symlink_metadata(stop_file) {
-        Ok(_) => true,
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    let stop_file_exists = signal_present(stop_file);
+    // 早期解除済みの一時停止は、元の見積もりの時刻までファイルに残る（まだ解除を読んで
+    // いないワーカーを取り残さないため）。何も止めていないので「一時停止中」とは扱わない。
+    let (pause, lift) = match crate::rate_control::read_pause(pause_file) {
+        Ok(Some(state)) if state.is_lifted() => (
+            None,
+            Some(Lift {
+                reason: state
+                    .lift_reason
+                    .as_deref()
+                    .map(single_line)
+                    .unwrap_or_default(),
+                lifted_at: state.lifted_at.unwrap_or(now),
+                resume_at: state.resume_at,
+                window: state.window,
+            }),
+        ),
+        Ok(Some(state)) => (
+            Some(Pause {
+                not_liftable: super::recovery::not_liftable(&state),
+                resume_at: state.resume_at,
+                since: state.since,
+                window: state.window,
+            }),
+            None,
+        ),
+        _ => (None, None),
     };
-    let pause = crate::rate_control::read_pause(pause_file)
-        .ok()
-        .flatten()
-        .map(|state| Pause {
-            resume_at: state.resume_at,
-            window: state.window,
-        });
     Observation {
         now,
         counts,
         errors,
         pause,
+        lift,
         stop_file_exists,
+    }
+}
+
+/// stop file があるか。権限異常などで存在を確かめられないときは「ある」側に倒す
+/// （gate-claim と同じ）。
+pub fn signal_present(stop_file: &Path) -> bool {
+    match std::fs::symlink_metadata(stop_file) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
 }
 
@@ -433,10 +533,7 @@ mod tests {
         let mut c = controller();
         let actions = c.observe(Observation {
             now: START,
-            pause: Some(Pause {
-                resume_at: START + 90,
-                window: "five_hour".into(),
-            }),
+            pause: Some(Pause::new(START + 90, "five_hour")),
             ..Observation::default()
         });
         assert!(actions.is_empty());
@@ -457,10 +554,7 @@ mod tests {
         let mut c = controller();
         let paused = |resume_at: i64, window: &str| Observation {
             now: START,
-            pause: Some(Pause {
-                resume_at,
-                window: window.into(),
-            }),
+            pause: Some(Pause::new(resume_at, window)),
             ..Observation::default()
         };
         c.observe(paused(START + 100, "five_hour"));
@@ -478,10 +572,7 @@ mod tests {
     #[test]
     fn an_expired_pause_clears_the_notice() {
         let mut c = controller();
-        let pause = Some(Pause {
-            resume_at: START + 10,
-            window: "five_hour".into(),
-        });
+        let pause = Some(Pause::new(START + 10, "five_hour"));
         c.observe(Observation {
             now: START,
             pause: pause.clone(),
@@ -502,14 +593,89 @@ mod tests {
         c.interrupt();
         c.observe(Observation {
             now: START,
-            pause: Some(Pause {
-                resume_at: START + 60,
-                window: "five_hour".into(),
-            }),
+            pause: Some(Pause::new(START + 60, "five_hour")),
             ..Observation::default()
         });
         assert_eq!(c.notice(), Some(&Notice::Interrupted));
         assert_eq!(c.phase(), Phase::Stopping);
+        // 停止した後の早期解除も、停止の通知を置き換えない。
+        c.observe(Observation {
+            now: START + 1,
+            lift: Some(lift(START + 60, START)),
+            ..Observation::default()
+        });
+        assert_eq!(c.notice(), Some(&Notice::Interrupted));
+        assert_eq!(c.phase(), Phase::Stopping);
+    }
+
+    fn lift(resume_at: i64, lifted_at: i64) -> Lift {
+        Lift {
+            window: "five_hour".into(),
+            reason: "five_hour dropped from 100% to 0%".into(),
+            lifted_at,
+            resume_at,
+        }
+    }
+
+    #[test]
+    fn an_early_lift_resumes_the_countdown_and_says_why() {
+        // 手動リセットで枠が戻り、モニターが一時停止を解除した。ワーカーはもう待っていない
+        // ので、最下行は再開までの残りではなくデッドラインまでの残りに戻す。
+        let mut c = controller();
+        c.observe(Observation {
+            now: START,
+            pause: Some(Pause::new(START + 3600, "five_hour")),
+            ..Observation::default()
+        });
+        assert_eq!(c.phase(), Phase::Resuming(3600));
+        let actions = c.observe(Observation {
+            now: START + 5,
+            lift: Some(lift(START + 3600, START + 4)),
+            ..Observation::default()
+        });
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(c.pause(), None);
+        assert_eq!(c.phase(), Phase::Countdown(DEADLINE - START - 5));
+        assert_eq!(
+            c.notice(),
+            Some(&Notice::ResumedEarly {
+                window: "five_hour".into(),
+                reason: "five_hour dropped from 100% to 0%".into(),
+                lifted_at: START + 4,
+            })
+        );
+        // 元の見積もりの時刻を過ぎたら、解除を知らせる意味は無い。
+        c.observe(Observation {
+            now: START + 3600,
+            lift: Some(lift(START + 3600, START + 4)),
+            ..Observation::default()
+        });
+        assert_eq!(c.notice(), None);
+    }
+
+    #[test]
+    fn a_pause_after_an_early_lift_is_shown_again() {
+        // 解除の直後にまた止まった（再発）。解除の通知を残さず、一時停止へ戻す。
+        let mut c = controller();
+        c.observe(Observation {
+            now: START,
+            lift: Some(lift(START + 3600, START)),
+            ..Observation::default()
+        });
+        assert!(matches!(c.notice(), Some(Notice::ResumedEarly { .. })));
+        c.observe(Observation {
+            now: START + 30,
+            pause: Some(Pause::new(START + 3600, "five_hour")),
+            ..Observation::default()
+        });
+        assert_eq!(
+            c.notice(),
+            Some(&Notice::Paused {
+                window: "five_hour".into(),
+                resume_at: START + 3600
+            })
+        );
+        assert_eq!(c.phase(), Phase::Resuming(3600 - 30));
     }
 
     #[test]
@@ -554,23 +720,72 @@ mod tests {
         let pause = crate::rate_control::pause_path_for(&stop);
         crate::rate_control::write_pause(
             &pause,
-            &crate::rate_control::PauseState {
-                resume_at: START + 600,
-                window: "five_hour".into(),
-                reason: "five_hour 90% >= threshold 90%".into(),
-            },
+            &crate::rate_control::PauseState::new(
+                START + 600,
+                "five_hour",
+                "five_hour 90% >= threshold 90%",
+            ),
         )
         .unwrap();
         std::fs::write(&stop, "").unwrap();
         let observation = read_observation(tmp.path(), &stop, &pause, START);
+        let since = crate::rate_control::read_pause(&pause)
+            .unwrap()
+            .unwrap()
+            .since;
         assert_eq!(
             observation.pause,
             Some(Pause {
                 resume_at: START + 600,
-                window: "five_hour".into()
+                window: "five_hour".into(),
+                since,
+                // 根拠の使用率が記録されていない（比べる元が無い）。
+                not_liftable: Some("the pause has no recorded usage"),
             })
         );
+        assert_eq!(observation.lift, None);
         assert!(observation.stop_file_exists);
+    }
+
+    #[test]
+    fn a_lifted_pause_is_not_read_as_paused() {
+        // 早期解除済みの一時停止はファイルに残るが、何も止めていない。
+        use crate::rate_control::{PauseCause, PauseSource, PauseState, lift_pause, read_pause};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let pause = crate::rate_control::pause_path_for(&stop);
+        let now = crate::rate_control::now_epoch();
+        crate::rate_control::write_pause(
+            &pause,
+            &PauseState::new(now + 3600, "five_hour", "request rejected (five_hour)")
+                .observed(PauseSource::Api, PauseCause::Rejected, now - 60)
+                .with_basis(100.0, Some(now + 3570)),
+        )
+        .unwrap();
+        let before = read_observation(tmp.path(), &stop, &pause, now);
+        assert_eq!(before.pause.as_ref().unwrap().not_liftable, None);
+        let revision = read_pause(&pause).unwrap().unwrap().revision;
+        assert!(
+            lift_pause(
+                &pause,
+                revision,
+                "five_hour dropped\nfrom 100% to 0%",
+                std::time::Duration::from_secs(1)
+            )
+            .unwrap()
+        );
+        let lifted_at = read_pause(&pause).unwrap().unwrap().lifted_at.unwrap();
+        let observation = read_observation(tmp.path(), &stop, &pause, now);
+        assert_eq!(observation.pause, None);
+        assert_eq!(
+            observation.lift,
+            Some(Lift {
+                window: "five_hour".into(),
+                reason: "five_hour dropped from 100% to 0%".into(),
+                lifted_at,
+                resume_at: now + 3600,
+            })
+        );
     }
 
     #[test]

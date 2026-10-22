@@ -60,10 +60,21 @@ pub struct ResumeEntry {
     pub session_id: String,
     /// 中断を記録した時刻。
     pub interrupted_at: DateTime<FixedOffset>,
-    /// これより前に再開しても同じ枠で拒否される時刻（5 時間枠のリセット + 猶予）。
-    /// 構造化された `rate_limit_event` から読めたときだけ持つ。
+    /// これより前に再開しても同じ枠で拒否されると見積もった時刻（5 時間枠のリセット +
+    /// 猶予）。構造化された `rate_limit_event` から読めたときだけ持つ。
+    ///
+    /// 見積もりにすぎない。利用者は手動リセットで枠を早く戻せるので、ai-usage 連携が
+    /// ある構成では、次の実行の開始時に実データを取り直して保留するかを決める
+    /// （`retry_basis_percent` と比べて回復していれば待たない）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after: Option<DateTime<FixedOffset>>,
+    /// 拒否されたときの 5 時間枠の使用率（%、API の値）。`retry_after` と一緒に記録する。
+    ///
+    /// 次の実行の開始時に、ai-usage の実データがこれより十分に下がっていれば
+    /// （手動リセット等）、`retry_after` まで待たずに始める（`rate_control::check_recovery`）。
+    /// 以前の版が保存した記録には無い。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_basis_percent: Option<f64>,
     /// 中断したタスクの元の実効プロンプトのハッシュ（`fnv1a64:<16 桁>`）。
     pub prompt_hash: String,
     /// 中断理由のメッセージ（表示用）。
@@ -331,19 +342,21 @@ pub fn is_valid_session_id(id: &str) -> bool {
 /// 中断した実行の jsonl から読み取れた情報。
 #[derive(Debug, Default, PartialEq)]
 pub struct Interruption {
-    /// 最後の `result`（無ければ `system/init`）の session_id。UUID でなければ `None`。
+    /// 分類に使う `result`（`classify::select_result`。無ければ `system/init`）の
+    /// session_id。UUID でなければ `None`。
     pub session_id: Option<String>,
     /// 5 時間枠の拒否から読めた再開可能時刻（Unix epoch 秒、猶予込み）。
     pub retry_after: Option<i64>,
-    /// 最後の `result` のメッセージ。
+    /// その拒否のときの 5 時間枠の使用率（%）。`retry_after` が読めたときだけ持つ。
+    pub retry_basis_percent: Option<f64>,
+    /// 分類に使う `result` のメッセージ。
     pub message: Option<String>,
 }
 
 /// jsonl の内容から、再開に必要な情報を取り出す。`now` は Unix epoch 秒。
 pub fn inspect_interruption(content: &str, now: i64) -> Interruption {
-    let mut result_session: Option<String> = None;
+    let mut results: Vec<serde_json::Value> = Vec::new();
     let mut init_session: Option<String> = None;
-    let mut message: Option<String> = None;
     let mut last_rejected: Option<serde_json::Value> = None;
 
     for line in content.lines() {
@@ -355,13 +368,7 @@ pub fn inspect_interruption(content: &str, now: i64) -> Interruption {
             continue;
         };
         match v.get("type").and_then(|t| t.as_str()) {
-            Some("result") => {
-                result_session = v
-                    .get("session_id")
-                    .and_then(|s| s.as_str())
-                    .map(str::to_string);
-                message = crate::classify::result_message(&v).filter(|m| !m.is_empty());
-            }
+            Some("result") => results.push(v),
             Some("system") if v.get("subtype").and_then(|s| s.as_str()) == Some("init") => {
                 if let Some(id) = v.get("session_id").and_then(|s| s.as_str()) {
                     init_session = Some(id.to_string());
@@ -376,13 +383,40 @@ pub fn inspect_interruption(content: &str, now: i64) -> Interruption {
         }
     }
 
+    // session_id とメッセージは、classify-result が分類に使うのと同じ result から取る。
+    // 最後の result をそのまま使うと、上限到達の後に続く「何もしなかった通知のターン」の
+    // result（`result:""`）でメッセージが消え、レート制限で保存した記録に上限到達の文言が
+    // 残らない。
+    let result = crate::classify::select_result(&results);
+    let result_session = result
+        .and_then(|r| r.get("session_id"))
+        .and_then(|s| s.as_str());
+    let message = result
+        .and_then(crate::classify::result_message)
+        .filter(|m| !m.is_empty());
+
+    let retry_after = last_rejected
+        .as_ref()
+        .and_then(|v| five_hour_retry_after(v, now));
     Interruption {
         session_id: result_session
             .filter(|id| is_valid_session_id(id))
+            .map(str::to_string)
             .or_else(|| init_session.filter(|id| is_valid_session_id(id))),
-        retry_after: last_rejected.and_then(|v| five_hour_retry_after(&v, now)),
+        retry_after,
+        retry_basis_percent: retry_after
+            .and(last_rejected.as_ref())
+            .and_then(five_hour_usage_percent),
         message: message.map(|m| truncate_message(&m)),
     }
+}
+
+/// 拒否イベントに載っている 5 時間枠の使用率（%）。読めなければ `None`。
+fn five_hour_usage_percent(event: &serde_json::Value) -> Option<f64> {
+    event["rate_limit_info"]["unifiedWindows"]["five_hour"]["utilization"]
+        .as_f64()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v * 100.0)
 }
 
 /// 5 時間枠による拒否なら、その枠のリセット時刻（+ 猶予）を返す。
@@ -450,6 +484,7 @@ pub fn save_from_jsonl(
             .retry_after
             .and_then(|epoch| Local.timestamp_opt(epoch, 0).single())
             .map(|t| t.fixed_offset()),
+        retry_basis_percent: interruption.retry_basis_percent,
         prompt_hash: prompt_hash(&prompt),
         message: interruption.message,
         log: Some(jsonl.to_path_buf()),
@@ -566,6 +601,7 @@ mod tests {
             session_id: session_id.to_string(),
             interrupted_at: DateTime::parse_from_rfc3339("2026-09-23T13:04:23+09:00").unwrap(),
             retry_after: None,
+            retry_basis_percent: None,
             prompt_hash: prompt_hash(prompt),
             message: Some("You've hit your session limit".to_string()),
             log: None,
@@ -842,10 +878,48 @@ mod tests {
             got.retry_after,
             Some(reset_at + rate_control::RESET_PROPAGATION_GRACE_SECS)
         );
+        // 拒否されたときの使用率も残す（次の実行で、実データと比べて回復を確かめる元）。
+        assert_eq!(got.retry_basis_percent, Some(100.0));
         assert_eq!(
             got.message.as_deref(),
             Some("You've hit your session limit · resets 2:30pm (Asia/Tokyo)")
         );
+    }
+
+    /// 実ログの形: 上限到達の後、サブエージェントの終了通知を受けた通知のターンが何もせずに
+    /// 終わり、`result:""` の result が続く（1 つの例と 3 つの例がある）。session_id と
+    /// 上限到達のメッセージは、classify-result が分類に使うのと同じ result から取る。
+    #[test]
+    fn inspect_keeps_the_limit_message_across_idle_notification_results() {
+        let now = 1_790_136_263;
+        let reset_at = 1_790_141_400;
+        let idle = format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"duration_api_ms":0,"num_turns":0,"stop_reason":null,"result":"","origin":{{"kind":"task-notification","producer":"session-task","runId":"0mvjnhe19-e65760ee"}},"session_id":"{SESSION}"}}"#
+        );
+        for idle_count in [1, 3] {
+            let mut lines = vec![interrupted_jsonl(reset_at)];
+            lines.extend(std::iter::repeat_n(idle.clone(), idle_count));
+            let content = lines.join("\n");
+
+            let got = inspect_interruption(&content, now);
+            assert_eq!(got.session_id.as_deref(), Some(SESSION));
+            assert_eq!(
+                got.message.as_deref(),
+                Some("You've hit your session limit · resets 2:30pm (Asia/Tokyo)"),
+                "{idle_count} idle notification result(s)"
+            );
+            // 拒否イベントから読む再開可能時刻と使用率は、result の選び方に関係しない
+            assert_eq!(
+                got.retry_after,
+                Some(reset_at + rate_control::RESET_PROPAGATION_GRACE_SECS)
+            );
+            assert_eq!(got.retry_basis_percent, Some(100.0));
+            // 保存する記録と分類がずれない（レート制限と分類した result から取っている）
+            assert_eq!(
+                crate::classify::classify_content(&content),
+                crate::classify::ResultClass::RateLimited
+            );
+        }
     }
 
     #[test]
@@ -880,6 +954,11 @@ mod tests {
         let overage = interrupted_jsonl(now + 600)
             .replace("\"isUsingOverage\":false", "\"isUsingOverage\":true");
         assert_eq!(inspect_interruption(&overage, now).retry_after, None);
+        // 待つ根拠が無ければ、比べる元の使用率も残さない
+        assert_eq!(
+            inspect_interruption(&overage, now).retry_basis_percent,
+            None
+        );
         // 週次枠の拒否は対象外（リセットは数日先で、この用途の待機にならない）
         let weekly = interrupted_jsonl(now + 600).replace(
             "\"rateLimitType\":\"five_hour\"",
@@ -909,6 +988,7 @@ mod tests {
             saved.retry_after.map(|t| t.timestamp()),
             Some(reset_at + rate_control::RESET_PROPAGATION_GRACE_SECS)
         );
+        assert_eq!(saved.retry_basis_percent, Some(100.0));
         assert_eq!(saved.log.as_deref(), Some(jsonl.as_path()));
         assert_eq!(
             ResumeStore::load_or_warn(&path).get("claude", Path::new("/tmp/repo")),

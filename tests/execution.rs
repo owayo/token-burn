@@ -72,6 +72,25 @@ fn write_executable(path: &Path, script: &str) {
 
 /// 実際の CLI で起動準備を通し、tmux と AI コマンドは実行せず生成物と引数を回収する。
 fn prepare_execution() -> (tempfile::TempDir, i64) {
+    let reset = chrono::Utc::now() + chrono::Duration::hours(1);
+    let usage = serde_json::json!({"accounts": [{
+        "profile": "Work", "provider": "codex", "ok": true,
+        "weekly": {"resets_at": reset.to_rfc3339(), "used_percent": 10.0}
+    }]});
+    let (tmp, output) = run_with_usage(&usage);
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (tmp, reset.timestamp())
+}
+
+/// 偽の ai-usage が `usage` を返す環境で `token-burn run` を通す。偽の ai-usage は受け取った
+/// 引数を `capture/ai-usage.log` へ 1 回 1 行で記録し、偽の tmux は new-session の時点の
+/// 起動情報・ワーカースクリプト・pause file を `capture/` へ写す。
+fn run_with_usage(usage: &serde_json::Value) -> (tempfile::TempDir, std::process::Output) {
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
     let bin = root.join("bin");
@@ -88,21 +107,22 @@ case "$1" in
   new-session)
     cp "$TMPDIR/token-burn/monitor.json" "$TB_CAPTURE/monitor.json"
     cp "$TMPDIR/token-burn/worker-0.sh" "$TB_CAPTURE/worker.sh"
+    if [ -f "$TMPDIR/token-burn/stop-pause.json" ]; then
+      cp "$TMPDIR/token-burn/stop-pause.json" "$TB_CAPTURE/stop-pause.json"
+    fi
+    if [ -f "$TMPDIR/token-burn/ai-usage-cache.json" ]; then
+      cp "$TMPDIR/token-burn/ai-usage-cache.json" "$TB_CAPTURE/ai-usage-cache.json"
+    fi
     ;;
   has-session) exit 1 ;;
 esac
 exit 0
 "#,
     );
-    let reset = chrono::Utc::now() + chrono::Duration::hours(1);
-    let usage = serde_json::json!({"accounts": [{
-        "profile": "Work", "provider": "codex", "ok": true,
-        "weekly": {"resets_at": reset.to_rfc3339(), "used_percent": 10.0}
-    }]});
     std::fs::write(root.join("usage.json"), usage.to_string()).unwrap();
     write_executable(
         &bin.join("ai-usage"),
-        "#!/bin/bash\ncat \"$TB_USAGE\"\nsleep 1.1\n",
+        "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$TB_USAGE_ARGS\"\ncat \"$TB_USAGE\"\nsleep 1.1\n",
     );
     let quote = |p: &Path| serde_json::to_string(&p.to_string_lossy()).unwrap();
     let config = format!(
@@ -151,15 +171,99 @@ directory = {target}
         .env("TB_CALLS", capture.join("tmux.log"))
         .env("TB_CAPTURE", &capture)
         .env("TB_USAGE", root.join("usage.json"))
+        .env("TB_USAGE_ARGS", capture.join("ai-usage.log"))
         .output()
         .unwrap();
+    (tmp, output)
+}
+
+#[test]
+fn usage_checks_refresh_and_the_startup_fetch_is_reused_for_the_cache() {
+    let (tmp, _) = prepare_execution();
+    let capture = tmp.path().join("capture");
+    // スケジュールの解決と実行開始時の判定は、ai-usage の共有キャッシュを通さずに取り直す。
+    // statusline 用キャッシュの初期化は実行開始時の判定の出力を使い、3 回目は取らない。
+    let calls = std::fs::read_to_string(capture.join("ai-usage.log")).unwrap();
+    assert_eq!(
+        calls.lines().collect::<Vec<_>>(),
+        ["--refresh", "--refresh"]
+    );
+    let cache = std::fs::read_to_string(capture.join("ai-usage-cache.json")).unwrap();
+    assert!(cache.contains("\"Work\""), "{cache}");
+    // usage-gate は呼ぶたびに取り直すので、キャッシュのパスを渡さない。
+    let worker = std::fs::read_to_string(capture.join("worker.sh")).unwrap();
+    assert!(worker.contains(" usage-gate "), "{worker}");
+    assert!(!worker.contains("--cache-file"), "{worker}");
+}
+
+#[test]
+fn a_weekly_window_over_the_threshold_starts_nothing() {
+    // 週次枠はデッドラインと同じ周期なので、待ってもこの実行の残り時間では回復しない。
+    // tmux もファイルも作らずに戻る。
+    let reset = chrono::Utc::now() + chrono::Duration::hours(1);
+    let usage = serde_json::json!({"accounts": [{
+        "profile": "Work", "provider": "codex", "ok": true,
+        "weekly": {"kind": "weekly", "resets_at": reset.to_rfc3339(), "used_percent": 96.0}
+    }]});
+    let (tmp, output) = run_with_usage(&usage);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
+        "{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    (tmp, reset.timestamp())
+    assert!(
+        stdout.contains("Stop: weekly 96% >= threshold 95% (ai-usage)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Not started"), "{stdout}");
+    let calls = std::fs::read_to_string(tmp.path().join("capture/tmux.log")).unwrap_or_default();
+    assert!(calls.is_empty(), "tmux を呼んではいけない: {calls}");
+    assert!(
+        !tmp.path().join("token-burn").exists(),
+        "実行用の一時ディレクトリを作ってはいけない"
+    );
+    assert!(
+        !tmp.path().join("reports").exists(),
+        "レポートディレクトリを作ってはいけない"
+    );
+}
+
+#[test]
+fn a_five_hour_window_over_the_threshold_starts_paused() {
+    // 5 時間枠が閾値に触れていれば、その枠のリセットまで一時停止した状態で始める。
+    // 根拠を pause file に残し、モニターが手動リセット等での回復を確かめられるようにする。
+    let now = chrono::Utc::now();
+    let weekly_reset = now + chrono::Duration::hours(30);
+    let five_hour_reset = now + chrono::Duration::minutes(30);
+    let usage = serde_json::json!({"accounts": [{
+        "profile": "Work", "provider": "codex", "ok": true,
+        "weekly": {"kind": "weekly", "resets_at": weekly_reset.to_rfc3339(), "used_percent": 20.0},
+        "five_hour": {"kind": "five_hour", "resets_at": five_hour_reset.to_rfc3339(), "used_percent": 97.0}
+    }]});
+    let (tmp, output) = run_with_usage(&usage);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Hold: five_hour 97% >= threshold 95% (ai-usage)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("the monitor resumes them earlier"),
+        "{stdout}"
+    );
+    let pause = std::fs::read_to_string(tmp.path().join("capture/stop-pause.json")).unwrap();
+    assert!(
+        pause.contains(&format!("resume_at={}\n", five_hour_reset.timestamp() + 30)),
+        "{pause}"
+    );
+    assert!(pause.contains("source=ai-usage\n"), "{pause}");
+    assert!(pause.contains("cause=threshold\n"), "{pause}");
+    assert!(pause.contains("used_percent=97\n"), "{pause}");
 }
 
 #[test]

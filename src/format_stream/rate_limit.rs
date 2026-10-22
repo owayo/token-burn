@@ -6,7 +6,9 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::format_stream::util::truncate_str;
-use crate::rate_control::{self, Basis, Decision, WindowKind, WindowObservation};
+use crate::rate_control::{
+    self, Basis, Decision, PauseCause, PauseSource, WindowKind, WindowObservation,
+};
 
 /// 自動停止の判定に使う枠（実際にリクエストを止める枠）と、併記用の短縮名。
 ///
@@ -73,7 +75,15 @@ pub(crate) fn handle_rate_limit_event(
                 Decision::Pause { resume_at, basis } => {
                     write_auto_pause(out, info, &basis, resume_at, &windows, threshold)?;
                     let reason = basis.reason(threshold);
-                    apply_pause(out, stop_file, resume_at, &basis, &reason, signal_failed)?;
+                    apply_pause(
+                        out,
+                        stop_file,
+                        resume_at,
+                        &basis,
+                        &reason,
+                        PauseCause::Threshold,
+                        signal_failed,
+                    )?;
                 }
                 Decision::Proceed => {
                     if status == "allowed_warning" {
@@ -110,7 +120,15 @@ pub(crate) fn handle_rate_limit_event(
                         "request rejected ({limit_type}); {} at {:.0}%",
                         basis.window, basis.used_percent
                     );
-                    apply_pause(out, stop_file, resume_at, &basis, &reason, signal_failed)?;
+                    apply_pause(
+                        out,
+                        stop_file,
+                        resume_at,
+                        &basis,
+                        &reason,
+                        PauseCause::Rejected,
+                        signal_failed,
+                    )?;
                 }
                 None => apply_stop(
                     out,
@@ -532,22 +550,24 @@ fn apply_stop(
 /// 閾値超過で待つ場合と `rejected` で待つ場合では成立している条件が違うため、
 /// 呼び出し側が事実に合う文言を渡す（`Basis::reason` を無条件に使うと、`rejected`
 /// では `five_hour 42% >= threshold 95%` のような成立していない不等式が残る）。
+///
+/// 根拠の使用率とその枠のリセット時刻も記録する。待機中にモニターが ai-usage を取り直し、
+/// 手動リセットで枠が戻ったことを確かめる比較の元になる（`rate_control::check_recovery`）。
 fn apply_pause(
     out: &mut impl Write,
     stop_file: Option<&Path>,
     resume_at: i64,
     basis: &Basis,
     reason: &str,
+    cause: PauseCause,
     signal_failed: &mut bool,
 ) -> Result<()> {
     let Some(path) = stop_file else {
         return Ok(());
     };
-    let state = rate_control::PauseState {
-        resume_at,
-        window: basis.window.clone(),
-        reason: reason.to_string(),
-    };
+    let state = rate_control::PauseState::new(resume_at, basis.window.clone(), reason)
+        .observed(PauseSource::Api, cause, rate_control::now_epoch())
+        .with_basis(basis.used_percent, basis.reset_at);
     if let Err(e) = rate_control::write_pause(&rate_control::pause_path_for(path), &state) {
         writeln!(
             out,

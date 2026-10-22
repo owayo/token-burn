@@ -7,8 +7,12 @@ use std::time::Duration;
 
 use crate::config::{CodexOutput, RuntimeAgent};
 use crate::display;
+use crate::rate_control::{
+    self, Decision, LiveObservation, PauseCause, PauseSource, PauseState, Recovery,
+};
 use crate::resume::ResumeEntry;
 use crate::scanner::{ResolvedTarget, Visibility};
+use crate::usage::LiveError;
 
 mod flags;
 mod scripts;
@@ -16,8 +20,8 @@ mod util;
 
 use flags::{agent_is_claude, claude_session_flag, ensure_required_flags};
 use scripts::{
-    TaskCtx, TaskResume, WorkerCtx, build_disk_cmd, build_refresh_cmd, build_statusline_cmd,
-    build_task_script, build_worker_script, env_prefix_parts, shell_escape,
+    TaskCtx, TaskResume, WorkerCtx, build_disk_cmd, build_live_cmd, build_refresh_cmd,
+    build_statusline_cmd, build_task_script, build_worker_script, env_prefix_parts, shell_escape,
 };
 use util::{sanitize_filename, strip_ansi_from_dir, truncate};
 
@@ -33,6 +37,12 @@ pub struct ExecutionPlan {
     pub resume: ResumePlan,
     /// タスクの出力の処理方法。command へのフラグ付与と同時に 1 度だけ決める。
     pub output: OutputPipeline,
+    /// 実行開始時の保留・停止。`build_plan` が保存した中断記録から決め、ai-usage 連携が
+    /// あれば `check_start` が実データで決め直す。
+    pub start: StartGate,
+    /// `check_start` が取得した `ai-usage --json`（全アカウント分）。statusline 用
+    /// キャッシュの初期化に使い、起動時のもう 1 回の取得を省く。
+    pub startup_usage: Option<Vec<u8>>,
 }
 
 /// タスクスクリプトが組み立てるパイプラインの形（stdin と出力の扱い）。
@@ -87,10 +97,6 @@ pub struct ResumePlan {
     pub discard: HashMap<PathBuf, String>,
     /// 再開時に送る継続プロンプト。
     pub prompt: String,
-    /// 再開するセッションを止めた 5 時間枠がまだリセットされていないときの待機時刻。
-    /// 早すぎる再実行で即座に同じ枠へ拒否され、継続プロンプトだけが transcript に
-    /// 積み重なるのを防ぐ。
-    pub hold_until: Option<DateTime<FixedOffset>>,
 }
 
 /// `build_plan` へ渡す再開の入力（呼び出し側が保存済み記録から判定した結果）。
@@ -142,15 +148,284 @@ pub fn resume_support(agent: &RuntimeAgent) -> ResumeSupport {
     }
 }
 
-/// 再開するセッションのうち、最も遅い「再開してよい時刻」がまだ先ならそれを返す。
-fn resume_hold_until<'a>(
-    entries: impl Iterator<Item = &'a ResumeEntry>,
-    now: DateTime<FixedOffset>,
-) -> Option<DateTime<FixedOffset>> {
-    entries
+/// 実行開始時の保留・停止。
+///
+/// 保存した中断記録の再開時刻（`retry_after`）は、その時刻まで待てば枠が空くという
+/// 見積もりにすぎない。利用者は手動リセット（claude.ai の "Reset for free"、Codex の
+/// banked reset）で枠を早く戻せるし、逆に前回の実行の後で使用率が閾値を越えていることも
+/// ある。実例では、5 時間枠が 100% で止まった直後に手動リセットしたのに、再実行が
+/// `retry_after`（1 時間半後）による保留で 1 件も始まらなかった。そこで ai-usage 連携が
+/// あれば、対象を確定した後・tmux を作る前に実行中のアカウントを取り直して決める
+/// （`check_start`）。連携が無ければ、保存した記録だけで決める（`build_plan`）。
+///
+/// ドライランの実行計画の表示（`print_plan`）と、実際に書く pause file・始めないことの
+/// 判断（`execute_plan_tmux`）は、どちらもこの値を使う（表示と実際の挙動を食い違わせない）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum StartGate {
+    /// そのまま始める。
+    Proceed,
+    /// 再開するセッションを止めた 5 時間枠が回復していたので、保存した再開時刻（`until`、
+    /// Unix epoch 秒）まで待たずに始める。`evidence` は回復を確かめた根拠（表示用）。
+    Recovered { until: i64, evidence: String },
+    /// `pause` の再開時刻まで一時停止した状態で始める。`why` は表示用の理由。
+    Hold { pause: PauseState, why: String },
+    /// この実行ではタスクを 1 件も始めない。デッドラインと同じ周期の枠（週次など）が
+    /// 閾値に触れていて、待っても実行の残り時間では回復しない等。`reason` は表示用。
+    Stop { reason: String },
+}
+
+/// 保存した中断記録による保留の理由（表示用）。
+const SAVED_HOLD_REASON: &str = "a resumed session hit the five_hour limit";
+
+impl StartGate {
+    /// 実行計画に出す行（ラベルと本文）。保留も停止もしないときは `None`。
+    ///
+    /// `recovery_checked` は、待機中にモニターが実データを取り直して回復を確かめる構成か
+    /// （ai-usage 連携あり）。そのときは見積もった時刻より早く再開し得ることを添える。
+    /// 見積もりどおりに待つとしか読めないと、手動リセットした利用者が待ち切れずに実行を
+    /// 打ち直してしまう。
+    fn plan_line(&self, recovery_checked: bool) -> Option<(&'static str, String)> {
+        match self {
+            StartGate::Proceed => None,
+            StartGate::Recovered { until, evidence } => Some((
+                "Hold:",
+                format!(
+                    "none — {SAVED_HOLD_REASON} (until {}), but the window has already recovered: {evidence}",
+                    format_local(*until)
+                ),
+            )),
+            StartGate::Hold { pause, why } => {
+                let early = if recovery_checked {
+                    "; the monitor resumes them earlier if the window recovers (e.g. a manual reset)"
+                } else {
+                    ""
+                };
+                Some((
+                    "Hold:",
+                    format!(
+                        "{why} — workers wait until {} before starting{early}",
+                        format_local(pause.resume_at)
+                    ),
+                ))
+            }
+            StartGate::Stop { reason } => Some((
+                "Stop:",
+                format!("{reason} — no tasks will be started in this run"),
+            )),
+        }
+    }
+}
+
+/// Unix epoch 秒をローカル時刻の `%Y-%m-%d %H:%M` で表す。
+fn format_local(epoch: i64) -> String {
+    use chrono::TimeZone;
+    match Local.timestamp_opt(epoch, 0).single() {
+        Some(at) => at.format("%Y-%m-%d %H:%M").to_string(),
+        None => epoch.to_string(),
+    }
+}
+
+/// 再開するセッションのうち、保存した再開時刻がまだ先のもの。
+fn pending_retries<'a>(
+    sessions: impl IntoIterator<Item = &'a ResumeEntry>,
+    now: i64,
+) -> Vec<&'a ResumeEntry> {
+    sessions
+        .into_iter()
+        .filter(|entry| entry.retry_after.is_some_and(|at| at.timestamp() > now))
+        .collect()
+}
+
+/// 保存した中断記録が見積もった、5 時間枠の一時停止（再開時刻を持つ記録が無ければ `None`）。
+///
+/// 回復の判定（`rate_control::check_recovery`）の比較の元にもなる。複数の記録は 1 つに
+/// まとめる。5 時間枠はアカウント単位なので、どの記録も同じ枠の回復を待っている。待つ時刻は
+/// 最も遅い再開時刻、根拠の使用率は最も低いもの（回復とみなすのに最も大きな下がり幅が要る）、
+/// 根拠の観測時刻は最も新しい中断にする。どれか 1 件の根拠だけを残すと、モニターがほかの
+/// 記録には足りない下がり幅で早期解除してしまう（42% で拒否された記録と 100% で拒否された
+/// 記録があるとき、100% の方だけを残すと 40% を回復とみなす）。まとめた条件は、どの記録の
+/// 条件より緩くならない（`rate_control::merge_basis`）。
+///
+/// 拒否されたときの使用率（`retry_basis_percent`）を持たない旧記録は、根拠が不明のまま
+/// 扱う。1 件でも不明なら、まとめた根拠も不明にする（既知の使用率で補わない）。拒否は
+/// 使用率と別の理由でも起き（42% で拒否された例がある）、不明な記録を 100% とみなすと、
+/// 42% のまま「100% から下がった」と誤って回復とみなすため。根拠が不明な一時停止は早期解除
+/// せず、保存した再開時刻まで待つ（この版より前に保存した記録だけが該当する）。
+fn saved_pause(entries: &[&ResumeEntry]) -> Option<PauseState> {
+    let entries: Vec<&ResumeEntry> = entries
+        .iter()
+        .copied()
+        .filter(|entry| entry.retry_after.is_some())
+        .collect();
+    let retry_after = entries
+        .iter()
         .filter_map(|entry| entry.retry_after)
-        .max()
-        .filter(|at| *at > now)
+        .max()?
+        .timestamp();
+    let observed_at = entries
+        .iter()
+        .map(|entry| entry.interrupted_at.timestamp())
+        .max()?;
+    let basis = entries
+        .iter()
+        .map(|entry| entry.retry_basis_percent)
+        .reduce(rate_control::merge_basis)
+        .flatten();
+    let mut pause = PauseState::new(
+        retry_after,
+        "five_hour",
+        format!(
+            "a resumed session was rate limited (five_hour) until {}",
+            format_local(retry_after)
+        ),
+    )
+    .observed(PauseSource::Saved, PauseCause::Rejected, observed_at);
+    pause.used_percent = basis.filter(|v| v.is_finite() && *v >= 0.0);
+    pause.window_reset_at = Some(retry_after - rate_control::RESET_PROPAGATION_GRACE_SECS);
+    Some(pause)
+}
+
+/// 保存した中断記録で保留する。`detail` は実データで確かめられなかった理由など（表示用）。
+///
+/// 一時停止には拒否されたときの使用率を根拠として記録する。実データを取れる構成では、
+/// 待機中にモニターがこれと比べて手動リセット等による回復を確かめ、早めに解除できる。
+fn saved_hold(entries: &[&ResumeEntry], detail: Option<&str>) -> StartGate {
+    let Some(pause) = saved_pause(entries) else {
+        return StartGate::Proceed;
+    };
+    let why = match detail {
+        Some(detail) => format!("{SAVED_HOLD_REASON} ({detail})"),
+        None => SAVED_HOLD_REASON.to_string(),
+    };
+    StartGate::Hold { pause, why }
+}
+
+/// 実データを使わずに、保存した中断記録だけで実行開始時の保留を決める（ai-usage 連携が
+/// 無いとき。連携があっても `check_start` が決め直すまでの既定値）。
+///
+/// 再開時刻がまだ先のセッションがあれば、その最も遅い時刻まで実行全体を一時停止した
+/// 状態で始める。5 時間枠はアカウント単位なので、再開以外のタスクも同じ時刻まで通らない。
+/// 早すぎる再実行で即座に同じ枠へ拒否され、継続プロンプトだけが transcript に積み重なる
+/// のを防ぐ。
+fn start_from_saved<'a>(
+    sessions: impl IntoIterator<Item = &'a ResumeEntry>,
+    now: i64,
+) -> StartGate {
+    saved_hold(&pending_retries(sessions, now), None)
+}
+
+/// 実行開始時に取り直した実データで、保留・停止を決める（I/O なし）。
+///
+/// - 閾値に触れた枠があれば、usage-gate と同じ判定（`rate_control::evaluate`）に従う。
+///   デッドラインと同じ周期の枠（週次など）なら 1 件も始めない。5 時間枠などなら、その枠の
+///   リセットまで一時停止した状態で始める。再開するセッションの有無は問わない（枠は
+///   アカウント単位なので、どのタスクも同じ枠で止まる）。保存した拒否の記録があれば、
+///   その条件も一時停止に残す（`rate_control::merge_pauses`。再開時刻は遅い方、早期解除の
+///   条件は厳しい方）。実データの枠の方が早く空いても、記録の条件を満たすまでは解除しない。
+/// - 閾値未満なら、再開するセッションを止めた 5 時間枠が回復したかを記録ごとに確かめる
+///   （`rate_control::check_recovery`）。すべて回復していれば待たない。回復を確かめられ
+///   ないものがあれば、それらの最も遅い再開時刻まで一時停止した状態で始める（実行中は
+///   モニターが回復を確かめ続けるので、手動リセットで戻れば早めに解除される）。
+/// - 使用率を確認できなければ（取得・解釈の失敗、`ok:false`）、1 件も始めない。usage-gate と
+///   同じく止める側に倒す（fail-closed）。始めると、使用率の分からないまま並列数ぶんの
+///   タスクが走る（codex にはタスク中の停止の経路も無い）。出力に該当アカウントが無いときは、
+///   usage-gate と同じく過剰停止を避け、保存した記録だけで決める。
+///
+/// `fetched_at` は取得を終えた時刻で、ai-usage による一時停止に根拠の観測時刻の上限として
+/// 記録する。モニターは、これより後に取得したデータでだけ早期解除を判定する（一時停止の
+/// 根拠より前の古いデータが「下がった」ように見えるのを防ぐ）。
+fn decide_start<'a>(
+    sessions: impl IntoIterator<Item = &'a ResumeEntry>,
+    live: &std::result::Result<LiveObservation, LiveError>,
+    fetched_at: i64,
+    threshold: u8,
+    now: i64,
+) -> StartGate {
+    let pending = pending_retries(sessions, now);
+    let live = match live {
+        Ok(live) => live,
+        Err(LiveError::NoEntry(reason)) => {
+            return saved_hold(&pending, Some(&format!("ai-usage: {reason}")));
+        }
+        Err(LiveError::Unavailable(reason)) => {
+            return StartGate::Stop {
+                reason: format!("cannot confirm the usage before starting (ai-usage: {reason})"),
+            };
+        }
+    };
+    match rate_control::evaluate(&live.windows, threshold, now) {
+        Decision::Stop { basis, detail } => StartGate::Stop {
+            reason: format!(
+                "{} (ai-usage{})",
+                basis.reason(threshold),
+                detail.map(|d| format!(": {d}")).unwrap_or_default()
+            ),
+        },
+        Decision::Pause { resume_at, basis } => {
+            let reason = basis.reason(threshold);
+            let live_pause = PauseState::new(
+                resume_at,
+                basis.window.clone(),
+                format!("usage at start: {reason}"),
+            )
+            .observed(PauseSource::AiUsage, PauseCause::Threshold, fetched_at)
+            .with_basis(basis.used_percent, basis.reset_at);
+            // 閾値に触れている間は、保存した記録の回復も確かめようが無い（どの枠も閾値未満で
+            // なければ回復とみなさない）。記録の条件をすべて残す。
+            let (pause, why) = match saved_pause(&pending) {
+                Some(saved) => (
+                    rate_control::merge_pauses(&live_pause, &saved),
+                    format!("{reason} (ai-usage); {SAVED_HOLD_REASON}"),
+                ),
+                None => (live_pause, format!("{reason} (ai-usage)")),
+            };
+            StartGate::Hold { pause, why }
+        }
+        Decision::Proceed => {
+            // 記録ごとに確かめる。回復した記録を待つ根拠に含めると、まとめた条件
+            // （saved_pause）が回復済みの記録の時刻まで保留を延ばしてしまう。
+            let mut waiting: Vec<&ResumeEntry> = Vec::new();
+            let mut evidence = None;
+            for entry in &pending {
+                let Some(pause) = saved_pause(&[entry]) else {
+                    continue;
+                };
+                match rate_control::check_recovery(&pause, live, threshold, now) {
+                    Recovery::Recovered(found) => {
+                        evidence.get_or_insert(found);
+                    }
+                    Recovery::NotYet(_) | Recovery::Undecidable(_) => waiting.push(entry),
+                }
+            }
+            if let Some(pause) = saved_pause(&waiting) {
+                // 表示する理由は、まとめた条件（モニターが早期解除に使うもの）で判定し直した
+                // ものにする。まとめた条件は記録ごとの条件より緩くならないので、どの記録も
+                // 回復していなければ回復にはならない（万一なっても待つ側に倒す）。
+                let detail = match rate_control::check_recovery(&pause, live, threshold, now) {
+                    Recovery::NotYet(detail) => format!("not recovered yet: {detail}"),
+                    Recovery::Undecidable(detail) => format!("cannot confirm a recovery: {detail}"),
+                    Recovery::Recovered(detail) => {
+                        format!("not every resumed session has recovered: {detail}")
+                    }
+                };
+                return StartGate::Hold {
+                    pause,
+                    why: format!("{SAVED_HOLD_REASON} ({detail})"),
+                };
+            }
+            match evidence {
+                Some(evidence) => StartGate::Recovered {
+                    until: pending
+                        .iter()
+                        .filter_map(|entry| entry.retry_after)
+                        .max()
+                        .map_or(now, |at| at.timestamp()),
+                    evidence,
+                },
+                None => StartGate::Proceed,
+            }
+        }
+    }
 }
 
 /// ai-usage 使用率ゲートの設定（各タスク完了後にワーカーが実行）。
@@ -160,9 +435,98 @@ pub struct UsageGateConfig {
     /// ai-usage を起動するコマンド（例: ["ai-usage", "--json"]）。
     pub command: Vec<String>,
     /// 選択 agent の env（CLAUDE_CONFIG_DIR 等）。usage-gate / monitor statusline /
-    /// 起動時キャッシュ初期化を、その agent の実行文脈で動かすために使う。
+    /// 実行開始時の判定を、その agent の実行文脈で動かすために使う。
     /// これにより起動シェルの環境継承で別アカウントの使用率を見るズレを防ぐ。
     pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// 実行開始時の保留・停止を、ai-usage の実データを取り直して決め直す（ai-usage 連携が
+/// あるときだけ。無ければ `build_plan` が保存した記録から決めたまま）。
+///
+/// TUI で対象と閾値を確定した後、tmux を作る前に呼ぶ。TUI の操作中にも枠は動く
+/// （手動リセット・ほかの作業での消費）ので、選択より前に取った値では決めない。
+/// 取得した出力（全アカウント分）は statusline 用キャッシュの初期化に使い、起動時の
+/// もう 1 回の取得を省く。ドライランでも呼ぶ（実行計画に実際と同じ判定を出すため）。
+pub fn check_start(plan: &mut ExecutionPlan, threshold: u8) {
+    let Some(gate) = plan.usage_gate.as_ref() else {
+        return;
+    };
+    let usage = fetch_start_usage(gate, AI_USAGE_STARTUP_TIMEOUT);
+    if let Err(reason) = &usage.observation {
+        eprintln!(
+            "{}: could not check the usage of {}/{} before starting: {}",
+            "warning".yellow(),
+            gate.profile,
+            gate.provider,
+            reason
+        );
+    }
+    plan.start = decide_start(
+        plan.resume.sessions.values(),
+        &usage.observation,
+        usage.fetched_at,
+        threshold,
+        rate_control::now_epoch(),
+    );
+    plan.startup_usage = usage.raw;
+}
+
+/// 実行開始時に取り直した ai-usage の実データ。
+struct StartUsage {
+    /// 実行中のアカウントの実測値。取得・解釈できなければその理由。
+    observation: std::result::Result<LiveObservation, LiveError>,
+    /// 取得を終えた時刻（Unix epoch 秒）。一時停止に、根拠の観測時刻の上限として記録する。
+    fetched_at: i64,
+    /// JSON として読めた出力（全アカウント分）。statusline 用キャッシュの初期化に使う。
+    raw: Option<Vec<u8>>,
+}
+
+/// 実行開始時の判定に使う `ai-usage --json` を、共有キャッシュを通さずに取り直す。
+///
+/// statusline の表示用キャッシュの初期化にも使うので、`--refresh` だけを足して対象の
+/// アカウントは絞らない。エージェントの env を「空文字は unset」の規則で適用し、期限を
+/// 過ぎたらプロセスグループごと止める（`run_ai_usage_sync`）。`--refresh` を知らない
+/// 古い ai-usage が使い方エラーで終わったら、設定どおりの command で取り直す。その値は
+/// 共有キャッシュを通った可能性があるので、回復の証拠には使わない（`fresh: false`）。
+fn fetch_start_usage(gate: &UsageGateConfig, timeout: Duration) -> StartUsage {
+    let sent = crate::usage::refresh_command(&gate.command);
+    let started = rate_control::now_epoch();
+    let fetched = run_ai_usage_sync(&sent, &gate.env, timeout).and_then(|output| {
+        if output.status.success() {
+            Ok((output.stdout, true))
+        } else if crate::usage::retry_without_added_flags(
+            output.status.code(),
+            &sent,
+            &gate.command,
+        ) {
+            spawn_ai_usage_sync_with_timeout(&gate.command, &gate.env, timeout)
+                .map(|stdout| (stdout, false))
+        } else {
+            Err(crate::usage::exit_error(&output))
+        }
+    });
+    let fetched_at = rate_control::now_epoch();
+    match fetched {
+        Ok((stdout, fresh)) => StartUsage {
+            observation: crate::usage::live_observation(
+                &stdout,
+                &gate.profile,
+                &gate.provider,
+                started - rate_control::LIVE_FRESHNESS_MARGIN_SECS,
+                fresh,
+            ),
+            fetched_at,
+            // 壊れた出力で statusline 用キャッシュを初期化しない（従来の初期化に任せる）。
+            raw: serde_json::from_slice::<serde_json::Value>(&stdout)
+                .is_ok()
+                .then_some(stdout),
+        },
+        Err(e) => StartUsage {
+            observation: Err(LiveError::Unavailable(format!("{e:#}"))),
+            fetched_at,
+            raw: None,
+        },
+    }
 }
 
 /// 実際に起動するワーカー数。タスク数を超えるワーカーは claim できる pending が
@@ -253,7 +617,9 @@ pub fn build_plan(
     sessions.retain(|dir, _| planned(dir));
     let mut discard = resume.discard;
     discard.retain(|dir, _| planned(dir) && !sessions.contains_key(dir));
-    let hold_until = resume_hold_until(sessions.values(), Local::now().fixed_offset());
+    // ai-usage 連携があれば check_start が実データで決め直す。呼ばれなくても、保存した
+    // 記録による保留は失わない。
+    let start = start_from_saved(sessions.values(), rate_control::now_epoch());
     ExecutionPlan {
         agent,
         tasks: targets,
@@ -263,36 +629,52 @@ pub fn build_plan(
             sessions,
             discard,
             prompt: resume.prompt,
-            hold_until,
         },
         output,
+        start,
+        startup_usage: None,
     }
 }
 
 /// 同期パスで ai-usage を起動し、`timeout` を超えたら SIGKILL してキルする。
-/// 専用スレッドの tokio ランタイムで待つため、同期・非同期どちらの呼び出し元でも使える。
-///
-/// 成功時は raw stdout を返す。stdout/stderr は非同期 I/O で並行に読むため、
-/// 出力サイズがパイプバッファを超えてもデッドロックしない。非ゼロ終了・spawn 失敗・
-/// タイムアウトはエラー。呼び出し側で fail-soft（キャッシュ初期化スキップ）にする。
-///
-/// env は「空文字の値は unset」という設定側の規約（`env_prefix_parts` が `env -u KEY`
-/// へ変換するのと同じ意味）に合わせて適用する。`envs()` へ素通しすると空文字がそのまま
-/// 子プロセスへ渡り、`CLAUDE_CONFIG_DIR=""` を「既定に戻す」つもりで書いた profile で
-/// ai-usage が cwd 相対の設定ディレクトリを見に行って別アカウントの使用率を拾う。
-/// この結果は起動時キャッシュとして usage-gate と共有されるため、誤った使用率で
-/// 停止判定が走る。
+/// 非ゼロ終了はエラーにする（[`run_ai_usage_sync`] 参照）。
 fn spawn_ai_usage_sync_with_timeout(
     command: &[String],
     env: &std::collections::BTreeMap<String, String>,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
+    let output = run_ai_usage_sync(command, env, timeout)?;
+    if !output.status.success() {
+        return Err(crate::usage::exit_error(&output));
+    }
+    Ok(output.stdout)
+}
+
+/// 同期パスで ai-usage を起動し、`timeout` を超えたら SIGKILL してキルする。
+/// 専用スレッドの tokio ランタイムで待つため、同期・非同期どちらの呼び出し元でも使える。
+///
+/// 終了した子の出力を、終了コードごと返す（古い ai-usage の使い方エラーを呼び出し側が
+/// 見分けられるように、非ゼロ終了はエラーにしない）。stdout/stderr は非同期 I/O で並行に
+/// 読むため、出力サイズがパイプバッファを超えてもデッドロックしない。spawn 失敗・
+/// タイムアウトはエラー。
+///
+/// env は「空文字の値は unset」という設定側の規約（`env_prefix_parts` が `env -u KEY`
+/// へ変換するのと同じ意味）に合わせて適用する。`envs()` へ素通しすると空文字がそのまま
+/// 子プロセスへ渡り、`CLAUDE_CONFIG_DIR=""` を「既定に戻す」つもりで書いた profile で
+/// ai-usage が cwd 相対の設定ディレクトリを見に行って別アカウントの使用率を拾う。
+/// この結果は実行開始時の保留・停止の判定と statusline の表示に使われるため、誤った
+/// 使用率で実行を止めたり始めたりしてしまう。
+fn run_ai_usage_sync(
+    command: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<std::process::Output> {
     anyhow::ensure!(!command.is_empty(), "ai_usage.command is empty");
     // 呼び出し元が tokio のランタイム内でも使えるよう、専用スレッドで非同期 I/O を動かす。
     // 子の終了と stdout/stderr の EOF をまとめて期限内に待ち、読み取りスレッドの join を避ける。
     std::thread::scope(|scope| {
         scope
-            .spawn(|| -> Result<Vec<u8>> {
+            .spawn(|| -> Result<std::process::Output> {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -350,16 +732,11 @@ fn spawn_ai_usage_sync_with_timeout(
                     })
                     .await;
                     match output {
-                        Ok(Ok((status, stdout, stderr))) => {
-                            if !status.success() {
-                                anyhow::bail!(
-                                    "ai-usage exited with {}: {}",
-                                    status,
-                                    String::from_utf8_lossy(&stderr).trim()
-                                );
-                            }
-                            Ok(stdout)
-                        }
+                        Ok(Ok((status, stdout, stderr))) => Ok(std::process::Output {
+                            status,
+                            stdout,
+                            stderr,
+                        }),
                         failure => {
                             #[cfg(unix)]
                             if let Some(pid) = group_pid {
@@ -465,17 +842,14 @@ pub fn print_plan(plan: &ExecutionPlan, parallelism: usize) {
             None => println!("      Prompt: {}", truncate(&task.prompt, 60).dimmed()),
         }
     }
-    if let Some(hold) = plan.resume.hold_until {
+    // 実行開始時の保留・停止。実際に書く pause file（または始めないこと）と同じ値を出す。
+    if let Some((label, text)) = plan.start.plan_line(plan.usage_gate.is_some()) {
         println!();
-        println!(
-            "{} {}",
-            "Hold:".yellow(),
-            format!(
-                "a resumed session hit the five_hour limit — workers wait until {} before starting",
-                hold.with_timezone(&Local).format("%Y-%m-%d %H:%M")
-            )
-            .yellow()
-        );
+        match plan.start {
+            StartGate::Stop { .. } => println!("{} {}", label.red().bold(), text.red()),
+            StartGate::Recovered { .. } => println!("{} {}", label.green(), text.green()),
+            _ => println!("{} {}", label.yellow(), text.yellow()),
+        }
     }
     println!();
 }
@@ -522,6 +896,24 @@ fn prepare_run_tmp_dir(tmp_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// 実行開始時の判定で一時停止すると決めたら（ai-usage の実データで枠が閾値に触れている、
+/// または再開するセッションを止めた 5 時間枠の回復を確かめられない）、実行全体をその状態で
+/// 始める（pause file を書く）。枠はアカウント単位なので、再開以外のタスクも同じ時刻まで
+/// 通らない。実行中に枠へ触れたときと同じ pause file を使うため、待機・デッドライン超過時の
+/// 停止・再開前の再確認・モニターによる早期解除（手動リセット等で枠が戻ったとき）は、
+/// すべて既存の gate-claim とモニターがそのまま扱う。
+///
+/// 再開時刻が起動準備の間に過ぎていても書く。gate-claim は期限切れの一時停止を「待機を
+/// 抜けた直後」として扱い、再開前の再確認（usage-gate）を経てから 1 件目を始める。書かずに
+/// 始めると、保留を決めた根拠（閾値超過・未回復）を確かめ直さないまま始めてしまう。
+fn write_start_pause(start: &StartGate, stop_file: &Path) -> Result<()> {
+    if let StartGate::Hold { pause, .. } = start {
+        rate_control::write_pause(&rate_control::pause_path_for(stop_file), pause)
+            .context("failed to write the pause file to start the run paused")?;
+    }
+    Ok(())
+}
+
 pub fn execute_plan_tmux(
     plan: ExecutionPlan,
     parallelism: usize,
@@ -532,6 +924,16 @@ pub fn execute_plan_tmux(
     rate_limit_threshold: u8,
 ) -> Result<()> {
     anyhow::ensure!(!plan.tasks.is_empty(), "No tasks to execute");
+
+    // 実行開始時の判定で始めないと決めたら、tmux もファイルも作らずに戻る（実行中の
+    // token-burn セッションも閉じない）。理由は実行計画の Stop: 行に出してある。
+    if let StartGate::Stop { .. } = plan.start {
+        println!(
+            "{}",
+            "Not started: the usage is already at or over the stop threshold.".red()
+        );
+        return Ok(());
+    }
 
     // tmux の存在確認
     std::process::Command::new("tmux")
@@ -590,25 +992,7 @@ pub fn execute_plan_tmux(
         std::fs::write(&resume_prompt_file, &plan.resume.prompt)?;
     }
 
-    // 再開するセッションを止めた 5 時間枠がまだリセットされていなければ、実行全体を
-    // その時刻まで一時停止した状態で始める。枠はアカウント単位なので、再開以外の
-    // タスクも同じ時刻まで通らない。実行中に 5 時間枠へ触れたときと同じ pause file を
-    // 使うため、待機・デッドライン超過時の停止・ai-usage による再開前の再確認は
-    // すべて既存の gate-claim がそのまま扱う。
-    if let Some(hold) = plan.resume.hold_until
-        && hold.timestamp() > crate::rate_control::now_epoch()
-    {
-        let pause = crate::rate_control::PauseState {
-            resume_at: hold.timestamp(),
-            window: "five_hour".to_string(),
-            reason: format!(
-                "a resumed session was rate limited (five_hour) until {}",
-                hold.with_timezone(&Local).format("%Y-%m-%d %H:%M")
-            ),
-        };
-        crate::rate_control::write_pause(&crate::rate_control::pause_path_for(&stop_file), &pause)
-            .context("failed to write the pause file for the resumed sessions")?;
-    }
+    write_start_pause(&plan.start, &stop_file)?;
 
     // 各タスクの実行スクリプトと pending マーカーを書き出す
     for (idx_zero, task) in plan.tasks.iter().enumerate() {
@@ -648,7 +1032,8 @@ pub fn execute_plan_tmux(
     }
 
     // ai-usage 連携時、各タスク完了後に使用率をチェックする usage-gate コマンドを組み立てる。
-    let cache_file = tmp_dir.join("ai-usage-cache.json");
+    // usage-gate は呼ぶたびに実行中のアカウントを `--refresh` で取り直すので、キャッシュの
+    // パスは渡さない（以前の版が渡していた `--cache-file` は受け付けたまま無視する）。
     let usage_gate_cmd = plan.usage_gate.as_ref().map(|g| {
         // usage-gate プロセス自体に選択 agent の env を前置きする。`--` 以降に KEY=val を
         // 入れると hidden CLI が実行ファイルと誤認するため、サブコマンドより前に置く。
@@ -664,8 +1049,6 @@ pub fn execute_plan_tmux(
             rate_limit_threshold.to_string(),
             "--stop-file".to_string(),
             shell_escape(&stop_file.to_string_lossy()),
-            "--cache-file".to_string(),
-            shell_escape(&cache_file.to_string_lossy()),
             "--".to_string(),
         ]);
         parts.extend(g.command.iter().map(|s| shell_escape(s)));
@@ -673,8 +1056,11 @@ pub fn execute_plan_tmux(
     });
 
     // モニターペインが使う ai-usage のコマンド（env prefix 付き）。`--json` の出力で
-    // usage-gate と共有するキャッシュを atomic に置き換え、statusline は `--input` でその
-    // キャッシュを読む。ディスク容量は使用量のキャッシュに混ぜず `--disk --json` で別に取る。
+    // statusline 用のキャッシュを atomic に置き換え、statusline は `--input` でその
+    // キャッシュを読む。キャッシュは表示専用で、停止・一時停止の判定には使わない（判定は
+    // usage-gate と実行開始時の判定が `--refresh` で取り直す）。ディスク容量は使用量の
+    // キャッシュに混ぜず `--disk --json` で別に取る。
+    let cache_file = tmp_dir.join("ai-usage-cache.json");
     let monitor_ai_usage = plan.usage_gate.as_ref().and_then(|g| {
         Some(crate::monitor::AiUsageCommands {
             refresh: build_refresh_cmd(&g.command, &g.env)?,
@@ -686,16 +1072,24 @@ pub fn execute_plan_tmux(
                 &g.provider,
             )?,
             disk: build_disk_cmd(&g.command, &g.env)?,
+            live: build_live_cmd(&g.command, &g.env, &g.profile, &g.provider)?,
+            profile: g.profile.clone(),
+            provider: g.provider.clone(),
             cache_file: cache_file.clone(),
         })
     });
-    // 起動時に ai-usage キャッシュを初期化し、monitor 起動直後から statusline を表示できるようにする
-    // （以後は usage-gate が各タスク完了時に 20 秒 TTL で更新する）。
-    // ai-usage コマンド自体がハングすると tmux 起動前に token-burn 全体が固まるため、
-    // AI_USAGE_STARTUP_TIMEOUT でキルする。失敗時はキャッシュ更新をスキップし、
-    // monitor 側の初回 fetch_usage に委ねる。
+    // 起動時に statusline 用の ai-usage キャッシュを初期化し、monitor 起動直後から statusline を
+    // 表示できるようにする（以後はモニターが 10 秒ごとに更新する）。実行開始時の判定
+    // （check_start）が全アカウント分を取り直していれば、その出力を使ってもう 1 回の取得を
+    // 省く。取れていなければ従来どおりここで取得する。ai-usage コマンド自体がハングすると
+    // tmux 起動前に token-burn 全体が固まるため、AI_USAGE_STARTUP_TIMEOUT でキルする。
+    // 失敗時はキャッシュ更新をスキップし、monitor 側の初回取得に委ねる。
     if let Some(g) = plan.usage_gate.as_ref() {
-        match spawn_ai_usage_sync_with_timeout(&g.command, &g.env, AI_USAGE_STARTUP_TIMEOUT) {
+        let initial = match plan.startup_usage.as_deref() {
+            Some(bytes) => Ok(bytes.to_vec()),
+            None => spawn_ai_usage_sync_with_timeout(&g.command, &g.env, AI_USAGE_STARTUP_TIMEOUT),
+        };
+        match initial {
             Ok(bytes) => {
                 let _ = std::fs::write(&cache_file, &bytes);
             }
@@ -758,6 +1152,7 @@ pub fn execute_plan_tmux(
         worker_count,
         stop_file: stop_file.clone(),
         report_dir: run_dir.clone(),
+        threshold: rate_limit_threshold,
         ai_usage: monitor_ai_usage,
     }
     .write(&manifest_path)?;
@@ -984,9 +1379,13 @@ pub fn execute_plan_tmux(
     if plan.resume.save_interrupted {
         let store =
             crate::resume::ResumeStore::load_or_warn(&crate::resume::resume_path(state_file));
-        if let Some(line) =
-            saved_sessions_notice(&store, &plan.agent.name, &plan.tasks, now.fixed_offset())
-        {
+        if let Some(line) = saved_sessions_notice(
+            &store,
+            &plan.agent.name,
+            &plan.tasks,
+            now.fixed_offset(),
+            plan.usage_gate.is_some(),
+        ) {
             println!("  {}", line.cyan());
         }
     }
@@ -997,11 +1396,15 @@ pub fn execute_plan_tmux(
 ///
 /// `since` より後に保存された記録だけを数える（前の実行から残っている記録は含めない）。
 /// 再開可能時刻が分かっていれば、それより前に打ち直しても待つことになる旨を添える。
+///
+/// `recovery_checked` は、次の実行が開始時に ai-usage の実データで回復を確かめる構成か。
+/// そのときは手動リセットすれば再開可能時刻を待たずに始められることも添える。
 fn saved_sessions_notice(
     store: &crate::resume::ResumeStore,
     agent_name: &str,
     tasks: &[ResolvedTarget],
     since: DateTime<FixedOffset>,
+    recovery_checked: bool,
 ) -> Option<String> {
     let saved: Vec<&ResumeEntry> = tasks
         .iter()
@@ -1022,8 +1425,13 @@ fn saved_sessions_notice(
         .filter_map(|entry| entry.retry_after)
         .max()
         .map(|at| {
+            let early = if recovery_checked {
+                ", or earlier if you reset it manually"
+            } else {
+                ""
+            };
             format!(
-                " (the rate limit resets at {})",
+                " (the rate limit resets at {}{early})",
                 at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
             )
         })
@@ -1277,8 +1685,8 @@ mod tests {
     /// 設定の env は「空文字の値は unset」という規約（シェル側は `env -u KEY`）で扱う。
     /// `envs()` へ素通しすると空文字がそのまま子へ渡り、`CLAUDE_CONFIG_DIR=""` を
     /// 「既定に戻す」つもりで書いた profile で ai-usage が cwd 相対の設定ディレクトリを
-    /// 見に行って別アカウントの使用率を拾う。その結果は起動時キャッシュとして
-    /// usage-gate と共有されるため、誤った使用率で停止判定が走る。
+    /// 見に行って別アカウントの使用率を拾う。その結果で実行開始時の判定（保留・停止）が
+    /// 走り、statusline にも別アカウントの使用率が出る。
     ///
     /// `${VAR-<unset>}` は「未設定」のときだけ既定値へ落ちるため、空文字を素通しする
     /// 旧実装では空文字が返り、除去する現実装では `<unset>` が返る。テストプロセスの
@@ -1456,6 +1864,7 @@ mod tests {
             session_id: "0633fa18-8643-40f7-9106-a35330ed247d".to_string(),
             interrupted_at: Local::now().fixed_offset(),
             retry_after,
+            retry_basis_percent: None,
             prompt_hash: crate::resume::prompt_hash("review"),
             message: None,
             log: None,
@@ -1496,7 +1905,7 @@ mod tests {
         assert_eq!(plan.resume.sessions.len(), 1);
         assert!(plan.resume.sessions.contains_key(Path::new("/tmp/repo")));
         assert!(plan.resume.save_interrupted);
-        assert_eq!(plan.resume.hold_until, None);
+        assert_eq!(plan.start, StartGate::Proceed);
     }
 
     #[test]
@@ -1514,7 +1923,8 @@ mod tests {
         let store = crate::resume::ResumeStore::load_or_warn(&path);
         let tasks = vec![repo_target("/tmp/a"), repo_target("/tmp/b")];
 
-        let notice = saved_sessions_notice(&store, "claude", &tasks, started).expect("notice");
+        let notice =
+            saved_sessions_notice(&store, "claude", &tasks, started, false).expect("notice");
         assert!(
             notice.starts_with(
                 "↻ Saved 1 interrupted session — run the same command again to continue it"
@@ -1528,13 +1938,23 @@ mod tests {
             )),
             "{notice}"
         );
+        // 次の実行が実データで回復を確かめる構成なら、手動リセットで早く始められる。
+        let notice =
+            saved_sessions_notice(&store, "claude", &tasks, started, true).expect("notice");
+        assert!(
+            notice.contains(&format!(
+                "(the rate limit resets at {}, or earlier if you reset it manually)",
+                reset.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+            )),
+            "{notice}"
+        );
         // 別エージェントの記録や、この実行より前の記録だけなら案内しない
         assert_eq!(
-            saved_sessions_notice(&store, "claude-home", &tasks, started),
+            saved_sessions_notice(&store, "claude-home", &tasks, started, false),
             None
         );
         assert_eq!(
-            saved_sessions_notice(&store, "claude", &tasks[1..], started),
+            saved_sessions_notice(&store, "claude", &tasks[1..], started, false),
             None
         );
     }
@@ -1615,14 +2035,669 @@ mod tests {
                 discard: HashMap::new(),
             },
         );
-        // 全セッションが同じ枠の制限を受けるので、最も遅い時刻まで待つ
-        assert_eq!(plan.resume.hold_until, Some(later));
+        // 全セッションが同じ枠の制限を受けるので、最も遅い時刻まで待つ。実データで確かめる
+        // 前の既定値なので、根拠は保存した記録（拒否されたときの使用率）になる。
+        let StartGate::Hold { pause, why } = &plan.start else {
+            panic!("expected a hold, got {:?}", plan.start);
+        };
+        assert_eq!(pause.resume_at, later.timestamp());
+        assert_eq!(pause.source, PauseSource::Saved);
+        assert_eq!(pause.cause, PauseCause::Rejected);
+        assert_eq!(why, SAVED_HOLD_REASON);
 
         // すべて過ぎていれば待たない
         assert_eq!(
-            resume_hold_until([saved_session(Some(past))].iter(), now),
-            None
+            start_from_saved([&saved_session(Some(past))], now.timestamp()),
+            StartGate::Proceed
         );
+    }
+
+    fn five_hour(used: f64, reset_at: Option<i64>) -> rate_control::WindowObservation {
+        rate_control::WindowObservation::new(rate_control::WindowKind::FIVE_HOUR, "five_hour", used)
+            .with_reset_at(reset_at)
+    }
+
+    fn weekly(used: f64, reset_at: Option<i64>) -> rate_control::WindowObservation {
+        rate_control::WindowObservation::new(rate_control::WindowKind::Deadline, "weekly", used)
+            .with_reset_at(reset_at)
+    }
+
+    /// `now` に `--refresh` で取り直した実データ。
+    fn live_at(
+        windows: Vec<rate_control::WindowObservation>,
+        now: i64,
+    ) -> std::result::Result<LiveObservation, LiveError> {
+        Ok(LiveObservation {
+            windows,
+            observed_from: now - rate_control::LIVE_FRESHNESS_MARGIN_SECS,
+            fresh: true,
+        })
+    }
+
+    /// 5 時間枠で拒否されて中断した記録。`interrupted_ago` 秒前に中断し、`retry_in` 秒後に
+    /// 再開できると見積もった。
+    fn rejected_session(
+        now: i64,
+        interrupted_ago: i64,
+        retry_in: i64,
+        basis: Option<f64>,
+    ) -> ResumeEntry {
+        use chrono::TimeZone;
+        let at = |epoch: i64| Local.timestamp_opt(epoch, 0).unwrap().fixed_offset();
+        ResumeEntry {
+            interrupted_at: at(now - interrupted_ago),
+            retry_after: Some(at(now + retry_in)),
+            retry_basis_percent: basis,
+            ..saved_session(None)
+        }
+    }
+
+    #[test]
+    fn start_stops_when_a_deadline_window_is_over_the_threshold() {
+        // 週次枠はデッドラインと同じ周期なので、待ってもこの実行の残り時間では回復しない。
+        // 1 件目を始めてから usage-gate で止めるのではなく、最初から始めない。
+        let now = rate_control::now_epoch();
+        let session = rejected_session(now, 60, 3600, Some(100.0));
+        let gate = decide_start(
+            [&session],
+            &live_at(
+                vec![
+                    weekly(96.0, Some(now + 3 * 86_400)),
+                    five_hour(10.0, Some(now + 3600)),
+                ],
+                now,
+            ),
+            now,
+            95,
+            now,
+        );
+        let StartGate::Stop { reason } = &gate else {
+            panic!("expected a stop, got {gate:?}");
+        };
+        assert_eq!(reason, "weekly 96% >= threshold 95% (ai-usage)");
+    }
+
+    #[test]
+    fn start_stop_explains_why_it_cannot_wait() {
+        // 5 時間枠でもリセット時刻が読めなければ、いつ再開してよいか分からないので始めない
+        // （usage-gate と同じ fail-closed）。理由を添える。
+        let now = rate_control::now_epoch();
+        let gate = decide_start([], &live_at(vec![five_hour(97.0, None)], now), now, 95, now);
+        assert_eq!(
+            gate,
+            StartGate::Stop {
+                reason: "five_hour 97% >= threshold 95% (ai-usage: reset time unavailable)"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn start_pauses_until_the_window_resets_even_without_resumed_sessions() {
+        // 5 時間枠が閾値に触れていれば、再開するセッションが無くても待つ（枠はアカウント単位）。
+        let now = rate_control::now_epoch();
+        let reset = now + 1800;
+        let gate = decide_start(
+            [],
+            &live_at(
+                vec![
+                    five_hour(97.0, Some(reset)),
+                    weekly(40.0, Some(now + 3 * 86_400)),
+                ],
+                now,
+            ),
+            now - 1,
+            95,
+            now,
+        );
+        let StartGate::Hold { pause, why } = &gate else {
+            panic!("expected a hold, got {gate:?}");
+        };
+        assert_eq!(
+            pause.resume_at,
+            reset + rate_control::RESET_PROPAGATION_GRACE_SECS
+        );
+        assert_eq!(pause.window, "five_hour");
+        // モニターが同じ取得元どうしで回復を比べられるよう、根拠と観測時刻を残す。
+        assert_eq!(pause.source, PauseSource::AiUsage);
+        assert_eq!(pause.cause, PauseCause::Threshold);
+        assert_eq!(pause.observed_at, now - 1, "取得を終えた時刻");
+        assert_eq!(pause.used_percent, Some(97.0));
+        assert_eq!(pause.window_reset_at, Some(reset));
+        assert_eq!(why, "five_hour 97% >= threshold 95% (ai-usage)");
+    }
+
+    #[test]
+    fn start_does_not_wait_for_a_window_that_was_reset_manually() {
+        // 実際に起きた事故の再現: 5 時間枠が 100% で止まった直後に手動リセットし、すぐに
+        // 実行し直した。保存した再開時刻（1 時間半後）まで待たずに始める。
+        let now = rate_control::now_epoch();
+        let session = rejected_session(now, 360, 5400, Some(100.0));
+        let gate = decide_start(
+            [&session],
+            &live_at(
+                vec![five_hour(0.0, None), weekly(30.0, Some(now + 3 * 86_400))],
+                now,
+            ),
+            now,
+            95,
+            now,
+        );
+        let StartGate::Recovered { until, evidence } = &gate else {
+            panic!("expected to start without waiting, got {gate:?}");
+        };
+        assert_eq!(*until, now + 5400);
+        assert_eq!(evidence, "five_hour dropped from 100% to 0%");
+    }
+
+    #[test]
+    fn start_holds_until_the_saved_time_when_the_window_has_not_recovered() {
+        // 閾値未満というだけでは回復と言えない（拒否は使用率と別の理由でも起き、取得元の
+        // 違う値は反映の遅れでずれる）。保存した再開時刻まで待ち、その間はモニターが
+        // 回復を確かめ続けられるよう、拒否されたときの根拠を一時停止に残す。
+        let now = rate_control::now_epoch();
+        let session = rejected_session(now, 360, 5400, Some(100.0));
+        let gate = decide_start(
+            [&session],
+            &live_at(vec![five_hour(85.0, Some(now + 5370))], now),
+            now,
+            95,
+            now,
+        );
+        let StartGate::Hold { pause, why } = &gate else {
+            panic!("expected a hold, got {gate:?}");
+        };
+        assert_eq!(pause.resume_at, now + 5400);
+        assert_eq!(pause.window, "five_hour");
+        assert_eq!(pause.source, PauseSource::Saved);
+        assert_eq!(pause.cause, PauseCause::Rejected);
+        assert_eq!(pause.observed_at, now - 360, "根拠は中断したときの観測");
+        assert_eq!(pause.used_percent, Some(100.0));
+        assert_eq!(
+            pause.window_reset_at,
+            Some(now + 5400 - rate_control::RESET_PROPAGATION_GRACE_SECS)
+        );
+        assert_eq!(
+            why,
+            "a resumed session hit the five_hour limit (not recovered yet: five_hour at 85% (was 100% when paused))"
+        );
+    }
+
+    #[test]
+    fn legacy_records_without_a_basis_wait_for_the_saved_time() {
+        // 以前の版が保存した記録には拒否されたときの使用率が無い。拒否は使用率と別の理由でも
+        // 起きる（42% で拒否された例がある）ので、100% と補って比べると、42% のままでも
+        // 回復とみなしてしまう。比べる元が無い記録は回復を確かめられないとして、保存した
+        // 再開時刻まで保留する。
+        let now = rate_control::now_epoch();
+        let session = rejected_session(now, 360, 5400, None);
+        let gate = decide_start(
+            [&session],
+            &live_at(vec![five_hour(40.0, None)], now),
+            now,
+            95,
+            now,
+        );
+        let StartGate::Hold { pause, why } = &gate else {
+            panic!("expected a hold, got {gate:?}");
+        };
+        assert_eq!(pause.resume_at, now + 5400);
+        assert_eq!(pause.used_percent, None);
+        assert!(why.contains("cannot confirm a recovery"), "{why}");
+        // 根拠のある記録と不明な記録をまとめても、不明な方を既知の使用率で補わない。
+        let known = rejected_session(now, 300, 3000, Some(100.0));
+        let merged = saved_pause(&[&session, &known]).unwrap();
+        assert_eq!(merged.used_percent, None);
+    }
+
+    #[test]
+    fn start_keeps_the_saved_rejection_while_a_window_is_over_the_threshold() {
+        // 保存した記録は 42% で拒否されて 90 分後まで待つ見込み。開始時の実データは 5 時間枠が
+        // 95% でリセットは 30 分後。実データだけで一時停止を作ると、後で 40% になったとき
+        // （記録の拒否の条件は満たしていない）にモニターが解除してしまい、モニターが回復を
+        // 確かめられない構成では 30 分で再開してしまう。記録の条件も残す。
+        let now = rate_control::now_epoch();
+        let session = rejected_session(now, 360, 5400, Some(42.0));
+        let gate = decide_start(
+            [&session],
+            &live_at(vec![five_hour(95.0, Some(now + 1800))], now),
+            now,
+            95,
+            now,
+        );
+        let StartGate::Hold { pause, why } = &gate else {
+            panic!("expected a hold, got {gate:?}");
+        };
+        assert_eq!(pause.resume_at, now + 5400, "待つ時刻は遅い方");
+        assert_eq!(pause.used_percent, Some(42.0), "比較の元は厳しい方");
+        assert!(
+            why.contains("a resumed session hit the five_hour limit"),
+            "{why}"
+        );
+        let later = LiveObservation {
+            windows: vec![five_hour(40.0, Some(now + 1800))],
+            observed_from: now + 60,
+            fresh: true,
+        };
+        assert!(matches!(
+            rate_control::check_recovery(pause, &later, 95, now + 60),
+            Recovery::NotYet(_)
+        ));
+    }
+
+    #[test]
+    fn start_holds_when_the_usage_may_come_from_the_ai_usage_cache() {
+        // `--refresh` を使えない古い ai-usage の値は、共有キャッシュ（既定 120 秒）を通って
+        // リセット前のものかもしれない。回復の証拠にせず、保存した再開時刻まで待つ。
+        let now = rate_control::now_epoch();
+        let session = rejected_session(now, 360, 5400, Some(100.0));
+        let cached = Ok(LiveObservation {
+            windows: vec![five_hour(0.0, None)],
+            observed_from: now - rate_control::LIVE_FRESHNESS_MARGIN_SECS,
+            fresh: false,
+        });
+        let gate = decide_start([&session], &cached, now, 95, now);
+        let StartGate::Hold { pause, why } = &gate else {
+            panic!("expected a hold, got {gate:?}");
+        };
+        assert_eq!(pause.resume_at, now + 5400);
+        assert!(why.contains("cannot confirm a recovery"), "{why}");
+    }
+
+    #[test]
+    fn start_does_not_begin_when_the_usage_cannot_be_confirmed() {
+        // 取得の失敗・ok:false では使用率を確認できない。usage-gate と同じく止める側に倒し、
+        // 使用率の分からないまま並列数ぶんのタスクを始めない。
+        let now = rate_control::now_epoch();
+        let session = rejected_session(now, 360, 5400, Some(100.0));
+        let unavailable = Err(LiveError::Unavailable("auth expired".to_string()));
+        for sessions in [vec![&session], vec![]] {
+            let gate = decide_start(sessions, &unavailable, now, 95, now);
+            let StartGate::Stop { reason } = &gate else {
+                panic!("expected a stop, got {gate:?}");
+            };
+            assert!(reason.contains("auth expired"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn start_falls_back_to_the_saved_records_when_the_account_is_missing() {
+        // 出力に該当アカウントが無いのは、usage-gate でも過剰停止を避けて続行する扱い。
+        // 保存した再開時刻だけで決める。
+        let now = rate_control::now_epoch();
+        let session = rejected_session(now, 360, 5400, Some(100.0));
+        let missing = Err(LiveError::NoEntry(
+            "no ai-usage entry for (Work, claude)".to_string(),
+        ));
+        let gate = decide_start([&session], &missing, now, 95, now);
+        let StartGate::Hold { pause, why } = &gate else {
+            panic!("expected a hold, got {gate:?}");
+        };
+        assert_eq!(Some(pause), saved_pause(&[&session]).as_ref());
+        assert_eq!(
+            why,
+            "a resumed session hit the five_hour limit (ai-usage: no ai-usage entry for (Work, claude))"
+        );
+        // 保留する根拠が無ければ、そのまま始める。
+        assert_eq!(decide_start([], &missing, now, 95, now), StartGate::Proceed);
+        // 再開時刻を過ぎた記録は待つ根拠にならない。
+        let past = rejected_session(now, 9000, -60, Some(100.0));
+        assert_eq!(
+            decide_start([&past], &missing, now, 95, now),
+            StartGate::Proceed
+        );
+    }
+
+    #[test]
+    fn start_waits_for_the_latest_session_that_has_not_recovered() {
+        let now = rate_control::now_epoch();
+        let soon = rejected_session(now, 600, 1200, Some(100.0));
+        let later = rejected_session(now, 300, 3000, Some(100.0));
+        let past = rejected_session(now, 9000, -60, Some(100.0));
+        let gate = decide_start(
+            [&soon, &later, &past],
+            &live_at(vec![five_hour(90.0, None)], now),
+            now,
+            95,
+            now,
+        );
+        let StartGate::Hold { pause, .. } = &gate else {
+            panic!("expected a hold, got {gate:?}");
+        };
+        assert_eq!(pause.resume_at, now + 3000);
+        assert_eq!(pause.observed_at, now - 300);
+        // 再開時刻を過ぎた記録しか無ければ、待つ根拠が無いのでそのまま始める。
+        assert_eq!(
+            decide_start(
+                [&past],
+                &live_at(vec![five_hour(90.0, None)], now),
+                now,
+                95,
+                now
+            ),
+            StartGate::Proceed
+        );
+    }
+
+    #[test]
+    fn a_combined_hold_keeps_the_strictest_recovery_condition() {
+        // 42% で拒否された記録と 100% で拒否された記録がある。後者の根拠だけを pause file に
+        // 残すと、モニターは 40% を「100% から下がった」とみなして解除するが、前者にとって
+        // 42% → 40% は回復ではない。まとめた一時停止は最も低い根拠と最も新しい観測を持つ。
+        let now = rate_control::now_epoch();
+        let low = rejected_session(now, 600, 1800, Some(42.0));
+        let high = rejected_session(now, 300, 3600, Some(100.0));
+        let gate = decide_start(
+            [&low, &high],
+            &live_at(vec![five_hour(60.0, None)], now),
+            now,
+            95,
+            now,
+        );
+        let StartGate::Hold { pause, why } = &gate else {
+            panic!("expected a hold, got {gate:?}");
+        };
+        assert_eq!(pause.resume_at, now + 3600, "最も遅い再開時刻まで待つ");
+        assert_eq!(pause.used_percent, Some(42.0), "最も厳しい下がり幅を求める");
+        assert_eq!(
+            pause.observed_at,
+            now - 300,
+            "最も新しい中断より後のデータを求める"
+        );
+        assert_eq!(
+            why,
+            "a resumed session hit the five_hour limit (not recovered yet: five_hour at 60% (was 42% when paused))"
+        );
+        // モニターが同じ条件で判定したとき、40% では解除しない。0% なら解除する。
+        let later = now + 60;
+        assert!(matches!(
+            rate_control::check_recovery(
+                pause,
+                &live_at(vec![five_hour(40.0, None)], later).unwrap(),
+                95,
+                later
+            ),
+            Recovery::NotYet(_)
+        ));
+        assert!(matches!(
+            rate_control::check_recovery(
+                pause,
+                &live_at(vec![five_hour(0.0, None)], later).unwrap(),
+                95,
+                later
+            ),
+            Recovery::Recovered(_)
+        ));
+    }
+
+    #[test]
+    fn start_holds_only_for_the_sessions_that_have_not_recovered() {
+        // 再開時刻の遅い記録（100% で拒否）は 30% で回復とみなせるが、早い記録（42% で拒否）
+        // は回復していない。待つのは回復していない記録の再開時刻までで、回復した記録の時刻
+        // まで延ばさない。
+        let now = rate_control::now_epoch();
+        let low = rejected_session(now, 600, 1800, Some(42.0));
+        let high = rejected_session(now, 300, 3600, Some(100.0));
+        let gate = decide_start(
+            [&low, &high],
+            &live_at(vec![five_hour(30.0, None)], now),
+            now,
+            95,
+            now,
+        );
+        let StartGate::Hold { pause, .. } = &gate else {
+            panic!("expected a hold, got {gate:?}");
+        };
+        assert_eq!(pause.resume_at, now + 1800);
+        assert_eq!(pause.used_percent, Some(42.0));
+        assert_eq!(pause.observed_at, now - 600);
+        // どちらも回復していれば、最も遅い見積もり時刻を待たずに始める。
+        let recovered = decide_start(
+            [&low, &high],
+            &live_at(vec![five_hour(0.0, None)], now),
+            now,
+            95,
+            now,
+        );
+        assert!(
+            matches!(&recovered, StartGate::Recovered { until, .. } if *until == now + 3600),
+            "{recovered:?}"
+        );
+    }
+
+    #[test]
+    fn write_start_pause_writes_a_hold_even_after_it_expired() {
+        // 判定から書き込みまでの間に再開時刻が過ぎても書く。期限切れの pause file があると
+        // gate-claim は「待機を抜けた直後」として再開前の再確認を経てから始める。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let now = rate_control::now_epoch();
+        let expired = saved_hold(&[&rejected_session(now, 9000, -5, Some(100.0))], None);
+        write_start_pause(&expired, &stop).unwrap();
+        let written = rate_control::read_pause(&rate_control::pause_path_for(&stop))
+            .unwrap()
+            .expect("期限切れでも書くべき");
+        assert_eq!(written.resume_at, now - 5);
+        assert_eq!(written.source, PauseSource::Saved);
+        assert!(!stop.exists(), "一時停止は恒久停止ではない");
+
+        // 保留しないなら何も書かない。
+        let other = tempfile::TempDir::new().unwrap();
+        let stop = other.path().join("stop");
+        write_start_pause(&StartGate::Proceed, &stop).unwrap();
+        assert!(!rate_control::pause_path_for(&stop).exists());
+    }
+
+    #[test]
+    fn plan_line_tells_when_the_monitor_can_resume_early() {
+        let now = rate_control::now_epoch();
+        let hold = saved_hold(&[&rejected_session(now, 60, 3600, Some(100.0))], None);
+        let (label, text) = hold.plan_line(true).unwrap();
+        assert_eq!(label, "Hold:");
+        assert!(
+            text.starts_with("a resumed session hit the five_hour limit — workers wait until "),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "; the monitor resumes them earlier if the window recovers (e.g. a manual reset)"
+            ),
+            "{text}"
+        );
+        // 実データを取れない構成（ai-usage 連携無し）では、見積もりどおりに待つ。
+        let (_, text) = hold.plan_line(false).unwrap();
+        assert!(text.ends_with(" before starting"), "{text}");
+
+        let (label, text) = StartGate::Stop {
+            reason: "weekly 96% >= threshold 95% (ai-usage)".to_string(),
+        }
+        .plan_line(true)
+        .unwrap();
+        assert_eq!(label, "Stop:");
+        assert_eq!(
+            text,
+            "weekly 96% >= threshold 95% (ai-usage) — no tasks will be started in this run"
+        );
+
+        let (label, text) = StartGate::Recovered {
+            until: now + 3600,
+            evidence: "five_hour dropped from 100% to 0%".to_string(),
+        }
+        .plan_line(true)
+        .unwrap();
+        assert_eq!(label, "Hold:");
+        assert!(text.starts_with("none — "), "{text}");
+        assert!(
+            text.ends_with(
+                "but the window has already recovered: five_hour dropped from 100% to 0%"
+            ),
+            "{text}"
+        );
+        assert_eq!(StartGate::Proceed.plan_line(true), None);
+    }
+
+    /// 偽の ai-usage（`sh -c`）。受け取った引数を 1 回 1 行で記録し、`json` を出力する。
+    /// `refuse_refresh` なら、`--refresh` を知らない古い ai-usage と同じく使い方エラー
+    /// （終了コード 2）で終わる。
+    fn fake_usage_gate(dir: &Path, json: &str, refuse_refresh: bool) -> (UsageGateConfig, PathBuf) {
+        let output = dir.join("ai-usage-output.json");
+        std::fs::write(&output, json).unwrap();
+        let log = dir.join("ai-usage-args.log");
+        let refuse = if refuse_refresh {
+            "case \" $* \" in *' --refresh '*) exit 2;; esac; "
+        } else {
+            ""
+        };
+        let script = format!(
+            "printf '%s\\n' \"$*\" >> {}; {refuse}cat {}",
+            shell_escape(&log.to_string_lossy()),
+            shell_escape(&output.to_string_lossy())
+        );
+        let gate = UsageGateConfig {
+            profile: "Work".to_string(),
+            provider: "claude".to_string(),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                script,
+                "ai-usage".to_string(),
+                "--json".to_string(),
+            ],
+            env: std::collections::BTreeMap::new(),
+        };
+        (gate, log)
+    }
+
+    fn logged_calls(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .map(|calls| calls.lines().map(String::from).collect())
+            .unwrap_or_default()
+    }
+
+    const RECOVERED_USAGE: &str = r#"{"accounts":[{"profile":"Other","provider":"codex","ok":true},{"profile":"Work","provider":"claude","ok":true,"five_hour":{"kind":"five_hour","used_percent":0.0},"weekly":{"kind":"weekly","used_percent":30.0}}]}"#;
+
+    #[test]
+    fn start_check_refreshes_every_account_once() {
+        // 判定と statusline 用キャッシュの初期化を 1 回の取得で済ませる。キャッシュに使う
+        // ので対象のアカウントは絞らず、--refresh だけを足す。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gate, log) = fake_usage_gate(tmp.path(), RECOVERED_USAGE, false);
+        let before = rate_control::now_epoch();
+        let usage = fetch_start_usage(&gate, Duration::from_secs(5));
+        assert_eq!(logged_calls(&log), ["--json --refresh"]);
+        let observation = usage.observation.expect("実行中のアカウントを読めるべき");
+        assert!(observation.fresh);
+        assert!(observation.observed_from <= before - rate_control::LIVE_FRESHNESS_MARGIN_SECS);
+        assert_eq!(observation.windows.len(), 2);
+        assert!(usage.fetched_at >= before);
+        assert_eq!(usage.raw.as_deref(), Some(RECOVERED_USAGE.as_bytes()));
+    }
+
+    #[test]
+    fn start_check_retries_without_refresh_on_an_old_ai_usage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gate, log) = fake_usage_gate(tmp.path(), RECOVERED_USAGE, true);
+        let usage = fetch_start_usage(&gate, Duration::from_secs(5));
+        assert_eq!(logged_calls(&log), ["--json --refresh", "--json"]);
+        let observation = usage
+            .observation
+            .expect("設定どおりの command で取り直すべき");
+        assert!(!observation.fresh, "共有キャッシュを通った可能性がある値");
+        assert!(usage.raw.is_some());
+    }
+
+    #[test]
+    fn start_check_reports_failures_without_caching_them() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut gate, _) = fake_usage_gate(tmp.path(), "", false);
+        gate.command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo boom >&2; exit 1".to_string(),
+        ];
+        let usage = fetch_start_usage(&gate, Duration::from_secs(5));
+        let error = usage.observation.expect_err("取得の失敗");
+        assert!(
+            matches!(&error, LiveError::Unavailable(reason) if reason.contains("boom")),
+            "{error}"
+        );
+        assert!(usage.raw.is_none());
+
+        // 読めない出力で statusline 用キャッシュを初期化しない。
+        let (gate, _) = fake_usage_gate(tmp.path(), "not json", false);
+        let usage = fetch_start_usage(&gate, Duration::from_secs(5));
+        assert!(usage.observation.is_err());
+        assert!(usage.raw.is_none());
+
+        // 読めても実行中のアカウントが無ければ判定には使えないが、キャッシュには使える。
+        let (mut gate, _) = fake_usage_gate(tmp.path(), RECOVERED_USAGE, false);
+        gate.profile = "Home".to_string();
+        let usage = fetch_start_usage(&gate, Duration::from_secs(5));
+        assert!(usage.observation.is_err());
+        assert!(usage.raw.is_some());
+    }
+
+    #[test]
+    fn check_start_decides_with_the_refreshed_usage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gate, _) = fake_usage_gate(tmp.path(), RECOVERED_USAGE, false);
+        let mut agent = make_agent(vec!["claude", "-p"]);
+        agent.ai_usage = Some(crate::config::RuntimeAiUsage {
+            profile: "Work".to_string(),
+            provider: "claude".to_string(),
+        });
+        let now = rate_control::now_epoch();
+        let mut plan = build_plan(
+            &agent,
+            vec![repo_target("/tmp/repo")],
+            Some(gate.command.clone()),
+            ResumeOptions {
+                save_interrupted: true,
+                sessions: HashMap::from([(
+                    PathBuf::from("/tmp/repo"),
+                    rejected_session(now, 360, 5400, Some(100.0)),
+                )]),
+                prompt: "continue".to_string(),
+                discard: HashMap::new(),
+            },
+        );
+        // 実データを見る前は、保存した再開時刻まで待つ見積もり。
+        assert!(matches!(plan.start, StartGate::Hold { .. }));
+        check_start(&mut plan, 95);
+        assert!(
+            matches!(plan.start, StartGate::Recovered { .. }),
+            "手動リセットで戻った枠を待たない: {:?}",
+            plan.start
+        );
+        assert_eq!(
+            plan.startup_usage.as_deref(),
+            Some(RECOVERED_USAGE.as_bytes())
+        );
+    }
+
+    #[test]
+    fn check_start_keeps_the_saved_hold_without_ai_usage() {
+        // ai-usage 連携が無ければ ai-usage を呼ばず、保存した記録による保留のまま。
+        let agent = make_agent(vec!["claude", "-p"]);
+        let now = rate_control::now_epoch();
+        let mut plan = build_plan(
+            &agent,
+            vec![repo_target("/tmp/repo")],
+            None,
+            ResumeOptions {
+                save_interrupted: true,
+                sessions: HashMap::from([(
+                    PathBuf::from("/tmp/repo"),
+                    rejected_session(now, 360, 5400, Some(100.0)),
+                )]),
+                prompt: "continue".to_string(),
+                discard: HashMap::new(),
+            },
+        );
+        let before = plan.start.clone();
+        check_start(&mut plan, 95);
+        assert_eq!(plan.start, before);
+        assert!(plan.startup_usage.is_none());
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! ai-usage の使用量の表示を 10 秒ごとに更新する。
 //!
 //! `ai-usage --json` の出力でキャッシュを置き換え、その後 statusline を `--input <cache>` で
-//! 描かせる。キャッシュは usage-gate と共有しているため、モニターの更新が並列ワーカーの
-//! 使用率の判定にも効く。取得に失敗したら直前の表示を残す（fail-soft）。
+//! 描かせる。キャッシュは表示専用で、ai-usage の共有キャッシュ（既定 120 秒）を通った値を
+//! 持つ。停止の判定（usage-gate）と一時停止中の回復の確認（monitor::recovery）は、実行中の
+//! アカウントを `--refresh` で取り直すので、このキャッシュを読まない。取得に失敗したら
+//! 直前の表示を残す（fail-soft）。
 
 use std::path::Path;
 use std::time::Duration;
@@ -34,18 +36,18 @@ pub async fn run(commands: AiUsageCommands, events: mpsc::Sender<Event>) {
     }
 }
 
-/// `ai-usage --json` の出力でキャッシュを置き換える。JSON として読めない出力では置き換えない
-/// （usage-gate が壊れたキャッシュを読んで止まるのを防ぐ）。
-async fn refresh_cache(runner: &mut Runner, command: &str, cache_file: &Path) {
+/// `ai-usage --json` の出力でキャッシュを置き換える。置き換えたら true。JSON として読めない
+/// 出力では置き換えない（statusline が壊れたキャッシュを読んで表示を失うのを防ぐ）。
+async fn refresh_cache(runner: &mut Runner, command: &str, cache_file: &Path) -> bool {
     let Ok(output) = runner.run(command, TIMEOUT).await else {
-        return;
+        return false;
     };
     if !output.status.success()
         || serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err()
     {
-        return;
+        return false;
     }
-    let _ = write_atomically(cache_file, &output.stdout);
+    write_atomically(cache_file, &output.stdout).is_ok()
 }
 
 async fn render_statusline(runner: &mut Runner, command: &str) -> Option<Vec<Line<'static>>> {
@@ -87,13 +89,13 @@ mod tests {
         std::fs::write(&cache, r#"{"old":true}"#).unwrap();
         let mut runner = Runner::default();
 
-        refresh_cache(&mut runner, "printf 'not json'", &cache).await;
+        assert!(!refresh_cache(&mut runner, "printf 'not json'", &cache).await);
         assert_eq!(std::fs::read_to_string(&cache).unwrap(), r#"{"old":true}"#);
 
-        refresh_cache(&mut runner, r#"printf '{"new":1}'; exit 1"#, &cache).await;
+        assert!(!refresh_cache(&mut runner, r#"printf '{"new":1}'; exit 1"#, &cache).await);
         assert_eq!(std::fs::read_to_string(&cache).unwrap(), r#"{"old":true}"#);
 
-        refresh_cache(&mut runner, r#"printf '{"new":1}'"#, &cache).await;
+        assert!(refresh_cache(&mut runner, r#"printf '{"new":1}'"#, &cache).await);
         assert_eq!(std::fs::read_to_string(&cache).unwrap(), r#"{"new":1}"#);
         // 一時ファイルを残さない。
         let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
@@ -124,6 +126,9 @@ mod tests {
             // statusline はキャッシュを読む。更新後の中身が出ることで順序を確かめる。
             statusline: format!("cat {}", quote(&cache)),
             disk: String::new(),
+            live: String::new(),
+            profile: "Work".to_string(),
+            provider: "claude".to_string(),
             cache_file: cache.clone(),
         };
         let (tx, mut rx) = mpsc::channel(4);

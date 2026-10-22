@@ -222,56 +222,258 @@ pub fn evaluate(observations: &[WindowObservation], threshold: u8, now: i64) -> 
     }
 }
 
+/// 早期再開の証拠にする使用率の下がり幅（ポイント）。
+///
+/// 1 つの枠の中で使用率は下がらない。下がったならリセット（手動リセットを含む）が
+/// あった証拠になる。ただし取得元の違う値（API ヘッダと claude.ai の `/usage`）の比較や、
+/// 反映の遅れを「下がった」と読まないよう、半分以下かつこの幅以上の低下だけを認める。
+pub const RECOVERY_DROP_POINTS: f64 = 10.0;
+
+/// 早期再開の直後にまた止まったとき、その一時停止を「再発」とみなす期間（秒）。
+///
+/// 早期再開した直後に API が同じ枠でまた拒否したなら、再開の根拠にした観測が実際の
+/// 制限と食い違っている（ai-usage が別アカウントを見ている等）。その状態で同じ種類の
+/// 証拠を信じ続けると、解除と拒否を繰り返してキューを失敗で使い切る。
+pub const RELAPSE_SECS: i64 = 15 * 60;
+
+/// ai-usage を `--refresh` で取り直したデータが、取得を始めた時刻より古い可能性の上限（秒）。
+///
+/// `--refresh` は、ほかのプロセスが先に始めた取得が終わるのを待ってその結果を共有する
+/// ことがある（ai-usage 側の仕様）。その取得の開始は、こちらの開始より最大で ai-usage の
+/// ロック待ちの上限ぶん前になり得る。
+pub const LIVE_FRESHNESS_MARGIN_SECS: i64 = 35;
+
+/// 一時停止の根拠になった観測の取得元。
+///
+/// 早期再開の判定で、取得元の違う使用率を比べてよいかを決めるのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseSource {
+    /// claude の stream-json の `rate_limit_event`（API の応答）。
+    Api,
+    /// `ai-usage --json`（claude.ai / chatgpt.com の使用量ページと同じ値）。
+    AiUsage,
+    /// 以前の実行で保存した中断記録（`resume.json` の `retry_after`）。
+    Saved,
+    /// 取得元を記録していない（旧形式の pause file）。
+    Unknown,
+}
+
+impl PauseSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            PauseSource::Api => "api",
+            PauseSource::AiUsage => "ai-usage",
+            PauseSource::Saved => "saved",
+            PauseSource::Unknown => "unknown",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "api" => PauseSource::Api,
+            "ai-usage" => PauseSource::AiUsage,
+            "saved" => PauseSource::Saved,
+            _ => PauseSource::Unknown,
+        }
+    }
+}
+
+/// 一時停止した理由の種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseCause {
+    /// 使用率が閾値に触れた。
+    Threshold,
+    /// リクエストが拒否された（使用率とは別の理由でも起きる）。
+    Rejected,
+    /// 理由を記録していない（旧形式の pause file）。
+    Unknown,
+}
+
+impl PauseCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            PauseCause::Threshold => "threshold",
+            PauseCause::Rejected => "rejected",
+            PauseCause::Unknown => "unknown",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "threshold" => PauseCause::Threshold,
+            "rejected" => PauseCause::Rejected,
+            _ => PauseCause::Unknown,
+        }
+    }
+}
+
 /// 一時停止の状態。pause file に `key=value` の行で保存する。
 ///
 /// 平文にしたのは、以前は tmux モニターのシェルスクリプトもこれを読んでいたため
 /// （1 行 1 キーなら `sed -n 's/^resume_at=//p'` で確実に取り出せる）。今はワーカー・
 /// usage-gate・モニターのすべてが [`read_pause`] で読むが、書式は変えていない。
 /// 値に改行を含めない正規化は [`PauseState::to_text`] が行う。
+///
+/// `resume_at` は「その時刻まで待てば再開できる」という確定値ではなく、根拠の観測から
+/// 見積もった回復時刻にすぎない。利用者は手動リセットで枠を早く戻せるため、ai-usage
+/// 連携がある構成では、モニターが待機中に実データを取り直して回復を確かめ、
+/// [`lift_pause`] で早期に解除する。解除した状態は削除せずに残す（`lifted_at`）。
+/// 削除すると、まだ解除を読んでいないワーカーが「消えても元の時刻まで待つ」で
+/// 取り残され、直後の再発も判定できなくなる。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PauseState {
-    /// 再開してよい時刻（Unix epoch 秒）。
+    /// 再開してよいと見積もった時刻（Unix epoch 秒）。
     pub resume_at: i64,
     /// 停止理由になった枠名。
     pub window: String,
     /// 表示用の理由。
     pub reason: String,
+    /// 書き込みのたびに増える世代（Unix epoch ミリ秒以上の単調増加）。
+    ///
+    /// 待機中のワーカーはこれが変わったら状態全体を読み直す。モニターの早期解除は、
+    /// 判定に使った世代のままのときだけ書く（判定の最中に届いた新しい拒否を消さない）。
+    /// 旧形式の pause file では 0。
+    pub revision: u64,
+    /// この一時停止（途切れずに続いている保留）が始まった時刻。旧形式では 0。
+    pub since: i64,
+    /// 根拠の観測の取得元。
+    pub source: PauseSource,
+    /// 一時停止した理由の種類。
+    pub cause: PauseCause,
+    /// 根拠の観測が行われた時刻の上限（Unix epoch 秒）。旧形式では 0。
+    ///
+    /// 早期解除の証拠は、これより後に取得したデータに限る（一時停止より前の古いデータが
+    /// 「下がった」ように見えるのを防ぐ）。同じ一時停止に新しい観測が届いたら進める。
+    pub observed_at: i64,
+    /// 根拠にした枠の使用率（%）。早期解除の判定で比べる。
+    pub used_percent: Option<f64>,
+    /// 根拠にした枠自身のリセット時刻（猶予を含まない。`resume_at` とは別）。
+    pub window_reset_at: Option<i64>,
+    /// 早期解除の直後に始まった一時停止か（[`RELAPSE_SECS`] 参照）。
+    pub relapse: bool,
+    /// 早期解除した時刻。`Some` なら新しいタスクを止めていない。
+    pub lifted_at: Option<i64>,
+    /// 早期解除の理由（表示用）。
+    pub lift_reason: Option<String>,
 }
 
 impl PauseState {
+    /// 1 つの観測に基づく一時停止。取得元と根拠は [`Self::observed`] /
+    /// [`Self::with_basis`] で足す。
+    pub fn new(resume_at: i64, window: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            resume_at,
+            window: window.into(),
+            reason: reason.into(),
+            revision: 0,
+            since: 0,
+            source: PauseSource::Unknown,
+            cause: PauseCause::Unknown,
+            observed_at: 0,
+            used_percent: None,
+            window_reset_at: None,
+            relapse: false,
+            lifted_at: None,
+            lift_reason: None,
+        }
+    }
+
+    /// 根拠の観測の取得元・理由・観測時刻（の上限）を記録する。
+    pub fn observed(mut self, source: PauseSource, cause: PauseCause, observed_at: i64) -> Self {
+        self.source = source;
+        self.cause = cause;
+        self.observed_at = observed_at;
+        self
+    }
+
+    /// 根拠にした枠の使用率とリセット時刻を記録する。
+    pub fn with_basis(mut self, used_percent: f64, window_reset_at: Option<i64>) -> Self {
+        self.used_percent = Some(used_percent).filter(|v| v.is_finite() && *v >= 0.0);
+        self.window_reset_at = window_reset_at;
+        self
+    }
+
+    /// 早期解除済みか。
+    pub fn is_lifted(&self) -> bool {
+        self.lifted_at.is_some()
+    }
+
+    /// `now` の時点で新しいタスクの開始を止めているか。
+    pub fn blocks(&self, now: i64) -> bool {
+        !self.is_lifted() && self.resume_at > now
+    }
+
     fn to_text(&self) -> String {
-        format!(
-            "resume_at={}\nwindow={}\nreason={}\n",
+        let mut text = format!(
+            "resume_at={}\nwindow={}\nreason={}\nrevision={}\nsince={}\nsource={}\ncause={}\nobserved_at={}\n",
             self.resume_at,
             single_line(&self.window),
-            single_line(&self.reason)
-        )
+            single_line(&self.reason),
+            self.revision,
+            self.since,
+            self.source.as_str(),
+            self.cause.as_str(),
+            self.observed_at,
+        );
+        if let Some(used) = self.used_percent {
+            text.push_str(&format!("used_percent={used}\n"));
+        }
+        if let Some(reset) = self.window_reset_at {
+            text.push_str(&format!("window_reset_at={reset}\n"));
+        }
+        if self.relapse {
+            text.push_str("relapse=1\n");
+        }
+        if let Some(lifted) = self.lifted_at {
+            text.push_str(&format!("lifted_at={lifted}\n"));
+        }
+        if let Some(reason) = &self.lift_reason {
+            text.push_str(&format!("lift_reason={}\n", single_line(reason)));
+        }
+        text
     }
 
     /// `key=value` 行から復元する。`resume_at` が読めなければ壊れているとみなす。
     ///
     /// 負値やゼロは epoch として成立しない。壊れた状態を「期限切れの一時停止」として
     /// 受け入れると即座に続行してしまうため、構文が通っても値を検証する。
+    /// 追加のキーが無い旧形式も読める（世代 0・取得元不明として扱う）。
     fn parse(text: &str) -> Option<Self> {
         let mut resume_at = None;
-        let mut window = String::new();
-        let mut reason = String::new();
+        let mut state = Self::new(0, String::new(), String::new());
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
             match key {
                 "resume_at" => resume_at = value.trim().parse::<i64>().ok().filter(|v| *v > 0),
-                "window" => window = value.to_string(),
-                "reason" => reason = value.to_string(),
+                "window" => state.window = value.to_string(),
+                "reason" => state.reason = value.to_string(),
+                "revision" => state.revision = value.trim().parse().unwrap_or(0),
+                "since" => state.since = value.trim().parse().unwrap_or(0),
+                "source" => state.source = PauseSource::parse(value.trim()),
+                "cause" => state.cause = PauseCause::parse(value.trim()),
+                "observed_at" => state.observed_at = value.trim().parse().unwrap_or(0),
+                "used_percent" => {
+                    state.used_percent = value
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|v| v.is_finite() && *v >= 0.0);
+                }
+                "window_reset_at" => state.window_reset_at = value.trim().parse().ok(),
+                "relapse" => state.relapse = value.trim() == "1",
+                // 解除時刻が読めない解除済みの状態を「解除されていない」へ倒すと、待機中の
+                // ワーカーが元の時刻まで待つだけで済む（解除を誤って作るよりは安全）。
+                "lifted_at" => {
+                    state.lifted_at = value.trim().parse::<i64>().ok().filter(|v| *v > 0)
+                }
+                "lift_reason" => state.lift_reason = Some(value.to_string()),
                 _ => {}
             }
         }
-        Some(Self {
-            resume_at: resume_at?,
-            window,
-            reason,
-        })
+        state.resume_at = resume_at?;
+        Some(state)
     }
 }
 
@@ -389,45 +591,315 @@ pub fn sidecar_lock_path(path: &Path) -> PathBuf {
     parent.join(format!(".{file_name}.lock"))
 }
 
-/// pause file を書く。既存より再開時刻が遅い場合だけ更新する。
+/// [`write_pause`] が pause file に何をしたか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseWrite {
+    /// 新しい一時停止を始めた（一時停止が無い・期限切れ・早期解除済みだった）。
+    /// `relapse` は早期解除の直後の再発か。
+    Started { relapse: bool },
+    /// 同じ一時停止の再開時刻を遅らせた。
+    Extended,
+    /// 再開時刻は変えず、より新しい観測があったことだけを記録した（世代は進む）。
+    Noted,
+    /// 早期解除より前の観測だったので書かなかった（解除を古いデータで取り消さない）。
+    Ignored,
+}
+
+/// pause file を書く。
 ///
 /// 並列ワーカーが同時に書いても壊れないよう、control ロックの下で read-modify-write を
-/// 行い、本体は同一ディレクトリの一時ファイル → `rename` で置き換える。既存の方が遅い
-/// （＝より長く待つ必要がある）場合は上書きしない。戻り値は実際に更新したかどうか。
-pub fn write_pause(pause_file: &Path, state: &PauseState) -> Result<bool> {
+/// 行い、本体は同一ディレクトリの一時ファイル → `rename` で置き換える。
+///
+/// - 同じ一時停止が続いているあいだは、再開時刻の遅い方を残す（早い時刻での上書きは
+///   待つべき時間を縮めてしまう）。再開時刻が変わらなくても、より新しい観測時刻を記録して
+///   世代を進める。こうすると、その観測より前のデータで判定していた早期解除は
+///   [`lift_pause`] の世代の照合で失敗する。
+/// - 同じ一時停止に重なった観測は、早期解除の条件をどの観測の条件より緩くしないように
+///   まとめる（[`merge_basis`] / [`merge_source`]）。再開時刻の遅い方の観測で根拠を置き換えると、
+///   例えば ai-usage の 100% で止まった後に API が 42% で拒否した場合、比較の元が 100% のまま
+///   残り、42% のままでも「100% から下がった」と誤って解除する。
+/// - 早期解除済みの状態に届いた観測は、解除と同じ秒かそれより前のもの
+///   （`observed_at <= lifted_at`）なら書かない。解除より後なら新しい一時停止として書き、
+///   [`RELAPSE_SECS`] 以内なら再発の印を付ける。再開時刻の大小は問わない（解除済みの状態は
+///   何も止めていない）。
+pub fn write_pause(pause_file: &Path, state: &PauseState) -> Result<PauseWrite> {
     with_control_lock(&pause_lock_path(pause_file), || {
+        let now = now_epoch();
         // 壊れた既存ファイルは上書きしてよい（一時停止は再取得できる揮発状態であり、
         // state.json のような失うと困る履歴ではない）。
-        if let Ok(Some(existing)) = read_pause(pause_file)
-            && existing.resume_at >= state.resume_at
-        {
-            return Ok(false);
-        }
-        let body = state.to_text();
-        let parent = pause_file.parent().unwrap_or_else(|| Path::new("."));
-        let tmp = parent.join(format!(
-            ".{}.tmp.{}",
-            pause_file
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "pause".to_string()),
-            std::process::id()
-        ));
-        let write_result = (|| -> Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(body.as_bytes())?;
-            f.sync_all()?;
-            Ok(())
-        })();
-        if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e).with_context(|| format!("failed to write {}", tmp.display()));
-        }
-        std::fs::rename(&tmp, pause_file).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })?;
-        Ok(true)
+        let existing = read_pause(pause_file).ok().flatten();
+        let mut next = state.clone();
+        next.lifted_at = None;
+        next.lift_reason = None;
+        let outcome = match &existing {
+            Some(current) if current.is_lifted() => {
+                let lifted_at = current.lifted_at.unwrap_or(0);
+                // 時刻は秒単位なので、解除と同じ秒の観測は前後を決められない。解除より前に
+                // 作った観測が解除の後に届いたものなら、それを再発として書くと（API 由来なら）
+                // 以後の早期解除ができず、手動リセットしても元の時刻まで待つ。逆に解除の直後の
+                // 本物の拒否を 1 回読み落としても、続くリクエストの拒否で次の秒に書かれる
+                // （解除の後に始まるタスクは、再開前の再検証を経るので同じ秒には届かない）。
+                // 取り返しのつかない前者を避け、同じ秒は解除より前の観測として扱う。
+                if state.observed_at <= lifted_at {
+                    return Ok(PauseWrite::Ignored);
+                }
+                // 元の枠がまだリセットされていない（見積もった再開時刻の前）うちに止まり
+                // 直したなら、早期解除の根拠が実際の制限と食い違っていた。
+                next.relapse = current.resume_at > now && now - lifted_at < RELAPSE_SECS;
+                next.since = now;
+                PauseWrite::Started {
+                    relapse: next.relapse,
+                }
+            }
+            Some(current) if current.resume_at > now => {
+                next = merge_pauses(current, state);
+                next.lifted_at = None;
+                next.lift_reason = None;
+                next.since = current.since;
+                if state.resume_at > current.resume_at {
+                    PauseWrite::Extended
+                } else {
+                    PauseWrite::Noted
+                }
+            }
+            _ => {
+                next.since = now;
+                next.relapse = false;
+                PauseWrite::Started { relapse: false }
+            }
+        };
+        next.revision = next_revision(existing.as_ref());
+        write_pause_file(pause_file, &next)?;
+        Ok(outcome)
     })
+}
+
+/// 同じ枠を止めている 2 つの一時停止（観測）を 1 つにまとめる。
+///
+/// 再開時刻・枠名・理由・リセット時刻は再開時刻の遅い方（同じなら `a`）に合わせる。観測時刻は
+/// 新しい方、早期解除の条件はどちらの条件より緩くならないように（[`merge_basis`] /
+/// [`merge_source`]）、再発の印はどちらかに付いていれば残す。[`write_pause`] が同じ一時停止に
+/// 届いた観測を重ねるときと、実行開始時に実データの閾値超過と保存した拒否の記録を重ねる
+/// ときに使う。世代・開始時刻・解除の記録は呼び出し側が決める。
+pub fn merge_pauses(a: &PauseState, b: &PauseState) -> PauseState {
+    let mut merged = if b.resume_at > a.resume_at {
+        b.clone()
+    } else {
+        a.clone()
+    };
+    merged.observed_at = a.observed_at.max(b.observed_at);
+    merged.used_percent = merge_basis(a.used_percent, b.used_percent);
+    merged.source = merge_source(a.source, b.source);
+    merged.relapse = a.relapse || b.relapse;
+    merged
+}
+
+/// 同じ一時停止に重なった観測の、根拠の使用率をまとめる。
+///
+/// 回復とみなす条件（[`check_recovery`]）は根拠が低いほど厳しい（大きな下がり幅が要る）ので、
+/// 低い方を採る。拒否は使用率と別の理由でも起きる（42% で拒否された例がある）ため、拒否した
+/// ときの低い使用率を、先に記録した高い使用率で上書きしてはいけない。どちらかが不明なら
+/// 不明にする（比べる元が無い一時停止は早期解除しない）。
+pub fn merge_basis(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    Some(a?.min(b?))
+}
+
+/// 同じ一時停止に重なった観測の取得元をまとめる。
+///
+/// どれも ai-usage のときだけ ai-usage とする。API や保存した記録の観測が混じった一時停止を
+/// ai-usage 由来として扱うと、API が拒否した再発（`relapse`）の後に ai-usage の観測が重なった
+/// だけで、取得元の違う証拠で解除しない再発ガード（[`check_recovery`]）が外れる。
+pub fn merge_source(a: PauseSource, b: PauseSource) -> PauseSource {
+    match (a, b) {
+        (PauseSource::AiUsage, PauseSource::AiUsage) => PauseSource::AiUsage,
+        (PauseSource::Api, _) | (_, PauseSource::Api) => PauseSource::Api,
+        (PauseSource::AiUsage, other) | (other, PauseSource::AiUsage) => other,
+        (first, _) => first,
+    }
+}
+
+/// 一時停止を早期解除する（手動リセット等で枠が回復したことを確かめたとき）。
+///
+/// 判定に使った世代（`expected_revision`）のままで、解除済みでも期限切れでもないときだけ
+/// 書く。判定の最中に新しい拒否が記録されていたら世代が進んでいるので、解除しない。
+/// 解除した状態は削除せずに残す（[`PauseState`] 参照）。待機中のワーカーは毎秒これを読み、
+/// 再開前の再検証を経て次のタスクへ進む。
+///
+/// ロックは `lock_timeout` までしか待たない（モニターの描画と Ctrl-C の受け付けを
+/// 止めないため）。取れなければ解除せず `false` を返す（待ち続けるだけで安全側）。
+pub fn lift_pause(
+    pause_file: &Path,
+    expected_revision: u64,
+    reason: &str,
+    lock_timeout: std::time::Duration,
+) -> Result<bool> {
+    let Some(_guard) = FileLock::acquire_within(&pause_lock_path(pause_file), lock_timeout) else {
+        return Ok(false);
+    };
+    let now = now_epoch();
+    let Some(current) = read_pause(pause_file)? else {
+        return Ok(false);
+    };
+    if current.revision != expected_revision || !current.blocks(now) {
+        return Ok(false);
+    }
+    let mut next = current.clone();
+    next.lifted_at = Some(now);
+    next.lift_reason = Some(reason.to_string());
+    next.revision = next_revision(Some(&current));
+    write_pause_file(pause_file, &next)?;
+    Ok(true)
+}
+
+/// 次の世代。直前の世代より大きく、かつ現在時刻（ミリ秒）以上にする。
+///
+/// ファイルを消してから作り直した場合でも、以前の世代と同じ値にならないようにする
+/// （待機中のワーカーは世代が変わったかどうかで読み直しを決めるため）。
+fn next_revision(previous: Option<&PauseState>) -> u64 {
+    let now_millis = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    previous
+        .map(|p| p.revision.saturating_add(1))
+        .unwrap_or(0)
+        .max(now_millis)
+}
+
+/// pause file 本体を同一ディレクトリの一時ファイル → `rename` で置き換える。
+/// 呼び出し側で control ロックを取っていること。
+fn write_pause_file(pause_file: &Path, state: &PauseState) -> Result<()> {
+    let body = state.to_text();
+    let parent = pause_file.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        pause_file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "pause".to_string()),
+        std::process::id()
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("failed to write {}", tmp.display()));
+    }
+    std::fs::rename(&tmp, pause_file).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(())
+}
+
+/// 待機中に取り直した、1 アカウントの実データ。
+#[derive(Debug, Clone)]
+pub struct LiveObservation {
+    /// 使用率が数値として読めた枠（読めない枠は含めない）。
+    pub windows: Vec<WindowObservation>,
+    /// データが取得された時刻の下限（Unix epoch 秒）。取得開始から
+    /// [`LIVE_FRESHNESS_MARGIN_SECS`] を引いた値。
+    pub observed_from: i64,
+    /// ai-usage の共有キャッシュを通さずに取り直したか（`--refresh`）。古い ai-usage で
+    /// `--refresh` が使えずに通常の取得へ落ちた場合は false で、早期解除の証拠にしない。
+    pub fresh: bool,
+}
+
+/// 早期解除の判定結果。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Recovery {
+    /// 一時停止の根拠になった枠が回復した（値は表示用の説明）。
+    Recovered(String),
+    /// まだ回復していない、または回復と言い切れるほど下がっていない。
+    NotYet(String),
+    /// このデータでは判定できない（古い・取得元を比べられない・枠が無い等）。
+    Undecidable(String),
+}
+
+/// 待機中に取り直した実データで、一時停止の根拠が解消したかを判定する。
+///
+/// 回復とみなすのは、次をすべて満たすときだけ。
+///
+/// - 一時停止がまだ効いている（解除済み・期限切れではない）
+/// - `--refresh` で取り直したデータで、一時停止の観測より後に取得された
+///   （一時停止より前の古いデータが「下がった」ように見えるのを防ぐ）
+/// - 一時停止に根拠の使用率が記録されていて、同じ枠の値が取れている
+/// - 取ったデータのどの枠も閾値未満（[`evaluate`] が `Proceed`）
+/// - 根拠の枠の使用率が、記録時の半分以下、かつ [`RECOVERY_DROP_POINTS`] 以上下がった
+///
+/// 下がり幅で判定するのは、閾値を下回っただけでは回復と言えないため。拒否は使用率と
+/// 別の理由でも起きる（実データでは 5 時間枠が 42% でも拒否された）し、取得元の違う
+/// 値（API ヘッダと claude.ai の `/usage`）は丸めや反映の遅れでずれる。リセットされた枠は
+/// 0% 近くまで下がるので、半分以下という大きな改善は反映の遅れでは説明できない。
+///
+/// 早期解除の直後に API が再び拒否した一時停止（`relapse`）では、取得元の違う証拠を
+/// 使わない。ai-usage が実際に動かしているのと別のアカウントを見ている構成では、
+/// 解除と拒否を繰り返してキューを失敗で使い切るため。ai-usage 自身が書いた一時停止なら
+/// 同じ取得元どうしの比較なので、再発でも判定する。
+pub fn check_recovery(
+    pause: &PauseState,
+    live: &LiveObservation,
+    threshold: u8,
+    now: i64,
+) -> Recovery {
+    if !pause.blocks(now) {
+        return Recovery::Undecidable("no pause in effect".to_string());
+    }
+    if !live.fresh {
+        return Recovery::Undecidable(
+            "the usage may come from the ai-usage cache (--refresh unavailable)".to_string(),
+        );
+    }
+    if live.observed_from < pause.observed_at {
+        return Recovery::Undecidable("the usage may predate the pause".to_string());
+    }
+    let Some(basis) = pause.used_percent else {
+        return Recovery::Undecidable("the pause has no recorded usage".to_string());
+    };
+    if pause.relapse && pause.source != PauseSource::AiUsage {
+        return Recovery::Undecidable(
+            "the API rejected requests again right after an early resume".to_string(),
+        );
+    }
+    let Some(window) = live
+        .windows
+        .iter()
+        .find(|w| same_window(&w.label, &pause.window))
+    else {
+        return Recovery::Undecidable(format!("no usage for the {} window", pause.window));
+    };
+    if !window.used_percent.is_finite() || window.used_percent < 0.0 {
+        return Recovery::Undecidable(format!("no usage for the {} window", pause.window));
+    }
+    if evaluate(&live.windows, threshold, now) != Decision::Proceed {
+        return Recovery::NotYet(format!(
+            "{} at {:.0}% (a window is still at or over {}%)",
+            pause.window, window.used_percent, threshold
+        ));
+    }
+    if window.used_percent <= basis / 2.0 && basis - window.used_percent >= RECOVERY_DROP_POINTS {
+        Recovery::Recovered(format!(
+            "{} dropped from {:.0}% to {:.0}%",
+            pause.window, basis, window.used_percent
+        ))
+    } else {
+        Recovery::NotYet(format!(
+            "{} at {:.0}% (was {:.0}% when paused)",
+            pause.window, window.used_percent, basis
+        ))
+    }
+}
+
+/// 枠名が同じ枠を指すか。7 日枠は API では `seven_day`、ai-usage のスロット名では
+/// `weekly` と呼ばれる。
+fn same_window(a: &str, b: &str) -> bool {
+    fn normalize(label: &str) -> &str {
+        match label {
+            "seven_day" => "weekly",
+            other => other,
+        }
+    }
+    normalize(a) == normalize(b)
 }
 
 /// stop file を冪等に作成する（恒久停止シグナル）。
@@ -487,8 +959,10 @@ pub fn now_epoch() -> i64 {
 enum GateOutcome {
     /// 停止シグナルが無く、そのまま進んでよい。
     Proceed,
-    /// 一時停止を抜けた直後。値は今回の再開時刻で、延長後の再検証に使う。
-    Resumed(i64),
+    /// 一時停止を抜けた直後。値は抜けたときの pause file の (世代, 見積もった再開時刻) で、
+    /// 延長・再停止の後にもう一度再検証するかを決めるのに使う。再開時刻も含めるのは、
+    /// 世代を持たない旧形式（世代 0）の書き込みが続いた場合も別の一時停止と見分けるため。
+    Resumed((u64, i64)),
     /// 恒久停止。ワーカーはループを抜ける。
     Stop,
 }
@@ -551,17 +1025,20 @@ pub async fn run_gate_claim(
         return Ok(ClaimOutcome::Empty);
     }
     let pause_file = pause_path_for(stop_file);
-    let mut revalidated_resume_at = None;
+    let mut revalidated = None;
+    // 再検証のコマンドがある（ai-usage 連携が有効な）構成では、モニターが待機中に実データを
+    // 取り直し、手動リセット等で枠が戻れば一時停止を早期解除する。
+    let recovery_checked = revalidate.is_some();
 
     loop {
-        match wait_for_gate(stop_file, &pause_file, deadline_epoch).await? {
+        match wait_for_gate(stop_file, &pause_file, deadline_epoch, recovery_checked).await? {
             GateOutcome::Stop => return Ok(ClaimOutcome::Stopped),
             GateOutcome::Proceed => {}
-            GateOutcome::Resumed(resume_at) => {
+            GateOutcome::Resumed(pause) => {
                 // 一時停止を抜けた直後だけ、実データで裏を取ってから開始する。
-                // 再検証が一時停止を延長した場合は、次の再開時刻にも確認する。
-                if let Some(cmd) = revalidate.filter(|_| revalidated_resume_at != Some(resume_at)) {
-                    revalidated_resume_at = Some(resume_at);
+                // 再検証が一時停止を延長・再開した場合は、次に抜けたときにも確認する。
+                if let Some(cmd) = revalidate.filter(|_| revalidated != Some(pause)) {
+                    revalidated = Some(pause);
                     if !run_revalidation(cmd, stop_file) {
                         return Ok(ClaimOutcome::Stopped);
                     }
@@ -586,8 +1063,8 @@ pub async fn run_gate_claim(
                 return Ok(None);
             }
             match read_pause(&pause_file) {
-                // 一時停止が再び未来を指しているなら claim せず待ち直す。
-                Ok(Some(state)) if state.resume_at > now_epoch() => return Ok(None),
+                // 一時停止が再び効いているなら claim せず待ち直す（早期解除済みは止めない）。
+                Ok(Some(state)) if state.blocks(now_epoch()) => return Ok(None),
                 Ok(_) => {}
                 Err(_) => return Ok(None),
             }
@@ -722,10 +1199,15 @@ fn run_revalidation(cmd: &str, stop_file: &Path) -> bool {
 }
 
 /// 停止・一時停止の判定と待機。claim はしない。
+///
+/// `recovery_checked` は、待機中にモニターが実データを取り直して早期解除する構成か
+/// （ai-usage 連携あり）。その場合は見積もった再開時刻がデッドラインを越えても、
+/// 手動リセットで枠が戻る可能性があるので、デッドラインまで待つ。
 async fn wait_for_gate(
     stop_file: &Path,
     pause_file: &Path,
     deadline_epoch: Option<i64>,
+    recovery_checked: bool,
 ) -> Result<GateOutcome> {
     if signal_present(stop_file) {
         return Ok(GateOutcome::Stop);
@@ -737,6 +1219,16 @@ async fn wait_for_gate(
         return Ok(stop_for_deadline(stop_file, "deadline reached"));
     }
     let mut state = match read_pause_for_gate(pause_file, stop_file) {
+        // 早期解除済みの一時停止は何も止めていない。待っていたワーカーではないので、
+        // 再開前の再検証もしない（解除はモニターが実データで確かめた結果）。元の見積もり
+        // 時刻を過ぎていれば片付ける（解除後のワーカーは Resumed の経路を通らないので、
+        // ここで消さないと期限切れの記録が残り続ける）。
+        Ok(Some(state)) if state.is_lifted() => {
+            if state.resume_at <= now_epoch() {
+                clear_expired_pause(pause_file);
+            }
+            return Ok(GateOutcome::Proceed);
+        }
         Ok(Some(state)) => state,
         Ok(None) => return Ok(GateOutcome::Proceed),
         Err(outcome) => return Ok(outcome),
@@ -754,21 +1246,35 @@ async fn wait_for_gate(
                 "deadline reached while paused",
             ));
         }
-        // 延長は再開時刻を待たず、毎周回確認する。期限越えをすぐ検出し、
-        // 残り時間と停止理由も延長後の観測に揃える。削除されても元の時刻までは待つ。
+        // 書き換わっていたら状態全体を読み直す。延長だけでなく、早期解除・解除後の
+        // 再停止・より早い再開時刻への変化も拾うため（遅い再開時刻だけを採ると、解除しても
+        // 元の時刻まで待ち続ける）。世代だけで比べないのは、世代を持たない旧形式（世代 0）の
+        // 書き込みが続いた場合も取りこぼさないため。期限越えもすぐ検出し、残り時間と
+        // 停止理由も最新の観測に揃える。削除されても元の時刻までは待つ。
         match read_pause_for_gate(pause_file, stop_file) {
-            Ok(Some(latest)) if latest.resume_at > state.resume_at => {
+            Ok(Some(latest)) if latest != state => {
                 state = latest;
             }
             Ok(_) => {}
             Err(outcome) => return Ok(outcome),
         }
-        if now >= state.resume_at {
-            return Ok(GateOutcome::Resumed(state.resume_at));
+        if state.is_lifted() {
+            eprintln!(
+                "\x1b[32m  \u{25b6} {} の枠の回復を確認したため再開します（{}）\x1b[0m",
+                state.window,
+                state.lift_reason.as_deref().unwrap_or("usage recovered")
+            );
+            return Ok(GateOutcome::Resumed((state.revision, state.resume_at)));
         }
-        // 待ってもデッドラインを越えるなら、待つ意味が無いので恒久停止にする。
+        if now >= state.resume_at {
+            return Ok(GateOutcome::Resumed((state.revision, state.resume_at)));
+        }
+        // 待ってもデッドラインを越えるなら、待つ意味が無いので恒久停止にする。ただし
+        // 実データで回復を確かめる構成では、手動リセットで戻ればまだ進められるので、
+        // デッドラインまで待つ（到達したら上の検査で止まる）。
         if let Some(deadline) = deadline_epoch
             && state.resume_at >= deadline
+            && !recovery_checked
         {
             eprintln!(
                 "\x1b[31m  \u{26d4} 一時停止の再開時刻がデッドラインを越えるため停止します（{}）\x1b[0m",
@@ -781,8 +1287,13 @@ async fn wait_for_gate(
         }
         if now - last_progress >= GATE_PROGRESS_INTERVAL_SECS {
             last_progress = now;
+            let early = if recovery_checked {
+                "。リセットされれば早めに再開"
+            } else {
+                ""
+            };
             eprintln!(
-                "\x1b[33m  \u{23f8} {} の枠がリセットされるまで待機中（残り {}）\x1b[0m",
+                "\x1b[33m  \u{23f8} {} の枠がリセットされるまで待機中（残り {}{early}）\x1b[0m",
                 state.window,
                 format_remaining(state.resume_at - now)
             );
@@ -917,14 +1428,10 @@ mod tests {
         let now = now_epoch();
         write_pause(
             &pause,
-            &PauseState {
-                resume_at: now + 300,
-                window: "five_hour".into(),
-                reason: "five_hour 90% >= threshold 90%".into(),
-            },
+            &PauseState::new(now + 300, "five_hour", "five_hour 90% >= threshold 90%"),
         )
         .unwrap();
-        let gate = wait_for_gate(&stop, &pause, Some(now + 600));
+        let gate = wait_for_gate(&stop, &pause, Some(now + 600), false);
         tokio::pin!(gate);
         // 最初の待機に入るまでポーリングし、経過時間に頼らず別ワーカーの延長を再現する。
         tokio::select! {
@@ -934,15 +1441,7 @@ mod tests {
         }
 
         let reason = "request rejected (daily); daily at 42%";
-        write_pause(
-            &pause,
-            &PauseState {
-                resume_at: now + 900,
-                window: "daily".into(),
-                reason: reason.into(),
-            },
-        )
-        .unwrap();
+        write_pause(&pause, &PauseState::new(now + 900, "daily", reason)).unwrap();
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), gate)
             .await
             .expect("元の再開時刻まで待たず、延長を検出して停止する")
@@ -960,14 +1459,10 @@ mod tests {
         let pause = pause_path_for(&stop);
         write_pause(
             &pause,
-            &PauseState {
-                resume_at: now_epoch() + 300,
-                window: "five_hour".into(),
-                reason: "waiting for reset".into(),
-            },
+            &PauseState::new(now_epoch() + 300, "five_hour", "waiting for reset"),
         )
         .unwrap();
-        let gate = wait_for_gate(&stop, &pause, None);
+        let gate = wait_for_gate(&stop, &pause, None, false);
         tokio::pin!(gate);
         tokio::select! {
             biased;
@@ -1110,33 +1605,499 @@ mod tests {
     fn write_and_read_pause_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("stop-pause.json");
-        let state = PauseState {
-            resume_at: NOW + 600,
-            window: "five_hour".to_string(),
-            reason: "five_hour 90% >= threshold 90%".to_string(),
-        };
-        assert!(write_pause(&path, &state).unwrap());
-        assert_eq!(read_pause(&path).unwrap(), Some(state));
+        let now = now_epoch();
+        let state = PauseState::new(now + 600, "five_hour", "five_hour 90% >= threshold 90%")
+            .observed(PauseSource::Api, PauseCause::Threshold, now)
+            .with_basis(90.0, Some(now + 570));
+        assert_eq!(
+            write_pause(&path, &state).unwrap(),
+            PauseWrite::Started { relapse: false }
+        );
+        let read = read_pause(&path).unwrap().unwrap();
+        // 世代と開始時刻は書き手（write_pause）が決める。それ以外は書いたとおりに読める。
+        assert!(read.revision > 0);
+        assert!(read.since >= now);
+        assert_eq!(
+            read,
+            PauseState {
+                revision: read.revision,
+                since: read.since,
+                ..state
+            }
+        );
+    }
+
+    #[test]
+    fn pause_text_keeps_lift_and_relapse_marks() {
+        let mut state = PauseState::new(NOW + 600, "five_hour", "request rejected (five_hour)")
+            .observed(PauseSource::AiUsage, PauseCause::Rejected, NOW)
+            .with_basis(100.0, None);
+        state.revision = 7;
+        state.since = NOW - 5;
+        state.relapse = true;
+        state.lifted_at = Some(NOW + 10);
+        state.lift_reason = Some("five_hour dropped\nfrom 100% to 0%".to_string());
+        let read = PauseState::parse(&state.to_text()).unwrap();
+        // 値の改行は 1 行に畳む（1 行 1 キーの書式を保つ）。
+        assert_eq!(
+            read.lift_reason.as_deref(),
+            Some("five_hour dropped from 100% to 0%")
+        );
+        assert_eq!(
+            read,
+            PauseState {
+                lift_reason: read.lift_reason.clone(),
+                ..state
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_pause_files_are_still_readable() {
+        // 以前の版が書いた 3 キーだけの pause file。世代 0・取得元不明として読む。
+        let read =
+            PauseState::parse("resume_at=1788480600\nwindow=five_hour\nreason=old\n").unwrap();
+        assert_eq!(read.resume_at, 1_788_480_600);
+        assert_eq!(read.revision, 0);
+        assert_eq!(read.source, PauseSource::Unknown);
+        assert_eq!(read.used_percent, None);
+        assert!(!read.is_lifted());
     }
 
     #[test]
     fn write_pause_keeps_the_later_resume_time() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("stop-pause.json");
-        let late = PauseState {
-            resume_at: NOW + 1200,
-            window: "five_hour".to_string(),
-            reason: "late".to_string(),
-        };
-        let early = PauseState {
-            resume_at: NOW + 600,
-            window: "five_hour".to_string(),
-            reason: "early".to_string(),
-        };
-        assert!(write_pause(&path, &late).unwrap());
+        let now = now_epoch();
+        let late = PauseState::new(now + 1200, "five_hour", "late").observed(
+            PauseSource::Api,
+            PauseCause::Threshold,
+            now,
+        );
+        let early = PauseState::new(now + 600, "five_hour", "early").observed(
+            PauseSource::Api,
+            PauseCause::Rejected,
+            now + 5,
+        );
+        write_pause(&path, &late).unwrap();
+        let first = read_pause(&path).unwrap().unwrap();
         // 早い再開時刻での上書きは、待つべき時間を短縮してしまうので拒否する。
-        assert!(!write_pause(&path, &early).unwrap());
-        assert_eq!(read_pause(&path).unwrap().unwrap().resume_at, NOW + 1200);
+        assert_eq!(write_pause(&path, &early).unwrap(), PauseWrite::Noted);
+        let second = read_pause(&path).unwrap().unwrap();
+        assert_eq!(second.resume_at, now + 1200);
+        assert_eq!(second.reason, "late");
+        // ただし新しい観測があったことは記録し、世代を進める（その観測より前のデータで
+        // 判定した早期解除を通さないため）。
+        assert_eq!(second.observed_at, now + 5);
+        assert!(second.revision > first.revision);
+        assert_eq!(second.since, first.since);
+    }
+
+    #[test]
+    fn write_pause_extends_within_the_same_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("stop-pause.json");
+        let now = now_epoch();
+        write_pause(&path, &PauseState::new(now + 600, "five_hour", "first")).unwrap();
+        let first = read_pause(&path).unwrap().unwrap();
+        assert_eq!(
+            write_pause(&path, &PauseState::new(now + 900, "five_hour", "later")).unwrap(),
+            PauseWrite::Extended
+        );
+        let second = read_pause(&path).unwrap().unwrap();
+        assert_eq!(second.resume_at, now + 900);
+        assert_eq!(second.reason, "later");
+        assert_eq!(second.since, first.since, "延長は同じ一時停止の続き");
+    }
+
+    /// 早期解除済みの pause file を作る。
+    fn lifted_pause(path: &Path, resume_at: i64, observed_at: i64) -> PauseState {
+        write_pause(
+            path,
+            &PauseState::new(resume_at, "five_hour", "five_hour 100% >= threshold 95%")
+                .observed(PauseSource::Api, PauseCause::Threshold, observed_at)
+                .with_basis(100.0, Some(resume_at - RESET_PROPAGATION_GRACE_SECS)),
+        )
+        .unwrap();
+        let state = read_pause(path).unwrap().unwrap();
+        assert!(
+            lift_pause(
+                path,
+                state.revision,
+                "reset",
+                std::time::Duration::from_secs(1)
+            )
+            .unwrap()
+        );
+        read_pause(path).unwrap().unwrap()
+    }
+
+    #[test]
+    fn lift_pause_marks_the_pause_lifted_without_deleting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("stop-pause.json");
+        let now = now_epoch();
+        let lifted = lifted_pause(&path, now + 3600, now - 10);
+        assert!(lifted.is_lifted());
+        assert!(!lifted.blocks(now), "解除済みは新しいタスクを止めない");
+        assert_eq!(lifted.resume_at, now + 3600, "元の見積もりは残す");
+        assert_eq!(lifted.lift_reason.as_deref(), Some("reset"));
+        // 二重の解除はしない。
+        assert!(
+            !lift_pause(
+                &path,
+                lifted.revision,
+                "again",
+                std::time::Duration::from_secs(1)
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn lift_pause_refuses_when_the_pause_changed_since_the_check() {
+        // 判定に使った世代のまま、という条件が無いと、取得中に届いた新しい拒否を
+        // 古いデータの判定で消してしまう。
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("stop-pause.json");
+        let now = now_epoch();
+        write_pause(&path, &PauseState::new(now + 600, "five_hour", "first")).unwrap();
+        let checked = read_pause(&path).unwrap().unwrap();
+        write_pause(
+            &path,
+            &PauseState::new(now + 600, "five_hour", "rejected again").observed(
+                PauseSource::Api,
+                PauseCause::Rejected,
+                now + 1,
+            ),
+        )
+        .unwrap();
+        assert!(
+            !lift_pause(
+                &path,
+                checked.revision,
+                "reset",
+                std::time::Duration::from_secs(1)
+            )
+            .unwrap()
+        );
+        assert!(read_pause(&path).unwrap().unwrap().blocks(now));
+        // 期限切れの一時停止も解除しない（もう何も止めていない）。
+        let mut expired = read_pause(&path).unwrap().unwrap();
+        expired.resume_at = now - 1;
+        write_pause_file(&path, &expired).unwrap();
+        assert!(
+            !lift_pause(
+                &path,
+                expired.revision,
+                "reset",
+                std::time::Duration::from_secs(1)
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn write_pause_ignores_observations_older_than_the_lift() {
+        // 解除の前に取得した古い使用率で、解除を取り消さない。
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("stop-pause.json");
+        let now = now_epoch();
+        let lifted = lifted_pause(&path, now + 3600, now - 100);
+        let stale = PauseState::new(now + 3600, "five_hour", "stale").observed(
+            PauseSource::AiUsage,
+            PauseCause::Threshold,
+            lifted.lifted_at.unwrap() - 1,
+        );
+        assert_eq!(write_pause(&path, &stale).unwrap(), PauseWrite::Ignored);
+        assert_eq!(read_pause(&path).unwrap().unwrap(), lifted);
+    }
+
+    #[test]
+    fn write_pause_after_an_early_lift_starts_a_relapse() {
+        // 解除の直後に API がまた拒否したら、新しい一時停止として書き、再発の印を付ける。
+        // 再開時刻が解除前と同じでも書く（解除済みの状態は何も止めていない）。
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("stop-pause.json");
+        let now = now_epoch();
+        let lifted = lifted_pause(&path, now + 3600, now - 100);
+        let again = PauseState::new(now + 3600, "five_hour", "request rejected (five_hour)")
+            .observed(PauseSource::Api, PauseCause::Rejected, now + 1)
+            .with_basis(100.0, Some(now + 3570));
+        assert_eq!(
+            write_pause(&path, &again).unwrap(),
+            PauseWrite::Started { relapse: true }
+        );
+        let read = read_pause(&path).unwrap().unwrap();
+        assert!(read.blocks(now));
+        assert!(read.relapse);
+        assert!(read.revision > lifted.revision);
+    }
+
+    #[test]
+    fn an_observation_in_the_same_second_as_the_lift_is_ignored() {
+        // 秒単位では解除と同じ秒の観測の前後を決められない。解除より前に作った観測が後から
+        // 届いたものを再発として書くと、早期解除できないまま元の時刻まで待つことになる。
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("stop-pause.json");
+        let now = now_epoch();
+        let lifted = lifted_pause(&path, now + 3600, now - 100);
+        let same_second = PauseState::new(now + 3600, "five_hour", "late arrival")
+            .observed(
+                PauseSource::Api,
+                PauseCause::Rejected,
+                lifted.lifted_at.unwrap(),
+            )
+            .with_basis(100.0, None);
+        assert_eq!(
+            write_pause(&path, &same_second).unwrap(),
+            PauseWrite::Ignored
+        );
+        assert_eq!(read_pause(&path).unwrap().unwrap(), lifted);
+    }
+
+    #[test]
+    fn overlapping_observations_keep_the_strictest_basis() {
+        // ai-usage の 100% で止まった後に、API が 42% で拒否した。比較の元を 100% のまま残すと、
+        // 42% のままでも「100% から下がった」と誤って解除する。低い方（厳しい方）を残す。
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("stop-pause.json");
+        let now = now_epoch();
+        write_pause(
+            &path,
+            &PauseState::new(now + 3600, "five_hour", "usage-gate: five_hour 100%")
+                .observed(PauseSource::AiUsage, PauseCause::Threshold, now - 60)
+                .with_basis(100.0, Some(now + 3570)),
+        )
+        .unwrap();
+        assert_eq!(
+            write_pause(
+                &path,
+                &PauseState::new(now + 3000, "five_hour", "request rejected (five_hour)")
+                    .observed(PauseSource::Api, PauseCause::Rejected, now - 30)
+                    .with_basis(42.0, Some(now + 2970)),
+            )
+            .unwrap(),
+            PauseWrite::Noted
+        );
+        let merged = read_pause(&path).unwrap().unwrap();
+        assert_eq!(merged.resume_at, now + 3600, "待つ時刻は遅い方");
+        assert_eq!(merged.used_percent, Some(42.0), "比較の元は低い方");
+        assert_eq!(
+            merged.source,
+            PauseSource::Api,
+            "API の観測が混じれば API 扱い"
+        );
+
+        let still_42 = live(vec![five_hour(42.0, Some(now + 2970))], now);
+        assert!(matches!(
+            check_recovery(&merged, &still_42, 95, now),
+            Recovery::NotYet(_)
+        ));
+        let reset = live(vec![five_hour(0.0, None)], now);
+        assert!(matches!(
+            check_recovery(&merged, &reset, 95, now),
+            Recovery::Recovered(_)
+        ));
+        // どちらかの根拠が不明なら、比べる元が無いので早期解除しない。
+        assert_eq!(merge_basis(Some(90.0), None), None);
+    }
+
+    #[test]
+    fn an_ai_usage_extension_keeps_the_relapse_guard() {
+        // 早期解除の直後に API がまた拒否した（API 由来の再発）。その後に ai-usage の観測が
+        // より遅い再開時刻で重なっても、取得元の違う証拠で解除しないガードは外さない。
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("stop-pause.json");
+        let now = now_epoch();
+        lifted_pause(&path, now + 3600, now - 100);
+        write_pause(
+            &path,
+            &PauseState::new(now + 3600, "five_hour", "request rejected (five_hour)")
+                .observed(PauseSource::Api, PauseCause::Rejected, now + 1)
+                .with_basis(100.0, Some(now + 3570)),
+        )
+        .unwrap();
+        assert_eq!(
+            write_pause(
+                &path,
+                &PauseState::new(now + 4000, "five_hour", "usage-gate: five_hour 99%")
+                    .observed(PauseSource::AiUsage, PauseCause::Threshold, now + 2)
+                    .with_basis(99.0, Some(now + 3970)),
+            )
+            .unwrap(),
+            PauseWrite::Extended
+        );
+        let merged = read_pause(&path).unwrap().unwrap();
+        assert!(merged.relapse);
+        assert_eq!(merged.source, PauseSource::Api);
+        let observation = live(vec![five_hour(0.0, None)], now + 10);
+        assert!(matches!(
+            check_recovery(&merged, &observation, 95, now),
+            Recovery::Undecidable(_)
+        ));
+    }
+
+    #[test]
+    fn a_pause_after_the_original_reset_is_not_a_relapse() {
+        // 元の枠がリセットされた後に止まり直したのは、新しい枠を使い切っただけ。
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("stop-pause.json");
+        let now = now_epoch();
+        let lifted = lifted_pause(&path, now + 3600, now - 100);
+        // 元の見積もり時刻を過ぎた状態を作る（解除済みの記録は時刻だけ書き換える）。
+        let mut past = lifted.clone();
+        past.resume_at = now - 1;
+        write_pause_file(&path, &past).unwrap();
+        let next = PauseState::new(now + 7200, "five_hour", "new window exhausted").observed(
+            PauseSource::Api,
+            PauseCause::Threshold,
+            now + 1,
+        );
+        assert_eq!(
+            write_pause(&path, &next).unwrap(),
+            PauseWrite::Started { relapse: false }
+        );
+    }
+
+    fn live(windows: Vec<WindowObservation>, observed_from: i64) -> LiveObservation {
+        LiveObservation {
+            windows,
+            observed_from,
+            fresh: true,
+        }
+    }
+
+    fn api_pause(now: i64, used: f64) -> PauseState {
+        let mut pause = PauseState::new(now + 3600, "five_hour", "five_hour >= threshold")
+            .observed(PauseSource::Api, PauseCause::Threshold, now - 60)
+            .with_basis(used, Some(now + 3570));
+        pause.revision = 1;
+        pause
+    }
+
+    #[test]
+    fn a_manual_reset_is_recognized_as_recovery() {
+        // 実際に起きた事故の再現: 5 時間枠が 99% で止まった後、利用者が手動リセットした。
+        // ai-usage では 5 時間枠も週次枠も 0% に戻っている。
+        let now = now_epoch();
+        let pause = api_pause(now, 99.0);
+        let observation = live(
+            vec![five_hour(0.0, None), weekly(0.0, Some(now + 50_000))],
+            now,
+        );
+        assert!(matches!(
+            check_recovery(&pause, &observation, 95, now),
+            Recovery::Recovered(_)
+        ));
+    }
+
+    #[test]
+    fn a_lagging_usage_page_is_not_mistaken_for_a_reset() {
+        // API ヘッダの 99% と、反映の遅れた /usage の 85% の差はリセットの証拠にならない。
+        let now = now_epoch();
+        let pause = api_pause(now, 99.0);
+        let observation = live(vec![five_hour(85.0, Some(now + 3570))], now);
+        assert!(matches!(
+            check_recovery(&pause, &observation, 95, now),
+            Recovery::NotYet(_)
+        ));
+    }
+
+    #[test]
+    fn a_rejection_below_the_threshold_needs_a_real_drop() {
+        // 拒否は使用率と別の理由でも起きる（実データでは 42% で拒否された）。閾値未満と
+        // いうだけでは回復と言えない。0% まで戻れば回復。
+        let now = now_epoch();
+        let mut pause = api_pause(now, 42.0);
+        pause.cause = PauseCause::Rejected;
+        let unchanged = live(vec![five_hour(43.0, Some(now + 3570))], now);
+        assert!(matches!(
+            check_recovery(&pause, &unchanged, 95, now),
+            Recovery::NotYet(_)
+        ));
+        let reset = live(vec![five_hour(0.0, None)], now);
+        assert!(matches!(
+            check_recovery(&pause, &reset, 95, now),
+            Recovery::Recovered(_)
+        ));
+    }
+
+    #[test]
+    fn recovery_needs_every_window_under_the_threshold() {
+        // 5 時間枠だけ戻しても、週次枠が閾値に触れていれば再開しない。
+        let now = now_epoch();
+        let pause = api_pause(now, 99.0);
+        let observation = live(
+            vec![five_hour(0.0, None), weekly(96.0, Some(now + 50_000))],
+            now,
+        );
+        assert!(matches!(
+            check_recovery(&pause, &observation, 95, now),
+            Recovery::NotYet(_)
+        ));
+    }
+
+    #[test]
+    fn recovery_is_undecidable_without_trustworthy_data() {
+        let now = now_epoch();
+        let pause = api_pause(now, 99.0);
+        let reset = vec![five_hour(0.0, None)];
+        // 一時停止より前に取得された可能性があるデータ。
+        let stale = live(reset.clone(), pause.observed_at - 1);
+        assert!(matches!(
+            check_recovery(&pause, &stale, 95, now),
+            Recovery::Undecidable(_)
+        ));
+        // --refresh を使えず、ai-usage のキャッシュを通った可能性があるデータ。
+        let cached = LiveObservation {
+            fresh: false,
+            ..live(reset.clone(), now)
+        };
+        assert!(matches!(
+            check_recovery(&pause, &cached, 95, now),
+            Recovery::Undecidable(_)
+        ));
+        // 根拠の枠のデータが無い（欠損を「余裕あり」とは扱わない）。
+        let missing = live(vec![weekly(0.0, None)], now);
+        assert!(matches!(
+            check_recovery(&pause, &missing, 95, now),
+            Recovery::Undecidable(_)
+        ));
+        // 根拠の使用率を記録していない旧形式の一時停止。
+        let mut legacy = pause.clone();
+        legacy.used_percent = None;
+        assert!(matches!(
+            check_recovery(&legacy, &live(reset.clone(), now), 95, now),
+            Recovery::Undecidable(_)
+        ));
+        // 解除済み・期限切れの一時停止は判定の対象外。
+        let mut lifted = pause.clone();
+        lifted.lifted_at = Some(now);
+        assert!(matches!(
+            check_recovery(&lifted, &live(reset.clone(), now), 95, now),
+            Recovery::Undecidable(_)
+        ));
+    }
+
+    #[test]
+    fn a_relapse_is_not_lifted_by_evidence_from_another_source() {
+        // 早期再開の直後に API がまた拒否した。ai-usage が別アカウントを見ている構成では
+        // ai-usage は 0% のままなので、取得元の違う証拠で解除すると拒否と解除を繰り返す。
+        let now = now_epoch();
+        let mut pause = api_pause(now, 100.0);
+        pause.relapse = true;
+        let observation = live(vec![five_hour(0.0, None)], now);
+        assert!(matches!(
+            check_recovery(&pause, &observation, 95, now),
+            Recovery::Undecidable(_)
+        ));
+        // ai-usage 自身が書いた一時停止なら同じ取得元どうしの比較なので判定する。
+        pause.source = PauseSource::AiUsage;
+        assert!(matches!(
+            check_recovery(&pause, &observation, 95, now),
+            Recovery::Recovered(_)
+        ));
     }
 
     #[test]
@@ -1157,11 +2118,7 @@ mod tests {
     fn pause_at(path: &Path, resume_at: i64) {
         write_pause(
             path,
-            &PauseState {
-                resume_at,
-                window: "five_hour".to_string(),
-                reason: "five_hour 90% >= threshold 90%".to_string(),
-            },
+            &PauseState::new(resume_at, "five_hour", "five_hour 90% >= threshold 90%"),
         )
         .unwrap();
     }
@@ -1472,19 +2429,160 @@ mod tests {
         let stop = tmp.path().join("stop");
         let pause_file = pause_path_for(&stop);
         pause_at(&pause_file, now_epoch() - 60);
-        // 再検証がデッドラインより先の再開時刻を書く = 待っても無駄なので恒久停止になる。
+        // 再検証がデッドラインより先の再開時刻を書く。実データで回復を確かめる構成なので
+        // 手動リセットに備えてデッドラインまで待ち、到達したら claim せずに止まる。
         let cmd = format!(
             "printf 'resume_at=%s\\nwindow=five_hour\\nreason=still over\\n' {} > {}",
             now_epoch() + 3600,
             pause_file.display()
         );
         assert_eq!(
-            run_gate_claim(&stop, &queue, Some(now_epoch() + 600), Some(&cmd))
+            run_gate_claim(&stop, &queue, Some(now_epoch() + 2), Some(&cmd))
                 .await
                 .unwrap(),
             ClaimOutcome::Stopped
         );
         assert!(queue.join("pending-0001").exists(), "claim してはいけない");
+    }
+
+    #[tokio::test]
+    async fn gate_resumes_as_soon_as_the_pause_is_lifted() {
+        // 手動リセットで枠が戻り、モニターが一時停止を早期解除したら、見積もった再開時刻
+        // （ここでは 1 時間後）を待たずに claim する。
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = queue_with(tmp.path(), 1);
+        let stop = tmp.path().join("stop");
+        let pause_file = pause_path_for(&stop);
+        pause_at(&pause_file, now_epoch() + 3600);
+        let revision = read_pause(&pause_file).unwrap().unwrap().revision;
+        let probe = tmp.path().join("revalidated");
+        let cmd = format!("touch {}", probe.display());
+        let gate = run_gate_claim(&stop, &queue, None, Some(&cmd));
+        tokio::pin!(gate);
+        tokio::select! {
+            biased;
+            result = &mut gate => panic!("待機せず終了した: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+
+        assert!(
+            lift_pause(
+                &pause_file,
+                revision,
+                "five_hour dropped from 99% to 0%",
+                std::time::Duration::from_secs(1)
+            )
+            .unwrap()
+        );
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), gate)
+            .await
+            .expect("解除を検出したら待たずに進む")
+            .unwrap();
+        assert_eq!(outcome, ClaimOutcome::Claimed("0001".to_string()));
+        assert!(probe.exists(), "再開前に使用率を確かめ直すべき");
+        // 解除済みの記録は元の見積もり時刻まで残す（再発の判定に使う）。
+        assert!(read_pause(&pause_file).unwrap().unwrap().is_lifted());
+    }
+
+    #[tokio::test]
+    async fn gate_claims_without_waiting_under_a_lifted_pause() {
+        // 解除の後に来たワーカーは待たない。再検証も繰り返さない。
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = queue_with(tmp.path(), 1);
+        let stop = tmp.path().join("stop");
+        let pause_file = pause_path_for(&stop);
+        lifted_pause(&pause_file, now_epoch() + 3600, now_epoch() - 10);
+        let probe = tmp.path().join("revalidated");
+        let cmd = format!("touch {}", probe.display());
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run_gate_claim(&stop, &queue, None, Some(&cmd))
+                .await
+                .unwrap(),
+            ClaimOutcome::Claimed("0001".to_string())
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!probe.exists());
+    }
+
+    #[tokio::test]
+    async fn gate_clears_a_lifted_pause_once_its_original_time_passes() {
+        // 解除済みの記録は元の見積もり時刻まで残し（再発の判定に使う）、過ぎたら片付ける。
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = queue_with(tmp.path(), 2);
+        let stop = tmp.path().join("stop");
+        let pause_file = pause_path_for(&stop);
+        let mut lifted = lifted_pause(&pause_file, now_epoch() + 3600, now_epoch() - 10);
+        assert!(matches!(
+            run_gate_claim(&stop, &queue, None, None).await.unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+        assert!(pause_file.exists(), "見積もり時刻の前は残す");
+
+        lifted.resume_at = now_epoch() - 1;
+        write_pause_file(&pause_file, &lifted).unwrap();
+        assert!(matches!(
+            run_gate_claim(&stop, &queue, None, None).await.unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+        assert!(
+            !pause_file.exists(),
+            "見積もり時刻を過ぎた解除済みの記録は片付ける"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_waits_for_a_relapse_after_an_early_lift() {
+        // 解除の後に再び止まったら（新しい世代）、それに従って待ち直す。
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = queue_with(tmp.path(), 1);
+        let stop = tmp.path().join("stop");
+        let pause_file = pause_path_for(&stop);
+        let now = now_epoch();
+        lifted_pause(&pause_file, now + 3600, now - 10);
+        // 解除より後（次の秒）に届いた拒否。
+        write_pause(
+            &pause_file,
+            &PauseState::new(now + 3600, "five_hour", "request rejected (five_hour)").observed(
+                PauseSource::Api,
+                PauseCause::Rejected,
+                now + 1,
+            ),
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            run_gate_claim(&stop, &queue, None, None),
+        )
+        .await;
+        assert!(result.is_err(), "再停止した一時停止の間は claim しない");
+        assert!(queue.join("pending-0001").exists());
+    }
+
+    #[tokio::test]
+    async fn gate_waits_until_the_deadline_when_recovery_is_checked() {
+        // 見積もった再開時刻がデッドラインを越えても、実データで回復を確かめる構成なら
+        // 手動リセットに備えてデッドラインまで待つ（すぐには止めない）。
+        let tmp = tempfile::tempdir().unwrap();
+        let stop = tmp.path().join("stop");
+        let pause = pause_path_for(&stop);
+        let now = now_epoch();
+        pause_at(&pause, now + 3600);
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_for_gate(&stop, &pause, Some(now + 2), true),
+        )
+        .await
+        .expect("デッドラインで止まる")
+        .unwrap();
+        assert_eq!(outcome, GateOutcome::Stop);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(900),
+            "デッドラインまで待つべき（{:?} で止まった）",
+            started.elapsed()
+        );
+        assert!(stop.exists());
     }
 
     #[tokio::test]
@@ -1513,6 +2611,38 @@ mod tests {
         assert!(probe.exists());
         assert!(stop.exists());
         assert!(queue.join("pending-0001").exists());
+    }
+
+    #[tokio::test]
+    async fn gate_revalidates_each_legacy_pause_written_in_a_row() {
+        // 世代を持たない旧形式（世代 0）の pause file が続けて書かれても、別の一時停止と
+        // して読み直し、抜けるたびに再検証する。世代だけで見分けると、2 回目の延長を
+        // 読み落とすか、抜けた後の再検証を飛ばして claim してしまう。
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = queue_with(tmp.path(), 1);
+        let stop = tmp.path().join("stop");
+        let pause_file = pause_path_for(&stop);
+        let calls = tmp.path().join("calls");
+        pause_at(&pause_file, now_epoch() - 60);
+        // 1 回目と 2 回目は旧形式で延長し、3 回目は何も書かずに通す。
+        let cmd = format!(
+            "echo x >> '{calls}'; n=$(wc -l < '{calls}'); if [ \"$n\" -le 2 ]; then printf 'resume_at=%s\\nwindow=five_hour\\nreason=still over\\n' $(( $(date +%s) + 1 )) > '{pause}'; fi",
+            calls = calls.display(),
+            pause = pause_file.display()
+        );
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            run_gate_claim(&stop, &queue, None, Some(&cmd)),
+        )
+        .await
+        .expect("延長のたびに抜けて再検証し、最後は claim する")
+        .unwrap();
+        assert_eq!(outcome, ClaimOutcome::Claimed("0001".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap().lines().count(),
+            3,
+            "延長された一時停止を抜けるたびに再検証する"
+        );
     }
 
     #[test]

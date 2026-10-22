@@ -19,6 +19,7 @@ use super::controller::{Controller, Finish, Notice, Phase};
 use super::disk::{DiskState, Row, Status, Volume};
 use super::load::{LoadHistory, WINDOW, pressure_from_code};
 use super::manifest::Manifest;
+use super::recovery;
 use super::system::Pressure;
 
 /// 値に添えるラベル（ai-usage の LABEL と同じ番号）。
@@ -66,6 +67,8 @@ pub struct View<'a> {
     pub disk: &'a DiskState,
     /// モニター自身の失敗（stop file を書けなかった等）。畳まずに必ず出す。
     pub alerts: &'a [String],
+    /// 一時停止中の回復の確認（手動リセット等による早期解除）の様子。
+    pub recovery: &'a recovery::Status,
     /// 履歴の時刻の基準（単調時計）。
     pub now: Instant,
 }
@@ -99,9 +102,12 @@ pub fn layout(view: &View, width: usize, height: usize) -> Vec<Line<'static>> {
     room -= alerts.len();
 
     let mut notices: Vec<Line<'static>> = notice_texts(view)
-        .iter()
-        .flat_map(|text| wrap(text, width))
-        .map(Line::from)
+        .into_iter()
+        .flat_map(|(text, style)| {
+            wrap(&text, width)
+                .into_iter()
+                .map(move |line| Line::styled(line, style))
+        })
         .collect();
     notices.truncate(room);
     room -= notices.len();
@@ -780,20 +786,66 @@ fn age(elapsed: Duration) -> String {
     }
 }
 
-/// 通知（または終了時の集計）。ペインが狭ければ単語の区切りで折り返して出す（ai-usage の行の
-/// ように切り捨てると、Ctrl-C の案内が読めなくなる）。
-fn notice_texts(view: &View) -> Vec<String> {
+/// 通知（または終了時の集計）と、その文字の装飾。ペインが狭ければ単語の区切りで折り返して
+/// 出す（ai-usage の行のように切り捨てると、Ctrl-C の案内が読めなくなる）。
+fn notice_texts(view: &View) -> Vec<(String, Style)> {
     let controller = view.controller;
     if let Some(finish) = controller.finished() {
-        vec![
-            finish_line(controller, finish),
-            format!(" 📁 Logs: {}", view.manifest.report_dir.display()),
-        ]
-    } else if let Some(notice) = controller.notice() {
-        vec![notice_line(notice, controller.now())]
-    } else {
-        Vec::new()
+        return vec![
+            (finish_line(controller, finish), Style::new()),
+            (
+                format!(" 📁 Logs: {}", view.manifest.report_dir.display()),
+                Style::new(),
+            ),
+        ];
     }
+    let Some(notice) = controller.notice() else {
+        return Vec::new();
+    };
+    let mut line = notice_line(notice, controller.now());
+    let mut detail = None;
+    if matches!(notice, Notice::Paused { .. }) {
+        let (suffix, note) = recovery_notes(controller, view.recovery);
+        line.push_str(suffix);
+        detail = note;
+    }
+    let mut texts = vec![(line, Style::new())];
+    // 確認の様子は通知の補足なので、ラベルと同じ控えめな色にする。
+    texts.extend(detail.map(|text| (text, Style::new().fg(LABEL))));
+    texts
+}
+
+/// 一時停止中に、回復を確かめていることを伝える補足（通知の末尾に足す）。
+const EARLY_RESUME: &str = ", or earlier if the window is reset";
+
+/// 一時停止中の回復の確認の様子。通知の末尾に足す補足と、その下に添える行を返す。
+///
+/// 回復を確かめていない構成（ai-usage 連携が無い・ai-usage が古い）と、確かめても解除
+/// できない一時停止では、早めに再開するとは案内しない（案内どおりにならないと、手動
+/// リセットしたのに待ち続ける理由が分からなくなる）。解除できない一時停止には理由を添える。
+fn recovery_notes(
+    controller: &Controller,
+    recovery: &recovery::Status,
+) -> (&'static str, Option<String>) {
+    let Some(pause) = controller.pause().filter(|_| recovery.active) else {
+        return ("", None);
+    };
+    if let Some(reason) = pause.not_liftable {
+        return ("", Some(format!("    early resume unavailable: {reason}")));
+    }
+    // 直近の確認の結果は、同じ一時停止についてのものだけ添える。
+    let last = recovery
+        .last
+        .as_ref()
+        .filter(|check| check.since == pause.since)
+        .map(|check| {
+            format!(
+                "    last checked {}: {}",
+                format_clock(check.at, controller.now()),
+                check.detail
+            )
+        });
+    (EARLY_RESUME, last)
 }
 
 /// 空白の位置で `width` に収まるように折り返す。続きの行は 3 桁下げる（先頭の絵文字の後ろに
@@ -830,6 +882,18 @@ pub fn notice_line(notice: &Notice, now: i64) -> String {
             " 💤 Paused: {window} window over threshold — resuming at {}",
             format_clock(*resume_at, now)
         ),
+        Notice::ResumedEarly {
+            window,
+            reason,
+            lifted_at,
+        } => {
+            let at = format_clock(*lifted_at, now);
+            if reason.is_empty() {
+                format!(" ✅ Resumed early: {window} window recovered ({at})")
+            } else {
+                format!(" ✅ Resumed early: {window} window recovered ({reason}, {at})")
+            }
+        }
         Notice::Interrupted => {
             " ⏳ Waiting for current tasks to finish... (Ctrl-C again to force kill)".to_string()
         }
@@ -992,6 +1056,7 @@ mod tests {
             worker_count: 2,
             stop_file: PathBuf::from("/tmp/stop"),
             report_dir: PathBuf::from("/tmp/report"),
+            threshold: 95,
             ai_usage: None,
         }
     }
@@ -1105,6 +1170,7 @@ mod tests {
             load: &load,
             disk: &disk,
             alerts: &[],
+            recovery: &recovery::Status::default(),
             now,
         };
         for width in [60u16, 70, 90] {
@@ -1174,6 +1240,7 @@ mod tests {
             load: &load,
             disk: &disk,
             alerts: &[],
+            recovery: &recovery::Status::default(),
             now,
         };
         let lines = render(&view, 70, 30);
@@ -1203,6 +1270,7 @@ mod tests {
             load: &load,
             disk: &disk,
             alerts: &[],
+            recovery: &recovery::Status::default(),
             now,
         };
         let lines = layout(&view, 90, 30);
@@ -1259,6 +1327,7 @@ mod tests {
             load: &load,
             disk: &disk,
             alerts: &[],
+            recovery: &recovery::Status::default(),
             now,
         };
         let lines = render(&view, 70, 24);
@@ -1291,6 +1360,7 @@ mod tests {
             load: &load,
             disk: &disk,
             alerts: &alerts,
+            recovery: &recovery::Status::default(),
             now,
         };
         let lines = render(&view, 40, 10);
@@ -1316,10 +1386,7 @@ mod tests {
         let mut controller = controller(Counts::default());
         controller.observe(Observation {
             now: NOW,
-            pause: Some(Pause {
-                resume_at: NOW + 3_725,
-                window: "five_hour".into(),
-            }),
+            pause: Some(Pause::new(NOW + 3_725, "five_hour")),
             ..Observation::default()
         });
         assert_eq!(
@@ -1374,6 +1441,143 @@ mod tests {
             finish_line(&stopped, Finish::Stopped),
             " 🛑 Stopped: 5/10 processed (fail:1 retry:0)"
         );
+    }
+
+    /// 一時停止中の通知の行（折り返さない幅で）。
+    fn paused_notices(pause: Pause, recovery: &recovery::Status) -> Vec<String> {
+        let manifest = manifest();
+        let mut controller = controller(Counts::default());
+        controller.observe(Observation {
+            now: NOW,
+            pause: Some(pause),
+            ..Observation::default()
+        });
+        let load = LoadHistory::default();
+        let disk = DiskState::default();
+        let view = View {
+            manifest: &manifest,
+            controller: &controller,
+            usage: &[],
+            load: &load,
+            disk: &disk,
+            alerts: &[],
+            recovery,
+            now: Instant::now(),
+        };
+        notice_texts(&view)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
+    }
+
+    #[test]
+    fn a_pause_says_it_may_resume_early_only_while_recovery_is_checked() {
+        let resume = format_clock(NOW + 3_600, NOW);
+        let pause = Pause {
+            since: NOW - 60,
+            ..Pause::new(NOW + 3_600, "five_hour")
+        };
+        // ai-usage 連携が無い（または ai-usage が古い）構成では、早めの再開を案内しない。
+        assert_eq!(
+            paused_notices(pause.clone(), &recovery::Status::default()),
+            [format!(
+                " 💤 Paused: five_hour window over threshold — resuming at {resume}"
+            )]
+        );
+        // 確かめている構成では案内し、同じ一時停止についての直近の確認を添える。
+        let mut status = recovery::Status::new(true);
+        status.last = Some(recovery::Check {
+            at: NOW,
+            since: NOW - 60,
+            detail: "five_hour at 100% (was 100% when paused)".into(),
+        });
+        assert_eq!(
+            paused_notices(pause.clone(), &status),
+            [
+                format!(
+                    " 💤 Paused: five_hour window over threshold — resuming at {resume}, or earlier if the window is reset"
+                ),
+                format!(
+                    "    last checked {}: five_hour at 100% (was 100% when paused)",
+                    format_clock(NOW, NOW)
+                ),
+            ]
+        );
+        // 別の一時停止についての古い確認は添えない。
+        status.last.as_mut().unwrap().since = NOW - 600;
+        assert_eq!(paused_notices(pause.clone(), &status).len(), 1);
+        // 確かめても解除できない一時停止では案内せず、理由を出す。
+        let unliftable = Pause {
+            not_liftable: Some("the pause has no recorded usage"),
+            ..pause
+        };
+        assert_eq!(
+            paused_notices(unliftable, &status),
+            [
+                format!(" 💤 Paused: five_hour window over threshold — resuming at {resume}"),
+                "    early resume unavailable: the pause has no recorded usage".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_early_resume_is_announced_with_the_reason_and_time() {
+        let notice = Notice::ResumedEarly {
+            window: "five_hour".into(),
+            reason: "five_hour dropped from 100% to 0%".into(),
+            lifted_at: NOW,
+        };
+        assert_eq!(
+            notice_line(&notice, NOW),
+            format!(
+                " ✅ Resumed early: five_hour window recovered (five_hour dropped from 100% to 0%, {})",
+                format_clock(NOW, NOW)
+            )
+        );
+        let without_reason = Notice::ResumedEarly {
+            window: "five_hour".into(),
+            reason: String::new(),
+            lifted_at: NOW,
+        };
+        assert_eq!(
+            notice_line(&without_reason, NOW),
+            format!(
+                " ✅ Resumed early: five_hour window recovered ({})",
+                format_clock(NOW, NOW)
+            )
+        );
+    }
+
+    #[test]
+    fn an_old_ai_usage_is_reported_as_an_alert_in_narrow_panes() {
+        let now = Instant::now();
+        let manifest = manifest();
+        let controller = controller(Counts::default());
+        let load = LoadHistory::default();
+        let disk = DiskState::default();
+        let alerts = vec![recovery::UNSUPPORTED_ALERT.to_string()];
+        let view = View {
+            manifest: &manifest,
+            controller: &controller,
+            usage: &[],
+            load: &load,
+            disk: &disk,
+            alerts: &alerts,
+            recovery: &recovery::Status::default(),
+            now,
+        };
+        let lines = render(&view, 40, 12);
+        // 折り返しの字下げを畳んで、文言が欠けずに出ていることを確かめる。
+        let text = lines
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("⛔ ai-usage does not support"), "{text}");
+        assert!(text.contains("(update ai-usage)"), "{text}");
+        for line in &lines {
+            assert!(line.width() <= 40, "{line}");
+        }
     }
 
     #[test]

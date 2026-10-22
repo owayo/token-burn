@@ -6,7 +6,21 @@ How token-burn holds back new tasks when an account's usage window fills up, and
 
 `rate_limit_threshold` is enforced on two paths. During a task, Claude Code's stream-json `rate_limit_event` is monitored in real time and new tasks are held back once the threshold is exceeded. In addition, when [ai-usage integration](configuration.md#ai-usage-integration-optional) is enabled, after each task completes the agent's real utilization is re-checked against this threshold using the matching `(profile, provider)` pair's `weekly` and `five_hour` `used_percent` values; this applies to both `claude` and `codex` agents, so `codex`, which has no real-time monitoring, stops too.
 
-Both paths decide **how** to hold back by the period of the window that crossed the threshold. A weekly window shares its period with the run's deadline, so it stops the run permanently. A short window — `five_hour`, or a 24-hour window reported as `kind:"daily"` — only pauses until that window resets; a worker rechecks usage before taking another task. The period comes from `kind`, never from the slot name, because providers do report a 24-hour window in the `five_hour` slot. A pause falls back to a permanent stop when the reset time is missing, implausible (further ahead than one period of that window), or later than the run's deadline.
+Both paths decide **how** to hold back by the period of the window that crossed the threshold. A weekly window shares its period with the run's deadline, so it stops the run permanently. A short window — `five_hour`, or a 24-hour window reported as `kind:"daily"` — only pauses until that window resets; a worker rechecks usage before taking another task. The period comes from `kind`, never from the slot name, because providers do report a 24-hour window in the `five_hour` slot. A pause falls back to a permanent stop when the reset time is missing or implausible (further ahead than one period of that window). It also stops when the reset comes after the run's deadline, but with ai-usage integration the workers wait until the deadline instead, in case the window is reset manually.
+
+With ai-usage integration, these checks use usage fetched with `--refresh`, bypassing ai-usage's shared cache (120 seconds by default): a cached value can still show the pre-reset usage right after a manual reset. Only the running account is fetched (`--profile` and `--only`), so the other accounts are not queried. An older ai-usage that does not know `--refresh` falls back to a plain fetch, and the early resume below does not happen.
+
+## Resuming early after a manual reset
+
+Claude ("Reset for free" in Settings > Usage on claude.ai) and Codex (banked resets) let you refill a usage window at any time. A pause's resume time is only an estimate made from the observation that stopped the run. With ai-usage integration, token-burn looks the reset up from live data every time instead of trusting the recorded time, and resumes as soon as a manual reset refills the window.
+
+While a pause is in effect, the monitor refetches the running account's usage about every 30 seconds. Once the window that caused the pause has dropped to half of its level at the pause (and by at least 10 points) and every window is under the threshold, the monitor lifts the pause. The waiting workers notice within a second, recheck usage, and take their next task. A small drop does not lift a pause: the API and the usage page on the web round and lag differently, and requests can be rejected for reasons other than the usage percentage.
+
+The start of a run is decided from live data too. If the five-hour window is at or above the threshold, the run starts paused until that window resets; if the weekly window is, no task starts. No task starts either when the usage cannot be confirmed (ai-usage fails, or it reports an error for the account). A session interrupted by a five-hour rejection in an earlier run no longer holds the next run back once the window has been refilled.
+
+If the API rejects requests again right after an early resume, that pause is not lifted by comparing ai-usage values with API values. When ai-usage is looking at a different account from the one actually running, lifting and getting rejected would repeat until the queue is used up by failed tasks.
+
+Without ai-usage integration there is no way to look the usage up, so workers wait until the estimated time.
 
 ## Stopping and pausing
 

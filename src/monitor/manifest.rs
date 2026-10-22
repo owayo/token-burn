@@ -32,6 +32,9 @@ pub struct Manifest {
     pub stop_file: PathBuf,
     /// この実行のログの置き場所。
     pub report_dir: PathBuf,
+    /// 使用率の停止閾値（%）。ワーカーの format-stream / usage-gate と同じ値。
+    /// 一時停止中に取り直した実データで、枠が回復したかを判定するのに使う。
+    pub threshold: u8,
     /// ai-usage 連携が有効なときのコマンド。連携しない構成では ai-usage を一切呼ばない。
     pub ai_usage: Option<AiUsageCommands>,
 }
@@ -39,13 +42,23 @@ pub struct Manifest {
 /// `bash -c` で実行する ai-usage のコマンド（選択中のエージェントの env を前置き済み）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiUsageCommands {
-    /// `ai-usage --json`。出力でキャッシュを置き換える（usage-gate と共有するキャッシュ）。
+    /// `ai-usage --json`。出力で statusline の表示用キャッシュを置き換える（停止の判定には
+    /// 使わない。判定は `live` と同じく `--refresh` で取り直す）。
     pub refresh: String,
     /// キャッシュを `--input` で読む statusline。
     pub statusline: String,
     /// `ai-usage --disk --json`。ディスク容量は使用量のキャッシュに混ぜず、別に取る。
     pub disk: String,
-    /// usage-gate と共有する `ai-usage --json` のキャッシュ。
+    /// 実行中のアカウントだけを ai-usage の共有キャッシュを通さずに取り直すコマンド
+    /// （`--refresh --profile <profile> --only <provider>` 付き）。一時停止中に、手動リセット等で
+    /// 枠が戻ったかを確かめるのに使う。出力は 1 アカウント分なので、全アカウント分の
+    /// キャッシュ（`cache_file`）を置き換えない。
+    pub live: String,
+    /// `ai-usage --json` の `profile`（実行中のアカウント）。
+    pub profile: String,
+    /// `ai-usage --json` の `provider`（実行中のアカウント）。
+    pub provider: String,
+    /// statusline が読む `ai-usage --json` のキャッシュ。
     pub cache_file: PathBuf,
 }
 
@@ -84,10 +97,14 @@ mod tests {
             worker_count: 2,
             stop_file: tmp.path().join("stop"),
             report_dir: tmp.path().join("report dir"),
+            threshold: 95,
             ai_usage: Some(AiUsageCommands {
                 refresh: "'ai-usage' '--json'".into(),
                 statusline: "'ai-usage' '--statusline'".into(),
                 disk: "'ai-usage' '--disk' '--json'".into(),
+                live: "'ai-usage' '--json' '--refresh' '--profile' 'Work' '--only' 'claude'".into(),
+                profile: "Work".into(),
+                provider: "claude".into(),
                 cache_file: tmp.path().join("cache.json"),
             }),
         };

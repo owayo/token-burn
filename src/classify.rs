@@ -85,7 +85,46 @@ fn is_resume_not_found(result: &serde_json::Value) -> bool {
             })
 }
 
-/// jsonl ファイルから最後の `"type":"result"` イベントを取り出して分類する。
+/// 何もせずに終わった通知のターンの result か。
+///
+/// Claude Code は、メインのターンが終わってもバックグラウンドのサブエージェントが走って
+/// いれば、その終了通知を受けて通知のターン（`origin.kind:"task-notification"`）を始め、
+/// ターンごとに result を出す。メインのターンがレート制限（429）で終わった実行では、この
+/// 通知のターンがモデルを 1 度も呼ばずに `num_turns:0`・`is_error:false`・`result:""` で
+/// 終わっていた（実ログ 3 件。1 件は 3 つ続いた）。これを最後の result として分類すると
+/// 「成功」になり、中断したタスクを state.json に処理済みとして記録し、中断したセッションを
+/// resume.json に保存しない。次の実行でも再開されず、作業が失われる。
+///
+/// 読み飛ばすのはこの形に限る。正常な実行でも通知のターンの result が最後に来るが、その
+/// ときはモデルが通知に応答して作業を続けている（`num_turns` が 1 以上）ので、その結果で
+/// 分類するのが正しい。別の `origin`、`num_turns` の無いもの、失敗した通知のターン
+/// （`is_error:true`）も読み飛ばさない。広げると、実行の最後に起きたことを見落とす。
+fn is_idle_notification_turn(result: &serde_json::Value) -> bool {
+    result["origin"]["kind"].as_str() == Some("task-notification")
+        && result["num_turns"].as_u64() == Some(0)
+        && result["is_error"].as_bool() != Some(true)
+}
+
+/// 分類に使う result を選ぶ。`results` は jsonl に出た順の result イベント。
+///
+/// 最後の result を使う。ただし末尾に続く「何もしなかった通知のターン」
+/// （[`is_idle_notification_turn`]）は読み飛ばし、その前の result を使う。すべてが
+/// それなら、従来どおり最後の result を使う。
+///
+/// `classify-result`（[`classify_content`]）と中断したセッションの保存
+/// （`resume::inspect_interruption` が取り出す session_id と上限到達のメッセージ）は、
+/// 必ずこれで同じ result を選ぶ。別々に選ぶと、レート制限と分類したのに保存する
+/// メッセージは空の通知 result から取る、といったずれが起きる。
+pub fn select_result(results: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    results
+        .iter()
+        .rev()
+        .find(|result| !is_idle_notification_turn(result))
+        .or_else(|| results.last())
+}
+
+/// jsonl ファイルから分類に使う `"type":"result"` イベント（[`select_result`]）を
+/// 取り出して分類する。
 /// ファイルが存在しない場合は Success（result イベントなしと等価）として扱うが、
 /// 権限エラーや I/O エラーで読めない場合は Failed として返す（成功扱いで
 /// state.json に誤記録するのを防ぐ）。
@@ -98,7 +137,7 @@ pub fn classify_jsonl(path: &Path) -> ResultClass {
 }
 
 pub fn classify_content(content: &str) -> ResultClass {
-    let mut last_result: Option<serde_json::Value> = None;
+    let mut results: Vec<serde_json::Value> = Vec::new();
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -108,11 +147,11 @@ pub fn classify_content(content: &str) -> ResultClass {
             continue;
         };
         if v.get("type").and_then(|t| t.as_str()) == Some("result") {
-            last_result = Some(v);
+            results.push(v);
         }
     }
 
-    let Some(v) = last_result else {
+    let Some(v) = select_result(&results) else {
         return ResultClass::Success;
     };
 
@@ -121,9 +160,9 @@ pub fn classify_content(content: &str) -> ResultClass {
         return ResultClass::Success;
     }
 
-    let message = result_message(&v).unwrap_or_default();
+    let message = result_message(v).unwrap_or_default();
 
-    if is_resume_not_found(&v) {
+    if is_resume_not_found(v) {
         return ResultClass::ResumeUnavailable(message);
     }
 
@@ -647,6 +686,126 @@ mod tests {
         assert_eq!(
             ResultClass::ResumeUnavailable("gone".to_string()).message(),
             Some("gone")
+        );
+    }
+
+    /// 実ログの形（ID は置き換え済み）。メインのターンが上限（429）で終わった result。
+    const SESSION_LIMIT: &str = r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"num_turns":120,"terminal_reason":"api_error","api_error":"usage_limit_reached","result":"You've hit your session limit · resets 1:30am (Asia/Tokyo)","session_id":"00000000-0000-4000-8000-000000000001","result_index":0}"#;
+
+    /// 実ログの形。上限に達した後、サブエージェントの終了通知を受けた通知のターンが、
+    /// モデルを呼ばずに終わった result。
+    const IDLE_NOTIFICATION: &str = r#"{"type":"result","subtype":"success","is_error":false,"duration_api_ms":0,"num_turns":0,"stop_reason":null,"result":"","origin":{"kind":"task-notification","producer":"session-task","runId":"0mvjnhe19-e65760ee"},"session_id":"00000000-0000-4000-8000-000000000001","result_index":1}"#;
+
+    /// 正常に終わったメインのターンの result。
+    const MAIN_SUCCESS: &str = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":13,"terminal_reason":"completed","result":"done"}"#;
+
+    /// `from` を `to` に置き換える。置き換え対象が無ければ失敗させ、元の形のまま検査が
+    /// 素通りするのを防ぐ。
+    fn replaced(event: &str, from: &str, to: &str) -> String {
+        assert!(event.contains(from), "{from} not found in {event}");
+        event.replace(from, to)
+    }
+
+    /// 実ログ 3 件の不具合: 上限到達の後に何もしなかった通知のターンの result が続き、
+    /// 最後の result（`is_error:false`）で「成功」と分類されていた。通知が 1 つでも
+    /// 3 つでも（実ログに両方ある）、上限到達の result で分類する。
+    #[test]
+    fn idle_notification_turns_after_a_session_limit_stay_rate_limited() {
+        for idle_count in [1, 3] {
+            let mut events = vec![SESSION_LIMIT];
+            events.extend(std::iter::repeat_n(IDLE_NOTIFICATION, idle_count));
+            assert_eq!(
+                classify_content(&events.join("\n")),
+                ResultClass::RateLimited,
+                "{idle_count} idle notification result(s)"
+            );
+        }
+    }
+
+    /// 正常に終わった実行の後に何もしなかった通知のターンが続いても、成功のまま。
+    #[test]
+    fn idle_notification_turns_after_a_success_stay_success() {
+        let content = [MAIN_SUCCESS, IDLE_NOTIFICATION, IDLE_NOTIFICATION].join("\n");
+        assert_eq!(classify_content(&content), ResultClass::Success);
+    }
+
+    /// 通知に応答したターン（`num_turns` が 1 以上）は正常な実行の最後にも来る。読み飛ばさず、
+    /// 従来どおり最後の result で分類する。
+    #[test]
+    fn notification_turns_that_did_work_are_classified_as_before() {
+        // 上限に達した後でも、通知に応答して作業できたなら、その結果（成功）で分類する
+        let answered = replaced(
+            &replaced(IDLE_NOTIFICATION, "\"num_turns\":0", "\"num_turns\":2"),
+            "\"result\":\"\"",
+            "\"result\":\"通知を待ちます。\"",
+        );
+        assert_eq!(
+            classify_content(&[SESSION_LIMIT, answered.as_str()].join("\n")),
+            ResultClass::Success
+        );
+        // 成功したメインのターンの後、通知に応答したターンが上限に達したなら、その上限で
+        // 分類する（実ログの形）
+        let answered_and_limited = replaced(
+            SESSION_LIMIT,
+            "\"num_turns\":120",
+            "\"num_turns\":36,\"origin\":{\"kind\":\"task-notification\",\"producer\":\"session-task\"}",
+        );
+        assert_eq!(
+            classify_content(&[MAIN_SUCCESS, answered_and_limited.as_str()].join("\n")),
+            ResultClass::RateLimited
+        );
+    }
+
+    /// 読み飛ばすのは「何もしなかった通知のターン」の形だけ。条件を 1 つでも欠くものは
+    /// 最後の result として従来どおり分類する。
+    #[test]
+    fn only_idle_notification_turns_are_skipped() {
+        let not_idle = [
+            // 通知のターンではない
+            replaced(
+                IDLE_NOTIFICATION,
+                r#""origin":{"kind":"task-notification","producer":"session-task","runId":"0mvjnhe19-e65760ee"},"#,
+                "",
+            ),
+            replaced(IDLE_NOTIFICATION, "task-notification", "scheduled-task"),
+            // ターン数が分からない
+            replaced(IDLE_NOTIFICATION, "\"num_turns\":0,", ""),
+        ];
+        for last in &not_idle {
+            assert_eq!(
+                classify_content(&[SESSION_LIMIT, last.as_str()].join("\n")),
+                ResultClass::Success,
+                "{last}"
+            );
+        }
+        // 失敗した通知のターンは、モデルを呼ばずに終わっていても、その失敗で分類する
+        let failed_notification = replaced(
+            &replaced(
+                IDLE_NOTIFICATION,
+                "\"is_error\":false",
+                "\"is_error\":true,\"api_error_status\":429",
+            ),
+            "\"result\":\"\"",
+            "\"result\":\"You've hit your session limit · resets 1:30am (Asia/Tokyo)\"",
+        );
+        assert_eq!(
+            classify_content(&[MAIN_SUCCESS, failed_notification.as_str()].join("\n")),
+            ResultClass::RateLimited
+        );
+    }
+
+    /// すべてが何もしなかった通知のターンなら、従来どおり最後の result を使う。
+    #[test]
+    fn select_result_falls_back_to_the_last_result() {
+        assert_eq!(select_result(&[]), None);
+        let idle: serde_json::Value = serde_json::from_str(IDLE_NOTIFICATION).unwrap();
+        let mut last = idle.clone();
+        last["result_index"] = 2.into();
+        let results = [idle, last.clone()];
+        assert_eq!(select_result(&results), Some(&last));
+        assert_eq!(
+            classify_content(&[IDLE_NOTIFICATION, IDLE_NOTIFICATION].join("\n")),
+            ResultClass::Success
         );
     }
 }

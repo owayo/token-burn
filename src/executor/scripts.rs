@@ -753,10 +753,11 @@ pub(super) fn build_statusline_cmd(
 }
 
 /// ai-usage の `--json` 取得コマンドに env prefix を付けて bash で実行できる
-/// 文字列を組み立てる。monitor 側で `eval $CMD > $cache.tmp && mv $cache.tmp $cache`
-/// の atomic 更新に使い、`--input <cache>` で読む statusline と同じファイルを
-/// 共有する。これにより monitor のリフレッシュが usage-gate にも反映され、
-/// 長時間タスク中に表示が古いまま固定される問題を解消する。空コマンドなら None。
+/// 文字列を組み立てる。monitor が出力で statusline 用のキャッシュを atomic に置き換え、
+/// statusline は `--input <cache>` で同じファイルを読む。長時間タスク中に表示が古いまま
+/// 固定されないようにするためで、キャッシュは表示専用（停止・一時停止の判定は usage-gate と
+/// 実行開始時の判定が `--refresh` で取り直す）。ai-usage の共有キャッシュを通す取得で
+/// よいので `--refresh` は付けない。空コマンドなら None。
 pub(super) fn build_refresh_cmd(
     command: &[String],
     env: &std::collections::BTreeMap<String, String>,
@@ -766,6 +767,27 @@ pub(super) fn build_refresh_cmd(
     }
     let mut all = env_prefix_parts(env);
     all.extend(command.iter().map(|s| shell_escape(s)));
+    Some(all.join(" "))
+}
+
+/// 実行中のアカウントだけを ai-usage の共有キャッシュを通さずに取り直すコマンド
+/// （[`crate::usage::live_command`]）に env prefix を付けた、bash で実行できる文字列。
+/// モニターが一時停止中に、手動リセット等で枠が戻ったかを確かめるのに使う。空コマンドなら None。
+pub(super) fn build_live_cmd(
+    command: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    profile: &str,
+    provider: &str,
+) -> Option<String> {
+    if command.is_empty() {
+        return None;
+    }
+    let mut all = env_prefix_parts(env);
+    all.extend(
+        crate::usage::live_command(command, profile, provider)
+            .iter()
+            .map(|s| shell_escape(s)),
+    );
     Some(all.join(" "))
 }
 
@@ -1915,6 +1937,7 @@ mod tests {
             interrupted_at: chrono::DateTime::parse_from_rfc3339("2026-09-23T13:04:23+09:00")
                 .unwrap(),
             retry_after: None,
+            retry_basis_percent: None,
             prompt_hash: crate::resume::prompt_hash("review"),
             message: None,
             log: None,

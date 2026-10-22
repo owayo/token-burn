@@ -8,6 +8,8 @@
 //! - [`controller`] はマーカーと停止・一時停止のファイルから、停止の発行と終了を決める
 //! - [`system`] / [`load`] / [`history`] は 1 秒ごとの負荷の計測と、5 分ぶんの履歴
 //! - [`usage`] / [`disk`] は ai-usage の取得（別タスク。取得を待つ間も判定と描画を止めない）
+//! - [`recovery`] は一時停止中に実データを取り直し、手動リセット等で枠が戻ったら一時停止を
+//!   早期解除する（別タスク。ai-usage 連携があるときだけ）
 //! - [`ui`] は描画（描画に失敗しても判定と終了処理は続ける）
 
 mod ansi;
@@ -17,6 +19,7 @@ mod history;
 mod load;
 pub mod manifest;
 mod process;
+mod recovery;
 mod system;
 mod ui;
 mod usage;
@@ -50,6 +53,8 @@ pub enum Event {
     InputClosed,
     /// stop file の書き込みが終わった（失敗なら理由）。
     StopWritten(Result<(), String>),
+    /// 一時停止中の回復の確認の結果（早期解除を含む）。
+    Recovery(recovery::Update),
 }
 
 /// stop file のロックを待つ上限。ロックを握る処理（pause の読み書きと claim）は短いので
@@ -107,6 +112,20 @@ async fn event_loop(terminal: Option<DefaultTerminal>, manifest: &Manifest) -> R
     if let Some(commands) = manifest.ai_usage.clone() {
         tokio::spawn(usage::run(commands, events_tx.clone()));
     }
+    // 回復の確認は ai-usage 連携があるときだけ（連携が無ければ ai-usage を一切呼ばない）。
+    let recovery_commands = manifest
+        .ai_usage
+        .clone()
+        .filter(|commands| !commands.live.is_empty());
+    let mut recovery_status = recovery::Status::new(recovery_commands.is_some());
+    if let Some(commands) = recovery_commands {
+        tokio::spawn(recovery::run(
+            commands,
+            manifest.stop_file.clone(),
+            manifest.threshold,
+            events_tx.clone(),
+        ));
+    }
     tokio::spawn(disk::run(
         manifest
             .ai_usage
@@ -139,13 +158,7 @@ async fn event_loop(terminal: Option<DefaultTerminal>, manifest: &Manifest) -> R
         tokio::select! {
             _ = tick.tick() => {
                 load.record(sampler.sample(Instant::now()));
-                let observation = controller::read_observation(
-                    &manifest.marker_dir,
-                    &manifest.stop_file,
-                    &pause_file,
-                    rate_control::now_epoch(),
-                );
-                actions.extend(controller.observe(observation));
+                actions.extend(observe(&mut controller, manifest, &pause_file));
             }
             Some(event) = events.recv() => match event {
                 Event::Usage(lines) => usage = lines,
@@ -163,6 +176,16 @@ async fn event_loop(terminal: Option<DefaultTerminal>, manifest: &Manifest) -> R
                     ));
                 }
                 Event::StopWritten(Ok(())) => {}
+                Event::Recovery(update) => {
+                    let lifted = matches!(update, recovery::Update::Lifted { .. });
+                    if let Some(alert) = recovery_status.apply(update) {
+                        alerts.push(alert);
+                    }
+                    if lifted {
+                        // 解除を通知と最下行へすぐ反映する（次の 1 秒の観測を待たない）。
+                        actions.extend(observe(&mut controller, manifest, &pause_file));
+                    }
+                }
             },
             _ = sigint.recv() => actions.push(controller.interrupt()),
             _ = sigterm.recv() => actions.push(controller.interrupt()),
@@ -195,6 +218,7 @@ async fn event_loop(terminal: Option<DefaultTerminal>, manifest: &Manifest) -> R
             load: &load,
             disk: &disk,
             alerts: &alerts,
+            recovery: &recovery_status,
             now: Instant::now(),
         });
 
@@ -208,6 +232,17 @@ async fn event_loop(terminal: Option<DefaultTerminal>, manifest: &Manifest) -> R
             close_session(&mut screen, &manifest.session);
         }
     }
+}
+
+/// マーカーと停止・一時停止のファイルを読んで判定へ反映し、行うべきことを返す。
+fn observe(controller: &mut Controller, manifest: &Manifest, pause_file: &Path) -> Vec<Action> {
+    let observation = controller::read_observation(
+        &manifest.marker_dir,
+        &manifest.stop_file,
+        pause_file,
+        rate_control::now_epoch(),
+    );
+    controller.observe(observation)
 }
 
 /// Ctrl-C とペインの大きさの変化を受け取る。raw mode では Ctrl-C は SIGINT ではなく

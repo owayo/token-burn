@@ -235,9 +235,15 @@ enum Commands {
         /// 閾値超過時に作成する stop file のパス
         #[arg(long)]
         stop_file: PathBuf,
-        /// ai-usage 出力の短 TTL キャッシュファイルのパス
-        #[arg(long)]
-        cache_file: PathBuf,
+        /// 以前の版が渡していた ai-usage 出力のキャッシュファイル。今は使わない。
+        ///
+        /// usage-gate は呼ぶたびに `--refresh` で取り直すようになったが、引数は受け付けたまま
+        /// 無視する。ワーカースクリプトは実行開始時のバイナリが生成し、タスクごとに絶対パスで
+        /// usage-gate を呼び直すため、長い実行の途中で新しいバイナリへ入れ替えると、古い
+        /// スクリプトが新しいバイナリへこの引数を渡す。未知の引数として拒否すると usage-gate が
+        /// 失敗し、fail-closed で実行全体が止まってしまう。
+        #[arg(long, hide = true)]
+        cache_file: Option<PathBuf>,
         /// ai-usage コマンド（`--` 以降）
         #[arg(last = true)]
         command: Vec<String>,
@@ -475,14 +481,11 @@ async fn main() -> Result<()> {
         provider,
         threshold,
         stop_file,
-        cache_file,
+        cache_file: _,
         command,
     } = &command
     {
-        usage::run_usage_gate(
-            profile, provider, *threshold, stop_file, cache_file, command,
-        )
-        .await?;
+        usage::run_usage_gate(profile, provider, *threshold, stop_file, command).await?;
         return Ok(());
     }
 
@@ -933,7 +936,10 @@ async fn run(opts: RunOptions) -> Result<()> {
         .filter(|g| g.enabled)
         .map(|g| g.command.clone());
     let resume_options = resume_options(&config, agent, resumes)?;
-    let plan = executor::build_plan(agent, targets, ai_usage_command, resume_options);
+    let mut plan = executor::build_plan(agent, targets, ai_usage_command, resume_options);
+    // 保留・停止は対象と閾値を確定した後に、実データを取り直して決める（ai-usage 連携が
+    // あるとき）。ドライランでも同じ判定を実行計画に出す。
+    executor::check_start(&mut plan, run_settings.rate_limit_threshold);
     executor::print_plan(&plan, run_settings.workers);
     println!("  Stop threshold: {}%", run_settings.rate_limit_threshold);
 
@@ -2825,6 +2831,7 @@ mod tests {
                     interrupted_at: (chrono::Local::now() - chrono::Duration::hours(1))
                         .fixed_offset(),
                     retry_after: None,
+                    retry_basis_percent: None,
                     prompt_hash: resume::prompt_hash(prompt),
                     message: None,
                     log: None,
@@ -3118,5 +3125,43 @@ mod tests {
         let cli = Cli::try_parse_from(["token-burn", "run", "--no-resume"]).expect("parse");
         assert!(cli.no_resume);
         assert!(!cli.fresh);
+    }
+
+    /// usage-gate はキャッシュを使わなくなったが、以前の版のワーカースクリプトが渡す
+    /// `--cache-file` は受け付ける。実行の途中でバイナリを入れ替えると古いスクリプトが
+    /// 新しいバイナリを呼ぶため、拒否すると fail-closed で実行全体が止まる。
+    #[test]
+    fn cli_usage_gate_accepts_the_legacy_cache_file_argument() {
+        let base = [
+            "token-burn",
+            "usage-gate",
+            "--profile",
+            "Work",
+            "--provider",
+            "claude",
+            "--threshold",
+            "95",
+            "--stop-file",
+            "/tmp/token-burn/stop",
+        ];
+        for extra in [
+            &["--cache-file", "/tmp/token-burn/ai-usage-cache.json"][..],
+            &[][..],
+        ] {
+            let args = base
+                .iter()
+                .chain(extra)
+                .chain(&["--", "ai-usage", "--json"])
+                .copied();
+            let cli = Cli::try_parse_from(args).expect("parse");
+            let Some(Commands::UsageGate {
+                profile, command, ..
+            }) = cli.command
+            else {
+                panic!("usage-gate として読めるべき");
+            };
+            assert_eq!(profile, "Work");
+            assert_eq!(command, ["ai-usage", "--json"]);
+        }
     }
 }
