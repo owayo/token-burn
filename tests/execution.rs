@@ -116,6 +116,9 @@ case "$1" in
     ;;
   has-session) exit 1 ;;
 esac
+case "$1" in
+  new-session|split-window) printf '%s\n' "${!#}" >> "$TB_CAPTURE/panes.log" ;;
+esac
 exit 0
 "#,
     );
@@ -329,6 +332,16 @@ fn all_tmux_targets_match_only_the_owned_session() {
 }
 
 #[test]
+fn every_tmux_pane_removes_inherited_no_color() {
+    let (tmp, _) = prepare_execution();
+    let commands = std::fs::read_to_string(tmp.path().join("capture/panes.log")).unwrap();
+    assert_eq!(commands.lines().count(), 3, "monitor and both workers");
+    for command in commands.lines() {
+        assert!(command.starts_with("env -u NO_COLOR "), "{command}");
+    }
+}
+
+#[test]
 fn tmux_window_targets_work_without_touching_similar_session() {
     if !Command::new("tmux")
         .arg("-V")
@@ -385,7 +398,10 @@ fn tmux_window_targets_work_without_touching_similar_session() {
         }
         if args[0] == "split-window" {
             // 本物の AI コマンドやモニターを起動せず、生成された対象指定だけを検査する。
-            *args.last_mut().unwrap() = "sleep 30";
+            // shell-command は空白を含むので、対象ペインより後ろをまとめて置き換える。
+            let command_index = args.iter().position(|arg| *arg == "-t").unwrap() + 2;
+            args.truncate(command_index);
+            args.push("sleep 30");
             args.insert(1, "-d");
         } else if args[0] == "set-option" && call.contains("pane-border-format") {
             // ログでは引用符を保存していないため、書式文字列を引数 1 個へ戻す。

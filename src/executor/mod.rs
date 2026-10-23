@@ -864,7 +864,14 @@ pub fn print_plan(plan: &ExecutionPlan, parallelism: usize) {
 /// 「no such session」で失敗して真因と無関係なエラーになる。生成するシェルスクリプトの
 /// 内側は `shell_escape` 済みで、この tmux 呼び出しだけが取りこぼしだった。
 fn tmux_script_arg(path: &std::path::Path) -> String {
-    shell_escape(&path.to_string_lossy())
+    tmux_pane_command(&shell_escape(&path.to_string_lossy()))
+}
+
+/// 親や既存の tmux サーバーに残った NO_COLOR をペインへ持ち込まない。
+/// tmux クライアントの env_remove だけではサーバー側の環境に効かないため、
+/// モニター・ワーカーの実行直前に除去する。ほかの tmux セッションの環境は変更しない。
+fn tmux_pane_command(command: &str) -> String {
+    format!("env -u NO_COLOR {command}")
 }
 
 /// 実行用の一時ディレクトリを、必ず自分が作った空のディレクトリとして用意する。
@@ -1156,11 +1163,11 @@ pub fn execute_plan_tmux(
         ai_usage: monitor_ai_usage,
     }
     .write(&manifest_path)?;
-    let monitor_command = format!(
+    let monitor_command = tmux_pane_command(&format!(
         "{} monitor --manifest {}",
         shell_escape(&exe_path.to_string_lossy()),
         shell_escape(&manifest_path.to_string_lossy())
-    );
+    ));
 
     // モニター（左ペイン）付き tmux セッションを作成。
     // `.status()?` は tmux の起動失敗しか捕まえない（tmux が non-zero 終了しても Ok）。
@@ -1449,14 +1456,14 @@ mod tests {
     #[test]
     fn tmux_script_arg_quotes_paths_with_spaces() {
         let arg = tmux_script_arg(std::path::Path::new("/tmp/my tmp/token-burn/monitor.sh"));
-        assert_eq!(arg, "'/tmp/my tmp/token-burn/monitor.sh'");
+        assert_eq!(arg, "env -u NO_COLOR '/tmp/my tmp/token-burn/monitor.sh'");
     }
 
     /// シェルメタ文字を含むパスもコマンドとして解釈させない。
     #[test]
     fn tmux_script_arg_neutralizes_shell_metacharacters() {
         let arg = tmux_script_arg(std::path::Path::new("/tmp/a;touch evil/monitor.sh"));
-        assert_eq!(arg, "'/tmp/a;touch evil/monitor.sh'");
+        assert_eq!(arg, "env -u NO_COLOR '/tmp/a;touch evil/monitor.sh'");
         assert!(!arg.starts_with('/'), "生パスのまま渡してはいけない: {arg}");
     }
 
@@ -1464,7 +1471,26 @@ mod tests {
     #[test]
     fn tmux_script_arg_escapes_single_quotes() {
         let arg = tmux_script_arg(std::path::Path::new("/tmp/it's/monitor.sh"));
-        assert_eq!(arg, r"'/tmp/it'\''s/monitor.sh'");
+        assert_eq!(arg, r"env -u NO_COLOR '/tmp/it'\''s/monitor.sh'");
+    }
+
+    #[test]
+    fn tmux_pane_command_removes_only_inherited_no_color() {
+        let command = tmux_pane_command(
+            r#"sh -c 'test "${NO_COLOR+x}" != x && printf "%s" "$TOKEN_BURN_COLOR_TEST"'"#,
+        );
+        for no_color in [Some("1"), Some("0"), Some(""), None] {
+            let mut process = std::process::Command::new("sh");
+            process.args(["-c", &command]);
+            process.env("TOKEN_BURN_COLOR_TEST", "preserved");
+            match no_color {
+                Some(value) => process.env("NO_COLOR", value),
+                None => process.env_remove("NO_COLOR"),
+            };
+            let output = process.output().unwrap();
+            assert!(output.status.success(), "NO_COLOR={no_color:?}");
+            assert_eq!(output.stdout, b"preserved");
+        }
     }
 
     use super::flags::CLAUDE_PRINT_BG_WAIT_ENV;
