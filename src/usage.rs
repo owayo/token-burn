@@ -578,25 +578,48 @@ pub async fn run_usage_gate(
             .with_basis(basis.used_percent, basis.reset_at);
             // pause を書けない場合は恒久停止へ倒す。待機の根拠を共有できない以上、
             // 走り続けるより止める側が安全（fail-closed）。
-            if let Err(e) =
-                rate_control::write_pause(&rate_control::pause_path_for(stop_file), &state)
-            {
-                if write_stop_file(stop_file, &format!("usage-gate: {reason}")) {
-                    eprintln!(
-                        "\x1b[31m  \u{26d4} usage-gate: pause を記録できないため停止 ({e})\x1b[0m"
-                    );
-                } else if !stop_file.exists() {
-                    anyhow::bail!("usage-gate: failed to write pause file: {e}");
+            match rate_control::write_pause(&rate_control::pause_path_for(stop_file), &state) {
+                Err(e) => {
+                    if write_stop_file(stop_file, &format!("usage-gate: {reason}")) {
+                        eprintln!(
+                            "\x1b[31m  \u{26d4} usage-gate: pause を記録できないため停止 ({e})\x1b[0m"
+                        );
+                    } else if !stop_file.exists() {
+                        anyhow::bail!("usage-gate: failed to write pause file: {e}");
+                    }
                 }
-            } else {
-                eprintln!(
-                    "\x1b[33m  \u{23f8} usage-gate: {profile}/{provider} {reason} のため {} の枠がリセットされるまで待機\x1b[0m",
-                    basis.window
-                );
+                Ok(written) => eprintln!(
+                    "{}",
+                    pause_notice(written, profile, provider, &reason, &basis.window)
+                ),
             }
         }
     }
     Ok(())
+}
+
+/// 一時停止を書いた結果（[`rate_control::write_pause`]）を知らせる 1 行（stderr に出す）。
+///
+/// 早期解除より前に取得を終えた観測は書かれない（`Ignored`。解除を古いデータで取り消さない）。
+/// そのときワーカーは待たずに次のタスクを claim するので、「待機」と出すと実際の動きと
+/// 食い違う。記録しなかったことを伝える。
+fn pause_notice(
+    written: rate_control::PauseWrite,
+    profile: &str,
+    provider: &str,
+    reason: &str,
+    window: &str,
+) -> String {
+    match written {
+        rate_control::PauseWrite::Ignored => format!(
+            "\x1b[2m  usage-gate: {profile}/{provider} {reason} ですが、一時停止の早期解除より前に取得した値なので記録しません（解除済みのまま続行）\x1b[0m"
+        ),
+        rate_control::PauseWrite::Started { .. }
+        | rate_control::PauseWrite::Extended
+        | rate_control::PauseWrite::Noted => format!(
+            "\x1b[33m  \u{23f8} usage-gate: {profile}/{provider} {reason} のため {window} の枠がリセットされるまで待機\x1b[0m"
+        ),
+    }
 }
 
 /// usage-gate の閾値判定に渡す枠ごとの観測値を組み立てる。
@@ -629,6 +652,12 @@ fn gate_observations(acc: &AiUsageAccount) -> Vec<WindowObservation> {
 /// `--refresh` で取り直す。`--profile` / `--only` で対象を 1 アカウントに絞り、待機中に
 /// 繰り返し取っても、ほかのアカウント（ほかのサービス）へ問い合わせないようにする。
 /// 利用者の command に既にあるフラグは足さない（二重指定は ai-usage の CLI が拒否する）。
+///
+/// 値は `--profile=<name>` の形で繋ぐ。2 引数で渡すと、`-` で始まる名前を ai-usage（clap）が
+/// 別のフラグと読んで使い方の誤り（終了コード 2）で終わり、古い ai-usage と取り違えて
+/// `--refresh` 無しで取り直してしまう。`--profile` は `,` で区切って複数の profile を受け付ける
+/// ので、`,` を含む名前では付けない（割れて別の profile を指す）。そのときは `--only` だけで
+/// 絞り、呼び出し側が結果から `(profile, provider)` の一致するアカウントを選ぶ。
 pub fn live_command(base: &[String], profile: &str, provider: &str) -> Vec<String> {
     let has = |long: &str, short: Option<&str>| {
         base.iter().any(|arg| {
@@ -641,13 +670,11 @@ pub fn live_command(base: &[String], profile: &str, provider: &str) -> Vec<Strin
     if !has("--refresh", None) {
         command.push("--refresh".to_string());
     }
-    if !has("--profile", Some("-p")) {
-        command.push("--profile".to_string());
-        command.push(profile.to_string());
+    if !profile.contains(',') && !has("--profile", Some("-p")) {
+        command.push(format!("--profile={profile}"));
     }
     if !has("--only", None) {
-        command.push("--only".to_string());
-        command.push(provider.to_string());
+        command.push(format!("--only={provider}"));
     }
     command
 }
@@ -813,7 +840,7 @@ mod tests {
             Self::with_guard(
                 dir,
                 json,
-                "case \" $* \" in *' --only '*) echo 'Error: No signed-in Claude/Codex/PixelLab sessions or Antigravity/Grok token found.' >&2; exit 1;; esac; ",
+                "case \" $* \" in *' --only='*) echo 'Error: No signed-in Claude/Codex/PixelLab sessions or Antigravity/Grok token found.' >&2; exit 1;; esac; ",
             )
         }
 
@@ -906,6 +933,40 @@ mod tests {
         );
         let already = refresh_command(&base);
         assert_eq!(refresh_command(&already), already, "二重に足さない");
+    }
+
+    #[test]
+    fn live_command_passes_the_account_so_ai_usage_cannot_misread_it() {
+        let base = vec!["ai-usage".to_string(), "--json".to_string()];
+        // 値は `=` で繋ぐ。`--profile -dev` の 2 引数だと ai-usage（clap）は `-dev` を別の
+        // フラグと読んで使い方の誤り（終了コード 2）で終わり、token-burn はそれを古い
+        // ai-usage と取り違えて `--refresh` 無しの値で判定してしまう。
+        assert_eq!(
+            live_command(&base, "-dev", "claude"),
+            [
+                "ai-usage",
+                "--json",
+                "--refresh",
+                "--profile=-dev",
+                "--only=claude"
+            ]
+        );
+        // ai-usage の `--profile` は `,` で区切って複数の profile を受け付ける。`,` を含む
+        // 名前は割れて別の profile を指すので絞らず、`--only` で取った全 profile の結果から
+        // 実行中のアカウントを選ぶ（usage-gate と回復の確認はどちらも find で選ぶ）。
+        assert_eq!(
+            live_command(&base, "Work, Inc", "claude"),
+            ["ai-usage", "--json", "--refresh", "--only=claude"]
+        );
+        // command に既にあるフラグは足さない（二重指定は ai-usage の CLI が拒否する）。
+        let narrowed: Vec<String> = ["ai-usage", "--json", "-pWork", "--only=codex"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            live_command(&narrowed, "Work", "codex"),
+            ["ai-usage", "--json", "-pWork", "--only=codex", "--refresh"]
+        );
     }
 
     #[test]
@@ -1427,12 +1488,36 @@ mod tests {
         assert_eq!(
             fake.calls(),
             [
-                "--json --refresh --profile Work --only claude",
-                "--json --refresh --profile Work --only claude"
+                "--json --refresh --profile=Work --only=claude",
+                "--json --refresh --profile=Work --only=claude"
             ],
             "呼ぶたびに実行中のアカウントだけを取り直すべき"
         );
         assert!(!stop.exists());
+    }
+
+    #[tokio::test]
+    async fn usage_gate_selects_the_account_itself_when_the_profile_name_has_a_comma() {
+        // `,` を含む profile 名は `--profile` で絞れない（ai-usage が別の profile へ割る）。
+        // `--only` だけで取り、全 profile の結果から実行中のアカウントを選んで判定する。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let fake = FakeAiUsage::new(
+            tmp.path(),
+            r#"{"accounts":[{"profile":"Work","provider":"claude","ok":true,"weekly":{"used_percent":99.0}},{"profile":"Work, Inc","provider":"claude","ok":true,"weekly":{"used_percent":95.0}}]}"#,
+            false,
+        );
+        run_usage_gate("Work, Inc", "claude", 96, &stop, &fake.command)
+            .await
+            .unwrap();
+        assert_eq!(fake.calls(), ["--json --refresh --only=claude"]);
+        assert!(!stop.exists(), "別の profile（Work の 99%）で止めない");
+
+        run_usage_gate("Work, Inc", "claude", 95, &stop, &fake.command)
+            .await
+            .unwrap();
+        let reason = std::fs::read_to_string(&stop).expect("実行中のアカウントの 95% で止める");
+        assert!(reason.contains("weekly 95%"), "{reason}");
     }
 
     #[tokio::test]
@@ -1452,7 +1537,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             fake.calls(),
-            ["--json --refresh --profile Work --only claude", "--json"]
+            ["--json --refresh --profile=Work --only=claude", "--json"]
         );
         assert!(stop.exists(), "取り直した値で閾値超過を判定するべき");
         let reason = std::fs::read_to_string(&stop).unwrap();
@@ -1517,7 +1602,7 @@ mod tests {
         assert_eq!(
             fake.calls(),
             [
-                "--json --refresh --profile Work --only claude",
+                "--json --refresh --profile=Work --only=claude",
                 "--json --refresh"
             ]
         );
@@ -1647,6 +1732,94 @@ mod tests {
             "観測時刻の上限は取得を終えた時刻: {} not in {before}..={after}",
             state.observed_at
         );
+    }
+
+    /// 早期解除より前に取得を終えた観測は書かれない（`PauseWrite::Ignored`）。ワーカーは
+    /// そのまま次のタスクを claim するので、「リセットされるまで待機」と出すと実際の動きと
+    /// 食い違う。
+    #[test]
+    fn pause_notice_does_not_claim_to_wait_when_the_observation_was_ignored() {
+        use rate_control::PauseWrite;
+        let reason = "five_hour 95% >= threshold 90%";
+        let ignored = pause_notice(PauseWrite::Ignored, "Work", "claude", reason, "five_hour");
+        assert!(!ignored.contains("待機"), "{ignored}");
+        assert!(ignored.contains("記録しません"), "{ignored}");
+        assert!(ignored.contains("Work/claude"), "{ignored}");
+        for written in [
+            PauseWrite::Started { relapse: false },
+            PauseWrite::Started { relapse: true },
+            PauseWrite::Extended,
+            PauseWrite::Noted,
+        ] {
+            let notice = pause_notice(written, "Work", "claude", reason, "five_hour");
+            assert!(notice.contains("待機"), "{written:?}: {notice}");
+        }
+    }
+
+    /// 子プロセスで usage-gate を動かすときに、作業用ディレクトリを渡す環境変数。
+    const GATE_CHILD_DIR_ENV: &str = "TOKEN_BURN_TEST_USAGE_GATE_CHILD_DIR";
+
+    #[tokio::test]
+    async fn usage_gate_keeps_an_early_resume_and_says_it_recorded_nothing_on_stderr() {
+        // モニターが早期解除した後に、それより前に取得を終えた usage-gate の観測が届いた。
+        // 解除を古いデータで取り消さず（pause file はそのまま、恒久停止もしない）、通知は
+        // 「待機」ではなく記録しなかった旨を stderr に出す。stdout は gate-claim の claim 番号に
+        // 直結するので何も書かない。eprintln! の出力はテストの中では捕まえられないので、
+        // このテスト自身を子プロセスとして起動し、その中で usage-gate を動かす。
+        if let Some(dir) = std::env::var_os(GATE_CHILD_DIR_ENV) {
+            let dir = Path::new(&dir);
+            let resets_at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+            let fake = FakeAiUsage::new(
+                dir,
+                &format!(
+                    r#"{{"accounts":[{{"profile":"Work","provider":"claude","ok":true,"five_hour":{{"kind":"five_hour","resets_at":"{resets_at}","used_percent":95.0}}}}]}}"#
+                ),
+                false,
+            );
+            run_usage_gate("Work", "claude", 90, &dir.join("stop"), &fake.command)
+                .await
+                .unwrap();
+            return;
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let pause = rate_control::pause_path_for(&stop);
+        let now = rate_control::now_epoch();
+        let lifted = format!(
+            "resume_at={}\nwindow=five_hour\nreason=usage-gate: five_hour 100% >= threshold 90%\nrevision=5\nsince={}\nsource=ai-usage\ncause=threshold\nobserved_at={}\nused_percent=100\nlifted_at={}\nlift_reason=five_hour dropped from 100% to 0%\n",
+            now + 600,
+            now - 60,
+            now - 60,
+            now + 300,
+        );
+        std::fs::write(&pause, &lifted).unwrap();
+        // libtest のテスト名はクレート名を含まない（`usage::tests::<名前>`）。
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, rest)| rest);
+        let test_name = format!(
+            "{module}::usage_gate_keeps_an_early_resume_and_says_it_recorded_nothing_on_stderr"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+            .env(GATE_CHILD_DIR_ENV, tmp.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "子プロセスでテストが 1 件だけ動くべき\n{stdout}\n{stderr}"
+        );
+        assert!(stderr.contains("記録しません"), "{stderr}");
+        assert!(!stderr.contains("待機"), "{stderr}");
+        assert!(
+            !stdout.contains("usage-gate"),
+            "stdout は claim 番号専用: {stdout}"
+        );
+        assert!(!stop.exists());
+        assert_eq!(std::fs::read_to_string(&pause).unwrap(), lifted);
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Local, NaiveDateTime};
 use colored::Colorize;
 use std::path::{Path, PathBuf};
@@ -15,9 +15,22 @@ fn parse_dir_timestamp(name: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(&name[..15], "%Y%m%d_%H%M%S").ok()
 }
 
+/// [`cleanup_old_reports`] の結果。
+#[derive(Debug, Default)]
+pub struct CleanupReport {
+    /// 削除したディレクトリ。
+    pub deleted: Vec<PathBuf>,
+    /// 削除できなかったもの（パスと理由を含む 1 行の説明）。
+    pub failures: Vec<String>,
+}
+
 /// `report_dir` から `max_age` より古いレポートディレクトリを削除する。
-/// 削除されたディレクトリパスのリストを返す。
-pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<Vec<PathBuf>> {
+///
+/// 1 件の失敗（消せないディレクトリ、列挙の途中のエラー）では止めず、パスと理由を
+/// [`CleanupReport::failures`] に記録して残りの削除を続ける。最初の失敗で止めていた頃は、
+/// 消せないディレクトリが 1 つあるだけで、それより後の古いログが永久に消えなかった。
+/// `report_dir` 自体を読めない場合はエラーを返す（何も調べられない）。
+pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<CleanupReport> {
     let duration = parse_duration(max_age)?;
     let cutoff = Local::now()
         .naive_local()
@@ -26,14 +39,25 @@ pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<Vec<PathB
 
     let entries = match std::fs::read_dir(report_dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(e.into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(CleanupReport::default()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {}", report_dir.display()));
+        }
     };
 
-    let mut deleted = Vec::new();
+    let mut report = CleanupReport::default();
 
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                report.failures.push(format!(
+                    "failed to read an entry in {}: {e}",
+                    report_dir.display()
+                ));
+                continue;
+            }
+        };
         let path = entry.path();
         // path.is_dir() はシンボリックリンクを追跡するため、
         // リンク先のディレクトリを誤って削除しないようリンクは除外する
@@ -51,18 +75,26 @@ pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<Vec<PathB
         };
 
         if ts < cutoff {
-            std::fs::remove_dir_all(&path)?;
-            deleted.push(path);
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => report.deleted.push(path),
+                Err(e) => report
+                    .failures
+                    .push(format!("failed to remove {}: {e}", path.display())),
+            }
         }
     }
 
-    Ok(deleted)
+    Ok(report)
 }
 
-/// クリーンアップ結果を表示する。
-pub fn print_cleanup_result(deleted: &[PathBuf]) {
+/// クリーンアップ結果を表示する。削除できなかったものは stderr に警告する。
+pub fn print_cleanup_result(report: &CleanupReport) {
+    let deleted = &report.deleted;
     if deleted.is_empty() {
-        println!("{}", "No old report directories to clean up.".dimmed());
+        // 消せなかったものがあるのに「片付けるものは無い」とは言わない。
+        if report.failures.is_empty() {
+            println!("{}", "No old report directories to clean up.".dimmed());
+        }
     } else {
         println!(
             "{} {} report {}",
@@ -83,6 +115,9 @@ pub fn print_cleanup_result(deleted: &[PathBuf]) {
                     .unwrap_or_default()
             );
         }
+    }
+    for failure in &report.failures {
+        eprintln!("{}: {failure}", "Warning".yellow());
     }
 }
 
@@ -130,7 +165,7 @@ mod tests {
         let skip_dir = base.join("random_dir");
         fs::create_dir(&skip_dir).unwrap();
 
-        let deleted = cleanup_old_reports(base, "1d").unwrap();
+        let deleted = cleanup_old_reports(base, "1d").unwrap().deleted;
 
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0].file_name().unwrap(), "20200101_000000_claude");
@@ -141,8 +176,9 @@ mod tests {
 
     #[test]
     fn cleanup_nonexistent_dir_returns_empty() {
-        let deleted = cleanup_old_reports(Path::new("/nonexistent/path/token-burn"), "7d").unwrap();
-        assert!(deleted.is_empty());
+        let report = cleanup_old_reports(Path::new("/nonexistent/path/token-burn"), "7d").unwrap();
+        assert!(report.deleted.is_empty());
+        assert!(report.failures.is_empty());
     }
 
     #[test]
@@ -162,7 +198,7 @@ mod tests {
         let file_path = base.join("20200101_000000_log.txt");
         fs::write(&file_path, "data").unwrap();
 
-        let deleted = cleanup_old_reports(base, "1d").unwrap();
+        let deleted = cleanup_old_reports(base, "1d").unwrap().deleted;
         assert!(deleted.is_empty());
         assert!(file_path.exists(), "ファイルは削除されるべきでない");
     }
@@ -170,7 +206,7 @@ mod tests {
     #[test]
     fn cleanup_empty_dir_returns_empty() {
         let tmp = TempDir::new().unwrap();
-        let deleted = cleanup_old_reports(tmp.path(), "1d").unwrap();
+        let deleted = cleanup_old_reports(tmp.path(), "1d").unwrap().deleted;
         assert!(deleted.is_empty());
     }
 
@@ -218,6 +254,56 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cleanup_continues_past_a_directory_it_cannot_remove() {
+        // 消せないディレクトリが 1 つあると、以前は最初の失敗で Err を返して残りの削除を
+        // 止めていた（それより後の古いログも永久に消えない）。エラーにパスも無かった。
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let names = [
+            "20200101_000000_a",
+            "20200102_000000_b",
+            "20200103_000000_c",
+            "20200104_000000_d",
+            "20200105_000000_e",
+        ];
+        for name in names {
+            fs::create_dir(base.join(name)).unwrap();
+            fs::write(base.join(name).join("x.log"), "x").unwrap();
+        }
+        // 書き込み権の無いサブディレクトリの中にファイルがあると remove_dir_all が失敗する。
+        let stuck = base.join("20200103_000000_c");
+        let locked = stuck.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("f"), "f").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        // root は権限の検査を素通りするので再現できない。
+        if fs::File::create(locked.join("probe")).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let result = cleanup_old_reports(base, "1d");
+        // 後始末で必ず権限を戻す（assert より先に戻さないと TempDir を消せない）。
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let report = result.expect("消せないディレクトリが 1 つあっても全体を失敗にしない");
+        for name in names.iter().filter(|name| base.join(name) != stuck) {
+            assert!(!base.join(name).exists(), "{name} は削除されるべき");
+        }
+        assert_eq!(report.deleted.len(), 4);
+        // 消せなかったものはパスと理由を添えて残す（表示側が警告する）。
+        assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+        assert!(
+            report.failures[0].contains(&stuck.display().to_string()),
+            "{}",
+            report.failures[0]
+        );
+        assert!(stuck.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cleanup_skips_symlinks_pointing_to_dirs() {
         // 回帰テスト: 旧実装の path.is_dir() はシンボリックリンクを追跡するため、
         // リンク先が古いタイムスタンプ形式のディレクトリを指していると
@@ -235,7 +321,7 @@ mod tests {
         let link_path = base.join("20200102_120000_link");
         symlink(&real_dir, &link_path).unwrap();
 
-        let deleted = cleanup_old_reports(base, "1d").unwrap();
+        let deleted = cleanup_old_reports(base, "1d").unwrap().deleted;
 
         // 削除されるのは実ディレクトリのみで、シンボリックリンクは保持される
         assert_eq!(deleted.len(), 1, "削除されたのは実ディレクトリだけのはず");

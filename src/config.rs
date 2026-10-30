@@ -292,8 +292,27 @@ impl Config {
             .parent()
             .unwrap_or(Path::new("."))
             .to_path_buf();
+        config.normalize_providers();
         config.validate()?;
         Ok(config)
+    }
+
+    /// provider の表記ゆれを検証の前にそろえる（前後の空白を落として小文字にし、空なら未設定）。
+    ///
+    /// provider は実行時のフラグ付与（[`agent_runs_cli`]）、ai-usage の `(profile, provider)`
+    /// の照合（完全一致）、ai-usage の `--only` / `--active-provider`（小文字しか受け付けない）に
+    /// そのまま渡る。ここでそろえないと、`provider = "claude "` は検証（trim して空かを見る）を
+    /// 通るのに claude と判定されず必須フラグが付かない、`provider = "Claude"` はフラグは付くのに
+    /// 使用率の照合に失敗する、という食い違いが起きる。空文字・空白だけを未設定にするのは、
+    /// `dedup_scope` の provider 照合と同じ扱い。
+    fn normalize_providers(&mut self) {
+        for agent in &mut self.agents {
+            agent.provider = agent
+                .provider
+                .take()
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty());
+        }
     }
 
     /// プロンプト値を解決: `.md` で終わる場合はファイル内容を読み込み、それ以外はそのまま使用。
@@ -679,12 +698,13 @@ pub(crate) fn command_is_cli(command: &[String], cli: &str) -> bool {
 }
 
 /// エージェントが `cli`（"claude" / "codex"）かを判定する。provider が明示されていればそれを
-/// 優先し（大文字小文字は区別しない）、無ければ実行ファイル名から推論する。
+/// 優先し（前後の空白と大文字小文字は区別しない）、無ければ実行ファイル名から推論する。
+/// 空白だけの provider は未設定と同じに扱う（`Config::load` の正規化と同じ規則）。
 ///
 /// 実行時のフラグ付与（`executor::flags`）と、設定読み込み時の `codex_output` の検証が同じ規則を
 /// 使うためにここへ置く。両者が食い違うと、検証を通った設定が実行時に黙って無視される。
 pub(crate) fn agent_runs_cli(provider: Option<&str>, command: &[String], cli: &str) -> bool {
-    match provider {
+    match provider.map(str::trim).filter(|p| !p.is_empty()) {
         Some(p) => p.eq_ignore_ascii_case(cli),
         None => command_is_cli(command, cli),
     }
@@ -1617,6 +1637,18 @@ mod tests {
         assert!(!agent_runs_cli(None, &wrapper, "codex"));
     }
 
+    /// `Config::load` を通らずに組み立てた RuntimeAgent（正規化前の provider）でも、
+    /// 前後の空白で判定を外さず、空白だけの provider は未設定として実行ファイル名から推論する。
+    #[test]
+    fn agent_runs_cli_ignores_surrounding_whitespace_and_blank_provider() {
+        let wrapper = command(&["/opt/bin/run-agent.sh"]);
+        assert!(agent_runs_cli(Some(" codex "), &wrapper, "codex"));
+        assert!(agent_runs_cli(Some("CLAUDE\t"), &wrapper, "claude"));
+        assert!(agent_runs_cli(Some(""), &command(&["codex"]), "codex"));
+        assert!(agent_runs_cli(Some("  "), &command(&["claude"]), "claude"));
+        assert!(!agent_runs_cli(Some("  "), &wrapper, "codex"));
+    }
+
     /// codex_output は TOML の小文字表記でパースでき、省略時は未指定（None）として残る。
     /// 未指定と `auto` を区別するのは、codex 以外に「書いた」ことを検出するため。
     #[test]
@@ -1693,6 +1725,113 @@ mod tests {
             config
                 .validate()
                 .unwrap_or_else(|e| panic!("{provider:?} {executable}: {e}"));
+        }
+    }
+
+    /// `[[agents]]` の TOML 断片から設定ファイルを書いて `Config::load` で読む。
+    fn load_with_agents(agents: &str) -> Result<Config> {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let body = format!(
+            r#"
+[settings]
+parallelism = 1
+[prompts]
+default = "review"
+[ai_usage]
+enabled = true
+[[ai_usage.profiles]]
+name = "work"
+profile = "Work"
+[[targets]]
+directory = "."
+{agents}
+"#
+        );
+        std::fs::write(&path, body).unwrap();
+        Config::load(&path)
+    }
+
+    /// 前後に空白のある provider は、検証（trim してから空かを見る）を通る。実行時の判定も
+    /// 同じ値で行わないと、`provider = "claude "` の claude に必須フラグ（`-p` /
+    /// stream-json）が付かず、対話モードの claude が起動して止まる。空白だけの provider は
+    /// 未設定と同じに扱い、実行ファイル名から推論する（`dedup_scope` の判定と同じ扱い）。
+    #[test]
+    fn whitespace_in_provider_does_not_hide_the_cli_at_runtime() {
+        for provider in ["claude ", " Claude", "  "] {
+            let config = load_with_agents(&format!(
+                r#"
+[[agents]]
+name = "claude"
+provider = "{provider}"
+command = ["claude", "--model", "opus"]
+reset_weekday = "monday"
+reset_time = "09:00"
+timezone = "UTC"
+"#
+            ))
+            .unwrap_or_else(|e| panic!("{provider:?}: {e}"));
+            let agents = config.expand_runtime_agents().unwrap();
+            assert!(
+                agent_runs_cli(agents[0].provider.as_deref(), &agents[0].command, "claude"),
+                "provider = {provider:?} の claude は実行時も claude として扱うべき"
+            );
+            assert!(
+                !agent_runs_cli(agents[0].provider.as_deref(), &agents[0].command, "codex"),
+                "{provider:?}"
+            );
+        }
+    }
+
+    /// ai-usage の出力の provider は小文字（`claude` / `codex` …）で、照合は完全一致。
+    /// 読み込み時に小文字へそろえないと、`provider = "Claude"` はフラグの判定（大文字小文字を
+    /// 区別しない）だけ通り、使用率の照合と `--only` の指定（ai-usage は小文字しか受け付けない）
+    /// で失敗する。
+    #[test]
+    fn provider_is_lowercased_for_the_ai_usage_lookup() {
+        let config = load_with_agents(
+            r#"
+[[agents]]
+name = "claude"
+provider = " Claude "
+command = ["claude"]
+reset_weekday = "monday"
+reset_time = "09:00"
+timezone = "UTC"
+[agents.ai_usage]
+profiles = ["work"]
+"#,
+        )
+        .expect("load");
+        let agents = config.expand_runtime_agents().unwrap();
+        assert_eq!(agents[0].provider.as_deref(), Some("claude"));
+        assert_eq!(agents[0].ai_usage.as_ref().unwrap().provider, "claude");
+    }
+
+    /// codex_output の検証も正規化した provider で行う。空白付き・大文字の codex を
+    /// 「codex ではない」と弾かない。空文字は未設定なので、実行ファイル名から推論する。
+    #[test]
+    fn codex_output_is_validated_against_the_normalized_provider() {
+        for (provider, executable) in [(" Codex ", "/opt/bin/run-agent.sh"), ("", "codex")] {
+            let config = load_with_agents(&format!(
+                r#"
+[[agents]]
+name = "codex"
+provider = "{provider}"
+command = ["{executable}", "exec"]
+codex_output = "json"
+reset_weekday = "monday"
+reset_time = "09:00"
+timezone = "UTC"
+"#
+            ))
+            .unwrap_or_else(|e| panic!("{provider:?} {executable}: {e}"));
+            let agents = config.expand_runtime_agents().unwrap();
+            assert!(
+                agent_runs_cli(agents[0].provider.as_deref(), &agents[0].command, "codex"),
+                "{provider:?} {executable}"
+            );
+            assert_eq!(agents[0].codex_output, CodexOutput::Json);
         }
     }
 

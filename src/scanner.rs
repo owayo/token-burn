@@ -274,13 +274,17 @@ fn check_repo(
     scan: &Scan,
     visibility_map: &HashMap<String, Visibility>,
 ) -> Option<ResolvedTarget> {
-    // パスは `OsStr` のまま渡す。`to_string_lossy()` は不正な UTF-8 バイトを U+FFFD へ
-    // 置換するため、非 UTF-8 のディレクトリ名では存在しないパスを git に渡すことになり、
-    // `username` 指定時はそのリポジトリが黙って対象から消える。`repo_last_modified` は
-    // すでに `.arg(dir)` で正しく渡しており、ここだけ振る舞いが食い違っていた。
-    let remote_url = run_git_capture(path, &["remote", "get-url", "origin"])
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let remote_url = match read_origin_url(path) {
+        Ok(url) => url,
+        // `username` 指定時は owner を照合できないので対象から外す。ほかの経路（読めない
+        // ディレクトリ・DirEntry の取得失敗・git 不在）と同じく、黙って消さずに警告する。
+        // `username` 未指定なら origin は可視性の照合にしか使わず（照合表も空）、外さない。
+        Err(reason) if scan.username.is_some() => {
+            eprintln!("{}: {}, skipping", "Warning".yellow(), reason);
+            return None;
+        }
+        Err(_) => None,
+    };
 
     if let Some(username) = &scan.username {
         let remote_url = remote_url.as_deref()?;
@@ -311,6 +315,49 @@ fn check_repo(
     })
 }
 
+/// `git remote get-url` が「その名前の remote が無い」ときの終了コード（git 2.30 以降）。
+/// それより古い git は 128 で終わるので、origin が無いリポジトリも警告してから外す。
+const GIT_NO_SUCH_REMOTE_EXIT: i32 = 2;
+
+/// `origin` remote の URL を読む。
+///
+/// `origin` が無いだけなら `Ok(None)`。git 自体が失敗した（`.git/config` の破損、
+/// `detected dubious ownership` 等。終了コード 128）ときは、パスと git のエラー出力の 1 行目を
+/// 添えた理由を `Err` で返す。両者を同じ「origin 無し」に潰すと、`username` 指定時に壊れた
+/// リポジトリが警告も無く対象から消え、`Found N repositories` の N が減るだけで原因を追えない。
+/// git を起動できない場合は [`run_git_capture`] が警告済みなので `Ok(None)`。
+fn read_origin_url(path: &Path) -> Result<Option<String>, String> {
+    // パスは `OsStr` のまま渡す。`to_string_lossy()` は不正な UTF-8 バイトを U+FFFD へ
+    // 置換するため、非 UTF-8 のディレクトリ名では存在しないパスを git に渡すことになり、
+    // `username` 指定時はそのリポジトリが黙って対象から消える。`repo_last_modified` は
+    // すでに `.arg(dir)` で正しく渡しており、ここだけ振る舞いが食い違っていた。
+    let Some(output) = run_git_capture(path, &["remote", "get-url", "origin"]) else {
+        return Ok(None);
+    };
+    if output.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ));
+    }
+    if output.status.code() == Some(GIT_NO_SUCH_REMOTE_EXIT) {
+        return Ok(None);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let summary = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no error output");
+    let status = output
+        .status
+        .code()
+        .map_or_else(|| output.status.to_string(), |code| code.to_string());
+    Err(format!(
+        "failed to read the origin remote of {} (git exited with {status}: {summary})",
+        path.display()
+    ))
+}
+
 fn remote_belongs_to_username(remote_url: &str, username: &str) -> bool {
     extract_remote_owner(remote_url)
         .map(|owner| owner.eq_ignore_ascii_case(username))
@@ -329,15 +376,19 @@ fn extract_remote_owner_and_repo(remote_url: &str) -> Option<(String, String)> {
     let trimmed = remote_url.trim().trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
 
-    // SSH 形式 (git@host:path) と HTTPS 形式 (scheme://host/path) を一段に正規化する。
-    let path_part: &str = if let Some((host_part, rest)) = trimmed.split_once(':')
-        && host_part.contains('@')
-        && !host_part.contains("://")
-    {
-        rest
-    } else if let Some((_, after_scheme)) = trimmed.split_once("://") {
+    // URL 形式 (scheme://host/path) と scp 形式 ([user@]host:path) を一段に正規化する。
+    // 判定は git と同じ順にする。`scheme://` で始まれば URL、そうでなければ「最初の `:` より
+    // 前に `/` が無い」ものだけを scp 形式とし、それ以外（`./dir:x` や `/abs/dir:x`）は
+    // ローカルのパス。user は省略できる（`~/.ssh/config` の Host 別名を使った
+    // `gh-work:owner/repo.git` 等）。
+    let path_part: &str = if let Some(after_scheme) = strip_url_scheme(trimmed) {
         let (_, path) = after_scheme.split_once('/')?;
         path
+    } else if let Some((host_part, rest)) = trimmed.split_once(':')
+        && !host_part.is_empty()
+        && !host_part.contains('/')
+    {
+        rest
     } else {
         return None;
     };
@@ -354,6 +405,19 @@ fn extract_remote_owner_and_repo(remote_url: &str) -> Option<(String, String)> {
         return None;
     }
     Some((owner.to_string(), repo.to_string()))
+}
+
+/// `scheme://` で始まる URL なら、`://` より後ろを返す。
+///
+/// scheme は git の `is_url` と同じく `[A-Za-z0-9][A-Za-z0-9+.-]*` に限る。`://` を含むだけで
+/// URL とみなすと、scp 形式のパスの中の `://`（`git@host:cache://owner/repo`）を URL の
+/// 始まりと読み違える。
+fn strip_url_scheme(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(rest)
 }
 
 async fn fetch_visibility_map(username: &str) -> Result<HashMap<String, Visibility>> {
@@ -555,6 +619,46 @@ mod tests {
         // 3 段以上のサブグループでも、末尾 2 セグメントが採用される。
         let parsed = extract_remote_owner_and_repo("git@gitlab.example.com:a/b/c/d/repo.git");
         assert_eq!(parsed, Some(("d".to_string(), "repo".to_string())));
+    }
+
+    #[test]
+    fn extract_remote_owner_and_repo_accepts_scp_style_without_user() {
+        // git の scp 形式は `[<user>@]<host>:<path>` で user を省略できる。`~/.ssh/config` の
+        // Host 別名（`gh-work:owner/repo.git`）でよく使う。`@` を必須にしていた頃は解析できず、
+        // `username` 指定時にそのリポジトリが警告なしで対象から消えていた。
+        let owner_repo = Some(("owner".to_string(), "repo".to_string()));
+        assert_eq!(
+            extract_remote_owner_and_repo("github.com:owner/repo.git"),
+            owner_repo
+        );
+        assert_eq!(
+            extract_remote_owner_and_repo("gh-work:owner/repo.git"),
+            owner_repo
+        );
+        assert_eq!(
+            extract_remote_owner_and_repo("gitlab.example.com:group/subgroup/repo.git"),
+            Some(("subgroup".to_string(), "repo".to_string()))
+        );
+        // URL 形式の中の `:`（ポート）は scp 形式と取り違えない。
+        assert_eq!(
+            extract_remote_owner_and_repo("ssh://git@github.com:22/owner/repo.git"),
+            owner_repo
+        );
+        // 逆に scp 形式のパスの中の `://` は URL の始まりではない（`://` の前が scheme の
+        // 形をしていない）。
+        assert_eq!(
+            extract_remote_owner_and_repo("git@example.com:cache://owner/repo.git"),
+            owner_repo
+        );
+    }
+
+    #[test]
+    fn extract_remote_owner_and_repo_does_not_read_local_paths_as_scp_style() {
+        // 最初の `:` より前に `/` があればローカルのパス（git と同じ判定）。
+        assert_eq!(extract_remote_owner_and_repo("./dir:x/repo"), None);
+        assert_eq!(extract_remote_owner_and_repo("/abs/dir:x/repo"), None);
+        assert_eq!(extract_remote_owner_and_repo("../owner:x/repo.git"), None);
+        assert_eq!(extract_remote_owner_and_repo(":owner/repo.git"), None);
     }
 
     #[test]
@@ -1436,6 +1540,67 @@ mod tests {
             .status()
             .expect("git init should run");
         assert!(status.success(), "git init should succeed");
+    }
+
+    fn add_origin(repo: &Path, url: &str) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["remote", "add", "origin", url])
+            .status()
+            .expect("git remote add should run");
+        assert!(status.success(), "git remote add should succeed");
+    }
+
+    #[test]
+    fn read_origin_url_reports_git_errors_but_not_a_missing_origin() {
+        // origin が無いだけ（git remote get-url の終了コード 2）と、git 自体のエラー
+        // （設定ファイルの破損・dubious ownership 等）を分ける。どちらも「origin 無し」に
+        // 潰していた頃は、`username` 指定時に壊れたリポジトリが警告も無く対象から消えた。
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let no_origin = tmp.path().join("no-origin");
+        init_test_repo(&no_origin);
+        assert_eq!(read_origin_url(&no_origin), Ok(None), "origin が無いだけ");
+
+        let with_origin = tmp.path().join("with-origin");
+        init_test_repo(&with_origin);
+        add_origin(&with_origin, "git@github.com:owner/repo.git");
+        // `remote get-url` は利用者の `url.<base>.insteadOf` で書き換えた URL を返すので、
+        // 書き換わらない末尾で確かめる。
+        let url = read_origin_url(&with_origin);
+        assert!(
+            matches!(&url, Ok(Some(url)) if url.ends_with("owner/repo.git")),
+            "{url:?}"
+        );
+
+        let broken = tmp.path().join("broken");
+        init_test_repo(&broken);
+        add_origin(&broken, "git@github.com:owner/repo.git");
+        let config = broken.join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("\n[broken\n");
+        std::fs::write(&config, text).unwrap();
+
+        let reason = read_origin_url(&broken).expect_err("git のエラーは origin 無しと区別する");
+        // 警告にはパスと git のエラー出力の要約（1 行目）を添える。git の文言はロケールで
+        // 変わり得るので、ファイル名と終了コードで確かめる。
+        assert!(reason.contains(&broken.display().to_string()), "{reason}");
+        assert!(reason.contains(".git/config"), "{reason}");
+        assert!(reason.contains("128"), "{reason}");
+        assert!(!reason.contains('\n'), "1 行に収める: {reason}");
+
+        // 壊れたリポジトリは `username` 指定時に対象から外す（警告は find_repos の手前で出す）。
+        let scan = Scan {
+            base_dirs: vec![],
+            recursive: false,
+            username: Some("owner".to_string()),
+            public_first: true,
+            exclude: vec![],
+        };
+        assert!(check_repo(&broken, "broken", &scan, &HashMap::new()).is_none());
+        assert!(check_repo(&no_origin, "no-origin", &scan, &HashMap::new()).is_none());
+        assert!(check_repo(&with_origin, "with-origin", &scan, &HashMap::new()).is_some());
     }
 
     #[cfg(unix)]

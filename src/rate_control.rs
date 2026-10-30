@@ -73,7 +73,7 @@ impl WindowKind {
     /// この枠のリセット時刻として妥当と認める、現在時刻からの最大の先行秒数。
     fn max_reset_ahead(self) -> i64 {
         match self {
-            Self::Short { period_secs } => period_secs + RESET_SKEW_MARGIN_SECS,
+            Self::Short { period_secs } => period_secs.saturating_add(RESET_SKEW_MARGIN_SECS),
             Self::Deadline => 0,
         }
     }
@@ -179,6 +179,10 @@ pub fn evaluate(observations: &[WindowObservation], threshold: u8, now: i64) -> 
 
     // ここに来るのは短周期の枠だけが触れているケース。触れた枠すべてが空くまで待てば
     // よいので、最も遅いリセット時刻を再開時刻に採る。
+    //
+    // `reset_at` は rate_limit_event の JSON を `as_i64()` で読んだだけの未検証の値で、
+    // i64 の端の値も来得る。時刻の加減算は飽和させる（overflow の panic は format-stream
+    // の中ではパイプを閉じ、上流の claude を SIGPIPE で道連れにする）。
     let mut latest_reset: Option<i64> = None;
     for o in &over {
         let Some(reset_at) = o.reset_at else {
@@ -189,20 +193,26 @@ pub fn evaluate(observations: &[WindowObservation], threshold: u8, now: i64) -> 
                 detail: Some("reset time unavailable".to_string()),
             };
         };
-        if reset_at > now + o.kind.max_reset_ahead() {
+        if reset_at > now.saturating_add(o.kind.max_reset_ahead()) {
             // 枠 1 周期ぶんより先を指している。枠の取り違えか壊れた値。
             return Decision::Stop {
                 basis: o.basis(),
-                detail: Some(format!("implausible reset {}s ahead", reset_at - now)),
+                detail: Some(format!(
+                    "implausible reset {}s ahead",
+                    reset_at.saturating_sub(now)
+                )),
             };
         }
-        if reset_at < now - RESET_SKEW_MARGIN_SECS {
+        if reset_at < now.saturating_sub(RESET_SKEW_MARGIN_SECS) {
             // 使用率は閾値を超えているのに、リセットはとうに過ぎたことになっている。
             // 観測が古すぎる（実データはリセットと同時に次の窓の時刻へ更新される）ので、
             // これを根拠に「猶予ぶん待てば再開できる」と判断してはいけない。
             return Decision::Stop {
                 basis: o.basis(),
-                detail: Some(format!("stale reset {}s in the past", now - reset_at)),
+                detail: Some(format!(
+                    "stale reset {}s in the past",
+                    now.saturating_sub(reset_at)
+                )),
             };
         }
         latest_reset = Some(latest_reset.map_or(reset_at, |cur: i64| cur.max(reset_at)));
@@ -217,7 +227,9 @@ pub fn evaluate(observations: &[WindowObservation], threshold: u8, now: i64) -> 
     Decision::Pause {
         // 既にリセット時刻を過ぎている観測（取得と判定の間にリセットが挟まった）でも、
         // 猶予ぶんは空けてから再開する。
-        resume_at: reset_at.max(now) + RESET_PROPAGATION_GRACE_SECS,
+        resume_at: reset_at
+            .max(now)
+            .saturating_add(RESET_PROPAGATION_GRACE_SECS),
         basis: worst.basis(),
     }
 }
@@ -1551,6 +1563,28 @@ mod tests {
         // 5 時間枠のはずが 1 日先を指している = 枠の取り違えか壊れた値。
         let obs = [five_hour(95.0, Some(NOW + 86_400))];
         assert!(matches!(evaluate(&obs, 90, NOW), Decision::Stop { .. }));
+    }
+
+    #[test]
+    fn extreme_reset_times_stop_without_overflowing() {
+        // `resetsAt` は rate_limit_event の JSON を `as_i64()` で読んだだけの未検証の値。
+        // 表示用の差（何秒先・何秒前か）を素の減算で求めると、i64::MIN 付近で debug build
+        // が overflow の panic を起こす。format-stream はパイプの中段なので、panic は
+        // パイプを閉じて上流の claude を SIGPIPE で道連れにする。
+        match evaluate(&[five_hour(95.0, Some(i64::MIN))], 90, NOW) {
+            Decision::Stop { detail, .. } => {
+                let detail = detail.expect("恒久停止にした理由を添えるべき");
+                assert!(detail.starts_with("stale reset"), "{detail}");
+            }
+            other => panic!("遠い過去のリセットは恒久停止になるべき: {other:?}"),
+        }
+        match evaluate(&[five_hour(95.0, Some(i64::MAX))], 90, NOW) {
+            Decision::Stop { detail, .. } => {
+                let detail = detail.expect("恒久停止にした理由を添えるべき");
+                assert!(detail.starts_with("implausible reset"), "{detail}");
+            }
+            other => panic!("遠い未来のリセットは恒久停止になるべき: {other:?}"),
+        }
     }
 
     #[test]

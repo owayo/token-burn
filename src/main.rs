@@ -965,12 +965,13 @@ async fn run(opts: RunOptions) -> Result<()> {
         run_settings.rate_limit_threshold,
     )?;
 
-    // 古いレポートディレクトリを自動クリーンアップ
+    // 古いレポートディレクトリを自動クリーンアップ。実行そのものは済んでいるので、
+    // 消せなかったものは警告に留める（print_cleanup_result がパスと理由を出す）。
     let max_age = config.settings.cleanup_after.as_deref().unwrap_or("7d");
     println!();
     match cleanup::cleanup_old_reports(&report_dir, max_age) {
-        Ok(deleted) => cleanup::print_cleanup_result(&deleted),
-        Err(e) => eprintln!("{}: cleanup failed: {}", "Warning".yellow(), e),
+        Ok(report) => cleanup::print_cleanup_result(&report),
+        Err(e) => eprintln!("{}: cleanup failed: {:#}", "Warning".yellow(), e),
     }
 
     Ok(())
@@ -982,8 +983,22 @@ fn run_clean(config: &config::Config, older_than: Option<String>) -> Result<()> 
         .as_deref()
         .or(config.settings.cleanup_after.as_deref())
         .unwrap_or("7d");
-    let deleted = cleanup::cleanup_old_reports(&report_dir, max_age)?;
-    cleanup::print_cleanup_result(&deleted);
+    let report = cleanup::cleanup_old_reports(&report_dir, max_age)?;
+    cleanup::print_cleanup_result(&report);
+    // 消せなかったものがあれば、消せるものを消したうえで失敗として終わる。警告だけで
+    // 終了コード 0 にすると、スクリプトや cron から呼んだときに全部片付いたのと区別できない。
+    let failed = report.failures.len();
+    if failed > 0 {
+        anyhow::bail!(
+            "could not remove {failed} old report {} in {} (see the warnings above)",
+            if failed == 1 {
+                "directory"
+            } else {
+                "directories"
+            },
+            report_dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -2388,6 +2403,45 @@ mod tests {
             "provider を復元できない記録で弾くより取りこぼす方に倒すべき"
         );
         assert_eq!(skipped.total, 0);
+    }
+
+    /// `clean` は消せるものを消したうえで、消せなかったものがあれば失敗で終わる。
+    /// 警告だけで終了コード 0 にすると、全部片付いたのと区別できない。
+    #[cfg(unix)]
+    #[test]
+    fn clean_fails_after_removing_the_rest_when_a_report_directory_remains() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let removable = tmp.path().join("20200101_000000_a");
+        let stuck = tmp.path().join("20200102_000000_b");
+        for dir in [&removable, &stuck] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("x.log"), "x").unwrap();
+        }
+        let locked = stuck.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("f"), "f").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // root は権限の検査を素通りするので再現できない。
+        if std::fs::File::create(locked.join("probe")).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let mut conf = dedup_test_config(&[("a", None)], None);
+        conf.settings.report_dir = Some(tmp.path().to_string_lossy().into_owned());
+
+        let result = run_clean(&conf, Some("1d".to_string()));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = result.expect_err("消せなかったものがあれば失敗で終わる");
+        assert!(
+            error
+                .to_string()
+                .contains("could not remove 1 old report directory"),
+            "{error}"
+        );
+        assert!(!removable.exists(), "消せるものは消す");
+        assert!(stuck.exists());
     }
 
     /// provider の照合は大文字小文字を無視する（"Codex" と "codex" を別グループにしない）。
