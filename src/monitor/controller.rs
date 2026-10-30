@@ -27,6 +27,10 @@ impl Counts {
 pub struct Pause {
     pub resume_at: i64,
     pub window: String,
+    /// 一時停止した理由（pause file の `reason` を 1 行に畳み、エスケープシーケンスと
+    /// 制御文字を除いたもの）。通知に出す（[`super::ui::notice_line`]）。旧形式の pause file
+    /// では空のことがある。
+    pub reason: String,
     /// この一時停止が始まった時刻（`PauseState::since`）。回復の確認の結果が、どの
     /// 一時停止についてのものかを照合するのに使う。
     pub since: i64,
@@ -42,6 +46,7 @@ impl Pause {
         Self {
             resume_at,
             window: window.into(),
+            reason: String::new(),
             since: 0,
             not_liftable: None,
         }
@@ -82,6 +87,8 @@ pub struct Observation {
 pub enum Notice {
     Paused {
         window: String,
+        /// [`Pause::reason`]。
+        reason: String,
         resume_at: i64,
     },
     /// 実データで枠の回復を確かめ、一時停止を見積もりより早く解除した。
@@ -136,7 +143,7 @@ pub struct Controller {
     errors: Vec<String>,
     /// 今効いている一時停止（再開時刻が未来のもの）。
     paused: Option<Pause>,
-    /// 一時停止の通知を最後に組み立てたときの状態。延長・枠の入れ替わり・早期解除を、
+    /// 一時停止の通知を最後に組み立てたときの状態。延長・枠や理由の入れ替わり・早期解除を、
     /// 一時停止中のままでも通知へ反映するために比べる。
     last_pause: Option<PauseKey>,
     notice: Option<Notice>,
@@ -150,6 +157,7 @@ struct PauseKey {
     paused: bool,
     resume_at: Option<i64>,
     window: String,
+    reason: String,
     /// 知らせている早期解除（解除した時刻）。
     lifted_at: Option<i64>,
 }
@@ -200,6 +208,11 @@ impl Controller {
                 .as_ref()
                 .map(|pause| pause.window.clone())
                 .unwrap_or_default(),
+            reason: observation
+                .pause
+                .as_ref()
+                .map(|pause| pause.reason.clone())
+                .unwrap_or_default(),
             lifted_at: lift.map(|lift| lift.lifted_at),
         };
         if self.last_pause.as_ref() != Some(&key) {
@@ -208,6 +221,7 @@ impl Controller {
                 self.notice = match (&paused, lift) {
                     (Some(pause), _) => Some(Notice::Paused {
                         window: pause.window.clone(),
+                        reason: pause.reason.clone(),
                         resume_at: pause.resume_at,
                     }),
                     (None, Some(lift)) => Some(Notice::ResumedEarly {
@@ -365,6 +379,7 @@ pub fn read_observation(
             Some(Pause {
                 not_liftable: super::recovery::not_liftable(&state),
                 resume_at: state.resume_at,
+                reason: single_line(&state.reason),
                 since: state.since,
                 window: state.window,
             }),
@@ -560,6 +575,7 @@ mod tests {
             c.notice(),
             Some(&Notice::Paused {
                 window: "five_hour".into(),
+                reason: String::new(),
                 resume_at: START + 90
             })
         );
@@ -582,10 +598,35 @@ mod tests {
             c.notice(),
             Some(&Notice::Paused {
                 window: "daily".into(),
+                reason: String::new(),
                 resume_at: START + 200
             })
         );
         assert_eq!(c.phase(), Phase::Resuming(200));
+    }
+
+    #[test]
+    fn a_new_reason_for_the_same_pause_updates_the_notice() {
+        // 再開時刻と枠名が同じままでも、理由が替われば通知を描き直す（古い理由を出し続けない）。
+        let mut c = controller();
+        let paused = |reason: &str| Observation {
+            now: START,
+            pause: Some(Pause {
+                reason: reason.into(),
+                ..Pause::new(START + 100, "five_hour")
+            }),
+            ..Observation::default()
+        };
+        c.observe(paused("five_hour 96% >= threshold 95%"));
+        c.observe(paused("request rejected (five_hour); five_hour at 42%"));
+        assert_eq!(
+            c.notice(),
+            Some(&Notice::Paused {
+                window: "five_hour".into(),
+                reason: "request rejected (five_hour); five_hour at 42%".into(),
+                resume_at: START + 100
+            })
+        );
     }
 
     #[test]
@@ -691,6 +732,7 @@ mod tests {
             c.notice(),
             Some(&Notice::Paused {
                 window: "five_hour".into(),
+                reason: String::new(),
                 resume_at: START + 3600
             })
         );
@@ -757,6 +799,7 @@ mod tests {
             Some(Pause {
                 resume_at: START + 600,
                 window: "five_hour".into(),
+                reason: "five_hour 90% >= threshold 90%".into(),
                 since,
                 // 根拠の使用率が記録されていない（比べる元が無い）。
                 not_liftable: Some("the pause has no recorded usage"),
@@ -764,6 +807,32 @@ mod tests {
         );
         assert_eq!(observation.lift, None);
         assert!(observation.stop_file_exists);
+    }
+
+    #[test]
+    fn a_pause_recorded_at_a_low_usage_is_read_as_not_liftable() {
+        // 8% で拒否された一時停止。0% まで下がっても回復と認める下がり幅に届かないので、
+        // 通知に「リセットされれば早めに再開」と出さず、解除できない理由を出す。
+        use crate::rate_control::{PauseCause, PauseSource, PauseState};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let pause = crate::rate_control::pause_path_for(&stop);
+        crate::rate_control::write_pause(
+            &pause,
+            &PauseState::new(
+                START + 600,
+                "five_hour",
+                "request rejected (five_hour); five_hour at 8%",
+            )
+            .observed(PauseSource::Api, PauseCause::Rejected, START - 60)
+            .with_basis(8.0, Some(START + 570)),
+        )
+        .unwrap();
+        let observation = read_observation(tmp.path(), &stop, &pause, START);
+        assert_eq!(
+            observation.pause.unwrap().not_liftable,
+            Some("the recorded usage is too low to confirm a reset")
+        );
     }
 
     #[test]

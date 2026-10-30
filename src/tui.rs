@@ -482,9 +482,9 @@ fn draw(frame: &mut Frame, state: &SelectorState, ctx: &RunContext, list_state: 
 
     // パスは残り幅に合わせて縮める。固定列（マーク・実行順・可視性・名前・更新日時）と
     // 枠・選択記号の分を引いた残りを割り当て、狭い端末でも列がずれないようにする。
-    let path_width = (list_area.width as usize)
-        .saturating_sub(FIXED_COLUMNS_WIDTH)
-        .max(MIN_PATH_WIDTH);
+    // 残りが足りなくても広げない。広げた分は右端が枠で切り落とされ、display_path が残した
+    // リポジトリ名の側が見えなくなる。残りが無ければパスを出さない。
+    let path_width = (list_area.width as usize).saturating_sub(FIXED_COLUMNS_WIDTH);
     let rows: Vec<ListItem> = order_numbers(state.items())
         .into_iter()
         .zip(state.items())
@@ -631,8 +631,6 @@ const FIXED_COLUMNS_WIDTH: usize = 4        // "[x] "
     + 2                                     // 更新日時とパスの区切り
     + 2                                     // リストの枠（左右）
     + 2; // 選択記号 "▶ "
-/// 端末が狭くてもパス列に最低限これだけは残す。
-const MIN_PATH_WIDTH: usize = 16;
 
 fn row_line(item: &SelectorItem, order: Option<usize>, path_width: usize) -> Line<'static> {
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -676,6 +674,13 @@ fn row_line(item: &SelectorItem, order: Option<usize>, path_width: usize) -> Lin
     } else {
         Span::raw("  ")
     };
+    // パス列に幅が残っていなければ、更新日時との区切りも置かない。
+    let path = display_path(&item.target.directory, path_width);
+    let path = if path.is_empty() {
+        path
+    } else {
+        format!("  {path}")
+    };
 
     Line::from(vec![
         Span::styled(format!("{mark} "), mark_style),
@@ -685,10 +690,7 @@ fn row_line(item: &SelectorItem, order: Option<usize>, path_width: usize) -> Lin
         resume,
         Span::raw(name),
         Span::styled(format!("  {modified}"), dim),
-        Span::styled(
-            format!("  {}", display_path(&item.target.directory, path_width)),
-            dim,
-        ),
+        Span::styled(path, dim),
     ])
 }
 
@@ -732,7 +734,11 @@ fn pad_end(text: &str, width: usize) -> String {
 
 /// 表示用にパスを縮める。ホーム配下は `~` に畳み、それでも長い場合は**先頭**を `…` で
 /// 落とす。末尾にリポジトリ名が来るため、切るなら前を捨てる方が識別しやすい。
+/// 幅 0 では何も返さない（どの幅でも表示幅を `max` 以下に収める）。
 fn display_path(path: &Path, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     let raw = match dirs::home_dir() {
         Some(home) => match path.strip_prefix(&home) {
             Ok(rest) => format!("~/{}", rest.display()),
@@ -740,7 +746,7 @@ fn display_path(path: &Path, max: usize) -> String {
         },
         None => path.display().to_string(),
     };
-    if raw.width() <= max || max == 0 {
+    if raw.width() <= max {
         return raw;
     }
     // 先頭の `…`（幅 1）を除いた分だけ末尾から残す。表示幅で数えるのは名前列と同じ理由。
@@ -1577,6 +1583,68 @@ mod tests {
     #[test]
     fn display_path_keeps_short_paths_as_is() {
         assert_eq!(display_path(Path::new("/tmp/repo"), 40), "/tmp/repo");
+    }
+
+    /// 幅 0 では何も出さない（指定幅に収める。全体を返すと行がはみ出す）。
+    #[test]
+    fn display_path_is_empty_for_zero_width() {
+        assert_eq!(display_path(Path::new("/tmp/repo"), 0), "");
+    }
+
+    /// 選択画面を `width` 桁で描き、`needle` を含む行を返す。
+    fn rendered_row(state: &SelectorState, width: u16, needle: &str) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let ctx = RunContext {
+            agent_name: "claude".to_string(),
+            reset_in: "1d".to_string(),
+            schedule_source: "fixed".to_string(),
+            settings: settings(),
+        };
+        let height = 16;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut list_state = ListState::default().with_selected(Some(0));
+        terminal
+            .draw(|frame| draw(frame, state, &ctx, &mut list_state))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}"))
+    }
+
+    /// パス列は固定列を引いた残り幅で描く。残りが足りなくても最低幅まで広げて描くと、
+    /// 右端が枠で切り落とされ、`display_path` が残したリポジトリ名の側が見えなくなる。
+    #[test]
+    fn the_path_column_keeps_the_repository_name_inside_the_list() {
+        let mut item = target("name");
+        item.directory = PathBuf::from("/srv/repositories/some-group/zz-tail-marker");
+        let state = SelectorState::new(
+            vec![item],
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            1,
+            settings(),
+        );
+        for (width, tail) in [
+            (80, "…rker"),
+            (90, "…zz-tail-marker"),
+            (120, "/srv/repositories/some-group/zz-tail-marker"),
+        ] {
+            let row = rendered_row(&state, width, "[x]");
+            let inside = row.trim_end_matches('│').trim_end();
+            assert!(inside.ends_with(tail), "{width} columns: {row:?}");
+        }
+        // 固定列で埋まる幅では、パスを出さない。
+        let row = rendered_row(&state, FIXED_COLUMNS_WIDTH as u16, "[x]");
+        assert!(!row.contains("srv") && !row.contains('…'), "{row:?}");
     }
 
     /// TTY が無い環境では非対話に落とさずエラーにする（テスト実行時は TTY 無し）。

@@ -229,6 +229,15 @@ pub fn evaluate(observations: &[WindowObservation], threshold: u8, now: i64) -> 
 /// 反映の遅れを「下がった」と読まないよう、半分以下かつこの幅以上の低下だけを認める。
 pub const RECOVERY_DROP_POINTS: f64 = 10.0;
 
+/// 根拠の使用率 `basis` から `used` への低下を、回復（リセット）の証拠と認めるか。
+///
+/// 記録時の半分以下、かつ [`RECOVERY_DROP_POINTS`] 以上の低下だけを認める（理由は
+/// [`check_recovery`]）。取り直す前に解除できない一時停止を見分けるモニター
+/// （`monitor::recovery::not_liftable`）も、判定を食い違わせないようにこれを使う。
+pub fn is_recovery_drop(basis: f64, used: f64) -> bool {
+    used <= basis / 2.0 && basis - used >= RECOVERY_DROP_POINTS
+}
+
 /// 早期再開の直後にまた止まったとき、その一時停止を「再発」とみなす期間（秒）。
 ///
 /// 早期再開した直後に API が同じ枠でまた拒否したなら、再開の根拠にした観測が実際の
@@ -877,7 +886,7 @@ pub fn check_recovery(
             pause.window, window.used_percent, threshold
         ));
     }
-    if window.used_percent <= basis / 2.0 && basis - window.used_percent >= RECOVERY_DROP_POINTS {
+    if is_recovery_drop(basis, window.used_percent) {
         Recovery::Recovered(format!(
             "{} dropped from {:.0}% to {:.0}%",
             pause.window, basis, window.used_percent

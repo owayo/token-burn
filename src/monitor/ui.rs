@@ -84,7 +84,7 @@ pub fn draw(frame: &mut Frame, view: &View) {
 /// 高さが足りないときは、次の順に行を割り当てる。最下行の進捗、モニター自身の失敗の警告
 /// （stop file を書けなかった等。ワーカーが止まらないことを知らせる）、通知（Ctrl-C の案内を
 /// 含む）、エラー（少なくとも 1 件と残りの件数）、本文（見出し・使用量・負荷）。本文は末尾から
-/// 削る。
+/// 削る。進捗の前の空行は、これらをすべて割り当てて余りがあるときだけ置く。
 pub fn layout(view: &View, width: usize, height: usize) -> Vec<Line<'static>> {
     if height == 0 {
         return Vec::new();
@@ -112,10 +112,6 @@ pub fn layout(view: &View, width: usize, height: usize) -> Vec<Line<'static>> {
     notices.truncate(room);
     room -= notices.len();
 
-    // 進捗の前の空行。余裕があるときだけ置く。
-    let gap = usize::from(room > 0);
-    room -= gap;
-
     let mut body = header(view.manifest);
     if !view.usage.is_empty() {
         body.push(Line::default());
@@ -135,6 +131,11 @@ pub fn layout(view: &View, width: usize, height: usize) -> Vec<Line<'static>> {
     let errors = error_lines(errors, error_budget);
     room -= errors.len();
     body.truncate(room);
+    room -= body.len();
+
+    // 進捗の前の空行。ほかの行をすべて割り当てて余りがあるときだけ置く。先に場所を取ると、
+    // 低いペインでエラーの要約や本文の行を押し出す。
+    let gap = usize::from(room > 0);
 
     let mut lines = body;
     lines.extend(errors);
@@ -878,10 +879,21 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 pub fn notice_line(notice: &Notice, now: i64) -> String {
     match notice {
-        Notice::Paused { window, resume_at } => format!(
-            " 💤 Paused: {window} window over threshold — resuming at {}",
-            format_clock(*resume_at, now)
-        ),
+        // 原因は決め付けず、pause file の理由（成立している条件だけを書いたもの）を出す。
+        // 閾値を下回っていても拒否されることがあり（42% で拒否された例がある）、前回の実行の
+        // 中断記録から保留することもある。理由の無い旧形式では枠名だけを出す。
+        Notice::Paused {
+            window,
+            reason,
+            resume_at,
+        } => {
+            let at = format_clock(*resume_at, now);
+            if reason.is_empty() {
+                format!(" 💤 Paused: {window} window — resuming at {at}")
+            } else {
+                format!(" 💤 Paused: {reason} — resuming at {at}")
+            }
+        }
         Notice::ResumedEarly {
             window,
             reason,
@@ -1393,9 +1405,10 @@ mod tests {
             progress_line(&controller, 200),
             " 💤 resuming in 01h 02m 05s  [░░░░░░░░░░░░░░░░░░░░] 0/10 (0%, fail:0 retry:0)"
         );
+        // 理由の無い一時停止では、原因を推測せず枠名だけを出す。
         assert!(
             notice_line(controller.notice().unwrap(), NOW)
-                .starts_with(" 💤 Paused: five_hour window over threshold — resuming at ")
+                .starts_with(" 💤 Paused: five_hour window — resuming at ")
         );
         controller.interrupt();
         assert!(progress_line(&controller, 200).starts_with(" ⏳ Stopping...  ["));
@@ -1474,15 +1487,17 @@ mod tests {
     fn a_pause_says_it_may_resume_early_only_while_recovery_is_checked() {
         let resume = format_clock(NOW + 3_600, NOW);
         let pause = Pause {
+            reason: "request rejected (five_hour); five_hour at 100%".into(),
             since: NOW - 60,
             ..Pause::new(NOW + 3_600, "five_hour")
         };
+        let paused = format!(
+            " 💤 Paused: request rejected (five_hour); five_hour at 100% — resuming at {resume}"
+        );
         // ai-usage 連携が無い（または ai-usage が古い）構成では、早めの再開を案内しない。
         assert_eq!(
             paused_notices(pause.clone(), &recovery::Status::default()),
-            [format!(
-                " 💤 Paused: five_hour window over threshold — resuming at {resume}"
-            )]
+            [paused.as_str()]
         );
         // 確かめている構成では案内し、同じ一時停止についての直近の確認を添える。
         let mut status = recovery::Status::new(true);
@@ -1494,9 +1509,7 @@ mod tests {
         assert_eq!(
             paused_notices(pause.clone(), &status),
             [
-                format!(
-                    " 💤 Paused: five_hour window over threshold — resuming at {resume}, or earlier if the window is reset"
-                ),
+                format!("{paused}, or earlier if the window is reset"),
                 format!(
                     "    last checked {}: five_hour at 100% (was 100% when paused)",
                     format_clock(NOW, NOW)
@@ -1514,7 +1527,7 @@ mod tests {
         assert_eq!(
             paused_notices(unliftable, &status),
             [
-                format!(" 💤 Paused: five_hour window over threshold — resuming at {resume}"),
+                paused,
                 "    early resume unavailable: the pause has no recorded usage".to_string(),
             ]
         );
@@ -1642,6 +1655,144 @@ mod tests {
             text.split_whitespace().collect::<Vec<_>>()
         );
         assert_eq!(wrap("short", 40), ["short"]);
+    }
+
+    fn texts(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn the_gap_before_the_progress_line_never_takes_a_row_from_the_errors() {
+        // 進捗・通知の後に 1 行しか残らないときは、その行でエラーの要約を出す
+        // （割り当て順: 進捗 → 警告 → 通知 → エラー → 本文。空行はこの順に無い）。
+        let now = Instant::now();
+        let manifest = manifest();
+        let mut controller = controller(Counts::default());
+        controller.observe(Observation {
+            now: NOW,
+            errors: (1..=5).map(|n| format!("task {n} failed")).collect(),
+            ..Observation::default()
+        });
+        controller.interrupt();
+        let load = LoadHistory::default();
+        let disk = DiskState::default();
+        let view = View {
+            manifest: &manifest,
+            controller: &controller,
+            usage: &[],
+            load: &load,
+            disk: &disk,
+            alerts: &[],
+            recovery: &recovery::Status::default(),
+            now,
+        };
+        let tiny = texts(&layout(&view, 120, 3));
+        assert_eq!(tiny.len(), 3, "{tiny:?}");
+        assert_eq!(tiny[0], " ❌ 5 errors", "{tiny:?}");
+        assert!(tiny[1].contains("Waiting for current tasks"), "{tiny:?}");
+        assert!(tiny[2].contains("0/10"), "{tiny:?}");
+
+        // 空行は、ほかの行をすべて割り当てて余りがあるときだけ置く。全部を出すのに 1 行
+        // 足りない高さでは、空行を省いてエラーも本文も削らない。
+        let full = texts(&layout(&view, 120, 200));
+        let gap = full.len() - 2;
+        assert_eq!(full[gap], "", "{full:?}");
+        let mut without_gap = full.clone();
+        without_gap.remove(gap);
+        assert_eq!(texts(&layout(&view, 120, full.len() - 1)), without_gap);
+        assert_eq!(texts(&layout(&view, 120, full.len())), full);
+    }
+
+    /// pause file を書いて読み直し、一時停止の通知の行を返す（折り返さない幅で）。
+    fn notices_for_pause_file(state: &crate::rate_control::PauseState) -> Vec<String> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop = tmp.path().join("stop");
+        let pause_file = crate::rate_control::pause_path_for(&stop);
+        crate::rate_control::write_pause(&pause_file, state).unwrap();
+        let observation = super::super::controller::read_observation(
+            &tmp.path().join("markers"),
+            &stop,
+            &pause_file,
+            NOW,
+        );
+        let manifest = manifest();
+        let mut controller = controller(Counts::default());
+        controller.observe(observation);
+        let load = LoadHistory::default();
+        let disk = DiskState::default();
+        let view = View {
+            manifest: &manifest,
+            controller: &controller,
+            usage: &[],
+            load: &load,
+            disk: &disk,
+            alerts: &[],
+            recovery: &recovery::Status::default(),
+            now: Instant::now(),
+        };
+        notice_texts(&view)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
+    }
+
+    #[test]
+    fn a_pause_notice_states_the_condition_recorded_in_the_pause_file() {
+        // 通知は pause file の理由（成立している条件だけを書いたもの）を出す。42% で拒否された
+        // 一時停止や、前回の実行の中断記録から保留した一時停止を「閾値超過」と出さない。
+        use crate::rate_control::{PauseCause, PauseSource, PauseState};
+        let resume = format_clock(NOW + 3_600, NOW);
+        let cases = [
+            (
+                PauseState::new(
+                    NOW + 3_600,
+                    "five_hour",
+                    "request rejected (five_hour); five_hour at 42%",
+                )
+                .observed(PauseSource::Api, PauseCause::Rejected, NOW - 60)
+                .with_basis(42.0, Some(NOW + 3_570)),
+                "request rejected (five_hour); five_hour at 42%",
+            ),
+            (
+                PauseState::new(
+                    NOW + 3_600,
+                    "five_hour",
+                    "a resumed session was rate limited (five_hour) until 2027-01-15 09:00",
+                )
+                .observed(PauseSource::Saved, PauseCause::Rejected, NOW - 3_600)
+                .with_basis(100.0, Some(NOW + 3_570)),
+                "a resumed session was rate limited (five_hour) until 2027-01-15 09:00",
+            ),
+            (
+                PauseState::new(NOW + 3_600, "five_hour", "five_hour 96% >= threshold 95%")
+                    .observed(PauseSource::Api, PauseCause::Threshold, NOW - 60)
+                    .with_basis(96.0, Some(NOW + 3_570)),
+                "five_hour 96% >= threshold 95%",
+            ),
+            // 改行・エスケープシーケンス・制御文字は 1 行に畳んで除く。
+            (
+                PauseState::new(
+                    NOW + 3_600,
+                    "five_hour",
+                    "usage-gate:\r\n\x1b[31mfive_hour 96%\x1b[0m >= threshold 95%",
+                ),
+                "usage-gate: five_hour 96% >= threshold 95%",
+            ),
+            // 理由の無い（旧形式の）一時停止では、原因を推測せず枠名だけを出す。
+            (
+                PauseState::new(NOW + 3_600, "five_hour", ""),
+                "five_hour window",
+            ),
+        ];
+        for (state, shown) in cases {
+            assert_eq!(
+                notices_for_pause_file(&state).first().map(String::as_str),
+                Some(format!(" 💤 Paused: {shown} — resuming at {resume}").as_str())
+            );
+        }
     }
 
     fn controller_with(total: usize, counts: Counts) -> Controller {

@@ -34,7 +34,9 @@ use crate::rate_control::{self, PauseSource, PauseState, Recovery};
 /// 確認の間隔と期限。テストでは短くする。
 #[derive(Debug, Clone, Copy)]
 struct Timing {
-    /// pause file を読む間隔。一時停止が始まってから最初の確認までの遅れはこれだけ。
+    /// pause file を読む間隔。確かめられるようになってから最初の確認までの遅れはこれだけ
+    /// （書かれた直後の一時停止は、根拠の観測から `LIVE_FRESHNESS_MARGIN_SECS` が過ぎてから
+    /// 確かめる。[`Checker::poll`]）。
     poll: Duration,
     /// 取得が終わってから次の取得を始めるまでの間隔。開始ではなく完了から数える
     /// （取得が長引いたときに休みなく取らない。monitor::usage と同じ考え方）。
@@ -134,9 +136,14 @@ impl Status {
 /// 食い違っても、取り直して判定できないか、取り直さずに待つかのどちらかで、解除を誤って
 /// 作ることはない。
 pub fn not_liftable(pause: &PauseState) -> Option<&'static str> {
-    if pause.used_percent.is_none() {
+    let Some(basis) = pause.used_percent else {
         // 旧形式の pause file や、根拠の使用率を持たない一時停止。比べる元が無い。
         return Some("the pause has no recorded usage");
+    };
+    if !rate_control::is_recovery_drop(basis, 0.0) {
+        // 根拠の使用率が低い（例: 8% で拒否された）。取り直して得られる最良の値の 0% まで
+        // 下がっても、回復と認める下がり幅に届かない。
+        return Some("the recorded usage is too low to confirm a reset");
     }
     if pause.relapse && pause.source != PauseSource::AiUsage {
         // 早期解除の直後に API がまた拒否した。ai-usage が別アカウントを見ている構成では、
@@ -209,7 +216,17 @@ impl Checker {
         }
         // 無い・読めない・壊れているときは確かめない（壊れた場合の扱いはワーカーが決める）。
         let pause = rate_control::read_pause(&self.pause_file).ok().flatten()?;
-        if !pause.blocks(rate_control::now_epoch()) || not_liftable(&pause).is_some() {
+        let now = rate_control::now_epoch();
+        if !pause.blocks(now) || not_liftable(&pause).is_some() {
+            return None;
+        }
+        // 取り直したデータの取得時刻の下限は「取得開始 − LIVE_FRESHNESS_MARGIN_SECS」
+        // （[`Self::check`]）。それが根拠の観測より前になるうちは、取っても check_recovery が
+        // 必ず判定できない。書かれた直後の一時停止を見つけてすぐ取ると、claude.ai への
+        // 問い合わせが無駄になり、早期再開も次の取得まで遅れる。取得の間隔の数え始めには
+        // しないので、条件を満たした次の確認ですぐ取る（前回の実行の中断記録から保留した
+        // 一時停止は根拠が前回の中断の時刻なので、見つけたらすぐ確かめる）。
+        if now - rate_control::LIVE_FRESHNESS_MARGIN_SECS < pause.observed_at {
             return None;
         }
         if self
@@ -772,5 +789,156 @@ mod tests {
         // ai-usage 自身が書いた再発なら、同じ取得元どうしの比較なので確かめる。
         relapse.source = PauseSource::AiUsage;
         assert_eq!(not_liftable(&relapse), None);
+    }
+
+    /// 根拠の観測時刻だけを変えた、API の拒否で始まった一時停止。
+    fn rejected_at(observed_at: i64) -> PauseState {
+        let now = rate_control::now_epoch();
+        PauseState::new(
+            now + 3600,
+            "five_hour",
+            "request rejected (five_hour); five_hour at 100%",
+        )
+        .observed(PauseSource::Api, PauseCause::Rejected, observed_at)
+        .with_basis(100.0, Some(now + 3570))
+    }
+
+    #[tokio::test]
+    async fn a_fresh_pause_is_checked_once_fetched_data_can_postdate_it() {
+        // 取り直したデータの取得時刻の下限は「取得開始 − LIVE_FRESHNESS_MARGIN_SECS」。
+        // 書かれた直後の一時停止では、取っても check_recovery が必ず判定できない
+        // （the usage may predate the pause）ので、claude.ai へ問い合わせない。
+        let (_tmp, stop, pause_file, marker) = setup();
+        let now = rate_control::now_epoch();
+        paused(&pause_file, &rejected_at(now));
+        // 取得の間隔は長くしておく。見送った確認が間隔の数え始めになっていれば、
+        // 次の取得は 1 時間後まで行われない。
+        let mut checker = checker(
+            &stop,
+            counted(&marker, &prints(&usage_json(0.0))),
+            timing(Duration::from_secs(3600)),
+        );
+        assert_eq!(checker.poll().await, None);
+        assert_eq!(fetches(&marker), 0);
+
+        // 根拠の観測から余裕の秒数が過ぎた（取り直すデータは根拠より後のものと言える）。
+        // 次の確認ですぐ取得し、判定できる。
+        std::fs::remove_file(&pause_file).unwrap();
+        paused(
+            &pause_file,
+            &rejected_at(now - rate_control::LIVE_FRESHNESS_MARGIN_SECS),
+        );
+        let update = checker.poll().await;
+        assert!(matches!(update, Some(Update::Lifted { .. })), "{update:?}");
+        assert_eq!(fetches(&marker), 1);
+    }
+
+    #[tokio::test]
+    async fn the_loop_fetches_on_the_next_poll_once_the_basis_is_old_enough() {
+        // 見送った後の確認は、取得の間隔（30 秒）ではなく毎回の poll で判定し直す。
+        let (_tmp, stop, pause_file, marker) = setup();
+        let now = rate_control::now_epoch();
+        paused(&pause_file, &rejected_at(now));
+        let (tx, mut rx) = mpsc::channel(4);
+        let task = tokio::spawn(run_with(
+            checker(
+                &stop,
+                counted(&marker, &prints(&usage_json(0.0))),
+                timing(Duration::from_secs(3600)),
+            ),
+            tx,
+        ));
+        // poll は 10ms ごと。何度確かめても、根拠の観測から余裕の秒数が過ぎるまでは取らない。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fetches(&marker), 0);
+        assert!(rx.try_recv().is_err());
+
+        std::fs::remove_file(&pause_file).unwrap();
+        paused(
+            &pause_file,
+            &rejected_at(now - rate_control::LIVE_FRESHNESS_MARGIN_SECS),
+        );
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(
+            matches!(event, Event::Recovery(Update::Lifted { .. })),
+            "unexpected event"
+        );
+        assert_eq!(fetches(&marker), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pause_held_from_a_previous_run_is_checked_at_once() {
+        // 前回の実行で中断したセッションの再開時刻まで保留した一時停止（source=saved）。
+        // 根拠の観測は前回の中断の時刻なので、見つけたらすぐ確かめる。
+        let (_tmp, stop, pause_file, marker) = setup();
+        let now = rate_control::now_epoch();
+        paused(
+            &pause_file,
+            &PauseState::new(
+                now + 3600,
+                "five_hour",
+                "a resumed session was rate limited (five_hour)",
+            )
+            .observed(PauseSource::Saved, PauseCause::Rejected, now - 3600)
+            .with_basis(100.0, Some(now + 3570)),
+        );
+        let mut checker = checker(
+            &stop,
+            counted(&marker, &prints(&usage_json(0.0))),
+            timing(Duration::from_secs(3600)),
+        );
+        let update = checker.poll().await;
+        assert!(matches!(update, Some(Update::Lifted { .. })), "{update:?}");
+        assert_eq!(fetches(&marker), 1);
+    }
+
+    #[test]
+    fn not_liftable_agrees_with_check_recovery_on_the_recorded_usage() {
+        // 根拠の使用率が RECOVERY_DROP_POINTS 未満だと、0%（取り直して得られる最良の値）まで
+        // 下がっても回復とは判定されない。そうした一時停止を「解除できない」と先に判定する。
+        let now = rate_control::now_epoch();
+        let reset = rate_control::LiveObservation {
+            windows: vec![rate_control::WindowObservation::new(
+                rate_control::WindowKind::FIVE_HOUR,
+                "five_hour",
+                0.0,
+            )],
+            observed_from: now,
+            fresh: true,
+        };
+        for basis in [0.0, 5.0, 8.0, 9.9, 10.0, 10.5, 42.0, 100.0] {
+            let pause = api_pause(basis);
+            let recovered = matches!(
+                rate_control::check_recovery(&pause, &reset, 95, now),
+                Recovery::Recovered(_)
+            );
+            assert_eq!(
+                not_liftable(&pause).is_none(),
+                recovered,
+                "basis {basis}%: {:?}",
+                not_liftable(&pause)
+            );
+        }
+        assert!(not_liftable(&api_pause(8.0)).is_some());
+        assert_eq!(not_liftable(&api_pause(10.0)), None);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_fetched_for_a_pause_recorded_at_a_low_usage() {
+        // 8% で拒否された一時停止。取り直しても解除されることが無いので問い合わせない
+        // （一時停止のあいだ 30 秒ごとに claude.ai へ問い合わせ続けない）。
+        let (_tmp, stop, pause_file, marker) = setup();
+        paused(&pause_file, &api_pause(8.0));
+        let mut checker = checker(
+            &stop,
+            counted(&marker, &prints(&usage_json(0.0))),
+            timing(Duration::ZERO),
+        );
+        assert_eq!(checker.poll().await, None);
+        assert_eq!(fetches(&marker), 0);
     }
 }

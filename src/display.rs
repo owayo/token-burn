@@ -11,6 +11,10 @@ use crate::usage::ScheduleResolver;
 
 const REDACTED_COMMAND_VALUE: &str = "<redacted>";
 
+/// `env` の短いオプションのうち値を取るもの。`-u` / `-C` / `-S` は GNU と BSD、`-P` は BSD、
+/// `-a`（`--argv0`）は GNU coreutils の env にある。
+const ENV_SHORT_OPTIONS_WITH_VALUE: [char; 5] = ['u', 'C', 'P', 'S', 'a'];
+
 /// ログや実行計画へ表示するコマンドから、秘密値になり得る引数を伏せる。
 pub fn format_command(command: &[String]) -> String {
     let mut rendered = Vec::with_capacity(command.len());
@@ -52,27 +56,46 @@ pub fn format_command(command: &[String]) -> String {
             }
             // -S は引数 1 個の中へコマンドと認証オプションまで収められる。
             // シェル文字列を再解釈せず、この表示用引数全体を伏せる。
-            if arg == "-S" || arg == "--split-string" {
+            if arg == "--split-string" {
                 rendered.push(arg.clone());
                 redact_next = true;
                 in_env_prefix = false;
                 continue;
             }
-            if arg.starts_with("--split-string=") || arg.starts_with("-S") {
-                let prefix = if arg.starts_with("--split-string=") {
-                    "--split-string="
-                } else {
-                    "-S"
-                };
-                rendered.push(format!("{prefix}{REDACTED_COMMAND_VALUE}"));
+            if arg.starts_with("--split-string=") {
+                rendered.push(format!("--split-string={REDACTED_COMMAND_VALUE}"));
                 in_env_prefix = false;
+                continue;
+            }
+            // 短いオプションは束ね得る（`-iu NAME` / `-vC/tmp` / `-iS STRING`）。getopt と同じく、
+            // 最初に現れた値を取るオプションの後ろが値で、それが空なら次の引数が値。束を値を
+            // 取らないオプションとして扱うと、値を実行ファイルと取り違えて後ろの代入が漏れる。
+            if let Some(cluster) = arg
+                .strip_prefix('-')
+                .filter(|cluster| !cluster.is_empty() && !cluster.starts_with('-'))
+            {
+                match cluster.find(ENV_SHORT_OPTIONS_WITH_VALUE) {
+                    Some(at) if cluster[at..].starts_with('S') => {
+                        if at + 1 == cluster.len() {
+                            rendered.push(arg.clone());
+                            redact_next = true;
+                        } else {
+                            rendered.push(format!("-{}{REDACTED_COMMAND_VALUE}", &cluster[..=at]));
+                        }
+                        in_env_prefix = false;
+                    }
+                    Some(at) => {
+                        env_option_value = at + 1 == cluster.len();
+                        rendered.push(arg.clone());
+                    }
+                    None => rendered.push(arg.clone()),
+                }
                 continue;
             }
             if arg.starts_with('-')
                 && !is_sensitive_option(arg.split_once('=').map_or(arg.as_str(), |(key, _)| key))
             {
-                env_option_value =
-                    matches!(arg.as_str(), "-u" | "--unset" | "-C" | "--chdir" | "-P");
+                env_option_value = matches!(arg.as_str(), "--unset" | "--chdir" | "--argv0");
                 rendered.push(arg.clone());
                 continue;
             }
@@ -263,6 +286,64 @@ mod tests {
                 "{rendered}"
             );
         }
+    }
+
+    /// 短いオプションの束（getopt と同じく、束の中で最初に現れた値を取るオプションの残りが
+    /// その値で、残りが空なら次の引数が値）。値を実行ファイルと取り違えると、後ろの代入が
+    /// 前置きの環境変数として伏せられない。
+    #[test]
+    fn format_command_redacts_env_assignments_after_bundled_short_options() {
+        let mut wrong = Vec::new();
+        for (prefix, shown) in [
+            (vec!["env", "-iu", "OLD_TOKEN"], "env -iu OLD_TOKEN"),
+            (vec!["env", "-iuOLD_TOKEN"], "env -iuOLD_TOKEN"),
+            (vec!["env", "-vC", "/tmp"], "env -vC /tmp"),
+            (vec!["env", "-vC/tmp"], "env -vC/tmp"),
+            (vec!["env", "-0iP", "/usr/bin"], "env -0iP /usr/bin"),
+            (vec!["env", "-ia", "client"], "env -ia client"),
+            (vec!["env", "--argv0", "client"], "env --argv0 client"),
+            (vec!["env", "--argv0=client"], "env --argv0=client"),
+            (vec!["env", "-iv"], "env -iv"),
+        ] {
+            let mut command: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+            command
+                .extend(["API_TOKEN=top-secret", "codex", "-c", "model=example"].map(String::from));
+            let rendered = format_command(&command);
+            if rendered != format!("{shown} API_TOKEN=<redacted> codex -c model=example") {
+                wrong.push(rendered);
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// 束の中の -S も、値（束の残り、残りが空なら次の引数）を丸ごと伏せる。
+    #[test]
+    fn format_command_redacts_split_string_in_bundled_short_options() {
+        for (args, shown) in [
+            (
+                vec!["env", "-iS", "client --api-key=top-secret"],
+                "env -iS <redacted>",
+            ),
+            (
+                vec!["env", "-iSclient --api-key=top-secret"],
+                "env -iS<redacted>",
+            ),
+            (
+                vec!["env", "-vS", "client --token top-secret", "arg"],
+                "env -vS <redacted> arg",
+            ),
+        ] {
+            let command: Vec<String> = args.into_iter().map(String::from).collect();
+            assert_eq!(format_command(&command), shown);
+        }
+    }
+
+    /// 値を取らないオプションだけの束は、次の引数を値として読み飛ばさない（実行ファイル
+    /// 以降の `key=value` はオプション値なので伏せない）。
+    #[test]
+    fn format_command_keeps_the_executable_after_flag_only_bundles() {
+        let command = ["env", "-iv", "codex", "-c", "model=example"].map(String::from);
+        assert_eq!(format_command(&command), "env -iv codex -c model=example");
     }
 
     #[test]
