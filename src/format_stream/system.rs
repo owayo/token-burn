@@ -50,6 +50,7 @@ pub(crate) fn handle_system_event(
         "task_notification" => write_task_notification(v, out)?,
         "task_updated" => write_task_updated(v, out, task_descriptions)?,
         "notification" => write_notification(v, out)?,
+        "ui_log" => write_ui_log(v, out)?,
         "permission_denied" => write_permission_denied(v, out)?,
         "api_retry" => write_api_retry(v, out)?,
         "model_refusal_fallback" => write_model_refusal_fallback(v, out)?,
@@ -119,6 +120,31 @@ fn write_compact_boundary(v: &serde_json::Value, out: &mut impl Write) -> Result
         attrs.join(", ")
     )?;
     Ok(())
+}
+
+/// 直前に表示した `init` と同じ内容の `init` か（表示しない）を判定し、記録を更新する。
+///
+/// Claude Code は同じセッションの `init` をターンごとに出す（バックグラウンドの
+/// サブエージェントの完了通知で走るターンを含む。実データで 1 プロセス最大 8 回）。
+/// セッション ID・モデル・CLI バージョン・権限モードが同じなら同じ情報の繰り返しなので、
+/// 「セッションにつき 1 行」を保つ。どれかが変われば（連結したログの別セッション等）表示する。
+pub(crate) fn is_repeated_init(v: &serde_json::Value, last_init: &mut Option<String>) -> bool {
+    if v["subtype"].as_str() != Some("init") {
+        return false;
+    }
+    let key = [
+        "session_id",
+        "model",
+        "claude_code_version",
+        "permissionMode",
+    ]
+    .map(|field| v[field].as_str().unwrap_or(""))
+    .join("\0");
+    if last_init.as_deref() == Some(key.as_str()) {
+        return true;
+    }
+    *last_init = Some(key);
+    false
 }
 
 /// `init`: セッション開始時のモデル・CLI バージョン・権限モードを 1 行で表示する。
@@ -463,6 +489,32 @@ fn write_notification(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
     Ok(())
 }
 
+/// `ui_log`: プラグインが Claude Code の画面へ出すログを表示する。
+///
+/// 実データでは `{"plugin":"<プラグイン名>","text":"its session.append hook was skipped. ..."}`
+/// のように、プラグインのフックが実行されなかった事実を伝える。対話実行なら画面に出る
+/// 内容だが、`-p` の無人実行ではこのイベントにしか残らない。未知の subtype として
+/// 捨てていた頃は、フックが動かなかった理由を整形済みログから追えなかった。
+fn write_ui_log(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+    let text = v["text"].as_str().unwrap_or("").trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let plugin = v["plugin"].as_str().unwrap_or("").trim();
+    let source = if plugin.is_empty() {
+        "UI log".to_string()
+    } else {
+        truncate_inline(plugin, 40)
+    };
+    writeln!(
+        out,
+        "\x1b[2m  \u{2139} {}: {}\x1b[0m",
+        source,
+        truncate_inline(text, 160)
+    )?;
+    Ok(())
+}
+
 /// `api_retry`: API リトライの試行回数とエラー情報を表示する。
 fn write_api_retry(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
     let attempt = v["attempt"].as_u64().unwrap_or(0);
@@ -484,7 +536,11 @@ fn write_api_retry(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
         writeln!(
             out,
             "\x1b[33m  \u{26a0} API retry {}/{}: {}{}\x1b[0m",
-            attempt, max_retries, error, status
+            attempt,
+            max_retries,
+            // エラー文は API の応答に由来する。1 行に畳み、制御文字を除いてから埋め込む。
+            truncate_inline(error, 160),
+            status
         )?;
     }
     Ok(())

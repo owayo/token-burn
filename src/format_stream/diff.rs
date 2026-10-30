@@ -1,6 +1,6 @@
 //! Edit ツールの新旧文字列からカラー差分を生成するモジュール。
 
-use crate::format_stream::util::first_string;
+use crate::format_stream::util::{first_string, sanitize_fragment};
 
 pub(crate) fn format_tool_diff(tool_name: &str, input_json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(input_json).ok()?;
@@ -87,7 +87,7 @@ pub(crate) fn format_diff_lines(old: &str, new: &str) -> String {
     // プレフィックスからのコンテキスト（末尾N行）
     let ctx_start = prefix_len.saturating_sub(max_context);
     for line in &old_lines[ctx_start..prefix_len] {
-        result.push_str(&format!("\x1b[2m    {}\x1b[0m\n", line));
+        result.push_str(&format!("\x1b[2m    {}\x1b[0m\n", sanitize_fragment(line)));
     }
 
     // 削除行
@@ -99,7 +99,7 @@ pub(crate) fn format_diff_lines(old: &str, new: &str) -> String {
             ));
             break;
         }
-        result.push_str(&format!("\x1b[31m  - {}\x1b[0m\n", line));
+        result.push_str(&format!("\x1b[31m  - {}\x1b[0m\n", sanitize_fragment(line)));
     }
 
     // 追加行
@@ -111,14 +111,14 @@ pub(crate) fn format_diff_lines(old: &str, new: &str) -> String {
             ));
             break;
         }
-        result.push_str(&format!("\x1b[32m  + {}\x1b[0m\n", line));
+        result.push_str(&format!("\x1b[32m  + {}\x1b[0m\n", sanitize_fragment(line)));
     }
 
     // サフィックスからのコンテキスト（先頭N行）
     let suffix_start = old_lines.len() - suffix_len;
     let suffix_show = std::cmp::min(suffix_len, max_context);
     for line in &old_lines[suffix_start..suffix_start + suffix_show] {
-        result.push_str(&format!("\x1b[2m    {}\x1b[0m\n", line));
+        result.push_str(&format!("\x1b[2m    {}\x1b[0m\n", sanitize_fragment(line)));
     }
 
     result

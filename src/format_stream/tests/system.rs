@@ -574,3 +574,50 @@ fn task_descriptions_are_isolated_between_sessions() {
     assert!(updates[1].ends_with("(First session)"), "{out}");
     assert!(updates[2].ends_with("(Second session)"), "{out}");
 }
+
+/// プラグインの UI ログは、対話実行なら画面に出る内容。`-p` ではこのイベントにしか残らない。
+#[test]
+fn ui_log_shows_the_plugin_and_text() {
+    let out = render(
+        r#"{"type":"system","subtype":"ui_log","plugin":"example-plugin","text":"its session.append hook was skipped. \"other-plugin\" runs first and sent the event on past it.","uuid":"u1","session_id":"s1"}"#,
+    );
+    assert_eq!(
+        out,
+        "\x1b[2m  \u{2139} example-plugin: its session.append hook was skipped. \"other-plugin\" runs first and sent the event on past it.\x1b[0m\n"
+    );
+}
+
+/// 複数行の本文は 1 行に畳み、長い本文とプラグイン名は切り詰める。
+#[test]
+fn ui_log_is_collapsed_and_bounded() {
+    let long_text = "x".repeat(300);
+    let long_plugin = "p".repeat(80);
+    let out = render(&format!(
+        r#"{{"type":"system","subtype":"ui_log","plugin":"{long_plugin}","text":"first\nsecond {long_text}"}}"#
+    ));
+    assert_eq!(out.lines().count(), 1, "{out:?}");
+    assert!(out.contains("first second"), "{out:?}");
+    assert!(out.contains(&format!("{}...:", "p".repeat(37))), "{out:?}");
+    assert!(!out.contains(&"x".repeat(200)), "{out:?}");
+}
+
+/// プラグイン名が無ければ `UI log` とし、本文が空・欠落・型違いなら何も出さない。
+#[test]
+fn ui_log_without_plugin_or_text() {
+    assert!(
+        render(r#"{"type":"system","subtype":"ui_log","text":"hello"}"#)
+            .contains("\u{2139} UI log: hello")
+    );
+    assert_eq!(
+        render(r#"{"type":"system","subtype":"ui_log","plugin":"p","text":" \n "}"#),
+        ""
+    );
+    assert_eq!(
+        render(r#"{"type":"system","subtype":"ui_log","plugin":"p"}"#),
+        ""
+    );
+    assert_eq!(
+        render(r#"{"type":"system","subtype":"ui_log","plugin":"p","text":42}"#),
+        ""
+    );
+}

@@ -905,3 +905,47 @@ fn resets_on_another_day_includes_date() {
         "翌日以降は日付付きで表示すべき: {result}"
     );
 }
+
+/// 使用率（0.0〜1.0）を % に換算する掛け算の誤差で、閾値ちょうどの使用率を見逃さない。
+/// `0.57 * 100.0` は `56.99999999999999` になり、「57% used」と表示しながら閾値 57 の
+/// 判定（`>=`）が成り立っていなかった（閾値 29 / 57 / 58 で起きる）。
+#[test]
+fn utilization_exactly_at_the_threshold_stops_despite_float_error() {
+    for (threshold, utilization) in [(29u8, "0.29"), (57, "0.57"), (58, "0.58")] {
+        // unifiedWindows の枠（判定の本線）
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop_file = tmp.path().join("stop");
+        let input = format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","rateLimitType":"seven_day","utilization":{utilization},"unifiedWindows":{{"seven_day":{{"utilization":{utilization},"resetsAt":4102444800}}}}}}}}"#
+        );
+        let clean = strip_ansi(&run_process_with_opts(
+            &input,
+            None,
+            Some(&stop_file),
+            threshold,
+        ));
+        assert!(
+            clean.contains("auto-stop"),
+            "threshold {threshold}: {clean}"
+        );
+        assert!(stop_file.exists(), "threshold {threshold}");
+
+        // unifiedWindows を持たない形式（top-level の utilization へのフォールバック）
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop_file = tmp.path().join("stop");
+        let input = format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","rateLimitType":"seven_day","utilization":{utilization}}}}}"#
+        );
+        let clean = strip_ansi(&run_process_with_opts(
+            &input,
+            None,
+            Some(&stop_file),
+            threshold,
+        ));
+        assert!(
+            clean.contains("auto-stop"),
+            "fallback threshold {threshold}: {clean}"
+        );
+        assert!(stop_file.exists(), "fallback threshold {threshold}");
+    }
+}

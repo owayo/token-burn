@@ -379,9 +379,16 @@ fn detail_web_fetch(v: &serde_json::Value) -> DetailResult {
     DetailResult::Fallback
 }
 
-/// WebSearch: クエリと allow/block ドメイン件数を表示。クエリが空なら汎用フォールバックへ。
+/// WebSearch: クエリと検索の種類、allow/block ドメイン件数を表示。クエリが空なら汎用フォールバックへ。
+///
+/// `mode` は `standard`（既定）と `extended` を取る。`extended` は網羅的な代わりに
+/// standard の数倍のコストがかかるので、既定以外のときだけ `mode:<種類>` を添える。
 fn detail_web_search(v: &serde_json::Value) -> DetailResult {
     let query = v["query"].as_str().unwrap_or("");
+    let mode = v["mode"]
+        .as_str()
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty() && *mode != "standard");
     let allowed = v["allowed_domains"]
         .as_array()
         .map(|a| a.len())
@@ -392,14 +399,17 @@ fn detail_web_search(v: &serde_json::Value) -> DetailResult {
         .unwrap_or(0);
     if !query.is_empty() {
         let mut detail = truncate_str(query, 80);
-        if allowed > 0 || blocked > 0 {
-            let mut filters = Vec::new();
-            if allowed > 0 {
-                filters.push(format!("allow:{allowed}"));
-            }
-            if blocked > 0 {
-                filters.push(format!("block:{blocked}"));
-            }
+        let mut filters = Vec::new();
+        if let Some(mode) = mode {
+            filters.push(format!("mode:{}", truncate_str(mode, 20)));
+        }
+        if allowed > 0 {
+            filters.push(format!("allow:{allowed}"));
+        }
+        if blocked > 0 {
+            filters.push(format!("block:{blocked}"));
+        }
+        if !filters.is_empty() {
             detail = format!("{} ({})", detail, filters.join(", "));
         }
         return DetailResult::Handled(detail);

@@ -369,20 +369,15 @@ fn tool_progress_does_not_split_text_mid_word() {
 }
 
 /// 思考ブロックの途中に system 通知が届いても、通知の前後で思考行を独立させ、
-/// ドットの累積は引き継ぐ（250 バイトで 2 ドット → 通知 → さらに 250 バイトで 3 ドット目）。
+/// ドットの累積は引き継ぐ（100 トークンで 2 ドット → 通知 → さらに 150 トークンで累計 5 ドット）。
 #[test]
 fn task_progress_between_thinking_deltas_keeps_dot_accumulation() {
-    let long = "x".repeat(250);
     let input = [
-        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}"#.to_string(),
-        format!(
-            r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{long}"}}}}}}"#
-        ),
-        r#"{"type":"system","subtype":"task_progress","description":"working","last_tool_name":"Bash"}"#.to_string(),
-        format!(
-            r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{long}"}}}}}}"#
-        ),
-        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#.to_string(),
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":100}}}"#,
+        r#"{"type":"system","subtype":"task_progress","description":"working","last_tool_name":"Bash"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":150}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
     ]
     .join("\n");
 
@@ -432,13 +427,13 @@ fn multiple_tool_results_in_one_user_event_share_top_level_metadata() {
     assert!(clean.contains("✓ Grep ["), "{clean:?}");
 }
 
-/// スカラーだけの JSON 行（`42` / `true` / `"..."`）は stream-json ではないが、
-/// パースは通るため `type` 無しの未知イベントとして無視される。非 JSON 行だけが
-/// そのまま出力される、という現在の切り分けを固定する。
+/// スカラーだけの JSON 行（`42` / `true` / `"..."`）は stream-json のイベントではない。
+/// パースが通っても `type` を持たないので、JSON 以外の行と同じくそのまま出す（stderr に
+/// 合流した出力を、JSON として読めるというだけで捨てない）。
 #[test]
-fn scalar_json_lines_are_ignored_and_plain_lines_pass_through() {
+fn scalar_json_lines_pass_through_like_plain_lines() {
     let input = "42\n\"plain text line\"\nnot json at all\ntrue\n";
-    assert_eq!(run_process(input), "not json at all\n");
+    assert_eq!(run_process(input), input);
 }
 
 /// `allowed` でも判定枠の使用率が閾値以上なら停止する。`allowed` と
@@ -452,4 +447,27 @@ fn allowed_status_still_triggers_auto_stop_over_threshold() {
         clean.contains("Rate limit auto-stop: 99% used (seven_day) >= threshold 95%"),
         "{clean:?}"
     );
+}
+
+/// 断片の境目で `\r\n` が割れても空行を作らない（CR は捨てる）。ESC は必ず捨てるので、
+/// シーケンスが断片をまたいでも端末の操作にはならない。制御文字が無ければ借用のまま返す。
+#[test]
+fn sanitize_fragment_keeps_newlines_and_drops_controls() {
+    use crate::format_stream::util::sanitize_fragment;
+    let joined: String = ["line one\r", "\nline two"]
+        .iter()
+        .map(|piece| sanitize_fragment(piece).into_owned())
+        .collect();
+    assert_eq!(joined, "line one\nline two");
+    assert_eq!(sanitize_fragment("tab\tand\nnewline"), "tab\tand\nnewline");
+    assert!(matches!(
+        sanitize_fragment("plain"),
+        std::borrow::Cow::Borrowed("plain")
+    ));
+    let split: String = ["red\x1b", "[31m text"]
+        .iter()
+        .map(|piece| sanitize_fragment(piece).into_owned())
+        .collect();
+    assert!(!split.contains('\x1b'), "{split:?}");
+    assert_eq!(sanitize_fragment("a\x1b[2Jb\u{9b}c"), "abc");
 }

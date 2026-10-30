@@ -1,7 +1,7 @@
 //! ストリーミング処理中に集約する状態（セッション要約・トークン使用量）を保持する
 //! モジュール。`StreamState` は 1 行の処理に必要な可変参照をまとめた束。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::format_stream::blocks::ContentBlockState;
 
@@ -23,6 +23,100 @@ pub(crate) struct StreamSummary {
     /// 各 `result.usage` はその結果のターン分だけなので、比較用に累積する。
     pub(crate) cumulative_main_input_tokens: u64,
     pub(crate) cumulative_main_output_tokens: u64,
+    /// この実行（このプロセス）のモデル別使用量。`model_usage_since_last_result` を持たない
+    /// 旧形式では `None` のまま。
+    pub(crate) run_models: Option<RunModelUsage>,
+}
+
+/// `result.model_usage_since_last_result` を足し合わせた、この実行のモデル別使用量。
+///
+/// `result.total_cost_usd` / `modelUsage` / `duration_api_ms` はセッションの累計で、
+/// `--resume` で再開したセッションでは中断前のプロセスの消費まで含む（実データ: 中断前
+/// $33.65・出力 448,091 → 再開後の 14 ターンで $40.26・459,323）。一方
+/// `model_usage_since_last_result` は前の `result` 以降（最初の `result` ではプロセスの
+/// 開始以降）の分で、サブエージェントの消費も含む。これを足せば、この実行の消費が求まる。
+#[derive(Default)]
+pub(crate) struct RunModelUsage {
+    /// モデル ID ごとの合計。キー順は `modelUsage`（serde_json の `Map`）と同じ昇順。
+    pub(crate) models: BTreeMap<String, ModelTotals>,
+    /// モデル別の報告が欠けたターン数（`result.usage` は消費を報告しているのに
+    /// `model_usage_since_last_result` が空か欠けていた `result` の `num_turns` の合計）。
+    ///
+    /// 実データでは、バックグラウンドのサブエージェントの完了通知で走る 2 件目以降の
+    /// `result` が、`usage` に 14 ターン・出力 11,048 トークンを報告しながら
+    /// `model_usage_since_last_result` を `{}` とし、`modelUsage` と `total_cost_usd` も
+    /// 1 件目から変えなかった。これらのターンの消費はどの集計にも入っていない。
+    pub(crate) unreported_turns: u64,
+    /// モデル別の報告が欠けた `result` があったか（ターン数が 0 と報告された場合も含む）。
+    pub(crate) incomplete: bool,
+}
+
+/// 1 モデル分の使用量（`modelUsage` / `model_usage_since_last_result` の 1 エントリ）。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ModelTotals {
+    pub(crate) cost_usd: f64,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_read_input_tokens: u64,
+    pub(crate) cache_creation_input_tokens: u64,
+    pub(crate) thinking_tokens: u64,
+    pub(crate) web_search_requests: u64,
+    pub(crate) context_window: Option<u64>,
+    pub(crate) max_output_tokens: Option<u64>,
+}
+
+impl ModelTotals {
+    pub(crate) fn from_value(value: &serde_json::Value) -> Self {
+        let mut totals = Self::default();
+        totals.add(value);
+        totals
+    }
+
+    /// 1 エントリ分を足す。壊れた巨大値でも panic させないよう飽和加算し、負値・NaN の
+    /// コストは足さない。`contextWindow` / `maxOutputTokens` は枠の大きさなので足さずに
+    /// 最後に見た値を持つ。
+    pub(crate) fn add(&mut self, value: &serde_json::Value) {
+        let field = |key: &str| value[key].as_u64().unwrap_or(0);
+        if let Some(cost) = value["costUSD"]
+            .as_f64()
+            .filter(|c| c.is_finite() && *c >= 0.0)
+        {
+            self.cost_usd += cost;
+        }
+        self.input_tokens = self.input_tokens.saturating_add(field("inputTokens"));
+        self.output_tokens = self.output_tokens.saturating_add(field("outputTokens"));
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(field("cacheReadInputTokens"));
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(field("cacheCreationInputTokens"));
+        self.thinking_tokens = self.thinking_tokens.saturating_add(field("thinkingTokens"));
+        self.web_search_requests = self
+            .web_search_requests
+            .saturating_add(field("webSearchRequests"));
+        if let Some(window) = value["contextWindow"].as_u64() {
+            self.context_window = Some(window);
+        }
+        if let Some(max_output) = value["maxOutputTokens"].as_u64() {
+            self.max_output_tokens = Some(max_output);
+        }
+    }
+
+    /// 入力側トークンの合計（キャッシュの読み書きを含む）。
+    pub(crate) fn total_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_input_tokens)
+            .saturating_add(self.cache_creation_input_tokens)
+    }
+
+    /// トークン数のどれかが `other` を上回るか。
+    pub(crate) fn exceeds_tokens(&self, other: &Self) -> bool {
+        self.input_tokens > other.input_tokens
+            || self.output_tokens > other.output_tokens
+            || self.cache_read_input_tokens > other.cache_read_input_tokens
+            || self.cache_creation_input_tokens > other.cache_creation_input_tokens
+    }
 }
 
 impl StreamSummary {
@@ -74,6 +168,43 @@ impl StreamSummary {
             .cumulative_main_output_tokens
             .saturating_add(result_usage.output_tokens);
         self.usage.merge_from_value(value.get("usage"));
+        self.update_run_models(value, &result_usage);
+    }
+
+    /// この実行のモデル別使用量へ `model_usage_since_last_result` を足す。
+    fn update_run_models(
+        &mut self,
+        value: &serde_json::Map<String, serde_json::Value>,
+        result_usage: &UsageSummary,
+    ) {
+        let reports_usage = result_usage.total_input_tokens() > 0 || result_usage.output_tokens > 0;
+        let turns = value
+            .get("num_turns")
+            .and_then(|turns| turns.as_u64())
+            .unwrap_or(0);
+        let since = value
+            .get("model_usage_since_last_result")
+            .and_then(|since| since.as_object());
+        let run = match since {
+            Some(_) => self.run_models.get_or_insert_with(RunModelUsage::default),
+            // 旧形式（フィールドが無い）は従来どおり `modelUsage` を表示に使う。新形式を
+            // 見た後で欠けた `result` は、モデル別の報告が欠けたものとして数える。
+            None => match self.run_models.as_mut() {
+                Some(run) => run,
+                None => return,
+            },
+        };
+        let mut reported = false;
+        for (model, usage) in since.into_iter().flatten() {
+            if usage.is_object() {
+                run.models.entry(model.clone()).or_default().add(usage);
+                reported = true;
+            }
+        }
+        if reports_usage && !reported {
+            run.incomplete = true;
+            run.unreported_turns = run.unreported_turns.saturating_add(turns);
+        }
     }
 }
 

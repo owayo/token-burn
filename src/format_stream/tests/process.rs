@@ -97,6 +97,15 @@ fn process_non_json_passthrough() {
     assert!(output.contains("another line"));
 }
 
+/// JSON として読めてもイベント（`type` を持つオブジェクト）でない行は、JSON 以外の行と同じく
+/// そのまま出す。イベントの分岐へ流していた頃は黙って捨てられ、ペインにも `.log` にも
+/// 残らなかった（stderr に合流したラッパーやフックの出力）。
+#[test]
+fn json_lines_that_are_not_events_are_passed_through() {
+    let input = "12345\n\"quoted\"\n[1,2]\nnull\n{\"level\":\"warn\",\"msg\":\"hook output\"}\n{\"type\":7}\n";
+    assert_eq!(run_process(input), input);
+}
+
 #[test]
 fn process_tool_progress_shows_elapsed_time() {
     let input = [
@@ -645,7 +654,9 @@ fn truncate_str_folds_newlines_into_spaces() {
     // 不変条件が破れ、`\x1b[2m` を開いたまま改行して閉じる `\x1b[0m` が最終行に
     // しか出ない（実ログの Bash ツール行 145 件がこれで割れていた）。
     assert_eq!(truncate_str("a\nb", 10), "a b");
-    assert_eq!(truncate_str("a\r\nb", 10), "a  b");
+    // CRLF は 1 つの改行なので空白 1 つ（CR は制御文字の除去で LF にそろえる）。
+    assert_eq!(truncate_str("a\r\nb", 10), "a b");
+    assert_eq!(truncate_str("a\rb", 10), "a b");
     // 改行も 1 文字として数えるので、切り詰め幅の契約は変わらない。
     assert_eq!(truncate_str("ab\ncdefgh", 7), "ab c...");
 }
@@ -841,10 +852,11 @@ fn process_task_progress_breaks_open_thinking_line() {
     ]
     .join("\n");
 
+    // 本文が届く思考（ナレーション）は本文を書き、割り込み後の続きは `↳ ` で示す。
     let clean = strip_ansi(&run_process(&input));
-    assert!(
-        clean.contains("💭 \n  🔄 Running checks (Bash)\n💭 "),
-        "system 通知の前後で思考行が独立しているべき: {clean:?}"
+    assert_eq!(
+        clean, "💭 検討中\n  🔄 Running checks (Bash)\n💭 \u{21b3} 続行\n",
+        "system 通知の前後で思考行が独立しているべき"
     );
 }
 
@@ -1742,6 +1754,85 @@ fn subagent_api_error_is_marked_as_error_instead_of_regular_text() {
     assert!(!clean.contains("💬"), "{clean}");
 }
 
+// --- 思考のナレーション（`thinking_display: "updates"`） ---
+// 実データでは思考ブロックの約 35% が `thinking` に本文（進捗の要約）を持つ。ドットに
+// 数えていた頃は、ナレーションが整形済みログに 1 件も残っていなかった。
+
+/// メインループのナレーションは、デルタに分かれて届いても 1 本の `💭` 行になり、
+/// 末尾の `\n\n` で空行を作らない。同じメッセージの assistant が再送しても重複しない。
+#[test]
+fn main_loop_narration_is_written_as_one_thinking_line() {
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}},"thinking_display":"updates"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}},"thinking_display":"updates"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"リモート同期は完了済みで、"}},"thinking_display":"updates"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"次はライブラリを更新します。\n\n"}},"thinking_display":"updates"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"c2ln"}}}"#,
+        r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"thinking","thinking":"リモート同期は完了済みで、次はライブラリを更新します。\n\n","signature":"c2ln"}]},"narration_block_indexes":[0],"thinking_display":"updates","thinking_duration_ms":433}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert_eq!(
+        clean, "💭 リモート同期は完了済みで、次はライブラリを更新します。\n",
+        "{clean:?}"
+    );
+}
+
+/// 伏せられた思考（本文が空で `estimated_tokens` だけ）は従来どおりドットで示す。
+#[test]
+fn redacted_thinking_still_shows_progress_dots() {
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":100}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":null}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+    ]
+    .join("\n");
+    assert_eq!(strip_ansi(&run_process(&input)), "💭 ..\n");
+}
+
+/// サブエージェントの思考は assistant にしか届かない。本文のあるブロックだけを
+/// タスク名付きの 1 行にし、再送では重複させない。伏せられたブロックは何も書かない。
+#[test]
+fn subagent_narration_is_written_with_attribution() {
+    let narration = r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","subagent_type":"general-purpose","task_description":"依存更新","message":{"id":"msg_1","content":[{"type":"thinking","thinking":"更新対象を確認しました。\n\n次はビルドを検証します。\n\n","signature":"c2ln"}]},"narration_block_indexes":[0]}"#;
+    let redacted = r#"{"type":"assistant","parent_tool_use_id":"toolu_parent","subagent_type":"general-purpose","task_description":"依存更新","message":{"id":"msg_2","content":[{"type":"thinking","thinking":"","signature":"c2ln"}]}}"#;
+    let clean = strip_ansi(&run_process(&[narration, narration, redacted].join("\n")));
+    assert_eq!(
+        clean, "  💭 @依存更新 更新対象を確認しました。 次はビルドを検証します。\n",
+        "{clean:?}"
+    );
+}
+
+/// サブエージェントのナレーションは 200 文字で切り、省略記号を付ける。
+#[test]
+fn subagent_narration_is_bounded() {
+    let long = "あ".repeat(300);
+    let input = format!(
+        r#"{{"type":"assistant","parent_tool_use_id":"toolu_parent","task_description":"調査","message":{{"id":"msg_1","content":[{{"type":"thinking","thinking":"{long}"}}]}}}}"#
+    );
+    let clean = strip_ansi(&run_process(&input));
+    let body = clean
+        .trim_end()
+        .strip_prefix("  💭 @調査 ")
+        .unwrap_or_else(|| panic!("{clean:?}"));
+    assert_eq!(body.chars().count(), 201, "200 文字 + 省略記号");
+    assert!(body.ends_with('\u{2026}'));
+}
+
+/// ストリームを伴わないメインの応答（API リトライ後）でも、ナレーションを本文・ツールと
+/// 同じ順で補う。
+#[test]
+fn unstreamed_main_message_keeps_narration_before_text() {
+    let input = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"thinking","thinking":"差分を確かめてから直します。\n\n"},{"type":"text","text":"修正を適用します。"}]}}"#;
+    let clean = strip_ansi(&run_process(&[input, input].join("\n")));
+    assert_eq!(
+        clean, "💭 差分を確かめてから直します。\n修正を適用します。\n",
+        "{clean:?}"
+    );
+}
+
 /// 帰属情報が無い（＝サブエージェントと判別できない）assistant は従来どおり素通し。
 #[test]
 fn assistant_without_attribution_is_not_treated_as_subagent() {
@@ -1787,4 +1878,91 @@ fn command_lifecycle_ignores_unknown_or_invalid_states() {
     ]
     .join("\n");
     assert!(run_process(&input).is_empty());
+}
+
+/// Claude Code は同じセッションの `init` をターンごとに出す（実データで 1 プロセス最大 8 回）。
+/// 同じ内容の繰り返しは出さず、「セッションにつき 1 行」を保つ。内容が変われば出す。
+#[test]
+fn repeated_session_init_is_shown_once() {
+    let init = |session: &str, mode: &str| {
+        format!(
+            r#"{{"type":"system","subtype":"init","session_id":"{session}","model":"claude-opus-5-5","claude_code_version":"2.1.312","permissionMode":"{mode}","tools":[]}}"#
+        )
+    };
+    let input = [
+        init("s1", "bypassPermissions"),
+        init("s1", "bypassPermissions"),
+        init("s1", "bypassPermissions"),
+        init("s1", "default"),
+        init("s2", "default"),
+    ]
+    .join("\n");
+    let clean = strip_ansi(&run_process(&input));
+    assert_eq!(
+        clean,
+        "  ℹ Session claude-opus-5-5 (v2.1.312, bypassPermissions)\n\
+         \x20 ℹ Session claude-opus-5-5 (v2.1.312, default)\n\
+         \x20 ℹ Session claude-opus-5-5 (v2.1.312, default)\n",
+        "{clean:?}"
+    );
+}
+
+/// 整形器が付ける装飾（SGR）以外のエスケープシーケンスが出力に無いことを確かめる。
+fn assert_no_foreign_escapes(output: &str) {
+    for needle in [
+        "\x1b[2J",
+        "\x1b[3J",
+        "\x1b[H",
+        "\x1b[?1049h",
+        "\x1b]",
+        "\x07",
+        "\u{9b}",
+    ] {
+        assert!(!output.contains(needle), "{needle:?} in {output:?}");
+    }
+}
+
+/// ツールの出力（Bash の stdout・失敗時の本文）のエスケープシーケンスは、完了行に素通しに
+/// しない。実データでは `make help` の色付きの出力がそのまま出ており、画面消去・代替画面・
+/// OSC 52（クリップボード）・OSC 2（ペインのタイトル）も通っていた。
+#[test]
+fn tool_output_escape_sequences_do_not_reach_the_pane() {
+    let input = [
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok","is_error":false}]},"tool_use_result":{"stdout":"\u001b[?1049h\u001b[H\u001b[2J\u001b]2;owned\u0007\u001b[36mhello\u001b[0m"}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"\u001b]52;c;ZWNobw==\u0007build failed\u001b[3J","is_error":true}]}}"#,
+    ]
+    .join("\n");
+    let output = run_process(&input);
+    assert_no_foreign_escapes(&output);
+    let clean = strip_ansi(&output);
+    assert!(clean.contains("stdout:hello"), "{clean:?}");
+    assert!(clean.contains("build failed"), "{clean:?}");
+}
+
+/// 本文のデルタ・ストリームを伴わない本文・JSON 以外の行・Edit の差分・API リトライの
+/// エラー文も、改行は残したまま制御文字を取り除く。
+#[test]
+fn raw_text_paths_drop_terminal_controls() {
+    let input = [
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"start\u001b[2J "}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"line\u001b]0;title\u0007 one\r\nline two\n"}}}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        r#"{"type":"assistant","message":{"id":"msg_x","content":[{"type":"text","text":"unstreamed\u001b[H text"}]}}"#,
+        "stderr line \u{1b}[?1049h with controls",
+        r#"{"type":"assistant","parent_tool_use_id":"p","task_description":"edit","message":{"id":"msg_y","content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/tmp/a.txt","old_string":"old\u001b[2J","new_string":"new\u001b]2;t\u0007"}}]}}"#,
+        r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":3,"error":"boom\u001b[2J\nsecond line"}"#,
+    ]
+    .join("\n");
+    let output = run_process(&input);
+    assert_no_foreign_escapes(&output);
+    let clean = strip_ansi(&output);
+    assert!(clean.contains("start line one\nline two\n"), "{clean:?}");
+    assert!(clean.contains("unstreamed text"), "{clean:?}");
+    assert!(clean.contains("stderr line  with controls"), "{clean:?}");
+    assert!(clean.contains("- old"), "{clean:?}");
+    assert!(clean.contains("+ new"), "{clean:?}");
+    assert!(
+        clean.contains("API retry 1/3: boom second line"),
+        "{clean:?}"
+    );
 }

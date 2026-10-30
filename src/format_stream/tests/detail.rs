@@ -360,6 +360,29 @@ fn extract_tool_detail_web_search_query_only() {
     assert_eq!(extract_tool_detail("WebSearch", input), "how to use tokio");
 }
 
+/// `extended` は standard の数倍のコストがかかる検索なので添える。既定の `standard` は出さない。
+#[test]
+fn extract_tool_detail_web_search_shows_non_default_mode() {
+    assert_eq!(
+        extract_tool_detail(
+            "WebSearch",
+            r#"{"query":"tokio release notes","mode":"extended","allowed_domains":["tokio.rs"]}"#
+        ),
+        "tokio release notes (mode:extended, allow:1)"
+    );
+    assert_eq!(
+        extract_tool_detail(
+            "WebSearch",
+            r#"{"query":"GNU make assignment operators","mode":"standard"}"#
+        ),
+        "GNU make assignment operators"
+    );
+    assert_eq!(
+        extract_tool_detail("WebSearch", r#"{"query":"q","mode":" "}"#),
+        "q"
+    );
+}
+
 #[test]
 fn extract_tool_detail_tool_search_with_max_results() {
     let input = r#"{"query":"select:TodoWrite,WebFetch","max_results":3}"#;

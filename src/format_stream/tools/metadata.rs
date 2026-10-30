@@ -732,7 +732,27 @@ fn bash_edit_diff_summary(value: Option<&serde_json::Value>) -> Option<String> {
     let diff = value?.as_object()?;
     let files = diff.get("files").and_then(|value| value.as_array())?;
     if files.is_empty() {
-        return None;
+        // 加除行数の詳細（`files` の hunk）が省かれていても、`changedFiles` に載った変更は
+        // 残す。実データでは `mv src/highlight_legacy.rs /tmp/…` が
+        // `{"files":[],"moreFiles":1,"changedFiles":["…/highlight_legacy.rs"]}` を返し、
+        // 追跡中のファイルが消えたのに完了行に痕跡が残らなかった。`changedFiles` も無い
+        // 応答（実データの大半）は従来どおり何も出さない。
+        let paths: Vec<&str> = diff
+            .get("changedFiles")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|path| path.as_str())
+            .filter(|path| !path.is_empty())
+            .collect();
+        return match paths.as_slice() {
+            [] => None,
+            [path] => Some(format!(
+                "bash-edits:{} (diff omitted)",
+                truncate_path_tail(path, 60)
+            )),
+            paths => Some(format!("bash-edits:{} files (diff omitted)", paths.len())),
+        };
     }
 
     let mut added = 0usize;

@@ -63,14 +63,18 @@ fn process(
     let mut signal_failed = false;
     let mut tool_id_map: HashMap<String, String> = HashMap::new();
     let mut task_descriptions = HashMap::new();
+    let mut last_init = None;
     let mut shown_notices = std::collections::HashSet::new();
     let mut streamed_message_ids = std::collections::HashSet::new();
     let mut blocks: HashMap<usize, ContentBlockState> = HashMap::new();
     let mut summary = StreamSummary::default();
     // 生ログを作れなくても表示と停止判定は続ける。障害は入力を読み切ってから返す。
+    // 生ログは 1 行ごとに書き出す（`LineWriter`）。`BufWriter` に溜めたままだと、ペインでの
+    // Ctrl-C やモニターの kill-session（SIGHUP）で整形器が落ちたとき、走行中のタスクの
+    // jsonl から直近の最大 8KB（短いセッションなら全部）が消えていた。
     let (mut raw_writer, raw_create_error) = match raw_output.map(File::create).transpose() {
         Ok(file) => (
-            file.map(|file| DrainWriter::new(io::BufWriter::new(file), "raw output write")),
+            file.map(|file| DrainWriter::new(io::LineWriter::new(file), "raw output write")),
             None,
         ),
         Err(error) => {
@@ -95,11 +99,20 @@ fn process(
             continue;
         }
 
-        let v: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => {
-                // JSON 以外 — そのまま出力（例: codex のプレーンテキスト出力、
-                // claude のラッパーバナー、`2>&1` で合流した stderr）。
+        // `type` を持つ JSON オブジェクトだけを stream-json のイベントとして扱う。数値・
+        // 文字列・配列・`null` や `type` の無いオブジェクトは JSON として読めても
+        // イベントではない（stderr に合流したラッパーやフックの出力）。イベントの分岐へ
+        // 流すと `_ => {}` で黙って捨てられ、ペインにも `.log` にも残らなかった。
+        let parsed = serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .filter(|v| v["type"].is_string());
+        let v = match parsed {
+            Some(v) => v,
+            None => {
+                // JSON 以外 — 内容をそのまま出力（例: codex のプレーンテキスト出力、
+                // claude のラッパーバナー、`2>&1` で合流した stderr）。エスケープ
+                // シーケンスと制御文字だけは取り除く（stderr に混ざった画面制御で
+                // ペインを壊さない）。
                 //
                 // 開きっぱなしの思考/テキスト行を閉じてから独立行へ書く。タスク
                 // スクリプトは `claude ... 2>&1 | format-stream` で stderr を同じ
@@ -109,7 +122,7 @@ fn process(
                 // リセットが dim を打ち消して以降の進捗ドットまで崩れる。
                 // system / rate_limit / user / tool_progress と同じ扱いに揃える。
                 render_out_of_band_event(&mut out, &mut blocks, |pending| {
-                    writeln!(pending, "{}", line)?;
+                    writeln!(pending, "{}", util::sanitize_fragment(&line))?;
                     Ok(())
                 })?;
                 out.flush()?;
@@ -122,9 +135,11 @@ fn process(
         match msg_type {
             "system" => {
                 summary.update_from_system(&v);
-                render_out_of_band_event(&mut out, &mut blocks, |pending| {
-                    handle_system_event(&v, pending, &mut task_descriptions)
-                })?;
+                if !system::is_repeated_init(&v, &mut last_init) {
+                    render_out_of_band_event(&mut out, &mut blocks, |pending| {
+                        handle_system_event(&v, pending, &mut task_descriptions)
+                    })?;
+                }
             }
             "stream_event" => {
                 handle_stream_event(

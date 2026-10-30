@@ -42,9 +42,19 @@ impl GatingWindow {
         } else {
             WindowKind::Deadline
         };
-        WindowObservation::new(kind, self.name, self.utilization * 100.0)
+        WindowObservation::new(kind, self.name, utilization_percent(self.utilization))
             .with_reset_at(self.resets_at)
     }
+}
+
+/// 使用率（0.0〜1.0）を % に換算する。
+///
+/// `0.57 * 100.0` は浮動小数の誤差で `56.99999999999999` になり、「57% used」と表示しながら
+/// 閾値 57 の判定（`>=`）が成り立たなかった（閾値 29 / 57 / 58 で起きる）。API の使用率は
+/// 小数 2 桁で届くので、% の小数 2 桁で丸めてから比べる。NaN・無限大はそのまま残り、
+/// 判定から外す既存の扱いを変えない。
+fn utilization_percent(utilization: f64) -> f64 {
+    (utilization * 10_000.0).round() / 100.0
 }
 
 /// レート制限イベントを表示する。
@@ -179,7 +189,7 @@ fn decide(info: &serde_json::Value, windows: &[GatingWindow], threshold: u8) -> 
     } else {
         limit_type
     };
-    let observation = WindowObservation::new(kind, label, utilization * 100.0)
+    let observation = WindowObservation::new(kind, label, utilization_percent(utilization))
         .with_reset_at(info["resetsAt"].as_i64());
     rate_control::evaluate(&[observation], threshold, now)
 }
@@ -210,7 +220,7 @@ fn rejected_decision(
     }
     // 週次枠の実測値が読めない、または閾値に触れているなら一時停止にはできない。
     let weekly = windows.iter().find(|w| w.name == "seven_day")?;
-    if weekly.utilization * 100.0 >= f64::from(threshold) {
+    if utilization_percent(weekly.utilization) >= f64::from(threshold) {
         return None;
     }
     let five_hour = windows.iter().find(|w| w.name == "five_hour")?;
@@ -223,7 +233,7 @@ fn rejected_decision(
             resume_at,
             mut basis,
         } => {
-            basis.used_percent = five_hour.utilization * 100.0;
+            basis.used_percent = utilization_percent(five_hour.utilization);
             Some((resume_at, basis))
         }
         _ => None,

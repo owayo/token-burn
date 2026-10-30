@@ -4,9 +4,13 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
-use crate::format_stream::blocks::{ContentBlockState, break_open_line, write_tool_use};
+use crate::format_stream::blocks::{
+    ContentBlockState, NARRATION_MAX_CHARS, NarrationText, SUBAGENT_NARRATION_MAX_CHARS,
+    break_open_line, write_tool_use,
+};
 use crate::format_stream::util::{
-    format_number, normalize_model_name, subagent_attribution, truncate_inline, truncate_str,
+    format_number, normalize_model_name, sanitize_fragment, subagent_attribution, truncate_inline,
+    truncate_str,
 };
 
 /// ツール ID の対応表を更新し、stream_event に現れないモデル切替と
@@ -47,6 +51,20 @@ pub(crate) fn handle_assistant_event(
                 tool_id_map.insert(id.to_string(), name.to_string());
                 if from_subagent || (unstreamed_main && !already_streamed) {
                     write_unstreamed_tool_use(item, id, name, &owner, &mut notices, shown_notices)?;
+                }
+            }
+
+            if item["type"].as_str() == Some("thinking") {
+                if from_subagent {
+                    write_subagent_narration(
+                        item,
+                        message_id,
+                        &owner,
+                        &mut notices,
+                        shown_notices,
+                    )?;
+                } else if unstreamed_main {
+                    write_unstreamed_narration(item, message_id, &mut notices, shown_notices)?;
                 }
             }
 
@@ -160,10 +178,54 @@ fn write_unstreamed_text(
     if text.is_empty() || !shown_notices.insert(format!("unstreamed-text:{message_id}:{text}")) {
         return Ok(());
     }
-    write!(out, "{text}")?;
+    write!(out, "{}", sanitize_fragment(text))?;
     if !text.ends_with('\n') {
         writeln!(out)?;
     }
+    Ok(())
+}
+
+/// ストリームが欠けた応答のナレーション（本文入りの思考ブロック）を、ストリーム経路と
+/// 同じ `💭` 行の形で補う。本文の無いブロックは伏せられた思考なので何も書かない。
+fn write_unstreamed_narration(
+    item: &serde_json::Value,
+    message_id: &str,
+    out: &mut impl Write,
+    shown_notices: &mut HashSet<String>,
+) -> Result<()> {
+    let line =
+        NarrationText::collapse(item["thinking"].as_str().unwrap_or(""), NARRATION_MAX_CHARS);
+    if line.is_empty() || !shown_notices.insert(format!("unstreamed-thinking:{message_id}:{line}"))
+    {
+        return Ok(());
+    }
+    writeln!(out, "\x1b[2m\u{1f4ad} {line}\x1b[0m")?;
+    Ok(())
+}
+
+/// サブエージェントのナレーション（本文入りの思考ブロック）を 1 行で書く。
+///
+/// サブエージェントの思考は `stream_event` に現れず、`assistant` イベントにしか届かない
+/// （実データで 2,043 ブロック中 55 個が本文を持ち、すべて `narration_block_indexes` が
+/// 指すナレーションだった）。何を確かめ、次に何をするかの要約なので、`💬` の本文と並べて
+/// 残す。本文の無いブロックは伏せられた思考なので何も書かない。
+fn write_subagent_narration(
+    item: &serde_json::Value,
+    message_id: &str,
+    owner: &str,
+    out: &mut impl Write,
+    shown_notices: &mut HashSet<String>,
+) -> Result<()> {
+    let summary = NarrationText::collapse(
+        item["thinking"].as_str().unwrap_or(""),
+        SUBAGENT_NARRATION_MAX_CHARS,
+    );
+    if summary.is_empty()
+        || !shown_notices.insert(format!("subagent-thinking:{message_id}:{summary}"))
+    {
+        return Ok(());
+    }
+    writeln!(out, "\x1b[2m  \u{1f4ad}{} {}\x1b[0m", owner, summary)?;
     Ok(())
 }
 

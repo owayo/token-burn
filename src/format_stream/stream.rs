@@ -8,6 +8,7 @@ use crate::format_stream::blocks::{
     BlockKind, ContentBlockState, finalize_block, finalize_open_blocks, infer_block_kind_from_delta,
 };
 use crate::format_stream::state::StreamState;
+use crate::format_stream::util::sanitize_fragment;
 
 pub(crate) fn handle_stream_event(
     event: &serde_json::Value,
@@ -47,7 +48,9 @@ pub(crate) fn handle_stream_event(
             }
             if current.text.is_empty() && !incoming.text.is_empty() {
                 current.text = incoming.text.clone();
-                write!(out, "{}", incoming.text)?;
+                // ツールの出力を引用した本文などにエスケープシーケンスが混ざっても、端末を
+                // 操作させない（`sanitize_fragment`）。改行の判定には元の本文を使う。
+                write!(out, "{}", sanitize_fragment(&incoming.text))?;
                 out.flush()?;
             }
 
@@ -83,31 +86,26 @@ pub(crate) fn handle_stream_event(
 
             match dt {
                 "thinking_delta" => {
-                    // Claude Code は思考本文を伏せるため `thinking` は空文字で届き、
-                    // 進捗は `estimated_tokens`（増分）にだけ入る。本文のバイト長だけを
-                    // 見ていた頃は実データ 7,504 件すべてでドットが 0 個になり、
-                    // 中身のない `💭 ` 行だけが並んでいた。
+                    // 伏せられた思考は `thinking` が空文字で届き、進捗は `estimated_tokens`
+                    // （増分）にだけ入る。本文のバイト長だけを見ていた頃は実データ 7,504 件
+                    // すべてでドットが 0 個になり、中身のない `💭 ` 行だけが並んでいた。
+                    // 本文が届くナレーションは本文そのものを書く（`ThinkingProgress`）。
+                    //
+                    // ブロック終端の `estimated_tokens: null` かつ本文なしのデルタ
+                    // （実データで 1,284 件）は進捗を何も報せないので、思考行を開かない。
                     let text = delta["thinking"].as_str().unwrap_or("");
                     let estimated_tokens = delta["estimated_tokens"].as_u64();
-                    // ブロック終端の `estimated_tokens: null` かつ本文なしのデルタ
-                    // （実データで 1,284 件）は進捗を何も報せないので、思考行を
-                    // 開かない。ドットに満たない量でも進捗があるなら `💭 ` は出す。
-                    // 短い思考が完全に消えると、本文が伏せられる形式では
-                    // 「考えていた区間そのもの」がログから失われるため。
-                    let has_progress = !text.is_empty() || estimated_tokens.is_some();
-                    let dots = block.thinking_progress.advance(text, estimated_tokens);
-                    if has_progress {
+                    if let Some(fragment) = block.thinking_progress.advance(text, estimated_tokens)
+                    {
                         block.ensure_thinking_started(out)?;
-                        for _ in 0..dots {
-                            write!(out, ".")?;
-                        }
+                        write!(out, "{fragment}")?;
                         out.flush()?;
                     }
                 }
                 "text_delta" => {
                     if let Some(text) = delta["text"].as_str() {
                         block.text.push_str(text);
-                        write!(out, "{}", text)?;
+                        write!(out, "{}", sanitize_fragment(text))?;
                         out.flush()?;
                     }
                 }

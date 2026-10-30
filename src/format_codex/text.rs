@@ -2,100 +2,11 @@
 //!
 //! どれも副作用の無い純粋関数で、表示にだけ使う。実行するコマンドや生ログには触れない。
 
-use std::iter::Peekable;
-use std::str::Chars;
 use std::time::Duration;
 
+// 制御文字の除去は format-stream と共通（`format_stream::util::sanitize`）。
+pub(super) use crate::format_stream::util::sanitize;
 use crate::format_stream::util::truncate_str;
-
-/// 端末へ出す前に、エスケープシーケンスと制御文字を取り除く。
-///
-/// codex のイベントにはコマンド出力（`aggregated_output`）やエージェントの文章がそのまま
-/// 入る。色付きの出力や画面制御を素通しすると、ペインの表示が崩れたり、OSC でペインの
-/// タイトルを書き換えられたりする。
-///
-/// - CSI（`ESC [ ...`）・OSC などの文字列型（`ESC ] ...` / `ESC P` / `ESC X` / `ESC ^` /
-///   `ESC _`、BEL か ST で終わる）・その他の ESC 列（`ESC (B` のような文字集合の指定を含む）を除く
-/// - 改行は LF に揃えて残す（CRLF も単独の CR も LF にする）。タブも残す
-/// - それ以外の C0 制御文字・DEL・C1 制御文字は捨てる
-pub(super) fn sanitize(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => skip_escape(&mut chars),
-            '\r' => {
-                // CRLF は LF 1 つにする。単独の CR も行の区切りとして扱う。
-                if chars.peek() != Some(&'\n') {
-                    out.push('\n');
-                }
-            }
-            '\n' | '\t' => out.push(c),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// ESC の直後から、エスケープシーケンスの残りを読み飛ばす。
-///
-/// 形が崩れたシーケンスでは、表示すべき文字まで食べないよう途中で止める（例えば CSI の
-/// 途中に日本語が来たら、そこから先は通常の文字として残す）。
-fn skip_escape(chars: &mut Peekable<Chars<'_>>) {
-    match chars.peek().copied() {
-        Some('[') => {
-            chars.next();
-            // パラメータ（0x30-0x3F）と中間バイト（0x20-0x2F）の後に終端バイト（0x40-0x7E）。
-            while let Some(&ch) = chars.peek() {
-                if ('\x20'..='\x3f').contains(&ch) {
-                    chars.next();
-                    continue;
-                }
-                if ('\x40'..='\x7e').contains(&ch) {
-                    chars.next();
-                }
-                break;
-            }
-        }
-        Some(']' | 'P' | 'X' | '^' | '_') => {
-            chars.next();
-            // 文字列型は BEL か ST（ESC \）で終わる。ESC は消費せずに抜け、呼び出し側で
-            // 次のシーケンス（ST なら `ESC \` の 2 文字）として読ませる。閉じていない
-            // 文字列が以降の行まで食べないよう、改行でも止める。
-            while let Some(&ch) = chars.peek() {
-                match ch {
-                    '\x07' => {
-                        chars.next();
-                        break;
-                    }
-                    '\x1b' | '\n' => break,
-                    _ => {
-                        chars.next();
-                    }
-                }
-            }
-        }
-        Some(_) => {
-            // 中間バイト（0x20-0x2F）の後に終端バイト（0x30-0x7E）。中間バイトが無ければ
-            // `ESC =` / `ESC M` のような 2 文字の列。`ESC (B` は `(` が中間バイトで、終端の
-            // `B` まで読み飛ばさないと `B` が文字として漏れる。
-            while let Some(&ch) = chars.peek() {
-                if ('\x20'..='\x2f').contains(&ch) {
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if let Some(&ch) = chars.peek()
-                && ('\x30'..='\x7e').contains(&ch)
-            {
-                chars.next();
-            }
-        }
-        None => {}
-    }
-}
 
 /// 制御文字を除いたうえで、改行（とその前後の空白）を空白 1 つに畳んで 1 行にする。
 ///

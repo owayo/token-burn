@@ -765,3 +765,121 @@ fn subagent_summary_without_type_breakdown_keeps_the_short_form() {
     );
     assert!(!clean.contains('['), "{clean}");
 }
+
+// --- 再開（`--resume`）したセッション: `model_usage_since_last_result` による「この実行」の集計 ---
+// `total_cost_usd` / `modelUsage` / `duration_api_ms` はセッションの累計で、中断前の
+// プロセスの消費を含む。`model_usage_since_last_result` はこのプロセスの分。
+
+/// 実データ（再開した 14 ターン・サブエージェント無し）の形。中断前の出力 448,091 トークンを
+/// サブエージェントの消費に見せず、この実行のコストを主に、累計を補足に出す。
+const RESUMED_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":131300,"duration_api_ms":4478720,"num_turns":14,"total_cost_usd":40.2602262,"usage":{"input_tokens":670,"cache_creation_input_tokens":613039,"cache_read_input_tokens":7396753,"output_tokens":11232,"output_tokens_details":{"thinking_tokens":7088}},"modelUsage":{"claude-opus-5-5":{"inputTokens":670,"outputTokens":459323,"cacheReadInputTokens":94326301,"cacheCreationInputTokens":1727737,"webSearchRequests":0,"costUSD":40.2602262,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":294231}},"model_usage_since_last_result":{"claude-opus-5-5":{"inputTokens":670,"outputTokens":11232,"cacheReadInputTokens":7396753,"cacheCreationInputTokens":613039,"webSearchRequests":0,"costUSD":6.6085354,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":7088}}}"#;
+
+#[test]
+fn resumed_session_footer_reports_this_run_and_session_totals_separately() {
+    let clean = strip_ansi(&run_process(RESUMED_RESULT));
+    assert!(clean.contains("💰 $6.6085 (session $40.2602)"), "{clean}");
+    assert!(clean.contains("session-api:74m 38s"), "{clean}");
+    assert!(!clean.contains(" api:74m"), "{clean}");
+    assert!(
+        !clean.contains("incl. subagents"),
+        "中断前の消費をサブエージェントの分として出さない: {clean}"
+    );
+    assert!(
+        clean.contains("claude-opus-5-5 $6.6085 (in:670 out:11,232 cache_read:7,396,753 cache_write:613,039 ctx:1M max_out:128K)"),
+        "{clean}"
+    );
+    assert!(!clean.contains("459,323"), "{clean}");
+}
+
+/// 再開していないセッション（since と modelUsage が一致）は従来と同じ表示になる。
+#[test]
+fn fresh_session_footer_is_unchanged_when_run_equals_session() {
+    let input = r#"{"type":"result","duration_ms":60000,"duration_api_ms":50000,"num_turns":3,"total_cost_usd":1.5,"usage":{"input_tokens":100,"output_tokens":50},"modelUsage":{"m":{"inputTokens":100,"outputTokens":900,"costUSD":1.5}},"model_usage_since_last_result":{"m":{"inputTokens":100,"outputTokens":900,"costUSD":1.5}}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("💰 $1.5000\n"), "{clean}");
+    assert!(clean.contains(" api:0m 50s"), "{clean}");
+    assert!(!clean.contains("session"), "{clean}");
+    // サブエージェントの消費（modelUsage 側の出力が多い）は従来どおり総計に出す。
+    assert!(
+        clean.contains("total in:100 out:900 (incl. subagents)"),
+        "{clean}"
+    );
+    assert!(clean.contains("m $1.5000 (in:100 out:900)"), "{clean}");
+}
+
+/// 2 件目以降の `result` が `usage` に消費を報告しながら `model_usage_since_last_result` を
+/// `{}` にする（実データ）。モデル別の報告が欠けたターン数を伝え、値が少なく出ていると分かるようにする。
+#[test]
+fn unreported_model_usage_is_called_out_as_an_undercount() {
+    let first = r#"{"type":"result","num_turns":10,"total_cost_usd":2.0,"usage":{"input_tokens":100,"output_tokens":50},"modelUsage":{"m":{"inputTokens":100,"outputTokens":50,"costUSD":2.0}},"model_usage_since_last_result":{"m":{"inputTokens":100,"outputTokens":50,"costUSD":2.0}}}"#;
+    let second = r#"{"type":"result","num_turns":14,"total_cost_usd":2.0,"usage":{"input_tokens":30,"output_tokens":11048},"modelUsage":{"m":{"inputTokens":100,"outputTokens":50,"costUSD":2.0}},"model_usage_since_last_result":{}}"#;
+    let clean = strip_ansi(&run_process(&[first, second].join("\n")));
+    let notes: Vec<_> = clean
+        .lines()
+        .filter(|line| line.contains("model usage not reported"))
+        .collect();
+    assert_eq!(
+        notes,
+        ["   model usage not reported for 14 turns (cost and model totals undercount)"],
+        "{clean}"
+    );
+}
+
+/// 何もしなかった通知のターン（usage 0・since `{}`）は、欠けたものとして数えない。
+#[test]
+fn idle_result_with_empty_model_usage_is_not_an_undercount() {
+    let first = r#"{"type":"result","num_turns":10,"total_cost_usd":2.0,"usage":{"input_tokens":100,"output_tokens":50},"modelUsage":{"m":{"inputTokens":100,"outputTokens":50,"costUSD":2.0}},"model_usage_since_last_result":{"m":{"inputTokens":100,"outputTokens":50,"costUSD":2.0}}}"#;
+    let idle = r#"{"type":"result","num_turns":0,"total_cost_usd":2.0,"usage":{"input_tokens":0,"output_tokens":0},"modelUsage":{"m":{"inputTokens":100,"outputTokens":50,"costUSD":2.0}},"model_usage_since_last_result":{}}"#;
+    let clean = strip_ansi(&run_process(&[first, idle].join("\n")));
+    assert!(!clean.contains("not reported"), "{clean}");
+    assert_eq!(clean.matches("💰 $2.0000\n").count(), 2, "{clean}");
+}
+
+/// 再開した直後に 1 ターンも消費せずに終わった（since が `{}`）なら、この実行のコストは 0。
+#[test]
+fn resumed_run_without_consumption_reports_zero_for_this_run() {
+    let input = r#"{"type":"result","num_turns":1,"duration_api_ms":4368670,"total_cost_usd":33.6516908,"usage":{"input_tokens":0,"output_tokens":0},"modelUsage":{"m":{"inputTokens":10,"outputTokens":448091,"costUSD":33.6516908}},"model_usage_since_last_result":{}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("💰 $0.0000 (session $33.6517)"), "{clean}");
+    assert!(!clean.contains("448,091"), "{clean}");
+}
+
+/// `model_usage_since_last_result` を持たない旧形式は、従来どおり `modelUsage` を出す。
+#[test]
+fn footer_without_since_field_keeps_the_session_values() {
+    let input = r#"{"type":"result","duration_ms":1000,"duration_api_ms":4478720,"total_cost_usd":40.26,"usage":{"input_tokens":10,"output_tokens":5},"modelUsage":{"m":{"inputTokens":10,"outputTokens":500,"costUSD":40.26}}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("💰 $40.2600\n"), "{clean}");
+    assert!(clean.contains("(api:74m 38s)"), "{clean}");
+    assert!(!clean.contains("session"), "{clean}");
+    assert!(clean.contains("m $40.2600 (in:10 out:500)"), "{clean}");
+    assert!(!clean.contains("not reported"), "{clean}");
+}
+
+/// 同じ実行の中で `model_usage_since_last_result` を足し合わせる（セッションの値は足さない）。
+#[test]
+fn run_model_usage_is_summed_across_results() {
+    let first = r#"{"type":"result","total_cost_usd":11.0,"usage":{"input_tokens":1,"output_tokens":100},"modelUsage":{"m":{"inputTokens":11,"outputTokens":1100,"costUSD":11.0}},"model_usage_since_last_result":{"m":{"inputTokens":1,"outputTokens":100,"costUSD":1.0}}}"#;
+    let second = r#"{"type":"result","total_cost_usd":12.0,"usage":{"input_tokens":1,"output_tokens":100},"modelUsage":{"m":{"inputTokens":12,"outputTokens":1200,"costUSD":12.0}},"model_usage_since_last_result":{"m":{"inputTokens":1,"outputTokens":100,"costUSD":1.0}}}"#;
+    let clean = strip_ansi(&run_process(&[first, second].join("\n")));
+    assert!(clean.contains("💰 $1.0000 (session $11.0000)"), "{clean}");
+    assert!(clean.contains("💰 $2.0000 (session $12.0000)"), "{clean}");
+    assert!(clean.contains("m $2.0000 (in:2 out:200)"), "{clean}");
+}
+
+/// 枠の大きさ（contextWindow / maxOutputTokens）がモデル別の報告に無ければ、セッション側から補う。
+#[test]
+fn run_model_usage_takes_window_sizes_from_the_session_entry() {
+    let input = r#"{"type":"result","total_cost_usd":1.0,"usage":{"input_tokens":1,"output_tokens":10},"modelUsage":{"m":{"inputTokens":1,"outputTokens":10,"costUSD":1.0,"contextWindow":200000,"maxOutputTokens":64000}},"model_usage_since_last_result":{"m":{"inputTokens":1,"outputTokens":10,"costUSD":1.0}}}"#;
+    let clean = strip_ansi(&run_process(input));
+    assert!(clean.contains("ctx:200K max_out:64K"), "{clean}");
+}
+
+/// 壊れた値（負のコスト・型違いのエントリ・巨大値）でも panic せず、足せる値だけを足す。
+#[test]
+fn run_model_usage_tolerates_broken_entries() {
+    let input = r#"{"type":"result","total_cost_usd":1.0,"usage":{"input_tokens":1,"output_tokens":10},"modelUsage":{"m":{"inputTokens":1,"outputTokens":10,"costUSD":1.0}},"model_usage_since_last_result":{"m":{"inputTokens":18446744073709551615,"outputTokens":18446744073709551615,"cacheReadInputTokens":18446744073709551615,"costUSD":-5.0},"x":"broken"}}"#;
+    let clean = strip_ansi(&run_process(&[input, input].join("\n")));
+    assert!(clean.contains("💰 $1.0000"), "{clean}");
+    assert!(clean.contains("18,446,744,073,709,551,615"), "{clean}");
+}

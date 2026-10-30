@@ -1214,6 +1214,34 @@ fn bash_edit_diff_with_no_files_is_silent() {
     let result: serde_json::Value =
         serde_json::from_str(r#"{"bashEditDiff":{"files":[],"shared":true}}"#).unwrap();
     assert_eq!(tool_result_metadata(&result), "");
+    let result: serde_json::Value = serde_json::from_str(
+        r#"{"bashEditDiff":{"files":[],"moreFiles":0,"changedFiles":[],"shared":true}}"#,
+    )
+    .unwrap();
+    assert_eq!(tool_result_metadata(&result), "");
+}
+
+/// 差分の詳細（`files`）が省かれても、`changedFiles` に載った変更は残す。実データでは
+/// `mv src/highlight_legacy.rs /tmp/…` が `files:[]` / `moreFiles:1` / `changedFiles:[path]`
+/// を返し、追跡中のファイルが消えたのに完了行に痕跡が残らなかった。
+#[test]
+fn bash_edit_diff_without_hunks_still_reports_the_changed_files() {
+    let single: serde_json::Value = serde_json::from_str(
+        r#"{"bashEditDiff":{"files":[],"moreFiles":1,"changedFiles":["/repo/src/highlight_legacy.rs"],"shared":true}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        tool_result_metadata(&single),
+        "bash-edits:/repo/src/highlight_legacy.rs (diff omitted)"
+    );
+    let several: serde_json::Value = serde_json::from_str(
+        r#"{"bashEditDiff":{"files":[],"moreFiles":2,"changedFiles":["/repo/a.rs","/repo/b.rs",""]}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        tool_result_metadata(&several),
+        "bash-edits:2 files (diff omitted)"
+    );
 }
 
 /// `type:"create"` は Write が新規作成だったケース。`file:` はどちらでも出るので、

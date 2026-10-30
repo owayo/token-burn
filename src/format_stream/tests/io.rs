@@ -212,3 +212,49 @@ fn raw_write_failure_still_displays_the_tail_and_checks_rate_limits() {
     assert!(String::from_utf8(output).unwrap().contains("last line"));
     assert!(stop.is_file());
 }
+
+/// 生ログは 1 行ごとに書き出す。8KB の `BufWriter` に溜めたままだと、ペインでの Ctrl-C や
+/// モニターの kill-session（SIGHUP）で整形器が落ちたとき、走行中のタスクの jsonl から直近の
+/// 最大 8KB（短いセッションなら全部）が消えていた。次の行を読む時点で、前の行がファイルに
+/// 書かれていることを確かめる。
+#[test]
+fn raw_output_is_written_line_by_line_before_the_next_read() {
+    struct Lines {
+        lines: std::collections::VecDeque<&'static [u8]>,
+        raw: std::path::PathBuf,
+        reads: usize,
+    }
+    impl io::Read for Lines {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(line) = self.lines.pop_front() else {
+                return Ok(0);
+            };
+            if self.reads > 0 {
+                let saved = std::fs::read_to_string(&self.raw).unwrap_or_default();
+                assert_eq!(
+                    saved.lines().count(),
+                    self.reads,
+                    "読み終えた行が生ログに書かれていない: {saved:?}"
+                );
+            }
+            self.reads += 1;
+            buf[..line.len()].copy_from_slice(line);
+            Ok(line.len())
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let raw = tmp.path().join("events.jsonl");
+    let reader = io::BufReader::new(Lines {
+        lines: [
+            b"{\"type\":\"system\",\"subtype\":\"status\"}\n".as_slice(),
+            b"plain line\n".as_slice(),
+            b"{\"type\":\"system\",\"subtype\":\"status\"}\n".as_slice(),
+        ]
+        .into(),
+        raw: raw.clone(),
+        reads: 0,
+    });
+    let mut out = Vec::new();
+    process(reader, &mut out, Some(&raw), None, 95).unwrap();
+    assert_eq!(std::fs::read_to_string(&raw).unwrap().lines().count(), 3);
+}
