@@ -339,16 +339,47 @@ fn reasoning(phase: Phase, item: &Value) -> Vec<String> {
     vec![dim(&format!("\u{1f4ad} {text}"))]
 }
 
-/// `web_search`: 完了時に検索語を出す。
+/// `web_search`: 完了時に、何をしたか（検索・ページを開く・ページ内の検索）と対象を出す。
+///
+/// codex-cli 0.160.1 の `item.completed` は `action` に `{type:"search",query}` /
+/// `{type:"open_page",url}` / `{type:"find_in_page",pattern}` / `{type:"other"}` を持ち、
+/// トップレベルの `query` には open_page なら URL、find_in_page なら `'pattern'` が入る
+/// （実データ）。種類を出さないと、`🔎 'following whitespace'` が Web 検索なのか直前に
+/// 開いたページの中の検索なのか区別できない。検索の `results` は検索全体のヒット数ではなく
+/// 返された項目の数なので `listed` と書く。`action` を持たない版・`other` は従来どおり
+/// 検索語だけを出す。
 fn web_search(phase: Phase, item: &Value) -> Vec<String> {
     if phase != Phase::Completed {
         return Vec::new();
     }
-    let query = one_line(item["query"].as_str().unwrap_or(""), QUERY_WIDTH);
-    let line = if query.is_empty() {
-        "\u{1f50e} web search".to_string()
-    } else {
-        format!("\u{1f50e} {query}")
+    let action = &item["action"];
+    let (label, target_key) = match action["type"].as_str() {
+        Some("search") => (Some("search"), "query"),
+        Some("open_page") => (Some("open"), "url"),
+        Some("find_in_page") => (Some("find"), "pattern"),
+        _ => (None, "query"),
+    };
+    let target = [action[target_key].as_str(), item["query"].as_str()]
+        .into_iter()
+        .flatten()
+        .map(|value| one_line(value, QUERY_WIDTH))
+        .find(|value| !value.is_empty());
+    let Some(target) = target else {
+        return vec![cyan("\u{1f50e} web search")];
+    };
+    let line = match label {
+        Some(label) => {
+            let listed = if label == "search" {
+                item["results"]
+                    .as_array()
+                    .map(|results| format!(" ({} listed)", results.len()))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            format!("\u{1f50e} {label}: {target}{listed}")
+        }
+        None => format!("\u{1f50e} {target}"),
     };
     vec![cyan(&line)]
 }

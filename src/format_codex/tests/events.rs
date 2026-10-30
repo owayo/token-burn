@@ -439,6 +439,42 @@ fn web_search_with_and_without_query() {
     );
 }
 
+/// 実データの `action` を持つ形。種類と対象を出し、検索だけ返された項目数を添える。
+#[test]
+fn web_search_shows_the_action_and_its_target() {
+    assert_eq!(
+        render(&[
+            r#"{"type":"item.started","item":{"id":"w1","type":"web_search","query":"","action":{"type":"other"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"w1","type":"web_search","query":"rust mpsc recv_timeout","action":{"type":"search","query":"rust mpsc recv_timeout"},"results":[{"type":"text_result","title":"a","url":"https://example.com/a"},{"type":"text_result","title":"b","url":"https://example.com/b"}]}}"#,
+            r#"{"type":"item.completed","item":{"id":"w2","type":"web_search","query":"https://example.com/doc","action":{"type":"open_page","url":"https://example.com/doc"},"results":[{"type":"text_result"}]}}"#,
+            r#"{"type":"item.completed","item":{"id":"w3","type":"web_search","query":"'following whitespace'","action":{"type":"find_in_page","pattern":"following whitespace"},"results":[]}}"#,
+        ]),
+        "\u{1f50e} search: rust mpsc recv_timeout (2 listed)\n\
+         \u{1f50e} open: https://example.com/doc\n\
+         \u{1f50e} find: following whitespace\n"
+    );
+}
+
+/// action の値が空・欠落ならトップレベルの `query` へ落とし、`other` と未知の種類は検索語だけ。
+/// `results` が無い検索は件数を省き、空配列なら `0 listed` とする。
+#[test]
+fn web_search_falls_back_to_the_top_level_query() {
+    assert_eq!(
+        render(&[
+            r#"{"type":"item.completed","item":{"id":"w1","type":"web_search","query":"from top","action":{"type":"search","query":""}}}"#,
+            r#"{"type":"item.completed","item":{"id":"w2","type":"web_search","query":"x","action":{"type":"search"},"results":[]}}"#,
+            r#"{"type":"item.completed","item":{"id":"w3","type":"web_search","query":"other query","action":{"type":"other"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"w4","type":"web_search","query":"","action":{"type":"brand_new"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"w5","type":"web_search","query":"q","action":"broken"}}"#,
+        ]),
+        "\u{1f50e} search: from top\n\
+         \u{1f50e} search: x (0 listed)\n\
+         \u{1f50e} other query\n\
+         \u{1f50e} web search\n\
+         \u{1f50e} q\n"
+    );
+}
+
 #[test]
 fn todo_list_prints_only_when_progress_or_next_item_changes() {
     let plan = |phase: &str, done: [bool; 3]| {
