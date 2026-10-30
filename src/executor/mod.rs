@@ -972,6 +972,69 @@ fn write_start_pause(start: &StartGate, stop_file: &Path) -> Result<()> {
     Ok(())
 }
 
+/// tmux のセッション名と、それを指し示すターゲット。
+///
+/// セッションを指し示すときは `=` 付きの厳密一致ターゲットを使う。tmux の
+/// `-t` は「完全一致 → 前方一致 → fnmatch」の順に解決するため、素の
+/// `token-burn` はセッションが存在しないとき `token-burn-notes` のような
+/// 無関係なセッションへ当たる（実測で確認）。`kill-session` がそれを掴むと
+/// ユーザーの別セッションを黙って破壊し、`has-session` が掴むと「デタッチ
+/// された」と誤判定して最終集計を出さずに終わる。
+/// `new-session -s` は新しい名前の指定であってターゲットではないので素の名前を渡す。
+struct TmuxSession {
+    /// tmux を起動するコマンド（先頭が実行ファイル）。テストでは呼び出しを記録する偽物
+    /// （`sh -c <script> tmux`）に差し替える。
+    program: Vec<String>,
+    /// 素のセッション名（`new-session -s` とモニターの起動情報に渡す）。
+    name: &'static str,
+    /// `=` 付きの厳密一致のセッションターゲット。
+    target: String,
+    /// ウィンドウ・ペイン対象では末尾の : が必要。無いとウィンドウ名として解釈される。
+    window: String,
+}
+
+impl TmuxSession {
+    fn new(name: &'static str) -> Self {
+        let target = format!("={name}");
+        let window = format!("{target}:");
+        Self {
+            program: vec!["tmux".to_string()],
+            name,
+            target,
+            window,
+        }
+    }
+
+    /// tmux を起動するコマンド（サブコマンドと引数は呼び出し側で足す）。
+    fn command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.program[0]);
+        command.args(&self.program[1..]);
+        command
+    }
+}
+
+/// 1 回の実行で使うディレクトリとファイルの置き場所。
+struct RunLayout {
+    /// 実行用の一時ディレクトリ。ワーカーとモニターが使うキュー・マーカー・スクリプト・
+    /// プロンプト・起動情報を置く。
+    tmp_dir: PathBuf,
+    /// 今回の実行用レポートディレクトリ（ログと errors.txt）。
+    run_dir: PathBuf,
+    /// 実行を始めた時刻。レポートディレクトリ名に使い、この実行で保存された中断セッションを
+    /// 数える基準にもする。
+    started_at: DateTime<Local>,
+    /// ワーカーが done-* / failed-* / retry-* / error-* / worker-done-* を書くディレクトリ。
+    marker_dir: PathBuf,
+    /// ワーカー間で共有するタスクキュー（pending-*。gate-claim が claimed-* へ rename する）。
+    queue_dir: PathBuf,
+    /// 各タスクの実行スクリプト（task-*.sh）。
+    task_dir: PathBuf,
+    /// 恒久停止のシグナル。一時停止のファイルはこの隣に置かれる。
+    stop_file: PathBuf,
+    /// ワーカーとモニターが呼び直す token-burn の実行ファイル。
+    exe_path: PathBuf,
+}
+
 pub fn execute_plan_tmux(
     plan: ExecutionPlan,
     parallelism: usize,
@@ -993,44 +1056,104 @@ pub fn execute_plan_tmux(
         return Ok(());
     }
 
+    let tmux = TmuxSession::new("token-burn");
+
     // tmux の存在確認
-    std::process::Command::new("tmux")
+    tmux.command()
         .arg("-V")
         .output()
         .context("tmux is not installed")?;
 
-    let session = "token-burn";
-    // セッションを指し示すときは `=` 付きの厳密一致ターゲットを使う。tmux の
-    // `-t` は「完全一致 → 前方一致 → fnmatch」の順に解決するため、素の
-    // `token-burn` はセッションが存在しないとき `token-burn-notes` のような
-    // 無関係なセッションへ当たる（実測で確認）。`kill-session` がそれを掴むと
-    // ユーザーの別セッションを黙って破壊し、`has-session` が掴むと「デタッチ
-    // された」と誤判定して最終集計を出さずに終わる。
-    // `new-session -s` は新しい名前の指定であってターゲットではないので素の名前を渡す。
-    let session_target = format!("={session}");
-    // ウィンドウ・ペイン対象では末尾の : が必要。無いとウィンドウ名として解釈される。
-    let window_target = format!("{session_target}:");
-
     // 既存セッションがあれば終了
-    let _ = std::process::Command::new("tmux")
-        .args(["kill-session", "-t", &session_target])
+    let _ = tmux
+        .command()
+        .args(["kill-session", "-t", &tmux.target])
         .output();
 
-    let tmp_dir = std::env::temp_dir().join("token-burn");
+    let layout = prepare_run_layout(
+        std::env::temp_dir().join("token-burn"),
+        report_dir,
+        &plan.agent.name,
+    )?;
+    let total = plan.tasks.len();
+    let worker_count = worker_count(parallelism, total);
+    prepare_task_queue(&plan, &layout, state_file, rate_limit_threshold)?;
+
+    // ai-usage 連携時だけ、ワーカーの usage-gate とモニターの ai-usage のコマンドを組み立て、
+    // statusline 用のキャッシュを初期化する。
+    let usage_gate_cmd = plan.usage_gate.as_ref().map(|g| {
+        build_usage_gate_cmd(g, &layout.exe_path, rate_limit_threshold, &layout.stop_file)
+    });
+    let cache_file = layout.tmp_dir.join("ai-usage-cache.json");
+    let monitor_ai_usage = plan
+        .usage_gate
+        .as_ref()
+        .and_then(|g| build_monitor_ai_usage(g, &cache_file));
+    if let Some(g) = plan.usage_gate.as_ref() {
+        init_statusline_cache(g, plan.startup_usage.as_deref(), &cache_file);
+    }
+
+    let gate_claim_cmd = build_gate_claim_cmd(
+        &layout.exe_path,
+        &layout.stop_file,
+        &layout.queue_dir,
+        deadline_epoch,
+        usage_gate_cmd.as_deref(),
+    );
+    let script_paths = write_worker_scripts(
+        &layout,
+        worker_count,
+        usage_gate_cmd.as_deref(),
+        &gate_claim_cmd,
+    )?;
+
+    // 左ペインのモニター（`token-burn monitor`）の起動情報。
+    let monitor_command = write_monitor_manifest(
+        &crate::monitor::Manifest {
+            agent: plan.agent.name.clone(),
+            command: display::format_command(&plan.agent.command),
+            reset: reset_info.to_string(),
+            total,
+            deadline_epoch,
+            marker_dir: layout.marker_dir.clone(),
+            session: tmux.name.to_string(),
+            worker_count,
+            stop_file: layout.stop_file.clone(),
+            report_dir: layout.run_dir.clone(),
+            threshold: rate_limit_threshold,
+            ai_usage: monitor_ai_usage,
+        },
+        &layout,
+    )?;
+
+    start_tmux_session(&tmux, &monitor_command, &script_paths, &layout.tmp_dir)?;
+    configure_tmux_window(&tmux);
+
+    attach_tmux_session(&tmux, deadline_epoch)?;
+    if tmux_session_alive(&tmux) {
+        // デタッチした。ワーカーは動き続けるので、キュー・タスクスクリプト・プロンプトを置いた
+        // 実行用の一時ディレクトリは消さずに残す。
+        print_detached(&tmux, &layout.tmp_dir);
+        return Ok(());
+    }
+    report_finished_run(&plan, &layout, state_file);
+    Ok(())
+}
+
+/// 実行用の一時ディレクトリ（`tmp_dir`）を空の状態から用意し、今回の実行用レポート
+/// ディレクトリと、ワーカー間で共有するキュー・マーカー・タスクのディレクトリを作る。
+fn prepare_run_layout(tmp_dir: PathBuf, report_dir: &Path, agent_name: &str) -> Result<RunLayout> {
     prepare_run_tmp_dir(&tmp_dir)?;
 
     // 今回の実行用レポートディレクトリを作成
     let now = chrono::Local::now();
-    let safe_agent_name = sanitize_filename(&plan.agent.name);
+    let safe_agent_name = sanitize_filename(agent_name);
     let run_dir = report_dir.join(format!(
         "{}_{}",
         now.format("%Y%m%d_%H%M%S"),
         safe_agent_name
     ));
     std::fs::create_dir_all(&run_dir)?;
-
-    let total = plan.tasks.len();
-    let worker_count = worker_count(parallelism, total);
 
     // ワーカー間で共有するタスクキュー
     let marker_dir = tmp_dir.join("markers");
@@ -1044,18 +1167,41 @@ pub fn execute_plan_tmux(
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("token-burn"));
     let stop_file = tmp_dir.join("stop");
 
+    Ok(RunLayout {
+        tmp_dir,
+        run_dir,
+        started_at: now,
+        marker_dir,
+        queue_dir,
+        task_dir,
+        stop_file,
+        exe_path,
+    })
+}
+
+/// ワーカーが処理するキューを書き出す。再開するタスクがあれば継続プロンプトを、実行開始時に
+/// 一時停止するなら pause file を書き、続けて各タスクのプロンプト・実行スクリプト・pending
+/// マーカーを書く。
+fn prepare_task_queue(
+    plan: &ExecutionPlan,
+    layout: &RunLayout,
+    state_file: &Path,
+    rate_limit_threshold: u8,
+) -> Result<()> {
+    let total = plan.tasks.len();
+
     // 継続プロンプトは全タスク共通なので 1 ファイルにまとめる。
-    let resume_prompt_file = tmp_dir.join("resume-prompt.txt");
+    let resume_prompt_file = layout.tmp_dir.join("resume-prompt.txt");
     if !plan.resume.sessions.is_empty() {
         std::fs::write(&resume_prompt_file, &plan.resume.prompt)?;
     }
 
-    write_start_pause(&plan.start, &stop_file)?;
+    write_start_pause(&plan.start, &layout.stop_file)?;
 
     // 各タスクの実行スクリプトと pending マーカーを書き出す
     for (idx_zero, task) in plan.tasks.iter().enumerate() {
         let idx = idx_zero + 1;
-        let prompt_file = tmp_dir.join(format!("prompt-{}.txt", idx));
+        let prompt_file = layout.tmp_dir.join(format!("prompt-{}.txt", idx));
         std::fs::write(&prompt_file, &task.prompt)?;
 
         let resume = plan
@@ -1072,99 +1218,120 @@ pub fn execute_plan_tmux(
             task,
             agent: &plan.agent,
             prompt_file: &prompt_file,
-            run_dir: &run_dir,
-            marker_dir: &marker_dir,
-            exe_path: &exe_path,
+            run_dir: &layout.run_dir,
+            marker_dir: &layout.marker_dir,
+            exe_path: &layout.exe_path,
             state_file,
-            stop_file: &stop_file,
+            stop_file: &layout.stop_file,
             rate_limit_threshold,
             output: plan.output,
             save_interrupted: plan.resume.save_interrupted,
             resume,
             discard_session: plan.resume.discard.get(&task.directory).map(String::as_str),
         });
-        let task_path = task_dir.join(format!("task-{:04}.sh", idx));
+        let task_path = layout.task_dir.join(format!("task-{:04}.sh", idx));
         std::fs::write(&task_path, &task_script)?;
 
-        std::fs::write(queue_dir.join(format!("pending-{:04}", idx)), "")?;
+        std::fs::write(layout.queue_dir.join(format!("pending-{:04}", idx)), "")?;
     }
+    Ok(())
+}
 
-    // ai-usage 連携時、各タスク完了後に使用率をチェックする usage-gate コマンドを組み立てる。
-    // usage-gate は呼ぶたびに実行中のアカウントを `--refresh` で取り直すので、キャッシュの
-    // パスは渡さない（以前の版が渡していた `--cache-file` は受け付けたまま無視する）。
-    let usage_gate_cmd = plan.usage_gate.as_ref().map(|g| {
-        // usage-gate プロセス自体に選択 agent の env を前置きする。`--` 以降に KEY=val を
-        // 入れると hidden CLI が実行ファイルと誤認するため、サブコマンドより前に置く。
-        let mut parts = env_prefix_parts(&g.env);
-        parts.extend([
-            shell_escape(&exe_path.to_string_lossy()),
-            "usage-gate".to_string(),
-            "--profile".to_string(),
-            shell_escape(&g.profile),
-            "--provider".to_string(),
-            shell_escape(&g.provider),
-            "--threshold".to_string(),
-            rate_limit_threshold.to_string(),
-            "--stop-file".to_string(),
-            shell_escape(&stop_file.to_string_lossy()),
-            "--".to_string(),
-        ]);
-        parts.extend(g.command.iter().map(|s| shell_escape(s)));
-        parts.join(" ")
-    });
+/// ai-usage 連携時、各タスク完了後に使用率をチェックする usage-gate のコマンド文字列を
+/// 組み立てる（ワーカーが bash で実行し、gate-claim の `--revalidate` にも渡す）。
+///
+/// usage-gate は呼ぶたびに実行中のアカウントを `--refresh` で取り直すので、キャッシュの
+/// パスは渡さない（以前の版が渡していた `--cache-file` は受け付けたまま無視する）。
+fn build_usage_gate_cmd(
+    gate: &UsageGateConfig,
+    exe_path: &Path,
+    rate_limit_threshold: u8,
+    stop_file: &Path,
+) -> String {
+    // usage-gate プロセス自体に選択 agent の env を前置きする。`--` 以降に KEY=val を
+    // 入れると hidden CLI が実行ファイルと誤認するため、サブコマンドより前に置く。
+    let mut parts = env_prefix_parts(&gate.env);
+    parts.extend([
+        shell_escape(&exe_path.to_string_lossy()),
+        "usage-gate".to_string(),
+        "--profile".to_string(),
+        shell_escape(&gate.profile),
+        "--provider".to_string(),
+        shell_escape(&gate.provider),
+        "--threshold".to_string(),
+        rate_limit_threshold.to_string(),
+        "--stop-file".to_string(),
+        shell_escape(&stop_file.to_string_lossy()),
+        "--".to_string(),
+    ]);
+    parts.extend(gate.command.iter().map(|s| shell_escape(s)));
+    parts.join(" ")
+}
 
-    // モニターペインが使う ai-usage のコマンド（env prefix 付き）。`--json` の出力で
-    // statusline 用のキャッシュを atomic に置き換え、statusline は `--input` でその
-    // キャッシュを読む。キャッシュは表示専用で、停止・一時停止の判定には使わない（判定は
-    // usage-gate と実行開始時の判定が `--refresh` で取り直す）。ディスク容量は使用量の
-    // キャッシュに混ぜず `--disk --json` で別に取る。
-    let cache_file = tmp_dir.join("ai-usage-cache.json");
-    let monitor_ai_usage = plan.usage_gate.as_ref().and_then(|g| {
-        Some(crate::monitor::AiUsageCommands {
-            refresh: build_refresh_cmd(&g.command, &g.env)?,
-            statusline: build_statusline_cmd(
-                &g.command,
-                &cache_file,
-                &g.env,
-                &g.profile,
-                &g.provider,
-            )?,
-            disk: build_disk_cmd(&g.command, &g.env)?,
-            live: build_live_cmd(&g.command, &g.env, &g.profile, &g.provider)?,
-            profile: g.profile.clone(),
-            provider: g.provider.clone(),
-            cache_file: cache_file.clone(),
-        })
-    });
-    // 起動時に statusline 用の ai-usage キャッシュを初期化し、monitor 起動直後から statusline を
-    // 表示できるようにする（以後はモニターが 10 秒ごとに更新する）。実行開始時の判定
-    // （check_start）が全アカウント分を取り直していれば、その出力を使ってもう 1 回の取得を
-    // 省く。取れていなければ従来どおりここで取得する。ai-usage コマンド自体がハングすると
-    // tmux 起動前に token-burn 全体が固まるため、AI_USAGE_STARTUP_TIMEOUT でキルする。
-    // 失敗時はキャッシュ更新をスキップし、monitor 側の初回取得に委ねる。
-    if let Some(g) = plan.usage_gate.as_ref() {
-        let initial = match plan.startup_usage.as_deref() {
-            Some(bytes) => Ok(bytes.to_vec()),
-            None => spawn_ai_usage_sync_with_timeout(&g.command, &g.env, AI_USAGE_STARTUP_TIMEOUT),
-        };
-        match initial {
-            Ok(bytes) => {
-                let _ = std::fs::write(&cache_file, &bytes);
-            }
-            Err(e) => {
-                eprintln!(
-                    "{}: failed to initialize ai-usage cache: {} (continuing without startup cache)",
-                    "warning".yellow(),
-                    e
-                );
-            }
+/// モニターペインが使う ai-usage のコマンド（env prefix 付き）。`--json` の出力で
+/// statusline 用のキャッシュ（`cache_file`）を atomic に置き換え、statusline は `--input` で
+/// そのキャッシュを読む。キャッシュは表示専用で、停止・一時停止の判定には使わない（判定は
+/// usage-gate と実行開始時の判定が `--refresh` で取り直す）。ディスク容量は使用量の
+/// キャッシュに混ぜず `--disk --json` で別に取る。command が空なら None。
+fn build_monitor_ai_usage(
+    gate: &UsageGateConfig,
+    cache_file: &Path,
+) -> Option<crate::monitor::AiUsageCommands> {
+    Some(crate::monitor::AiUsageCommands {
+        refresh: build_refresh_cmd(&gate.command, &gate.env)?,
+        statusline: build_statusline_cmd(
+            &gate.command,
+            cache_file,
+            &gate.env,
+            &gate.profile,
+            &gate.provider,
+        )?,
+        disk: build_disk_cmd(&gate.command, &gate.env)?,
+        live: build_live_cmd(&gate.command, &gate.env, &gate.profile, &gate.provider)?,
+        profile: gate.profile.clone(),
+        provider: gate.provider.clone(),
+        cache_file: cache_file.to_path_buf(),
+    })
+}
+
+/// 起動時に statusline 用の ai-usage キャッシュを初期化し、monitor 起動直後から statusline を
+/// 表示できるようにする（以後はモニターが 10 秒ごとに更新する）。実行開始時の判定
+/// （check_start）が全アカウント分を取り直していれば（`startup_usage`）、その出力を使って
+/// もう 1 回の取得を省く。取れていなければ従来どおりここで取得する。ai-usage コマンド自体が
+/// ハングすると tmux 起動前に token-burn 全体が固まるため、AI_USAGE_STARTUP_TIMEOUT でキルする。
+/// 失敗時はキャッシュ更新をスキップし、monitor 側の初回取得に委ねる。
+fn init_statusline_cache(gate: &UsageGateConfig, startup_usage: Option<&[u8]>, cache_file: &Path) {
+    let initial = match startup_usage {
+        Some(bytes) => Ok(bytes.to_vec()),
+        None => {
+            spawn_ai_usage_sync_with_timeout(&gate.command, &gate.env, AI_USAGE_STARTUP_TIMEOUT)
+        }
+    };
+    match initial {
+        Ok(bytes) => {
+            let _ = std::fs::write(cache_file, &bytes);
+        }
+        Err(e) => {
+            eprintln!(
+                "{}: failed to initialize ai-usage cache: {} (continuing without startup cache)",
+                "warning".yellow(),
+                e
+            );
         }
     }
+}
 
-    // ワーカーの「停止判定 + claim」。恒久停止なら 10、pending が無ければ 20 で終わり、
-    // 一時停止中（5 時間枠のように待てば回復する枠での停止）は再開時刻まで待つ。
-    // デッドラインは相対秒ではなく絶対 epoch で渡す。ワーカーは別プロセスで、しかも
-    // 待機を挟むため、相対値だと基準時刻がプロセスごとにずれる。
+/// ワーカーの「停止判定 + claim」のコマンド文字列を組み立てる。恒久停止なら 10、pending が
+/// 無ければ 20 で終わり、一時停止中（5 時間枠のように待てば回復する枠での停止）は再開時刻まで
+/// 待つ。デッドラインは相対秒ではなく絶対 epoch で渡す。ワーカーは別プロセスで、しかも
+/// 待機を挟むため、相対値だと基準時刻がプロセスごとにずれる。
+fn build_gate_claim_cmd(
+    exe_path: &Path,
+    stop_file: &Path,
+    queue_dir: &Path,
+    deadline_epoch: i64,
+    usage_gate_cmd: Option<&str>,
+) -> String {
     let mut gate_claim_cmd = format!(
         "{} gate-claim --stop-file {} --queue-dir {} --deadline-epoch {}",
         shell_escape(&exe_path.to_string_lossy()),
@@ -1174,100 +1341,163 @@ pub fn execute_plan_tmux(
     );
     // 一時停止から再開する直前に、実データで使用率を確かめ直す。待機の根拠は停止時点の
     // 観測なので、これが無いと状況が変わっていても 1 件は開始してしまう。
-    if let Some(cmd) = usage_gate_cmd.as_deref() {
+    if let Some(cmd) = usage_gate_cmd {
         gate_claim_cmd.push_str(" --revalidate ");
         gate_claim_cmd.push_str(&shell_escape(cmd));
     }
+    gate_claim_cmd
+}
 
+/// ワーカーごとのスクリプト（worker-N.sh）を書き出して実行権限を付け、tmux のペインで
+/// 起動する順にパスを返す。
+fn write_worker_scripts(
+    layout: &RunLayout,
+    worker_count: usize,
+    usage_gate_cmd: Option<&str>,
+    gate_claim_cmd: &str,
+) -> Result<Vec<PathBuf>> {
     let mut script_paths = Vec::new();
     for w in 0..worker_count {
-        let script_path = tmp_dir.join(format!("worker-{}.sh", w));
+        let script_path = layout.tmp_dir.join(format!("worker-{}.sh", w));
         let worker_script = build_worker_script(&WorkerCtx {
             worker_id: w,
-            queue_dir: &queue_dir,
-            task_dir: &task_dir,
-            marker_dir: &marker_dir,
-            usage_gate_cmd: usage_gate_cmd.as_deref(),
-            gate_claim_cmd: &gate_claim_cmd,
+            queue_dir: &layout.queue_dir,
+            task_dir: &layout.task_dir,
+            marker_dir: &layout.marker_dir,
+            usage_gate_cmd,
+            gate_claim_cmd,
         });
         std::fs::write(&script_path, &worker_script)?;
         ensure_executable(&script_path)?;
         script_paths.push(script_path);
     }
+    Ok(script_paths)
+}
 
-    // 左ペインのモニター（`token-burn monitor`）。起動情報は引数ではなくファイルで渡す
-    // （ai-usage のコマンドはクォート済みのシェル文字列で、tmux の shell-command へもう一段
-    // 埋め込むとクォートが二重になる）。
-    let manifest_path = tmp_dir.join("monitor.json");
-    crate::monitor::Manifest {
-        agent: plan.agent.name.clone(),
-        command: display::format_command(&plan.agent.command),
-        reset: reset_info.to_string(),
-        total,
-        deadline_epoch,
-        marker_dir: marker_dir.clone(),
-        session: session.to_string(),
-        worker_count,
-        stop_file: stop_file.clone(),
-        report_dir: run_dir.clone(),
-        threshold: rate_limit_threshold,
-        ai_usage: monitor_ai_usage,
-    }
-    .write(&manifest_path)?;
-    let monitor_command = tmux_pane_command(&format!(
+/// 左ペインのモニター（`token-burn monitor`）の起動情報を書き出し、ペインで実行する起動
+/// コマンドを返す。起動情報は引数ではなくファイルで渡す（ai-usage のコマンドはクォート済みの
+/// シェル文字列で、tmux の shell-command へもう一段埋め込むとクォートが二重になる）。
+fn write_monitor_manifest(
+    manifest: &crate::monitor::Manifest,
+    layout: &RunLayout,
+) -> Result<String> {
+    let manifest_path = layout.tmp_dir.join("monitor.json");
+    manifest.write(&manifest_path)?;
+    Ok(build_monitor_cmd(&layout.exe_path, &manifest_path))
+}
+
+/// モニターペインの起動コマンド（tmux の shell-command）。tmux は shell-command を `sh -c`
+/// 経由で実行するので、実行ファイルと起動情報のパスはクォートする。
+fn build_monitor_cmd(exe_path: &Path, manifest_path: &Path) -> String {
+    tmux_pane_command(&format!(
         "{} monitor --manifest {}",
         shell_escape(&exe_path.to_string_lossy()),
         shell_escape(&manifest_path.to_string_lossy())
-    ));
+    ))
+}
 
-    // モニター（左ペイン）付き tmux セッションを作成。
-    // `.status()?` は tmux の起動失敗しか捕まえない（tmux が non-zero 終了しても Ok）。
-    // ここで ExitStatus を検証しないと、セッション/ペイン生成に失敗してもワーカーが
-    // 起動しないままモニターだけが走り、進捗が進まずデッドラインまでハングする。
-    let mut session_created = false;
-    let setup_result = (|| -> Result<()> {
-        let new_session_status = std::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", session, &monitor_command])
-            .status()
-            .context("Failed to create tmux session")?;
-        anyhow::ensure!(
-            new_session_status.success(),
-            "tmux new-session failed (exit {:?})",
-            new_session_status.code()
-        );
-        session_created = true;
-
-        // ワーカーはタスクを消化し切ると自分で終了してペインを閉じる。ユーザーの tmux 設定が
-        // remain-on-exit を on にしていると終了済みペインが "Pane is dead" のまま画面に残り、
-        // ペインを閉じる意味が無くなるため、このウィンドウに限って off を明示する（window
-        // option なので -w で対象を明示する）。最速のタスクが終わる前に設定しておきたいので、
-        // ワーカー用のペイン分割より先に置く。設定できなくても実行そのものは完走するため、
-        // ここは失敗しても止めず、ペインが残り得ることだけ警告する。
-        let remain_on_exit_off = std::process::Command::new("tmux")
-            .args([
-                "set-option",
-                "-w",
-                "-t",
-                &window_target,
-                "remain-on-exit",
-                "off",
-            ])
+/// モニター（左ペイン）付きの tmux セッションを作り、ワーカーのペインを右側に足す。
+///
+/// 失敗したら実行用の一時ディレクトリを消してからエラーを返す。セッションを作った後の
+/// 失敗では、先にそのセッションを kill する。
+fn start_tmux_session(
+    tmux: &TmuxSession,
+    monitor_command: &str,
+    script_paths: &[PathBuf],
+    tmp_dir: &Path,
+) -> Result<()> {
+    if let Err(error) = create_tmux_session(tmux, monitor_command) {
+        let _ = std::fs::remove_dir_all(tmp_dir);
+        return Err(error);
+    }
+    if let Err(error) = add_worker_panes(tmux, script_paths) {
+        // セッション作成後にペイン初期化が失敗した場合、モニターだけが残って
+        // デッドラインまで動き続けないよう、自分で起動したセッションを回収する。
+        let _ = tmux
+            .command()
+            .args(["kill-session", "-t", &tmux.target])
             .status();
-        if !remain_on_exit_off.is_ok_and(|status| status.success()) {
-            eprintln!(
-                "{}: could not disable tmux remain-on-exit; finished worker panes may stay open",
-                "warning".yellow()
-            );
-        }
+        let _ = std::fs::remove_dir_all(tmp_dir);
+        return Err(error);
+    }
+    Ok(())
+}
 
-        // 最初のワーカー用に右ペインを分割
-        let split_status = std::process::Command::new("tmux")
+/// モニター（左ペイン）付き tmux セッションを作成する。
+///
+/// `.status()?` は tmux の起動失敗しか捕まえない（tmux が non-zero 終了しても Ok）。
+/// ここで ExitStatus を検証しないと、セッション/ペイン生成に失敗してもワーカーが
+/// 起動しないままモニターだけが走り、進捗が進まずデッドラインまでハングする。
+fn create_tmux_session(tmux: &TmuxSession, monitor_command: &str) -> Result<()> {
+    let new_session_status = tmux
+        .command()
+        .args(["new-session", "-d", "-s", tmux.name, monitor_command])
+        .status()
+        .context("Failed to create tmux session")?;
+    anyhow::ensure!(
+        new_session_status.success(),
+        "tmux new-session failed (exit {:?})",
+        new_session_status.code()
+    );
+    Ok(())
+}
+
+/// ワーカーのペインをモニターの右側に足す（最初のワーカーは水平分割、残りは右側を垂直分割）。
+/// 分割も `create_tmux_session` と同じ理由で終了ステータスまで確かめる。
+fn add_worker_panes(tmux: &TmuxSession, script_paths: &[PathBuf]) -> Result<()> {
+    // ワーカーはタスクを消化し切ると自分で終了してペインを閉じる。ユーザーの tmux 設定が
+    // remain-on-exit を on にしていると終了済みペインが "Pane is dead" のまま画面に残り、
+    // ペインを閉じる意味が無くなるため、このウィンドウに限って off を明示する（window
+    // option なので -w で対象を明示する）。最速のタスクが終わる前に設定しておきたいので、
+    // ワーカー用のペイン分割より先に置く。設定できなくても実行そのものは完走するため、
+    // ここは失敗しても止めず、ペインが残り得ることだけ警告する。
+    let remain_on_exit_off = tmux
+        .command()
+        .args([
+            "set-option",
+            "-w",
+            "-t",
+            &tmux.window,
+            "remain-on-exit",
+            "off",
+        ])
+        .status();
+    if !remain_on_exit_off.is_ok_and(|status| status.success()) {
+        eprintln!(
+            "{}: could not disable tmux remain-on-exit; finished worker panes may stay open",
+            "warning".yellow()
+        );
+    }
+
+    // 最初のワーカー用に右ペインを分割
+    let split_status = tmux
+        .command()
+        .args([
+            "split-window",
+            "-h",
+            "-t",
+            &tmux.window,
+            &tmux_script_arg(&script_paths[0]),
+        ])
+        .status()
+        .context("Failed to split tmux window for worker")?;
+    anyhow::ensure!(
+        split_status.success(),
+        "tmux split-window failed (exit {:?})",
+        split_status.code()
+    );
+
+    // 残りのワーカーを右エリアに垂直分割で追加
+    for script in &script_paths[1..] {
+        // 右側の最後のペインに垂直分割で追加
+        let split_status = tmux
+            .command()
             .args([
                 "split-window",
-                "-h",
+                "-v",
                 "-t",
-                &window_target,
-                &tmux_script_arg(&script_paths[0]),
+                &format!("{}:.right", tmux.target),
+                &tmux_script_arg(script),
             ])
             .status()
             .context("Failed to split tmux window for worker")?;
@@ -1276,94 +1506,78 @@ pub fn execute_plan_tmux(
             "tmux split-window failed (exit {:?})",
             split_status.code()
         );
-
-        // 残りのワーカーを右エリアに垂直分割で追加
-        for script in &script_paths[1..] {
-            // 右側の最後のペインに垂直分割で追加
-            let split_status = std::process::Command::new("tmux")
-                .args([
-                    "split-window",
-                    "-v",
-                    "-t",
-                    &format!("{}:.right", session_target),
-                    &tmux_script_arg(script),
-                ])
-                .status()
-                .context("Failed to split tmux window for worker")?;
-            anyhow::ensure!(
-                split_status.success(),
-                "tmux split-window failed (exit {:?})",
-                split_status.code()
-            );
-        }
-        Ok(())
-    })();
-
-    if let Err(error) = setup_result {
-        if session_created {
-            // セッション作成後にペイン初期化が失敗した場合、モニターだけが残って
-            // デッドラインまで動き続けないよう、自分で起動したセッションを回収する。
-            let _ = std::process::Command::new("tmux")
-                .args(["kill-session", "-t", &session_target])
-                .status();
-        }
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(error);
     }
+    Ok(())
+}
 
+/// ウィンドウの見た目と操作を整える（ペインの配置・モニターの幅・スクロールバック・マウス・
+/// ペインのタイトル・フォーカス）。どの結果も確かめず、失敗しても実行を続ける。
+fn configure_tmux_window(tmux: &TmuxSession) {
     // 右側ペインのサイズを均等化
-    let _ = std::process::Command::new("tmux")
-        .args(["select-layout", "-t", &window_target, "main-vertical"])
+    let _ = tmux
+        .command()
+        .args(["select-layout", "-t", &tmux.window, "main-vertical"])
         .status();
 
     // 左ペイン（モニター）の幅を約30%に設定
-    let _ = std::process::Command::new("tmux")
+    let _ = tmux
+        .command()
         .args([
             "resize-pane",
             "-t",
-            &format!("{}:.0", session_target),
+            &format!("{}:.0", tmux.target),
             "-x",
             "35%",
         ])
         .status();
 
     // スクロールバックとマウスサポートを有効化
-    let _ = std::process::Command::new("tmux")
-        .args(["set-option", "-t", &window_target, "history-limit", "50000"])
+    let _ = tmux
+        .command()
+        .args(["set-option", "-t", &tmux.window, "history-limit", "50000"])
         .status();
-    let _ = std::process::Command::new("tmux")
-        .args(["set-option", "-t", &window_target, "mouse", "on"])
+    let _ = tmux
+        .command()
+        .args(["set-option", "-t", &tmux.window, "mouse", "on"])
         .status();
 
     // ペインボーダータイトルを有効化
-    let _ = std::process::Command::new("tmux")
+    let _ = tmux
+        .command()
         .args([
             "set-option",
             "-t",
-            &window_target,
+            &tmux.window,
             "pane-border-status",
             "top",
         ])
         .status();
-    let _ = std::process::Command::new("tmux")
+    let _ = tmux
+        .command()
         .args([
             "set-option",
             "-t",
-            &window_target,
+            &tmux.window,
             "pane-border-format",
             " #{pane_title} ",
         ])
         .status();
 
     // モニターペインにフォーカス
-    let _ = std::process::Command::new("tmux")
-        .args(["select-pane", "-t", &format!("{}:.0", session_target)])
+    let _ = tmux
+        .command()
+        .args(["select-pane", "-t", &format!("{}:.0", tmux.target)])
         .status();
+}
 
+/// 開始の案内を出して tmux セッションに接続し、戻るまで（終了・kill・デタッチ）待つ。
+/// tmux を起動できなかったときだけエラーを返し、attach-session の終了コードは確かめない
+/// （戻った後のセッションの状態は `tmux_session_alive` で見る）。
+fn attach_tmux_session(tmux: &TmuxSession, deadline_epoch: i64) -> Result<()> {
     println!(
         "{} {} (deadline: {})",
         "Attached to tmux session:".bold(),
-        session.cyan(),
+        tmux.name.cyan(),
         display::format_duration(Duration::from_secs(
             deadline_epoch
                 .saturating_sub(crate::rate_control::now_epoch())
@@ -1377,51 +1591,57 @@ pub fn execute_plan_tmux(
     );
 
     // セッションに接続（終了またはkillされるまでブロック）
-    std::process::Command::new("tmux")
-        .args(["attach-session", "-t", &session_target])
+    tmux.command()
+        .args(["attach-session", "-t", &tmux.target])
         .status()
         .context("Failed to attach to tmux session")?;
+    Ok(())
+}
 
-    let session_alive = std::process::Command::new("tmux")
-        .args(["has-session", "-t", &session_target])
+/// tmux セッションがまだ生きているか（デタッチして戻ったなら true）。確かめられなければ false。
+fn tmux_session_alive(tmux: &TmuxSession) -> bool {
+    tmux.command()
+        .args(["has-session", "-t", &tmux.target])
         .status()
         .map(|status| status.success())
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
 
-    if session_alive {
-        println!();
-        println!(
-            "{} {}",
-            "Detached from tmux session:".bold(),
-            session.cyan()
-        );
-        println!(
-            "  {} tmux attach -t {}",
-            "Reattach:".dimmed(),
-            session_target
-        );
-        println!(
-            "  {} {}",
-            "Runtime files kept:".dimmed(),
-            tmp_dir.display().to_string().cyan()
-        );
-        return Ok(());
-    }
+/// デタッチしたときの案内（再接続の方法と、残した実行用の一時ディレクトリ）。
+fn print_detached(tmux: &TmuxSession, tmp_dir: &Path) {
+    println!();
+    println!(
+        "{} {}",
+        "Detached from tmux session:".bold(),
+        tmux.name.cyan()
+    );
+    println!("  {} tmux attach -t {}", "Reattach:".dimmed(), tmux.target);
+    println!(
+        "  {} {}",
+        "Runtime files kept:".dimmed(),
+        tmp_dir.display().to_string().cyan()
+    );
+}
+
+/// tmux セッションが終わった後の後始末（実行用の一時ディレクトリの削除・ログの ANSI 除去・
+/// errors.txt）と、呼び出し元の端末への最終集計。
+fn report_finished_run(plan: &ExecutionPlan, layout: &RunLayout, state_file: &Path) {
+    let total = plan.tasks.len();
 
     // モニターは完了・停止を検知するとセッションごと閉じるため、画面に出した集計は
     // tmux から抜けた時点で消える。同じ内容を呼び出し元の端末へ出し直す。マーカーは
     // tmp_dir 配下にあるので、クリーンアップより先に読む。
-    let summary = collect_run_summary(&marker_dir);
+    let summary = collect_run_summary(&layout.marker_dir);
 
     // クリーンアップ
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&layout.tmp_dir);
 
     // ログファイルから ANSI エスケープコードを除去
-    strip_ansi_from_dir(&run_dir);
+    strip_ansi_from_dir(&layout.run_dir);
 
     // 失敗の理由はモニターのペインと一時ディレクトリと一緒に消えるので、全件をログと同じ
     // ディレクトリに残す。表示のための記録なので、書けなくても警告して続ける。
-    let errors_saved = write_errors_file(&run_dir, &summary.errors).unwrap_or_else(|e| {
+    let errors_saved = write_errors_file(&layout.run_dir, &summary.errors).unwrap_or_else(|e| {
         eprintln!("{}: {:#}", "warning".yellow(), e);
         false
     });
@@ -1441,7 +1661,7 @@ pub fn execute_plan_tmux(
     println!(
         "  {} {}",
         "Logs:".dimmed(),
-        run_dir.display().to_string().cyan()
+        layout.run_dir.display().to_string().cyan()
     );
     // レート制限で中断して保存したセッションがあれば、同じコマンドで続きから再開できる
     // ことを伝える。失敗の集計だけだと「最初からやり直しになる」と読める。
@@ -1452,13 +1672,12 @@ pub fn execute_plan_tmux(
             &store,
             &plan.agent.name,
             &plan.tasks,
-            now.fixed_offset(),
+            layout.started_at.fixed_offset(),
             plan.usage_gate.is_some(),
         ) {
             println!("  {}", line.cyan());
         }
     }
-    Ok(())
 }
 
 /// この実行で保存された中断セッションの案内（無ければ `None`）。
@@ -3020,5 +3239,786 @@ mod tests {
         );
         // 既存パスを黙って上書き・再利用しない
         assert!(target.is_file(), "既存ファイルは触らないべき");
+    }
+
+    /// コマンド文字列のテストで使う ai-usage 連携の設定（env だけを変える）。
+    fn gate_with_env(env: &[(&str, &str)]) -> UsageGateConfig {
+        UsageGateConfig {
+            profile: "Work".to_string(),
+            provider: "claude".to_string(),
+            command: vec!["ai-usage".to_string(), "--json".to_string()],
+            env: env
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    /// シェルがコマンド文字列をどの語に分けるか（クォートを外した後の語）。コマンド自体は
+    /// 起動せず、`printf` に語を並べさせて NUL 区切りで読む。先頭の `KEY=val` は代入ではなく
+    /// 1 語として出る（env の適用そのものは確かめられない）。
+    fn shell_words(command: &str) -> Vec<String> {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\0' {command}"))
+            .output()
+            .expect("sh を起動できるべき");
+        assert!(output.status.success(), "{command}");
+        let stdout = output.stdout.strip_suffix(b"\0").unwrap_or(&output.stdout);
+        stdout
+            .split(|&byte| byte == 0)
+            .map(|word| String::from_utf8_lossy(word).into_owned())
+            .collect()
+    }
+
+    /// usage-gate のコマンドは、選択 agent の env をサブコマンドより前に置く（`--` 以降に
+    /// KEY=val を入れると hidden CLI が実行ファイルと誤認する）。空文字の値は `env -u` で外し、
+    /// 空白を含むパスはクォートする。
+    #[test]
+    fn usage_gate_cmd_puts_the_env_prefix_before_the_subcommand() {
+        let gate = gate_with_env(&[
+            ("CLAUDE_CONFIG_DIR", "/home/u/.claude home"),
+            ("EMPTY_PROBE", ""),
+        ]);
+        let cmd = build_usage_gate_cmd(
+            &gate,
+            Path::new("/opt/token burn/token-burn"),
+            90,
+            Path::new("/tmp/tb run/stop"),
+        );
+        assert_eq!(
+            cmd,
+            "env -u EMPTY_PROBE CLAUDE_CONFIG_DIR='/home/u/.claude home' \
+             '/opt/token burn/token-burn' usage-gate --profile 'Work' --provider 'claude' \
+             --threshold 90 --stop-file '/tmp/tb run/stop' -- 'ai-usage' '--json'"
+        );
+    }
+
+    /// env が無ければ前置きを付けず、値のある env は `KEY='値'`、空文字の env は `env -u KEY`
+    /// として実行ファイルの前に置く。
+    #[test]
+    fn usage_gate_cmd_prefixes_each_kind_of_env() {
+        let cmd_with = |env: &[(&str, &str)]| {
+            build_usage_gate_cmd(
+                &gate_with_env(env),
+                Path::new("/bin/token-burn"),
+                95,
+                Path::new("/tmp/stop"),
+            )
+        };
+        let rest = "'/bin/token-burn' usage-gate --profile 'Work' --provider 'claude' \
+                    --threshold 95 --stop-file '/tmp/stop' -- 'ai-usage' '--json'";
+        assert_eq!(cmd_with(&[]), rest);
+        assert_eq!(cmd_with(&[("A", "1")]), format!("A='1' {rest}"));
+        assert_eq!(cmd_with(&[("A", "")]), format!("env -u A {rest}"));
+    }
+
+    /// usage-gate のコマンドはワーカーの bash がそのまま実行する。空白・単引用符・`$`・空文字を
+    /// 含む値も、それぞれ 1 語のまま渡る。
+    #[test]
+    fn usage_gate_cmd_keeps_each_argument_as_one_shell_word() {
+        let mut gate = gate_with_env(&[("CLAUDE_CONFIG_DIR", "/home/it's me/$HOME")]);
+        gate.profile = "Work 'A'".to_string();
+        gate.command = vec![
+            "/opt/ai usage/ai-usage".to_string(),
+            "--json".to_string(),
+            String::new(),
+        ];
+        let cmd = build_usage_gate_cmd(
+            &gate,
+            Path::new("/opt/token burn/token-burn"),
+            90,
+            Path::new("/tmp/it's run/stop"),
+        );
+        assert_eq!(
+            shell_words(&cmd),
+            [
+                "CLAUDE_CONFIG_DIR=/home/it's me/$HOME",
+                "/opt/token burn/token-burn",
+                "usage-gate",
+                "--profile",
+                "Work 'A'",
+                "--provider",
+                "claude",
+                "--threshold",
+                "90",
+                "--stop-file",
+                "/tmp/it's run/stop",
+                "--",
+                "/opt/ai usage/ai-usage",
+                "--json",
+                "",
+            ]
+        );
+    }
+
+    /// ai-usage 連携が無ければ、再開前の再確認（`--revalidate`）を付けない。パスはクォートする。
+    #[test]
+    fn gate_claim_cmd_omits_revalidate_without_usage_gate() {
+        let cmd = build_gate_claim_cmd(
+            Path::new("/opt/token burn/token-burn"),
+            Path::new("/tmp/tb run/stop"),
+            Path::new("/tmp/tb run/queue"),
+            1_793_577_600,
+            None,
+        );
+        assert_eq!(
+            cmd,
+            "'/opt/token burn/token-burn' gate-claim --stop-file '/tmp/tb run/stop' \
+             --queue-dir '/tmp/tb run/queue' --deadline-epoch 1793577600"
+        );
+    }
+
+    /// usage-gate のコマンド（空白とクォートを含むシェル文字列）は `shell_escape` で
+    /// `--revalidate` の 1 引数にまとめ、gate-claim には元の文字列のまま届く。
+    #[test]
+    fn gate_claim_cmd_passes_the_usage_gate_as_one_revalidate_argument() {
+        let exe = Path::new("/opt/token burn/token-burn");
+        let stop = Path::new("/tmp/tb run/stop");
+        let gate = gate_with_env(&[
+            ("CLAUDE_CONFIG_DIR", "/home/u/.claude home"),
+            ("EMPTY_PROBE", ""),
+        ]);
+        let usage_gate_cmd = build_usage_gate_cmd(&gate, exe, 90, stop);
+        let cmd = build_gate_claim_cmd(
+            exe,
+            stop,
+            Path::new("/tmp/tb run/queue"),
+            1_793_577_600,
+            Some(&usage_gate_cmd),
+        );
+        assert_eq!(
+            shell_words(&cmd),
+            [
+                "/opt/token burn/token-burn",
+                "gate-claim",
+                "--stop-file",
+                "/tmp/tb run/stop",
+                "--queue-dir",
+                "/tmp/tb run/queue",
+                "--deadline-epoch",
+                "1793577600",
+                "--revalidate",
+                usage_gate_cmd.as_str(),
+            ]
+        );
+    }
+
+    /// デッドラインは相対秒に直さず、受け取った絶対 epoch をそのまま渡す（ワーカーは待機を
+    /// 挟む別プロセスなので、相対値だと基準時刻がプロセスごとにずれる）。
+    #[test]
+    fn gate_claim_cmd_passes_the_deadline_as_an_absolute_epoch() {
+        for deadline in [1_793_577_600_i64, 4_102_444_800] {
+            let words = shell_words(&build_gate_claim_cmd(
+                Path::new("token-burn"),
+                Path::new("stop"),
+                Path::new("queue"),
+                deadline,
+                None,
+            ));
+            let at = words
+                .iter()
+                .position(|word| word == "--deadline-epoch")
+                .expect("--deadline-epoch があるべき");
+            assert_eq!(words[at + 1], deadline.to_string());
+        }
+    }
+
+    /// モニターの ai-usage のコマンドは、どれも選択 agent の env を前置きし、ラッパーの前置き
+    /// （`env FOO=1 ai-usage`）を保つ。statusline は、モニターが置き換えるのと同じキャッシュを
+    /// `--input` で読む。
+    #[test]
+    fn monitor_ai_usage_commands_share_the_env_and_the_cache_file() {
+        let mut gate = gate_with_env(&[("CLAUDE_CONFIG_DIR", "/home/u/.claude home")]);
+        gate.command = ["env", "FOO=1", "ai-usage", "--json"]
+            .map(String::from)
+            .to_vec();
+        let cache_file = Path::new("/tmp/tb run/ai-usage-cache.json");
+
+        let commands =
+            build_monitor_ai_usage(&gate, cache_file).expect("command があれば組み立てるべき");
+
+        let prefix = "CLAUDE_CONFIG_DIR='/home/u/.claude home' 'env' 'FOO=1' 'ai-usage'";
+        assert_eq!(
+            commands,
+            crate::monitor::AiUsageCommands {
+                refresh: format!("{prefix} '--json'"),
+                statusline: format!(
+                    "{prefix} '--statusline' '--logos' '--compact' '--input' \
+                     '/tmp/tb run/ai-usage-cache.json' '--active-profile' 'Work' \
+                     '--active-provider' 'claude'"
+                ),
+                disk: format!("{prefix} '--disk' '--json'"),
+                live: format!("{prefix} '--json' '--refresh' '--profile' 'Work' '--only' 'claude'"),
+                profile: "Work".to_string(),
+                provider: "claude".to_string(),
+                cache_file: cache_file.to_path_buf(),
+            }
+        );
+        let statusline = shell_words(&commands.statusline);
+        let input = statusline
+            .iter()
+            .position(|word| word == "--input")
+            .expect("--input があるべき");
+        assert_eq!(Path::new(&statusline[input + 1]), commands.cache_file);
+    }
+
+    /// ai-usage のコマンドが空なら、モニターは ai-usage を呼ばない。
+    #[test]
+    fn monitor_ai_usage_commands_need_an_ai_usage_command() {
+        let mut gate = gate_with_env(&[]);
+        gate.command.clear();
+        assert_eq!(
+            build_monitor_ai_usage(&gate, Path::new("/tmp/ai-usage-cache.json")),
+            None
+        );
+    }
+
+    /// モニターペインの起動コマンドは NO_COLOR を外してから起動し、実行ファイルと起動情報の
+    /// パスをクォートする（tmux は shell-command を `sh -c` で実行する）。
+    #[test]
+    fn monitor_cmd_quotes_the_paths_and_drops_no_color() {
+        let cmd = build_monitor_cmd(
+            Path::new("/opt/token burn/token-burn"),
+            Path::new("/tmp/it's run/monitor.json"),
+        );
+        assert_eq!(
+            cmd,
+            r"env -u NO_COLOR '/opt/token burn/token-burn' monitor --manifest '/tmp/it'\''s run/monitor.json'"
+        );
+        assert_eq!(
+            shell_words(&cmd),
+            [
+                "env",
+                "-u",
+                "NO_COLOR",
+                "/opt/token burn/token-burn",
+                "monitor",
+                "--manifest",
+                "/tmp/it's run/monitor.json",
+            ]
+        );
+    }
+
+    /// 実行開始時の判定が取り直した出力があれば、ai-usage を呼ばずにそのままキャッシュにする。
+    #[test]
+    fn init_statusline_cache_reuses_the_usage_fetched_at_the_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gate, log) = fake_usage_gate(tmp.path(), RECOVERED_USAGE, false);
+        let cache_file = tmp.path().join("ai-usage-cache.json");
+
+        init_statusline_cache(&gate, Some(br#"{"accounts":[]}"#), &cache_file);
+
+        assert_eq!(std::fs::read(&cache_file).unwrap(), br#"{"accounts":[]}"#);
+        assert!(logged_calls(&log).is_empty(), "ai-usage を呼んではいけない");
+    }
+
+    /// 取り直した出力が無ければ、設定どおりのコマンドで 1 回取得してキャッシュにする。
+    #[test]
+    fn init_statusline_cache_fetches_when_the_start_check_did_not() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gate, log) = fake_usage_gate(tmp.path(), RECOVERED_USAGE, false);
+        let cache_file = tmp.path().join("ai-usage-cache.json");
+
+        init_statusline_cache(&gate, None, &cache_file);
+
+        assert_eq!(logged_calls(&log), ["--json"]);
+        assert_eq!(
+            std::fs::read(&cache_file).unwrap(),
+            RECOVERED_USAGE.as_bytes()
+        );
+    }
+
+    /// 取得に失敗してもキャッシュを書かずに続ける（モニターの初回取得に任せる）。
+    #[test]
+    fn init_statusline_cache_skips_the_cache_when_ai_usage_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut gate, _) = fake_usage_gate(tmp.path(), "", false);
+        gate.command = vec!["sh".to_string(), "-c".to_string(), "exit 1".to_string()];
+        let cache_file = tmp.path().join("ai-usage-cache.json");
+
+        init_statusline_cache(&gate, None, &cache_file);
+
+        assert!(!cache_file.exists());
+    }
+
+    /// 偽の tmux（`sh -c`）。受け取った引数を 1 行 1 個で `$CALLS` に記録し（呼び出しの区切りは
+    /// `---`）、続けて `body` を実行する。`body` が終了しなければ 0 で終わる。スクリプトを
+    /// ファイルに書いて実行しないので、並列のテストの子プロセスがそのファイルを開いたままに
+    /// して ETXTBSY で起動できなくなることも無い。
+    fn fake_tmux(dir: &Path, body: &str) -> (TmuxSession, PathBuf) {
+        let log = dir.join("tmux-calls.log");
+        let script = format!(
+            "CALLS={}\nprintf '%s\\n' \"$@\" --- >> \"$CALLS\"\n{body}\nexit 0\n",
+            shell_escape(&log.to_string_lossy())
+        );
+        let tmux = TmuxSession {
+            program: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                script,
+                "tmux".to_string(),
+            ],
+            ..TmuxSession::new("token-burn")
+        };
+        (tmux, log)
+    }
+
+    /// 偽の tmux が受け取った呼び出し（1 回ぶんの引数の列）。
+    fn tmux_calls(log: &Path) -> Vec<Vec<String>> {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        let mut calls = Vec::new();
+        let mut call = Vec::new();
+        for line in text.lines() {
+            if line == "---" {
+                calls.push(std::mem::take(&mut call));
+            } else {
+                call.push(line.to_string());
+            }
+        }
+        calls
+    }
+
+    /// 偽の tmux が受け取ったサブコマンドの列。
+    fn tmux_subcommands(log: &Path) -> Vec<String> {
+        tmux_calls(log)
+            .into_iter()
+            .map(|call| call[0].clone())
+            .collect()
+    }
+
+    /// セッションを指し示すときは `=` 付きの厳密一致にする（素の名前は無関係なセッションへ
+    /// 前方一致する）。ウィンドウ対象には末尾の `:` が要る。
+    #[test]
+    fn tmux_session_targets_match_the_session_exactly() {
+        let tmux = TmuxSession::new("token-burn");
+        assert_eq!(tmux.program, ["tmux"]);
+        assert_eq!(tmux.name, "token-burn");
+        assert_eq!(tmux.target, "=token-burn");
+        assert_eq!(tmux.window, "=token-burn:");
+    }
+
+    /// セッションを作ってからワーカーのペインを足す。remain-on-exit はペインを分割する前に
+    /// off にし、2 人目以降のワーカーは右側を垂直分割する。成功したら一時ディレクトリは残す。
+    #[test]
+    fn start_tmux_session_creates_the_monitor_and_worker_panes_in_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run = tmp.path().join("run dir");
+        std::fs::create_dir_all(&run).unwrap();
+        let (tmux, log) = fake_tmux(tmp.path(), "");
+        let scripts: Vec<PathBuf> = (0..3).map(|w| run.join(format!("worker-{w}.sh"))).collect();
+        let panes: Vec<String> = scripts.iter().map(|path| tmux_script_arg(path)).collect();
+
+        start_tmux_session(&tmux, "env -u NO_COLOR 'monitor'", &scripts, &run)
+            .expect("tmux が成功すれば成功するべき");
+
+        assert_eq!(
+            tmux_calls(&log),
+            [
+                vec![
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "token-burn",
+                    "env -u NO_COLOR 'monitor'"
+                ],
+                vec![
+                    "set-option",
+                    "-w",
+                    "-t",
+                    "=token-burn:",
+                    "remain-on-exit",
+                    "off"
+                ],
+                vec![
+                    "split-window",
+                    "-h",
+                    "-t",
+                    "=token-burn:",
+                    panes[0].as_str()
+                ],
+                vec![
+                    "split-window",
+                    "-v",
+                    "-t",
+                    "=token-burn:.right",
+                    panes[1].as_str()
+                ],
+                vec![
+                    "split-window",
+                    "-v",
+                    "-t",
+                    "=token-burn:.right",
+                    panes[2].as_str()
+                ],
+            ]
+        );
+        assert!(run.is_dir());
+    }
+
+    /// セッションを作れなかったら回収するセッションが無いので kill せず、実行用の一時
+    /// ディレクトリだけを消す。
+    #[test]
+    fn start_tmux_session_removes_only_the_tmp_dir_when_new_session_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run = tmp.path().join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let (tmux, log) = fake_tmux(tmp.path(), r#"[ "$1" = new-session ] && exit 1"#);
+
+        let error = start_tmux_session(&tmux, "monitor", &[run.join("worker-0.sh")], &run)
+            .expect_err("new-session の失敗はエラーにするべき");
+
+        assert_eq!(error.to_string(), "tmux new-session failed (exit Some(1))");
+        assert_eq!(tmux_subcommands(&log), ["new-session"]);
+        assert!(!run.exists(), "実行用の一時ディレクトリは消す");
+    }
+
+    /// セッションを作った後にペインを足せなかったら、モニターだけが残らないよう自分で作った
+    /// セッションを kill してから、実行用の一時ディレクトリを消す。
+    #[test]
+    fn start_tmux_session_kills_its_session_before_removing_the_tmp_dir_when_a_split_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run = tmp.path().join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let seen = tmp.path().join("tmp-dir-at-kill");
+        let (tmux, log) = fake_tmux(
+            tmp.path(),
+            &format!(
+                "[ \"$1\" = split-window ] && [ \"$(grep -c '^split-window$' \"$CALLS\")\" -ge 2 ] && exit 1\n\
+                 [ \"$1\" = kill-session ] && [ -d {run} ] && touch {seen}",
+                run = shell_escape(&run.to_string_lossy()),
+                seen = shell_escape(&seen.to_string_lossy()),
+            ),
+        );
+        let scripts: Vec<PathBuf> = (0..3).map(|w| run.join(format!("worker-{w}.sh"))).collect();
+
+        let error = start_tmux_session(&tmux, "monitor", &scripts, &run)
+            .expect_err("split-window の失敗はエラーにするべき");
+
+        assert_eq!(error.to_string(), "tmux split-window failed (exit Some(1))");
+        assert_eq!(
+            tmux_subcommands(&log),
+            [
+                "new-session",
+                "set-option",
+                "split-window",
+                "split-window",
+                "kill-session"
+            ]
+        );
+        assert_eq!(tmux_calls(&log)[4], ["kill-session", "-t", "=token-burn"]);
+        assert!(seen.exists(), "kill した時点では一時ディレクトリはまだある");
+        assert!(!run.exists(), "kill の後で一時ディレクトリを消す");
+    }
+
+    /// remain-on-exit を off にできなくてもペインの分割へ進む（ペインが残り得るだけで、実行は
+    /// 完走する）。
+    #[test]
+    fn start_tmux_session_continues_when_remain_on_exit_cannot_be_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run = tmp.path().join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let (tmux, log) = fake_tmux(tmp.path(), r#"[ "$1" = set-option ] && exit 1"#);
+
+        start_tmux_session(&tmux, "monitor", &[run.join("worker-0.sh")], &run)
+            .expect("remain-on-exit の失敗では止めないべき");
+
+        assert_eq!(
+            tmux_subcommands(&log),
+            ["new-session", "set-option", "split-window"]
+        );
+        assert!(run.is_dir());
+    }
+
+    /// ウィンドウの設定は、tmux が失敗しても残りの設定を続ける（結果は確かめない）。
+    #[test]
+    fn configure_tmux_window_applies_every_setting_even_if_tmux_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tmux, log) = fake_tmux(tmp.path(), "exit 1");
+
+        configure_tmux_window(&tmux);
+
+        assert_eq!(
+            tmux_calls(&log),
+            [
+                vec!["select-layout", "-t", "=token-burn:", "main-vertical"],
+                vec!["resize-pane", "-t", "=token-burn:.0", "-x", "35%"],
+                vec!["set-option", "-t", "=token-burn:", "history-limit", "50000"],
+                vec!["set-option", "-t", "=token-burn:", "mouse", "on"],
+                vec![
+                    "set-option",
+                    "-t",
+                    "=token-burn:",
+                    "pane-border-status",
+                    "top"
+                ],
+                vec![
+                    "set-option",
+                    "-t",
+                    "=token-burn:",
+                    "pane-border-format",
+                    " #{pane_title} "
+                ],
+                vec!["select-pane", "-t", "=token-burn:.0"],
+            ]
+        );
+    }
+
+    /// attach-session の終了コードではエラーにせず、戻った後の状態は has-session で見る
+    /// （成功ならデタッチして戻った）。tmux を起動できなければ attach はエラーにし、生存確認は
+    /// false にする。
+    #[test]
+    fn attach_ignores_the_exit_code_and_has_session_tells_whether_it_was_detached() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let detached_dir = tmp.path().join("detached");
+        std::fs::create_dir_all(&detached_dir).unwrap();
+        let (detached, log) = fake_tmux(&detached_dir, r#"[ "$1" = attach-session ] && exit 1"#);
+
+        attach_tmux_session(&detached, rate_control::now_epoch() + 60)
+            .expect("attach-session の終了コードではエラーにしないべき");
+
+        assert!(tmux_session_alive(&detached));
+        assert_eq!(
+            tmux_calls(&log),
+            [
+                vec!["attach-session", "-t", "=token-burn"],
+                vec!["has-session", "-t", "=token-burn"],
+            ]
+        );
+
+        let (ended, _) = fake_tmux(tmp.path(), r#"[ "$1" = has-session ] && exit 1"#);
+        assert!(!tmux_session_alive(&ended));
+
+        let missing = TmuxSession {
+            program: vec![
+                tmp.path()
+                    .join("no-such-tmux")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            ..TmuxSession::new("token-burn")
+        };
+        let error = attach_tmux_session(&missing, 0).expect_err("起動できなければエラーにするべき");
+        assert!(
+            format!("{error:#}").contains("Failed to attach to tmux session"),
+            "{error:#}"
+        );
+        assert!(!tmux_session_alive(&missing));
+    }
+
+    fn run_layout(dir: &Path) -> RunLayout {
+        prepare_run_layout(dir.join("tmp"), &dir.join("reports"), "claude")
+            .expect("実行用のディレクトリを作れるべき")
+    }
+
+    /// レポートディレクトリは開始時刻と（パス成分を無害化した）エージェント名で名付け、
+    /// ワーカーが共有するディレクトリは実行用の一時ディレクトリの下に作る。stop file は
+    /// 停止するまで作らない。
+    #[test]
+    fn prepare_run_layout_creates_the_run_directories() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let layout = prepare_run_layout(
+            tmp.path().join("tmp"),
+            &tmp.path().join("reports"),
+            "claude/work",
+        )
+        .unwrap();
+
+        assert_eq!(
+            layout.run_dir,
+            tmp.path().join("reports").join(format!(
+                "{}_claude_work",
+                layout.started_at.format("%Y%m%d_%H%M%S")
+            ))
+        );
+        assert_eq!(layout.marker_dir, layout.tmp_dir.join("markers"));
+        assert_eq!(layout.queue_dir, layout.tmp_dir.join("queue"));
+        assert_eq!(layout.task_dir, layout.tmp_dir.join("tasks"));
+        for dir in [
+            &layout.run_dir,
+            &layout.marker_dir,
+            &layout.queue_dir,
+            &layout.task_dir,
+        ] {
+            assert!(dir.is_dir(), "{}", dir.display());
+        }
+        assert_eq!(layout.stop_file, layout.tmp_dir.join("stop"));
+        assert!(!layout.stop_file.exists());
+    }
+
+    /// タスクごとにプロンプト・実行スクリプト・空の pending マーカーを、1 始まり・4 桁の番号で
+    /// 書く。再開するタスクが無ければ継続プロンプトを、一時停止しないなら pause file を作らない。
+    #[test]
+    fn prepare_task_queue_writes_the_files_of_each_task() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let layout = run_layout(tmp.path());
+        let state_file = tmp.path().join("state.json");
+        let mut targets = vec![repo_target("/tmp/repo-a"), repo_target("/tmp/repo-b")];
+        targets[1].prompt = "second".to_string();
+        let plan = build_plan(
+            &make_agent(vec!["claude", "-p"]),
+            targets,
+            None,
+            ResumeOptions::default(),
+        );
+
+        prepare_task_queue(&plan, &layout, &state_file, 90).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(layout.tmp_dir.join("prompt-1.txt")).unwrap(),
+            "review"
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.tmp_dir.join("prompt-2.txt")).unwrap(),
+            "second"
+        );
+        for pending in ["pending-0001", "pending-0002"] {
+            assert_eq!(std::fs::read(layout.queue_dir.join(pending)).unwrap(), b"");
+        }
+        let script = std::fs::read_to_string(layout.task_dir.join("task-0002.sh")).unwrap();
+        for path in [
+            layout.tmp_dir.join("prompt-2.txt"),
+            layout.marker_dir.join("failed-2"),
+            layout.stop_file.clone(),
+            state_file,
+        ] {
+            assert!(
+                script.contains(&shell_escape(&path.to_string_lossy())),
+                "{}: {script}",
+                path.display()
+            );
+        }
+        assert!(!layout.tmp_dir.join("resume-prompt.txt").exists());
+        assert!(!rate_control::pause_path_for(&layout.stop_file).exists());
+    }
+
+    /// 再開するタスクがあれば継続プロンプトを 1 ファイルにまとめて書き、そのタスクのスクリプト
+    /// だけが読む。実行開始時に一時停止するなら pause file も書く。
+    #[test]
+    fn prepare_task_queue_writes_the_resume_prompt_and_the_start_pause() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let layout = run_layout(tmp.path());
+        let now = rate_control::now_epoch();
+        let plan = build_plan(
+            &make_agent(vec!["claude", "-p"]),
+            vec![repo_target("/tmp/repo-a"), repo_target("/tmp/repo-b")],
+            None,
+            ResumeOptions {
+                save_interrupted: true,
+                sessions: HashMap::from([(
+                    PathBuf::from("/tmp/repo-b"),
+                    rejected_session(now, 360, 5400, Some(100.0)),
+                )]),
+                prompt: "continue".to_string(),
+                discard: HashMap::new(),
+            },
+        );
+        assert!(
+            matches!(plan.start, StartGate::Hold { .. }),
+            "保存した再開時刻まで待つ計画のはず: {:?}",
+            plan.start
+        );
+
+        prepare_task_queue(&plan, &layout, &tmp.path().join("state.json"), 90).unwrap();
+
+        let resume_prompt = layout.tmp_dir.join("resume-prompt.txt");
+        assert_eq!(std::fs::read_to_string(&resume_prompt).unwrap(), "continue");
+        let quoted = shell_escape(&resume_prompt.to_string_lossy());
+        let resumed = std::fs::read_to_string(layout.task_dir.join("task-0002.sh")).unwrap();
+        assert!(resumed.contains(&quoted), "{resumed}");
+        let fresh = std::fs::read_to_string(layout.task_dir.join("task-0001.sh")).unwrap();
+        assert!(!fresh.contains(&quoted), "{fresh}");
+        assert!(rate_control::pause_path_for(&layout.stop_file).exists());
+    }
+
+    /// ワーカーのスクリプトは 0 始まりの番号で 1 人 1 つ書いて実行権限を付け、ペインで起動する
+    /// 順に返す。どのワーカーも同じ gate-claim と usage-gate を使う。
+    #[cfg(unix)]
+    #[test]
+    fn write_worker_scripts_writes_one_executable_script_per_worker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let layout = run_layout(tmp.path());
+
+        let paths = write_worker_scripts(&layout, 2, Some("'usage-gate'"), "'gate-claim'").unwrap();
+
+        assert_eq!(
+            paths,
+            [
+                layout.tmp_dir.join("worker-0.sh"),
+                layout.tmp_dir.join("worker-1.sh")
+            ]
+        );
+        for path in &paths {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0, "{}", path.display());
+            let script = std::fs::read_to_string(path).unwrap();
+            assert!(script.contains("CLAIMED=$('gate-claim')"), "{script}");
+            assert!(script.contains("if ! 'usage-gate'; then"), "{script}");
+        }
+    }
+
+    /// モニターの起動情報は実行用の一時ディレクトリの monitor.json に書き、ペインの起動コマンドは
+    /// そのファイルを指す。
+    #[test]
+    fn write_monitor_manifest_points_the_monitor_at_the_written_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let layout = run_layout(tmp.path());
+        let manifest = crate::monitor::Manifest {
+            agent: "claude".to_string(),
+            command: "claude -p".to_string(),
+            reset: "2026/11/02 09:00".to_string(),
+            total: 1,
+            deadline_epoch: 1_793_577_600,
+            marker_dir: layout.marker_dir.clone(),
+            session: "token-burn".to_string(),
+            worker_count: 1,
+            stop_file: layout.stop_file.clone(),
+            report_dir: layout.run_dir.clone(),
+            threshold: 90,
+            ai_usage: None,
+        };
+
+        let command = write_monitor_manifest(&manifest, &layout).unwrap();
+
+        let path = layout.tmp_dir.join("monitor.json");
+        assert_eq!(crate::monitor::Manifest::read(&path).unwrap(), manifest);
+        assert_eq!(command, build_monitor_cmd(&layout.exe_path, &path));
+    }
+
+    /// セッションが終わったら、実行用の一時ディレクトリを消す前にマーカーを読み（消した後では
+    /// 失敗の理由が残らない）、失敗の理由を errors.txt に、ログを ANSI 除去済みで残す。
+    #[test]
+    fn report_finished_run_reads_the_markers_before_removing_the_tmp_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let layout = run_layout(tmp.path());
+        std::fs::write(layout.marker_dir.join("done-1"), "").unwrap();
+        std::fs::write(layout.marker_dir.join("failed-2"), "").unwrap();
+        std::fs::write(layout.marker_dir.join("error-2"), "[repo] boom\n").unwrap();
+        std::fs::write(
+            layout.run_dir.join("0001_repo.log"),
+            "\x1b[1mbold\x1b[0m plain\n",
+        )
+        .unwrap();
+        let plan = build_plan(
+            &make_agent(vec!["claude", "-p"]),
+            vec![repo_target("/tmp/repo-a"), repo_target("/tmp/repo-b")],
+            None,
+            ResumeOptions::default(),
+        );
+
+        report_finished_run(&plan, &layout, &tmp.path().join("state.json"));
+
+        assert!(!layout.tmp_dir.exists(), "実行用の一時ディレクトリは消す");
+        assert_eq!(
+            std::fs::read_to_string(layout.run_dir.join(ERRORS_FILE_NAME)).unwrap(),
+            "[repo] boom\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.run_dir.join("0001_repo.log")).unwrap(),
+            "bold plain\n"
+        );
     }
 }
