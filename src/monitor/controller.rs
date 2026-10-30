@@ -316,6 +316,8 @@ impl Controller {
 /// そのワーカーのタスクマーカーが見えていない」状態は起こらない。1 回の走査で両方を
 /// 数えると、走査中に作られたファイルが見えるかどうかは順序次第なので、全件成功でも
 /// 「⏹ Stopped: 9/10 processed」と誤報告し得る。そのため 2 回に分けて読む。
+/// エラーの理由（error-*）は表示だけに使い、件数の判定には関わらないので別に読む
+/// （[`read_errors`]）。
 pub fn read_observation(
     marker_dir: &Path,
     stop_file: &Path,
@@ -330,7 +332,6 @@ pub fn read_observation(
         workers_done,
         ..Counts::default()
     };
-    let mut error_files = Vec::new();
     for name in marker_names(marker_dir) {
         // worker-done-* は "done-" 始まりではないのでタスク件数に混ざらない。
         if name.starts_with("done-") {
@@ -339,17 +340,9 @@ pub fn read_observation(
             counts.failed += 1;
         } else if name.starts_with("retry-") {
             counts.retry += 1;
-        } else if let Some(index) = name.strip_prefix("error-") {
-            error_files.push((index.parse::<u64>().unwrap_or(u64::MAX), name));
         }
     }
-    error_files.sort();
-    let errors = error_files
-        .into_iter()
-        .filter_map(|(_, name)| std::fs::read_to_string(marker_dir.join(name)).ok())
-        .map(|text| single_line(&text))
-        .filter(|text| !text.is_empty())
-        .collect();
+    let errors = read_errors(marker_dir);
 
     let stop_file_exists = signal_present(stop_file);
     // 早期解除済みの一時停止は、元の見積もりの時刻までファイルに残る（まだ解除を読んで
@@ -387,6 +380,32 @@ pub fn read_observation(
         lift,
         stop_file_exists,
     }
+}
+
+/// error-* の中身（タスクが失敗・リトライした理由）をタスク番号の順に読む。
+///
+/// 並びは辞書順ではなく番号順（error-10 は error-3 の後）。改行は空白に畳み、エスケープ
+/// シーケンスと制御文字は除き（[`single_line`]）、空のものと読めないものは除く。
+/// モニターのペインの一覧と、tmux のセッションが閉じた後に呼び出し元の端末へ出す一覧
+/// （executor の最終集計）で同じ規則にそろえるため、ここに置いて両方から使う。
+pub fn read_errors(marker_dir: &Path) -> Vec<String> {
+    let mut error_files: Vec<(u64, String)> = marker_names(marker_dir)
+        .into_iter()
+        .filter_map(|name| {
+            let index = name
+                .strip_prefix("error-")?
+                .parse::<u64>()
+                .unwrap_or(u64::MAX);
+            Some((index, name))
+        })
+        .collect();
+    error_files.sort();
+    error_files
+        .into_iter()
+        .filter_map(|(_, name)| std::fs::read_to_string(marker_dir.join(name)).ok())
+        .map(|text| single_line(&text))
+        .filter(|text| !text.is_empty())
+        .collect()
 }
 
 /// stop file があるか。権限異常などで存在を確かめられないときは「ある」側に倒す

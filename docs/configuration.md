@@ -82,6 +82,8 @@ timezone = "Asia/Tokyo"
 
 `name` must not be empty and must be unique after profile expansion — the expanded name doubles as the `state.json` key, the report directory name, and the `--agent` selector, so a duplicate makes the second agent unreachable and silently merges the two agents' processed history. `command` must contain at least one element, and the first element must be a non-empty executable name. `prompt` overrides the global `[prompts].default` for this agent; target-level `prompt` takes highest priority.
 
+A wrapper script used as `command` should exit with code 75 (`EX_TEMPFAIL`) when it gives up for a temporary reason before starting the agent, such as a sync conflict or a lock timeout. Such a task is retried on the next run instead of being counted as a failure, and a saved session keeps its failure count (see [usage.md](usage.md#resuming-interrupted-sessions)).
+
 `reset_weekday`, `reset_time`, and `timezone` are normally required. They may be omitted only when ai-usage integration is enabled for the agent **and** the effective `fallback` is not `fixed`, since in that case the fixed-schedule calculation is never used. Otherwise they are still required as the fallback schedule. See [ai-usage integration (optional)](#ai-usage-integration-optional).
 
 **Prompt priority**: `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default`

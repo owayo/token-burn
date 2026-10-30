@@ -7,6 +7,21 @@ use crate::scanner::ResolvedTarget;
 use super::OutputPipeline;
 use super::util::task_log_base;
 
+/// エージェントのコマンドが「エージェントを起動する前に一時的な理由で諦めた」ことを
+/// 知らせる終了コード（sysexits.h の EX_TEMPFAIL）。
+///
+/// `claude` を起動する前に設定を同期するラッパースクリプトのように、起動の前段で失敗し得る
+/// コマンドとの約束。同期の衝突やロック待ちのタイムアウトで 75 を返したら、エージェントは
+/// 1 ターンも動いていない。そこでタスクを失敗（failed-N）ではなく、次の実行で処理し直す
+/// retry-N とし、再開したセッションの失敗回数（`resume-entry fail`）にも数えない。
+/// 数えると、セッションと無関係な起動の失敗だけで、保存済みのセッションが捨てられる。
+/// 実例では、2 つのワーカーが同じ秒に起動してラッパーの同期が衝突し、`claude` が起動する
+/// 前に落ちただけで、2 件のセッションが失敗回数 2 に達した。
+///
+/// Claude Code 自身は 75 で終わらないため、result を残さないクラッシュ（transcript の
+/// 読み込みで落ちる等）と取り違えない。それ以外の非ゼロ終了は従来どおり失敗として数える。
+const LAUNCH_TEMPFAIL_EXIT: i32 = 75;
+
 pub(super) struct TaskCtx<'a> {
     pub(super) idx: usize,
     pub(super) total: usize,
@@ -83,6 +98,11 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             .to_string_lossy(),
     );
     let error_prefix = shell_escape(&format!("[{}] ", ctx.task.display_name));
+    // 起動前の一時的な失敗（LAUNCH_TEMPFAIL_EXIT）の表示。リトライ可能エラー（分類 3）と
+    // 同じ言い回しにそろえる。
+    let tempfail_notice = shell_escape(&format!(
+        "━━━ Temporary launch failure (will retry next run): exit {LAUNCH_TEMPFAIL_EXIT} ━━━"
+    ));
     let stop_file_escaped = shell_escape(&ctx.stop_file.to_string_lossy());
     let cmd_str = build_shell_command(&ctx.agent.command, &ctx.agent.env, ctx.prompt_file);
     let mark_cmd = format!(
@@ -294,8 +314,10 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
         };
         // 再開したセッションがレート制限以外の理由で失敗したら数える。上限に達すると記録を
         // 捨て、次回は新規セッションで始める（続けられないセッションを延々と再開しない）。
-        // result を出さずに異常終了した場合（`*)` の分岐）も数える。transcript の読み込みで
-        // 落ち続けるセッションは result を残さないため、ここを数えないと記録が永久に残る。
+        // 分類に失敗した場合（`*)`）と、result を出さずに異常終了した場合（`0)` の分岐の
+        // 非ゼロ終了）も数える。transcript の読み込みで落ち続けるセッションは result を
+        // 残さないため、後者を数えないと記録が永久に残る。ただし LAUNCH_TEMPFAIL_EXIT
+        // （エージェントが起動していない）は数えない。
         let fail_cmd = ctx.resume.as_ref().map(|resume| {
             format!(
                 "if [ \"$RESUMING\" = 1 ]; then {tb} resume-entry fail {args} --session {session} || true; fi\n",
@@ -311,7 +333,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 .unwrap_or_default()
         };
         let fail_line = indented_fail("      ");
-        let crash_fail_line = indented_fail("        ");
+        let crash_fail_line = indented_fail("          ");
         script += &format!(
             concat!(
                 "case $CLASS_CODE in\n",
@@ -355,9 +377,16 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "      else\n",
                 "        ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
                 "        printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
-                "        echo '━━━ Error - continuing ━━━'\n",
+                // 起動前の一時的な失敗。エージェントは動いていないので、失敗として数えずに
+                // 次の実行で処理し直す（保存済みのセッションもそのまま残す）。
+                "        if [ \"$CMD_EXIT\" -eq {tempfail} ]; then\n",
+                "          echo {tempfail_notice}\n",
+                "          touch {retry}\n",
+                "        else\n",
+                "          echo '━━━ Error - continuing ━━━'\n",
                 "{crash_fail_line}",
-                "        touch {failed}\n",
+                "          touch {failed}\n",
+                "        fi\n",
                 "      fi\n",
                 "    elif {mark}; then\n",
                 "      touch {done}\n",
@@ -391,6 +420,8 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             save_line = save_line,
             fail_line = fail_line,
             crash_fail_line = crash_fail_line,
+            tempfail = LAUNCH_TEMPFAIL_EXIT,
+            tempfail_notice = tempfail_notice,
         );
     } else {
         script += &format!(
@@ -403,8 +434,14 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "  else\n",
                 "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
                 "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
-                "    touch {failed}\n",
-                "    echo '━━━ Error - continuing ━━━'\n",
+                // 起動前の一時的な失敗は claude と同じく、失敗にせず次の実行で処理し直す。
+                "    if [ \"$CMD_EXIT\" -eq {tempfail} ]; then\n",
+                "      touch {retry}\n",
+                "      echo {tempfail_notice}\n",
+                "    else\n",
+                "      touch {failed}\n",
+                "      echo '━━━ Error - continuing ━━━'\n",
+                "    fi\n",
                 "  fi\n",
                 "elif {mark}; then\n",
                 "  touch {done}\n",
@@ -418,8 +455,11 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             prefix = error_prefix,
             error = error_file,
             failed = failed_marker,
+            retry = retry_marker,
             done = done_marker,
             mark = mark_cmd,
+            tempfail = LAUNCH_TEMPFAIL_EXIT,
+            tempfail_notice = tempfail_notice,
         );
     }
     script += "echo ''\n";
@@ -459,6 +499,11 @@ impl ClaudeAttempt<'_> {
         // のに後続を止める手段が無い状態なので、このタスクを失敗として記録するだけでなく
         // ワーカーごと止める。`return 0` で次のタスクへ進むと、止めるべき状況のまま
         // クォータを使い続ける。
+        //
+        // 空の jsonl はログのパイプラインの故障として扱うが、コマンドが LAUNCH_TEMPFAIL_EXIT で
+        // 終わったときは除く。整形器と tee は成功しており、空なのはエージェントが起動せず
+        // 何も出力しなかったためなので、分類（result 無し = 0）へ進めて `0)` の分岐で
+        // 起動前の一時的な失敗として扱う。
         script += &format!(
             concat!(
                 "if [ \"$FORMAT_EXIT\" -eq {signal_exit} ]; then\n",
@@ -469,7 +514,7 @@ impl ClaudeAttempt<'_> {
                 "  WORKER_ABORT=1\n",
                 "  return 0\n",
                 "fi\n",
-                "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ] || [ ! -s {jsonl} ]; then\n",
+                "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ] || {{ [ ! -s {jsonl} ] && [ \"$CMD_EXIT\" -ne {tempfail} ]; }}; then\n",
                 "  printf '%slogging/classification pipeline failed (format=%s tee=%s)\\n' {prefix} \"$FORMAT_EXIT\" \"$TEE_EXIT\" > {error}\n",
                 "  touch {failed}\n",
                 "  echo '━━━ Error - logging pipeline failed ━━━'\n",
@@ -485,6 +530,7 @@ impl ClaudeAttempt<'_> {
             jsonl = jsonl_file,
             tb = self.tb,
             signal_exit = crate::format_stream::EXIT_STOP_SIGNAL_UNWRITABLE,
+            tempfail = LAUNCH_TEMPFAIL_EXIT,
         );
         script
     }
@@ -2088,6 +2134,10 @@ mod tests {
     /// 偽の claude は `--resume` 付きなら `RESUME_OUT`、無ければ `FRESH_OUT` を出力する。
     /// 偽の token-burn は format-stream を `tee`、classify-result を出力内容の目印で
     /// 分類し、mark / resume-entry の呼び出しを `calls.log` に残す。
+    ///
+    /// 次の出力は、claude を起動する前にラッパーが終わった形を真似る（result を残さない）。
+    /// `TEMPFAIL` は理由を stderr に出して 75、`SILENT_TEMPFAIL` は何も出さずに 75、
+    /// `SILENT_CRASH` は何も出さずに 1 で終わる。
     fn run_resumed_task(resume_out: &str, fresh_out: &str) -> (tempfile::TempDir, String, String) {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
@@ -2108,9 +2158,16 @@ mod tests {
                     "for last; do :; done\n",
                     "printf '%s\\n' \"$last\" >> {prompts}\n",
                     "case \" $* \" in\n",
-                    "  *' --resume '*) printf '%s\\n' {resume_out}; case {resume_out} in NOT_FOUND|CRASH) exit 1 ;; esac ;;\n",
-                    "  *) printf '%s\\n' {fresh_out} ;;\n",
+                    "  *' --resume '*) OUT={resume_out} ;;\n",
+                    "  *) OUT={fresh_out} ;;\n",
                     "esac\n",
+                    "case $OUT in\n",
+                    "  TEMPFAIL) echo 'wrapper: setup failed' >&2; exit 75 ;;\n",
+                    "  SILENT_TEMPFAIL) exit 75 ;;\n",
+                    "  SILENT_CRASH) exit 1 ;;\n",
+                    "esac\n",
+                    "printf '%s\\n' \"$OUT\"\n",
+                    "case $OUT in NOT_FOUND|CRASH) exit 1 ;; esac\n",
                     "exit 0\n",
                 ),
                 prompts = shell_escape(&prompts.to_string_lossy()),
@@ -2318,11 +2375,107 @@ mod tests {
             return;
         }
         // result を出さずに非ゼロ終了（transcript の読み込みで落ちる等）。数えないと、
-        // 続けられないセッションの記録が永久に残って毎回再開しては落ちる。
+        // 続けられないセッションの記録が永久に残って毎回再開しては落ちる。数えないのは
+        // 起動前の一時的な失敗（75）だけで、それ以外の終了コード（ここでは 1）は数える。
         let (tmp, calls, _) = run_resumed_task("CRASH", "unused");
         assert_eq!(calls.lines().count(), 1, "{calls}");
         assert!(calls.starts_with("resume-entry fail claude "), "{calls}");
-        assert!(marker_names(&tmp).contains(&"failed-1".to_string()));
+        assert_eq!(marker_names(&tmp), vec!["error-1", "failed-1"]);
+    }
+
+    /// ラッパーが claude を起動する前に一時的な理由で諦めた（LAUNCH_TEMPFAIL_EXIT）。
+    /// エージェントは動いていないので、失敗にも再開の失敗回数にも数えず、保存済みの
+    /// セッションをそのまま残して次の実行で処理し直す。理由は他の失敗と同じく error-N に
+    /// 残す。何も出力せずに終わった場合も、空の jsonl をログのパイプラインの故障と
+    /// 取り違えない。
+    #[test]
+    fn resumed_task_launch_tempfail_is_retried_without_counting() {
+        if !bash_available() {
+            return;
+        }
+        for outcome in ["TEMPFAIL", "SILENT_TEMPFAIL"] {
+            let (tmp, calls, prompts) = run_resumed_task(outcome, "unused");
+            assert_eq!(marker_names(&tmp), vec!["error-1", "retry-1"], "{outcome}");
+            assert_eq!(calls, "", "保存済みのセッションに触れない: {outcome}");
+            assert_eq!(
+                prompts, "continue please\n",
+                "新規セッションは起動しない: {outcome}"
+            );
+            let error = std::fs::read_to_string(tmp.path().join("markers/error-1")).unwrap();
+            assert!(error.starts_with("[repo] "), "{outcome}: {error}");
+        }
+    }
+
+    /// 再開できずに新規セッションへ切り替えた後の起動が一時的に失敗した場合も、同じく
+    /// 次の実行で処理し直す。
+    #[test]
+    fn launch_tempfail_after_falling_back_to_a_new_session_is_retried() {
+        if !bash_available() {
+            return;
+        }
+        let (tmp, calls, prompts) = run_resumed_task("NOT_FOUND", "TEMPFAIL");
+        assert_eq!(prompts, "continue please\noriginal prompt\n");
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines.len(), 1, "{calls}");
+        assert!(
+            lines[0].starts_with("resume-entry forget claude "),
+            "{calls}"
+        );
+        assert_eq!(marker_names(&tmp), vec!["error-1", "retry-1"]);
+    }
+
+    /// 空の jsonl の検査を外すのは 75 だけ。それ以外の終了コードで何も出さずに終わった
+    /// タスクは、従来どおり失敗として扱う。
+    #[test]
+    fn silent_exit_other_than_launch_tempfail_still_fails() {
+        if !bash_available() {
+            return;
+        }
+        let (tmp, _, _) = run_resumed_task("SILENT_CRASH", "unused");
+        assert_eq!(marker_names(&tmp), vec!["error-1", "failed-1"]);
+    }
+
+    #[test]
+    fn launch_tempfail_branch_retries_without_counting_the_session() {
+        let agent = agent_for_test("claude", &["claude", "-p"]);
+        let task = target_for_test("/tmp/repo");
+        let tmp = std::path::PathBuf::from("/tmp");
+        let entry = saved_session();
+        let mut ctx = task_ctx_for_test(4, &agent, &task, &tmp, OutputPipeline::ClaudeStreamJson);
+        ctx.resume = Some(TaskResume {
+            entry: &entry,
+            prompt_file: std::path::Path::new("/tmp/resume-prompt.txt"),
+        });
+        let script = build_task_script(&ctx);
+
+        // result を残さずに終わった（`0)` の分岐）うち 75 だけは retry にし、失敗回数を数えない
+        let start = script
+            .find("        if [ \"$CMD_EXIT\" -eq 75 ]; then\n")
+            .unwrap_or_else(|| panic!("tempfail branch missing: {script}"));
+        let end = start
+            + script[start..]
+                .find("        else\n")
+                .expect("tempfail branch must end");
+        let branch = &script[start..end];
+        assert!(branch.contains("touch '/tmp/retry-4'"), "{branch}");
+        assert!(
+            branch
+                .contains("echo '━━━ Temporary launch failure (will retry next run): exit 75 ━━━'"),
+            "{branch}"
+        );
+        assert!(!branch.contains("resume-entry fail"), "{branch}");
+        assert!(!branch.contains("failed-4"), "{branch}");
+        // 理由は 75 でも他の失敗と同じく error-N に残す（分岐より前に書く）
+        let error_write = script[..start]
+            .rfind("printf '%s%s\\n' '[repo] ' \"$ERROR_MSG\" > '/tmp/error-4'")
+            .expect("error is written before the branch");
+        assert!(error_write < start);
+        // 何も出さずに 75 で終わった場合の空の jsonl は、ログのパイプラインの故障にしない
+        assert!(
+            script.contains("{ [ ! -s '/tmp/0004_repo.jsonl' ] && [ \"$CMD_EXIT\" -ne 75 ]; }"),
+            "{script}"
+        );
+        assert_valid_bash(&script, "resumed task script");
     }
 
     #[test]
@@ -2344,13 +2497,14 @@ mod tests {
 
     /// claude 以外のタスクスクリプトを偽のエージェント / token-burn で実際に走らせる。
     ///
-    /// 偽のエージェントは stdin を読み切って `stdin.log` に残し、JSONL を 1 行出して正常終了する。
-    /// 偽の token-burn は format-codex で生ログを保存して `format_exit` で終わり、それ以外（mark）の
-    /// 呼び出しを `calls.log` に残す。ワーカーのシェルの stdin には、ペインに打たれたキー入力の
-    /// 代わりの文字列を流し込む。
+    /// 偽のエージェントは stdin を読み切って `stdin.log` に残し、JSONL を 1 行出して `agent_exit` で
+    /// 終わる。偽の token-burn は format-codex で生ログを保存して `format_exit` で終わり、それ以外
+    /// （mark）の呼び出しを `calls.log` に残す。ワーカーのシェルの stdin には、ペインに打たれた
+    /// キー入力の代わりの文字列を流し込む。
     fn run_agent_task(
         output: OutputPipeline,
         format_exit: u8,
+        agent_exit: u8,
     ) -> (tempfile::TempDir, String, String) {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
@@ -2373,8 +2527,10 @@ mod tests {
                     "#!/bin/bash\n",
                     "cat > {stdin_log}\n",
                     "printf '%s\\n' '{{\"type\":\"thread.started\"}}'\n",
+                    "exit {agent_exit}\n",
                 ),
                 stdin_log = shell_escape(&stdin_log.to_string_lossy()),
+                agent_exit = agent_exit,
             ),
         )
         .unwrap();
@@ -2462,7 +2618,7 @@ mod tests {
         if !bash_available() {
             return;
         }
-        let (tmp, calls, stdin_seen) = run_agent_task(OutputPipeline::CodexJson, 0);
+        let (tmp, calls, stdin_seen) = run_agent_task(OutputPipeline::CodexJson, 0, 0);
         assert_eq!(stdin_seen, "", "codex にペインのキー入力を渡してはいけない");
         assert!(calls.starts_with("mark codex "), "{calls}");
         assert_eq!(marker_names(&tmp), vec!["done-1"]);
@@ -2480,7 +2636,7 @@ mod tests {
         }
         // 整形器が生ログや出力を書けなかった場合（exit 1）は、codex が成功していても
         // 成功扱いせず、次回の実行で処理し直せるよう state.json に記録しない。
-        let (tmp, calls, _) = run_agent_task(OutputPipeline::CodexJson, 1);
+        let (tmp, calls, _) = run_agent_task(OutputPipeline::CodexJson, 1, 0);
         assert!(!calls.contains("mark"), "{calls}");
         assert_eq!(marker_names(&tmp), vec!["error-1", "failed-1"]);
         let error = std::fs::read_to_string(tmp.path().join("markers/error-1")).unwrap();
@@ -2492,7 +2648,7 @@ mod tests {
         if !bash_available() {
             return;
         }
-        let (tmp, calls, stdin_seen) = run_agent_task(OutputPipeline::CodexRaw, 0);
+        let (tmp, calls, stdin_seen) = run_agent_task(OutputPipeline::CodexRaw, 0, 0);
         assert_eq!(stdin_seen, "", "codex にペインのキー入力を渡してはいけない");
         assert!(calls.starts_with("mark codex "), "{calls}");
         assert_eq!(marker_names(&tmp), vec!["done-1"]);
@@ -2502,7 +2658,61 @@ mod tests {
         );
 
         // codex 以外は従来どおり stdin を引き継ぐ（同じハーネスでキー入力が届くことを確かめる）
-        let (_tmp, _, stdin_seen) = run_agent_task(OutputPipeline::Raw, 0);
+        let (_tmp, _, stdin_seen) = run_agent_task(OutputPipeline::Raw, 0, 0);
         assert_eq!(stdin_seen, "keys typed into the pane\n");
+    }
+
+    /// claude 以外のエージェントも、起動前の一時的な失敗（LAUNCH_TEMPFAIL_EXIT）は失敗にせず
+    /// 次の実行で処理し直す。理由は error-N に残す。それ以外の非ゼロ終了は従来どおり失敗。
+    #[test]
+    fn agent_task_launch_tempfail_is_retried_but_other_exits_fail() {
+        if !bash_available() {
+            return;
+        }
+        for output in [
+            OutputPipeline::CodexJson,
+            OutputPipeline::CodexRaw,
+            OutputPipeline::Raw,
+        ] {
+            let (tmp, calls, _) = run_agent_task(output, 0, 75);
+            assert!(!calls.contains("mark"), "{output:?}: {calls}");
+            assert_eq!(marker_names(&tmp), vec!["error-1", "retry-1"], "{output:?}");
+
+            let (tmp, calls, _) = run_agent_task(output, 0, 1);
+            assert!(!calls.contains("mark"), "{output:?}: {calls}");
+            assert_eq!(
+                marker_names(&tmp),
+                vec!["error-1", "failed-1"],
+                "{output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_task_script_for_non_claude_retries_launch_tempfail() {
+        let agent = agent_for_test("aider", &["aider", "--yes"]);
+        let task = target_for_test("/tmp/repo");
+        let tmp = std::path::PathBuf::from("/tmp");
+        let script = build_task_script(&task_ctx_for_test(
+            2,
+            &agent,
+            &task,
+            &tmp,
+            OutputPipeline::Raw,
+        ));
+        assert!(
+            script.contains(concat!(
+                "    printf '%s%s\\n' '[repo] ' \"$ERROR_MSG\" > '/tmp/error-2'\n",
+                "    if [ \"$CMD_EXIT\" -eq 75 ]; then\n",
+                "      touch '/tmp/retry-2'\n",
+                "      echo '━━━ Temporary launch failure (will retry next run): exit 75 ━━━'\n",
+                "    else\n",
+                "      touch '/tmp/failed-2'\n",
+                "      echo '━━━ Error - continuing ━━━'\n",
+                "    fi\n",
+            )),
+            "{script}"
+        );
+        assert_valid_bash(&script, "non-claude task script");
     }
 }

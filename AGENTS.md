@@ -15,14 +15,14 @@ token-burn/
 │   ├── schedule.rs         # 固定リセット計算（曜日ベース）・AgentSchedule/ScheduleSource
 │   ├── usage.rs            # ai-usage --json 連携・ScheduleResolver（スケジュール解決・最寄り選択）
 │   ├── executor/           # プロセス起動・並列実行管理（tokio、モジュール分割）
-│   │   ├── mod.rs          # ExecutionPlan / build_plan / print_plan / execute_plan_tmux / ai-usage 同期起動
+│   │   ├── mod.rs          # ExecutionPlan / build_plan / print_plan / execute_plan_tmux / ai-usage 同期起動 / tmux 終了後の最終集計（RunSummary・errors.txt）
 │   │   ├── flags.rs        # claude/codex 判定と必須フラグ・env（CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS 等）の自動注入
 │   │   ├── scripts.rs      # tmux 用シェルスクリプト生成（task/worker、ai-usage の statusline/refresh/disk コマンド、shell_escape/env 前置き）
 │   │   └── util.rs         # sanitize_filename / task_log_base / strip_ansi / truncate
 │   ├── monitor/            # tmux のモニターペイン（隠しサブコマンド `monitor`。ratatui の常駐プロセス）
 │   │   ├── mod.rs          # pub run（イベントループ。描画に失敗しても停止判定と終了処理は続ける）
 │   │   ├── manifest.rs     # Manifest（execute_plan_tmux が書く起動情報 monitor.json）
-│   │   ├── controller.rs   # マーカー・stop/pause file・デッドラインから停止の発行と終了を決める
+│   │   ├── controller.rs   # マーカー・stop/pause file・デッドラインから停止の発行と終了を決める（error-* の読み取り read_errors は最終集計と共有）
 │   │   ├── system.rs       # CPU・メモリ・スワップ・ロードアベレージの計測（差分と換算。どの OS でもテストする）
 │   │   ├── system/         # OS 固有の読み取り: macos.rs（Mach・sysctl）/ linux.rs / procfs.rs（/proc の解析。どの OS でもテスト）/ unix.rs（getloadavg 等）
 │   │   ├── history.rs      # 時間窓つきの時系列と、描画幅への集約
@@ -290,7 +290,8 @@ ai-usage 連携が有効なとき、`rate_limit_threshold`（%）は 2 経路で
 | 成功 | 0 | 従来どおり `token-burn mark` が `state.json` へ記録し、続けてエントリを削除する |
 | 再びレート制限 | 2 | 上書きする（同じ `session_id`、新しい `interrupted_at` / `retry_after`、`failed_resumes` は 0） |
 | セッションが既に無い | 4 | 削除し、同じタスクの中で元のプロンプトから新しいセッションを始め直す |
-| その他の失敗（キャンセル以外） | 1、または result 無しの非ゼロ終了 | `failed_resumes` を 1 増やし、3 回に達したら削除する |
+| 起動前の一時的な失敗（コマンドが result を残さず 75 で終了） | 0（result 無し） | 変更しない（失敗として数えない）。マーカーは `retry-N` で、次の実行で同じセッションを再開し直す |
+| その他の失敗（キャンセル以外） | 1、または result 無しの非ゼロ終了（75 を除く） | `failed_resumes` を 1 増やし、3 回に達したら削除する |
 | リトライ可能エラー / キャンセル | 3 / — | 変更しない |
 
 - `mark` は `state.json` を先に書き、エントリはその後で消します。逆順だと、エントリを消した直後に落ちたときに処理済み記録も再開情報も残らず、完了済みのターゲットを次の実行でまた最初から処理します。`state.json` を先に書いておけば、消し損ねたエントリは「`interrupted_at` より新しい処理済み記録がある」条件で使われなくなるだけなので、削除の失敗は警告にとどめます。`mark` は session ID を問わずそのエージェント・ディレクトリのエントリを消し、`resume.json` が無ければ何もしません（ロックファイルも作らない。`codex` など再開と無関係なエージェントの `mark` でも呼ばれるため）。
@@ -298,6 +299,9 @@ ai-usage 連携が有効なとき、`rate_limit_threshold`（%）は 2 経路で
 - 再びレート制限なら `failed_resumes` を 0 へ戻します。上限まで走れたこと自体が、そのセッションを続けられる証拠だからです。
 - 3 回で捨てるのは、壊れた transcript のように二度と続けられないセッションを、実行のたびに再開しては失敗し続けるのを防ぐためです。1 回で捨てないのは、認証切れのようにセッションと無関係な原因でも失敗するためです。リトライ可能エラーとキャンセルは、そのセッションを続けられるかどうかについて何も示さないので数えません。
 - `result` を出さずに非ゼロ終了した再開（`classify-result` は 0 のまま `CMD_EXIT` だけが非ゼロ。タスクスクリプトの `0)` 分岐）も失敗として数えます。transcript の読み込みで落ち続けるセッションは `result` を残さないため、分類 1 だけを数えていると上限に届かず、エントリが永久に残って実行のたびに再開しては落ちます。
+- ただし終了コード **75**（sysexits.h の `EX_TEMPFAIL`。`executor::scripts::LAUNCH_TEMPFAIL_EXIT`）だけは数えません。これは「エージェントを起動する前に一時的な理由で諦めた」ことを知らせる、エージェントのコマンドとの約束です。`claude` を起動する前に設定を同期するラッパースクリプトのように、起動の前段で失敗し得るコマンドが、同期の衝突やロック待ちのタイムアウトで 75 を返す想定です。エージェントは 1 ターンも動いていないので、タスクは `failed-N` ではなく `retry-N` とし（`error-N` には他の失敗と同じくペインの最終行を残す）、`resume-entry fail` も呼ばず、エントリはそのまま次の実行で再開し直します。数えていた頃は、2 つのワーカーが同じ秒に起動してラッパーの同期が衝突し、`claude` が起動する前に落ちただけで、2 件のセッションが `failed_resumes` 2 に達していました（もう 1 回で捨てられる）。Claude Code 自身は 75 で終わらないため、上の transcript で落ちるクラッシュと取り違えることはありません。それ以外の result 無しの非ゼロ終了は従来どおり数えます。
+- 75 で終わったコマンドが何も出力していなければ jsonl は空になりますが、この場合はログ・分類パイプラインの故障（後述「完了時の自動終了」の節にある、空の jsonl を `failed-N` にする検査）として扱いません。整形器と `tee` は成功しており、空なのはエージェントが起動しなかったためなので、分類（result 無しは 0）へ進めて `0)` 分岐で同じく `retry-N` にします。検査を外すのは 75 のときだけで、それ以外の終了コードの空の jsonl は従来どおり `failed-N` です。
+- 同じ約束は再開しないタスク、再開できずに新しいセッションへ切り替えた 2 回目の試行、`claude` 以外のエージェント（終了コードで判定する分岐）にも同じく効きます。いずれも 75 なら `retry-N`、それ以外の非ゼロ終了は `failed-N` です。キャンセル（Ctrl-C）は終了コードより先に見て、従来どおり `failed-N` にします。
 - セッションが消えていると、Claude Code は `No conversation found with session ID: <id>` を出し、exit 1 と共に `subtype:"error_during_execution"`・`num_turns:0`・`errors:[...]` の `result`（`result` 文字列は無い）を出します（Claude Code 2.1.280 で実測）。`classify-result` はこの形（`subtype` が `error_during_execution` で、かつ `errors[]` のいずれかが `No conversation found with session ID` を含む）に限って **4 = 再開不能（resume unavailable）** を返し、レート制限の判定より先に見ます。通常の失敗（1）に落とすと `failed_resumes` を数えるだけになり、エントリが捨てられるまで何も起きない再開を 3 回繰り返します。形で絞るのは、任意のエラー文で判定すると、本当に失敗したタスクを「まだ始まっていない」と見なして新しいセッションで二重に実行してしまうためです（`result` 本文に同じ文言があるだけのものや、起動時の別のエラーは 1 のまま）。
 - 新しいセッションは次の実行を待たずに同じタスクの中で始めます。次の実行がすることはまさに新しいセッションでの開始なので、今やれば実行 1 回ぶん早く済みます。失敗した再開は 1 ターンも進んでいない（`num_turns:0`）ので二重実行にもなりません。この 2 回目の試行は元の `<NNNN>_<name>.jsonl` / `.log` の隣の `<NNNN>_<name>.fresh.jsonl` / `<NNNN>_<name>.fresh.log` に書き、その結末は通常のタスクと同じに扱います（マーカーも 2 回目の結果で決まり、レート制限なら新しいセッションを保存する）。ログを試行ごとに分けるのは、分類も `session_id` の抽出も jsonl の最後の `result`（末尾の何もしなかった通知のターンを除く）を読むためです。同じ jsonl へ追記すると、新しいセッションが `result` を出さずに終わったとき（クラッシュ等）に再開失敗側の `result` を読んでしまい、上書きすれば再開に失敗した記録が消えます。キャンセルで 2 回目へ切り替えなかった場合と、再開しないタスクで万一 4 が返った場合は失敗として扱います。
 
@@ -369,9 +373,13 @@ statusline コマンドは usage-gate / 実行開始時の取得と同様に `[a
 
 自動終了するとモニターが最後に描いた集計は tmux ごと画面から消えるため、`execute_plan_tmux` は `attach-session` から戻った後（一時ディレクトリの削除より前）に `marker_dir` の `done-*` / `failed-*` / `retry-*` を `collect_run_summary` で数え直し、同じ文言（`✅ All N/N tasks completed` / `❗ Completed: ...` / `🛑 Stopped: ...`。どちらも `monitor::summary_text`）を呼び出し元の端末へ出します。`worker-done-*` は `done-` 始まりではないためタスク件数には混ざりません。集計に失敗しても 0 件として続行します（実行結果の記録自体は `state.json` が持つため）。デタッチ（`tmux has-session` が成功）時はタスクが走行中なので集計は出しません。
 
+集計行の直後（`Logs:` の行の前）には、失敗・リトライしたタスクの理由（`error-*` の中身）を `  ❌ <理由>` として赤で出します。読み方はモニターのペインと同じ `monitor::read_errors`（タスク番号の数値順で、error-10 は error-3 の後。改行を畳み、エスケープシーケンスと制御文字を除き、空のものは除く）で、`collect_run_summary` が `RunSummary.errors` に入れます。ペインのエラー一覧はセッションと一緒に消え、`error-*` も一時ディレクトリと一緒に消えます。そのため以前は `❗ Completed: 0 succeeded / 2 failed / 0 retry` と `Logs:` しか残らず、ログを開かなければ失敗の理由が分かりませんでした（実例: 起動前のラッパーの失敗で 2 件が落ちたとき）。端末に出すのは 20 件（`SHOWN_ERRORS_LIMIT`）までで、超えた分は `  ❌ +N more errors (see errors.txt in the logs directory)` にまとめます。多すぎると集計行とログの場所が流れて読めなくなるためです。行の組み立ては `RunSummary::error_lines` に切り出してあり、端末を用意せずにテストできます。
+
+エラーが 1 件以上あれば、全件を 1 行 1 件でレポートディレクトリの `errors.txt`（`<run_dir>/errors.txt`、`write_errors_file`）にも書きます。端末に出し切れなかった分と、端末を閉じた後にも読めるようにするためです。各行は `read_errors` が 1 行に畳んで制御文字を除いたもので、`strip_ansi_from_dir` は `*.log` しか書き換えないため `errors.txt` には触れません。書けなかった場合（ENOSPC など）は stderr に警告して続け、`+N more errors` の行も `errors.txt` を案内しません（書けなかったファイルを指さない）。集計と同じく表示のための記録で、実行の成否には関わらないためです。
+
 `claude` エージェントは出力を `.jsonl` + `format-stream`、`codex` エージェント（`--json` で起動したもの）は `.jsonl` + `format-codex` のパイプラインで処理します。それ以外（`codex_output = "human"` の codex や、`exec` が見つからず素通しにした codex を含む）は `.log` に直接出力します。
 
-`claude` エージェントでは、`format-stream` / `tee` / raw jsonl 保存のいずれかが失敗した場合、または jsonl が空の場合、そのタスクは `failed-N` として扱い、`state.json` には記録しません。ログ・分類パイプラインが壊れたタスクを成功扱いしないためです。codex の `--json` 実行でも、`format-codex`（生 jsonl の保存か表示の書き込みに失敗すると 1 で終わる）か `tee` が失敗したら `failed-N` にします。codex には結果の分類が無いので、空の jsonl は検査せず、その後は終了コードで判定します。素通しのエージェントでも `tee` が失敗した場合は `failed-N` として扱います。
+`claude` エージェントでは、`format-stream` / `tee` / raw jsonl 保存のいずれかが失敗した場合、または jsonl が空の場合、そのタスクは `failed-N` として扱い、`state.json` には記録しません。ログ・分類パイプラインが壊れたタスクを成功扱いしないためです。ただしコマンドが 75（起動前の一時的な失敗。前述「再開したタスクの結末」）で終わったときの空の jsonl は除きます。整形器と `tee` は成功しており、空なのはエージェントが起動しなかったためなので、分類へ進めて `retry-N` にします。codex の `--json` 実行でも、`format-codex`（生 jsonl の保存か表示の書き込みに失敗すると 1 で終わる）か `tee` が失敗したら `failed-N` にします。codex には結果の分類が無いので、空の jsonl は検査せず、その後は終了コードで判定します（75 なら `retry-N`、それ以外の非ゼロなら `failed-N`）。素通しのエージェントでも `tee` が失敗した場合は `failed-N` として扱います。
 
 ### codex の出力（format-codex）
 
@@ -395,6 +403,7 @@ codex の人間向けの出力は、ファイルを変更するコマンドや�
 - トランスポート層の一時障害（`api_error_status` が `null` かつ `terminal_reason` が `api_error`）→ `retry-N` マーカー。ワーカーは継続
 - 再開不能（`subtype` が `error_during_execution` で、かつ `errors[]` のいずれかが `No conversation found with session ID` を含む）→ 終了コード 4。`--resume` で指定したセッションが既に消えていたことを表し、レート制限の判定より先に見る。タスクはエントリを消し、同じタスクの中で元のプロンプトから新しいセッションを始め直す（マーカーはその結果で決まる。前述「中断セッションの再開（resume）」）
 - その他のプロバイダエラー → `failed-N` マーカーとエラーメッセージ（`result` フィールド）を `error-N` へ記録し、`━━━ Error - continuing ━━━` を表示してワーカーは次のタスクへ進む。1 リポジトリ固有の失敗（認証エラー・不正リクエスト等）で残りのターゲットを丸ごと捨てないため。ワーカー自体を止めるのは停止シグナル（stop / pause file）を書けなかったとき（`format-stream` の終了コード 11）だけで、これは後続を止める手段が無いまま走り続けるのを防ぐ唯一の例外（前述「停止シグナルを書けなかった場合」）
+- `result` 無し（分類は 0）のままコマンドが非ゼロ終了 → `failed-N` マーカーと、ペインの最終行（`tmux capture-pane`）を `error-N` へ記録し、再開したセッションなら `failed_resumes` を数える。ただしコマンドの終了コードが 75（`EX_TEMPFAIL`。エージェントを起動する前の一時的な失敗）なら、`error-N` は同じく残したうえで `retry-N` マーカーにし、`━━━ Temporary launch failure (will retry next run): exit 75 ━━━` を表示して、失敗回数は数えない（前述「再開したタスクの結末」）。claude 以外のエージェントは分類を持たず終了コードだけで判定するが、75 の扱いは同じ
 
 `api_error_status` が `null` のまま `terminal_reason` が `api_error` で終わったケースは、HTTP 応答そのものが返っていない = 接続断や名前解決失敗といったトランスポート層の一時障害です。実ログでは `API Error: Connection closed mid-response. The response above may be incomplete.` / `API Error: Unable to connect to API (ENOTFOUND)` が該当し、13 セッション中 5 セッションで発生していました。恒久エラー（`Failed`）に落とすとワーカーごと停止して以降のターゲットが 1 件も処理されないため、再試行可能として扱います。認証エラーや不正リクエストは HTTP ステータスを伴うため、この分岐には入らず従来どおり `Failed` のままです。
 
@@ -452,7 +461,7 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - レポートディレクトリ名に使うエージェント名は `sanitize_filename` でパス成分を無害化する
 - ワーカーのスクリプトは冒頭で `stty -ixon 2>/dev/null || true` を実行し、端末の XON/XOFF フロー制御を切る。有効なままだと、誤って押された ^S（XOFF）でペインへの出力が止まり、`tee` の書き込みが詰まってエージェントの出力まで止まる。macOS 既定の `ixany` では任意のキーで再開するため、ハングと見分けがつかない。遡って読むには tmux のコピーモードがある。stdin が端末でない場合は stty が失敗するだけなので無視する。モニター（tmux が既定でフォーカスするペイン）は raw mode で動くため、XON/XOFF は端末の初期化で無効になる
 
-結果として、`parallelism` で指定した並列数はタスクが尽きるまで維持されます（一部タスクが失敗しても他ワーカーは止まらない）。エラーは `marker_dir/error-<idx>` にタスク単位で記録されるため、同一ワーカーで複数エラーが起きてもモニターに全て表示されます。
+結果として、`parallelism` で指定した並列数はタスクが尽きるまで維持されます（一部タスクが失敗しても他ワーカーは止まらない）。エラーは `marker_dir/error-<idx>` にタスク単位で記録されるため、同一ワーカーで複数エラーが起きてもモニターに全て表示されます。セッションを閉じた後も、同じ一覧を呼び出し元の端末と `<run_dir>/errors.txt` に残します（前述「完了時の自動終了」）。
 
 並列数は CLI の `--workers` / `-w`（1 以上。0 は clap の `value_parser` で拒否）で実行ごとに上書きでき、未指定なら `[settings].parallelism` を使います。実際に起動するワーカー数は `worker_count`（= `parallelism.min(タスク数)`）で頭打ちになり、`print_plan` が同じ関数で算出した実効値を実行計画に `Workers:` として表示します（頭打ちのときは要求値も併記）。表示と `execute_plan_tmux` の起動数が食い違わないよう、両者は必ずこの関数を経由します。
 

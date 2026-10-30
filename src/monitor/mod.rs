@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use crate::rate_control;
+pub use controller::read_errors;
 use controller::{Action, Controller};
 pub use manifest::{AiUsageCommands, Manifest};
 pub use ui::summary_text;

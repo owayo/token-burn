@@ -544,7 +544,16 @@ struct RunSummary {
     done: usize,
     failed: usize,
     retry: usize,
+    /// タスクが失敗・リトライした理由（error-* の中身。タスク番号順・1 行に畳んだもの）。
+    errors: Vec<String>,
 }
+
+/// 最終集計の後に端末へ出すエラーの上限。超えた分は件数だけを出す（全件は
+/// [`ERRORS_FILE_NAME`] に残す）。多すぎると集計行やログの場所が流れて読めなくなる。
+const SHOWN_ERRORS_LIMIT: usize = 20;
+
+/// エラーの全件を書き出すファイル名（今回の実行用レポートディレクトリの直下に置く）。
+const ERRORS_FILE_NAME: &str = "errors.txt";
 
 impl RunSummary {
     fn processed(&self) -> usize {
@@ -560,12 +569,37 @@ impl RunSummary {
     fn describe(&self, total: usize) -> String {
         crate::monitor::summary_text(self.done, self.failed, self.retry, total)
     }
+
+    /// 集計行の後に出すエラーの行（字下げと色は呼び出し側で付ける）。
+    ///
+    /// モニターはセッションごと閉じるので、ペインに出していたエラーの一覧も画面から消える。
+    /// 件数だけでは失敗の理由が分からないため、同じ一覧を呼び出し元の端末に残す。
+    /// [`SHOWN_ERRORS_LIMIT`] 件を超えた分は件数にまとめ、全件を errors.txt に書けたときだけ
+    /// その場所を案内する（書けなかったファイルを指さない）。
+    fn error_lines(&self, saved_to_file: bool) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .errors
+            .iter()
+            .take(SHOWN_ERRORS_LIMIT)
+            .map(|error| format!("❌ {error}"))
+            .collect();
+        let hidden = self.errors.len().saturating_sub(SHOWN_ERRORS_LIMIT);
+        if hidden > 0 {
+            lines.push(if saved_to_file {
+                format!("❌ +{hidden} more errors (see {ERRORS_FILE_NAME} in the logs directory)")
+            } else {
+                format!("❌ +{hidden} more errors")
+            });
+        }
+        lines
+    }
 }
 
-/// マーカーディレクトリから done / failed / retry を数える。
+/// マーカーディレクトリから done / failed / retry を数え、エラーの理由（error-*）を読む。
 ///
 /// 読めない場合は 0 件として扱う。これは表示のための集計であり、実行結果の記録自体は
-/// `state.json` が持つため、ここで失敗しても実行の成否には影響しない。
+/// `state.json` が持つため、ここで失敗しても実行の成否には影響しない。エラーの読み方は
+/// モニターのペインと同じ（[`crate::monitor::read_errors`]）。
 fn collect_run_summary(marker_dir: &Path) -> RunSummary {
     let mut summary = RunSummary::default();
     let Ok(entries) = std::fs::read_dir(marker_dir) else {
@@ -583,7 +617,24 @@ fn collect_run_summary(marker_dir: &Path) -> RunSummary {
             summary.retry += 1;
         }
     }
+    summary.errors = crate::monitor::read_errors(marker_dir);
     summary
+}
+
+/// エラーの全件を 1 行 1 件で `<run_dir>/errors.txt` に書く。エラーが無ければ何も作らない。
+///
+/// 端末に出すのは先頭の [`SHOWN_ERRORS_LIMIT`] 件だけで、error-* は一時ディレクトリと一緒に
+/// 消えるため、全件を後から読める場所（ログと同じディレクトリ）に残す。各エラーは
+/// [`crate::monitor::read_errors`] が 1 行に畳んで制御文字を除いたもの。書いたら true。
+fn write_errors_file(run_dir: &Path, errors: &[String]) -> Result<bool> {
+    if errors.is_empty() {
+        return Ok(false);
+    }
+    let path = run_dir.join(ERRORS_FILE_NAME);
+    let mut text = errors.join("\n");
+    text.push('\n');
+    std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(true)
 }
 
 pub fn build_plan(
@@ -1368,6 +1419,13 @@ pub fn execute_plan_tmux(
     // ログファイルから ANSI エスケープコードを除去
     strip_ansi_from_dir(&run_dir);
 
+    // 失敗の理由はモニターのペインと一時ディレクトリと一緒に消えるので、全件をログと同じ
+    // ディレクトリに残す。表示のための記録なので、書けなくても警告して続ける。
+    let errors_saved = write_errors_file(&run_dir, &summary.errors).unwrap_or_else(|e| {
+        eprintln!("{}: {:#}", "warning".yellow(), e);
+        false
+    });
+
     println!();
     println!("{}", "tmux session ended.".bold());
     let summary_line = summary.describe(total);
@@ -1375,6 +1433,10 @@ pub fn execute_plan_tmux(
         println!("  {}", summary_line.yellow());
     } else {
         println!("  {}", summary_line.green());
+    }
+    // 件数だけでは理由が分からない（モニターに出ていた一覧はもう画面に無い）。
+    for line in summary.error_lines(errors_saved) {
+        println!("  {}", line.red());
     }
     println!(
         "  {} {}",
@@ -1533,9 +1595,105 @@ mod tests {
                 done: 2,
                 failed: 1,
                 retry: 1,
+                // 中身の無い error-* は理由として出さない
+                errors: Vec::new(),
             }
         );
         assert_eq!(summary.processed(), 4);
+    }
+
+    /// tmux を閉じた後に出す理由は、モニターのペインと同じくタスク番号の順に並べる
+    /// （辞書順ではない）。改行は畳み、エスケープシーケンスは除く。
+    #[test]
+    fn collect_run_summary_reads_errors_in_task_order() {
+        let tmp = tempfile::TempDir::new().expect("一時ディレクトリを作成できるべき");
+        let dir = tmp.path();
+        for (name, text) in [
+            ("failed-3", ""),
+            ("failed-10", ""),
+            ("retry-2", ""),
+            ("error-10", "[repo-j] later\n"),
+            ("error-3", "[repo-c] boom\n\x1b[31mred\x1b[0m\n"),
+            ("error-2", "[repo-b] wrapper: setup failed\n"),
+        ] {
+            std::fs::write(dir.join(name), text).expect("マーカーを作成できるべき");
+        }
+
+        let summary = collect_run_summary(dir);
+
+        assert_eq!(
+            summary.errors,
+            [
+                "[repo-b] wrapper: setup failed",
+                "[repo-c] boom red",
+                "[repo-j] later",
+            ]
+        );
+        assert_eq!((summary.failed, summary.retry), (2, 1));
+    }
+
+    fn summary_with_errors(count: usize) -> RunSummary {
+        RunSummary {
+            failed: count,
+            errors: (1..=count).map(|i| format!("[repo-{i}] boom")).collect(),
+            ..RunSummary::default()
+        }
+    }
+
+    /// 端末に出すのは 20 件まで。超えた分は件数にまとめ、全件を書けたときだけ errors.txt を案内する。
+    #[test]
+    fn run_summary_error_lines_are_capped_with_an_overflow_line() {
+        assert!(RunSummary::default().error_lines(false).is_empty());
+
+        let few = summary_with_errors(2).error_lines(true);
+        assert_eq!(few, ["❌ [repo-1] boom", "❌ [repo-2] boom"]);
+
+        let exactly = summary_with_errors(SHOWN_ERRORS_LIMIT).error_lines(true);
+        assert_eq!(exactly.len(), SHOWN_ERRORS_LIMIT);
+        assert_eq!(exactly.last().unwrap(), "❌ [repo-20] boom");
+
+        let many = summary_with_errors(SHOWN_ERRORS_LIMIT + 3);
+        let lines = many.error_lines(true);
+        assert_eq!(lines.len(), SHOWN_ERRORS_LIMIT + 1);
+        assert_eq!(lines[0], "❌ [repo-1] boom");
+        assert_eq!(lines[SHOWN_ERRORS_LIMIT - 1], "❌ [repo-20] boom");
+        assert_eq!(
+            lines[SHOWN_ERRORS_LIMIT],
+            "❌ +3 more errors (see errors.txt in the logs directory)"
+        );
+        // 書けなかったファイルは案内しない
+        assert_eq!(
+            many.error_lines(false)[SHOWN_ERRORS_LIMIT],
+            "❌ +3 more errors"
+        );
+    }
+
+    /// 全件を 1 行 1 件で残す。エラーが無ければファイルを作らない。
+    #[test]
+    fn write_errors_file_keeps_every_error_and_skips_when_there_are_none() {
+        let tmp = tempfile::TempDir::new().expect("一時ディレクトリを作成できるべき");
+        let errors = summary_with_errors(SHOWN_ERRORS_LIMIT + 2).errors;
+
+        assert!(write_errors_file(tmp.path(), &errors).expect("書けるべき"));
+        let text = std::fs::read_to_string(tmp.path().join(ERRORS_FILE_NAME))
+            .expect("errors.txt を読めるべき");
+        assert_eq!(text.lines().collect::<Vec<_>>(), errors);
+        assert!(text.ends_with("[repo-22] boom\n"), "{text}");
+
+        let empty = tempfile::TempDir::new().expect("一時ディレクトリを作成できるべき");
+        assert!(!write_errors_file(empty.path(), &[]).expect("何もしないだけ"));
+        assert!(!empty.path().join(ERRORS_FILE_NAME).exists());
+    }
+
+    /// 書けなければエラーを返す（呼び出し側は警告して続ける。表示のための記録なので
+    /// 実行の成否には関わらない）。
+    #[test]
+    fn write_errors_file_reports_a_write_failure() {
+        let tmp = tempfile::TempDir::new().expect("一時ディレクトリを作成できるべき");
+        let missing = tmp.path().join("missing");
+        let error = write_errors_file(&missing, &["[repo] boom".to_string()])
+            .expect_err("存在しないディレクトリには書けない");
+        assert!(format!("{error:#}").contains("errors.txt"), "{error:#}");
     }
 
     /// マーカーディレクトリが読めない場合も表示だけの集計なので 0 件で続行する。
@@ -1555,6 +1713,7 @@ mod tests {
             done: 10,
             failed: 0,
             retry: 0,
+            ..RunSummary::default()
         };
         assert_eq!(all_done.describe(10), "✅ All 10/10 tasks completed");
         assert!(!all_done.has_issues(10));
@@ -1563,6 +1722,7 @@ mod tests {
             done: 8,
             failed: 1,
             retry: 1,
+            ..RunSummary::default()
         };
         assert_eq!(
             mixed.describe(10),
@@ -1574,6 +1734,7 @@ mod tests {
             done: 4,
             failed: 1,
             retry: 0,
+            ..RunSummary::default()
         };
         assert_eq!(
             stopped.describe(10),
