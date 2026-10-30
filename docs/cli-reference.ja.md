@@ -14,7 +14,7 @@
 
 `init` は `--force`（`-f`）で既存ファイルを確認なしで上書きできます。
 
-`clean` は `--older-than` で `cleanup_after` の設定値を一時的に変更できます（例: `--older-than 3d`）。
+`clean` は `--older-than` で `cleanup_after` の設定値を一時的に変更できます（例: `--older-than 3d`）。削除できないディレクトリがあれば、そのパスを警告して残りの削除を続け、最後に 0 以外の終了コードで終わります。
 
 ## オプション
 

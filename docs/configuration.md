@@ -72,7 +72,7 @@ timezone = "Asia/Tokyo"
 |-------|-------------|---------|
 | `name` | Agent identifier | `"claude"` |
 | `command` | Command and arguments | `["claude"]` |
-| `provider` | Provider name used to match `(profile, provider)` against `ai-usage --json` output. Required when ai-usage integration is enabled for the agent | `"claude"` |
+| `provider` | Provider name used to match `(profile, provider)` against `ai-usage --json` output. Required when ai-usage integration is enabled for the agent. Surrounding spaces are removed and the value is lowercased when the config is loaded; an empty value counts as unset | `"claude"` |
 | `env` | Environment variables applied when launching the agent (optional). Keys must match `[A-Za-z_][A-Za-z0-9_]*`; values are `~`-expanded. Merged with (and overridden by) a profile's `env` | `{ CLAUDE_CONFIG_DIR = "~/.config/claude-home" }` |
 | `reset_weekday` | Reset day of week | `"monday"` |
 | `reset_time` | Reset time (HH:MM) | `"09:00"` |
@@ -92,7 +92,7 @@ A wrapper script used as `command` should exit with code 75 (`EX_TEMPFAIL`) when
 
 **Claude auto-injected environment**: `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` is added to the Claude process environment by default. Without it, `claude -p` waits at most 600s for background tasks (backgrounded subagents / workflows) after the main turn ends, then kills them ("Background tasks still running after 600s; terminating.") and reports success even though the work never finished. `0` waits indefinitely so background agents can complete and re-drive the main loop. Set the variable explicitly in the agent or profile `env` to override (an empty string unsets it, restoring Claude's default ceiling).
 
-**Codex auto-injected flags**: When the agent is Codex (`provider = "codex"`, or an executable named `codex` / `codex-*` / `codex_*`), `-c approval_policy=never` is inserted right after the executable so an unattended run never waits for approval, unless you already set an approval policy (`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`). Codex is started with standard input from `/dev/null`, so nothing typed into a worker pane can reach it.
+**Codex auto-injected flags**: When the agent is Codex (`provider = "codex"`, or an executable named `codex` / `codex-*` / `codex_*`), `-c approval_policy=never` is inserted right after the executable so an unattended run never waits for approval, unless you already set an approval policy (`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`). A command started as `env -S '<codex ...>'` keeps codex and its arguments in one string, so nothing is inserted there; put the approval policy inside the string yourself. Codex is started with standard input from `/dev/null`, so nothing typed into a worker pane can reach it.
 
 **Codex output (`codex_output`)**: Codex's human-readable output reprints the whole diff of the turn after every file change, which buries the pane and the log (126MB of a 141MB log in a 9-hour task). By default token-burn therefore runs `codex exec --json` and renders the events itself; see [monitor.md](monitor.md#codex-cli).
 
@@ -175,7 +175,7 @@ profiles = ["work", "home"]   # profile names to reference; multiple names expan
 - At run time, each agent is expanded across its referenced profiles. For example, `claude` with `["work", "home"]` becomes two agents, `claude-work` and `claude-home`, each launched with its profile's `env`.
 - Expanded names are also used as `state.json` keys, so processed-target state is tracked separately per account.
 - To resolve schedules (at the start of `status`, `list`, and `run`), `ai-usage --json` is invoked only once per process, with `--refresh` added so it bypasses ai-usage's shared cache (120 seconds by default). Right after a manual reset, a cached result can still carry the pre-reset reset times and usage.
-- The stop decisions — the post-task usage gate below, the check at the start of a run, and the recovery check during a pause — refetch only the running account with `--refresh --profile <profile> --only <provider>` (flags already in `command` are not added twice). With an older ai-usage that does not know `--refresh` (it exits with code 2), token-burn refetches with `command` as is, and the early resume after a manual reset does not happen (see [Rate limits](rate-limits.md#resuming-early-after-a-manual-reset)).
+- The post-task usage gate below and the recovery check during a pause refetch only the running account with `--refresh --profile=<profile> --only=<provider>` (flags already in `command` are not added twice; a profile name containing `,` is matched from the result instead of being passed). The check at the start of a run refetches every account with `--refresh`, because the same output also fills the statusline cache. With an older ai-usage that does not know `--refresh` (it exits with code 2), token-burn refetches with `command` as is, and the early resume after a manual reset does not happen (see [Rate limits](rate-limits.md#resuming-early-after-a-manual-reset)).
 - The tmux monitor pane runs the same command with `--disk` inserted before `--json` every 30 seconds to show free disk space, separately from the usage cache. With an ai-usage that predates `--disk`, the monitor reads the startup disk from the OS instead.
 - The reset time is taken from the `resets_at` value of the selected window (e.g. `weekly`) for the matching `(profile, provider)` pair.
 - The instant from `resets_at` is preserved, then converted to the local fixed offset for status/run display so UTC ai-usage output is shown in the user's local time.
@@ -215,7 +215,7 @@ public_first = false
 
 When `username` is set, visibility lookup uses the repository name parsed from each repository's `origin` remote URL (case-insensitive), so local directory names can differ from remote repository names.
 
-Owner and repository names are extracted from the last two segments of the remote URL path, so GitLab subgroup URLs such as `git@gitlab.example.com:group/subgroup/repo.git` resolve to `subgroup` as the owner and `repo` as the repository name.
+Owner and repository names are extracted from the last two segments of the remote URL path, so GitLab subgroup URLs such as `git@gitlab.example.com:group/subgroup/repo.git` resolve to `subgroup` as the owner and `repo` as the repository name. The scp-like form without a user, such as an ssh host alias in `gh-work:owner/repo.git`, is read as well. If git fails to read a repository's `origin` for a reason other than the remote not existing (a broken `.git/config`, `detected dubious ownership`), the repository is skipped with a warning that shows git's message.
 
 When `username` is not set, repositories are included even if they do not have an `origin` remote. In that case visibility remains `Unknown`.
 

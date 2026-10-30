@@ -71,7 +71,7 @@ timezone = "Asia/Tokyo"
 | フィールド | 説明 | 例 |
 |-----------|------|-----|
 | `name` | エージェント識別名 | `"claude"` |
-| `provider` | プロバイダ識別子。`ai-usage` の `(profile, provider)` 照合に使用（ai-usage 連携時は必須） | `"claude"` |
+| `provider` | プロバイダ識別子。`ai-usage` の `(profile, provider)` 照合に使用（ai-usage 連携時は必須）。読み込み時に前後の空白を除いて小文字にそろえ、空なら未設定として扱う | `"claude"` |
 | `command` | コマンドと引数 | `["claude"]` |
 | `env` | 起動時に付与する環境変数（任意）。プロファイル側の `env` で上書きマージされる | `{ FOO = "bar" }` |
 | `reset_weekday` | リセット曜日 | `"monday"` |
@@ -92,7 +92,7 @@ timezone = "Asia/Tokyo"
 
 **Claude 環境変数の自動付与**: Claude プロセスの環境にはデフォルトで `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` が追加されます。これが無いと `claude -p` はメインターン終了後にバックグラウンドタスク（background 起動のサブエージェント / ワークフロー）を最大 600 秒しか待たず、"Background tasks still running after 600s; terminating." と共に全タスクを強制終了し、仕事が未完のまま成功として報告されます。`0` は無期限待機を意味し、バックグラウンドエージェントの完了通知でメインループが再開して完走できるようになります。agent / profile の `env` で明示すれば上書きできます（空文字を指定すると unset され、Claude 既定の 600 秒に戻ります）。
 
-**Codex 必須フラグの自動付与**: エージェントが Codex（`provider = "codex"`、または実行ファイル名が `codex` / `codex-*` / `codex_*`）の場合、無人実行が承認待ちで止まらないよう `-c approval_policy=never` を実行ファイルの直後に挿入します。承認方針を指定済み（`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）なら挿入しません。Codex の標準入力は `/dev/null` にするため、ワーカーのペインで打ったキーが Codex へ届くことはありません。
+**Codex 必須フラグの自動付与**: エージェントが Codex（`provider = "codex"`、または実行ファイル名が `codex` / `codex-*` / `codex_*`）の場合、無人実行が承認待ちで止まらないよう `-c approval_policy=never` を実行ファイルの直後に挿入します。承認方針を指定済み（`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）なら挿入しません。`env -S '<codex ...>'` の形で起動するコマンドは codex とその引数を 1 つの文字列に収めるので、挿入する位置が無く、何も足しません。この形では文字列の中に承認方針を自分で書いてください。Codex の標準入力は `/dev/null` にするため、ワーカーのペインで打ったキーが Codex へ届くことはありません。
 
 **Codex の出力（`codex_output`）**: Codex の人間向けの出力は、ファイルを変更するたびにターン全体の diff を出し直し、ペインとログを埋め尽くします（9 時間のタスクで 141MB のログのうち 126MB）。そのため既定では `codex exec --json` で起動し、イベントを token-burn が整形します（[monitor.ja.md](monitor.ja.md#codex-cli) を参照）。
 
@@ -175,7 +175,7 @@ profiles = ["work", "home"]    # 参照する profile 名。複数指定でア�
 - 実行時に agent × profile を展開します。例: `claude` + `["work", "home"]` → `claude-work` / `claude-home` の 2 エージェント。各々プロファイルの `env` を付与して起動します。**profile を 1 つだけ参照する場合は展開名が agent 名のまま**（例: `codex` が `["home"]` のみ → `codex`）で、サフィックス `<agent>-<profile>` が付くのは 2 つ以上参照したときだけです。起動コマンドが異なる各アカウントを別 agent として定義しても展開名が冗長にならず、`state.json` キーも安定します。
 - 展開名は `state.json` のキーにも使われ、アカウントごとに処理済み状態が分離されます。
 - スケジュールの解決（`status` / `list` / `run` の最初）で、`ai-usage --json` を 1 プロセスにつき 1 回だけ実行します。このとき `--refresh` を付け、ai-usage の共有キャッシュ（既定 120 秒）を通さずに取り直します。手動リセットの直後でも、リセット前のリセット時刻や使用率を使わないためです。
-- 停止の判定（下記の使用率ゲート、実行開始時の判定、一時停止中の回復の確認）では、実行中のアカウントだけを `--refresh --profile <profile> --only <provider>` で取り直します。`command` に既に同じフラグがあれば足しません。`--refresh` を知らない古い ai-usage（終了コードが 2 になる）では、`command` のまま取り直します。この場合、手動リセットによる早めの再開は行いません（[レート制限](rate-limits.ja.md#手動リセットでの早めの再開)）。
+- 下記の使用率ゲートと一時停止中の回復の確認では、実行中のアカウントだけを `--refresh --profile=<profile> --only=<provider>` で取り直します。`command` に既に同じフラグがあれば足しません。profile 名に `,` を含む場合は `--profile` を渡さず、結果からアカウントを選びます。実行開始時の判定は、同じ出力で statusline のキャッシュも埋めるため、全アカウント分を `--refresh` で取り直します。`--refresh` を知らない古い ai-usage（終了コードが 2 になる）では、`command` のまま取り直します。この場合、手動リセットによる早めの再開は行いません（[レート制限](rate-limits.ja.md#手動リセットでの早めの再開)）。
 - tmux のモニターのペインは、同じコマンドの `--json` の前に `--disk` を挿したものを 30 秒ごとに実行し、ディスクの空き容量を表示します（使用量のキャッシュとは別に取ります）。ai-usage が `--disk` に対応していない古い版なら、起動ディスクの容量を OS から読みます。
 - **使用率ゲート（完了後チェック）**: ai-usage 連携が有効な場合、各タスク完了後に該当 agent の `(profile, provider)` の weekly / five_hour の `used_percent` を ai-usage から取得し、`rate_limit_threshold` 以上の枠があれば後続タスクの開始を止めます。Claude の stream-json `rate_limit_event` によるリアルタイム監視（タスク実行中の停止）に加えてこの完了後チェックが効くため、**リアルタイムの監視が無い codex でも実使用率で確実に止まります**（claude / codex 両方に適用）。
   - 止め方は枠の周期で分かれます。週次枠なら恒久停止、5 時間枠（や `kind:"daily"` の 24 時間枠）ならその枠のリセットまでの一時停止です。周期はスロット名ではなく `kind` から導くため、`five_hour` スロットに 24 時間枠を返すプロバイダでも取り違えません。
@@ -218,7 +218,7 @@ public_first = false
 
 `username` を指定した場合、可視性判定は各リポジトリの `origin` remote URL から取得したリポジトリ名（大文字小文字を無視）で行われます。ローカルのディレクトリ名は一致している必要がありません。
 
-remote URL の owner/repo は末尾 2 セグメントから抽出するため、GitLab のサブグループ（例: `git@gitlab.example.com:group/subgroup/repo.git`）でも直近の親 (`subgroup`) を owner として正しく扱います。
+remote URL の owner/repo は末尾 2 セグメントから抽出するため、GitLab のサブグループ（例: `git@gitlab.example.com:group/subgroup/repo.git`）でも直近の親 (`subgroup`) を owner として正しく扱います。user を省いた scp 形式（ssh の Host 別名を使う `gh-work:owner/repo.git` など）も読みます。`origin` が無いこと以外の理由（`.git/config` の破損、`detected dubious ownership` など）で git が `origin` を読めなかったリポジトリは、git のメッセージを添えて警告してから外します。
 
 `username` を指定しない通常スキャンでは、`origin` remote がないリポジトリも対象に含まれます。その場合の可視性は `Unknown` になります。
 

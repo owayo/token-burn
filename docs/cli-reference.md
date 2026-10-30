@@ -14,7 +14,7 @@ Every command and option of `token-burn`. The [README](../README.md#usage) shows
 
 `init` also accepts `--force` (`-f`) to overwrite existing files without confirmation.
 
-`clean` accepts `--older-than` to override the configured `cleanup_after` duration (e.g., `--older-than 3d`).
+`clean` accepts `--older-than` to override the configured `cleanup_after` duration (e.g., `--older-than 3d`). A directory that cannot be removed is reported with its path and the rest are still removed; `clean` then exits with a non-zero status.
 
 ## Options
 
