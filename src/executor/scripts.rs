@@ -62,7 +62,16 @@ pub(super) struct WorkerCtx<'a> {
     /// 停止判定とキューからの claim をまとめて行うコマンド。claim できた番号を stdout へ
     /// 出し、終了コードで 0=claim 成功 / 10=恒久停止 / 20=pending 無し を返す。
     pub(super) gate_claim_cmd: &'a str,
+    /// tmux のペインをすべて作り終えたことを知らせるファイル。指定されていれば、ワーカーは
+    /// これが現れるまでタスクを取りに行かない（`None` は待たない）。
+    pub(super) start_file: Option<&'a Path>,
 }
+
+/// 開始ファイルを待つ上限（0.1 秒単位。60 秒）。
+///
+/// ペインの作成はふつう 1 秒もかからない。作成に失敗した場合はセッションごと閉じられるので、
+/// この上限に達するのは、ペインを作った後で token-burn 自身が落ちたときくらいしかない。
+const WORKER_START_WAIT_TICKS: u32 = 600;
 
 /// キューから claim したワーカーが source して実行する、タスク単位のシェルスクリプトを生成する。
 pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
@@ -258,6 +267,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             script += "FORMAT_EXIT=${PIPE_STATUS[1]}\n";
             script += "TEE_EXIT=${PIPE_STATUS[2]}\n";
             script += "CURRENT_FAILED_MARKER=\"\"\n";
+            script += &cancel_check(&failed_marker);
             script += &format!(
                 concat!(
                     "if [ \"$FORMAT_EXIT\" -ne 0 ] || [ \"$TEE_EXIT\" -ne 0 ]; then\n",
@@ -278,6 +288,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             script += "CMD_EXIT=${PIPE_STATUS[0]}\n";
             script += "TEE_EXIT=${PIPE_STATUS[1]}\n";
             script += "CURRENT_FAILED_MARKER=\"\"\n";
+            script += &cancel_check(&failed_marker);
             script += &format!(
                 concat!(
                     "if [ \"$TEE_EXIT\" -ne 0 ]; then\n",
@@ -466,6 +477,28 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
     script
 }
 
+/// パイプラインの直後に、キャンセル（INT / TERM）を終了コードより先に見る。
+///
+/// bash は前面のパイプラインが終わってから trap を実行し、macOS の `/bin/bash`（3.2）では
+/// trap の中のコマンドが `PIPESTATUS` を上書きする。キャンセルされたパイプラインの終了コードは
+/// trap の最後のコマンドの値（0 など）に化け、`FORMAT_EXIT` / `TEE_EXIT` は空になる。そのまま
+/// 分岐すると、Ctrl-C で止めたタスクを成功として `mark` し、state.json に処理済みと記録して
+/// しまう（次の実行で処理し直されない）。キャンセルされたタスクは、終了コードによらず失敗に
+/// する（中断セッションの保存も失敗回数の更新もしない）。
+fn cancel_check(failed: &str) -> String {
+    format!(
+        concat!(
+            "if [ \"$CANCELLED\" -eq 1 ]; then\n",
+            "  touch {failed}\n",
+            "  echo '━━━ Cancelled ━━━'\n",
+            "  echo ''\n",
+            "  return 0\n",
+            "fi\n",
+        ),
+        failed = failed,
+    )
+}
+
 /// claude の 1 回分の起動（パイプライン → 失敗検査 → 分類）を組み立てる。
 ///
 /// 再開できなかったタスクを同じタスクのまま新規セッションで起動し直すため、同じ形を
@@ -495,6 +528,7 @@ impl ClaudeAttempt<'_> {
         script += "FORMAT_EXIT=${PIPE_STATUS[1]}\n";
         script += "TEE_EXIT=${PIPE_STATUS[2]}\n";
         script += "CURRENT_FAILED_MARKER=\"\"\n";
+        script += &cancel_check(self.failed);
         // 停止シグナル（stop / pause file）を書けなかった場合の専用コード。閾値を超えた
         // のに後続を止める手段が無い状態なので、このタスクを失敗として記録するだけでなく
         // ワーカーごと止める。`return 0` で次のタスクへ進むと、止めるべき状況のまま
@@ -558,15 +592,42 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
         ),
         None => String::new(),
     };
+    // tmux のペインをすべて作り終えるまで、タスクを取りに行かない。ペインは 1 つずつ作るので、
+    // 待たないと、途中の分割が失敗してセッションを閉じるまでの間に先に起動したワーカーが
+    // タスクを claim し、エージェントを起動したところで kill される（実行 1 回ぶんの
+    // タスクが記録も残さずに失われる）。
+    let start_wait = match ctx.start_file {
+        Some(path) => format!(
+            concat!(
+                "START_WAIT=0\n",
+                "while [ ! -e {start} ] && [ $START_WAIT -lt {ticks} ]; do\n",
+                "  sleep 0.1\n",
+                "  START_WAIT=$((START_WAIT + 1))\n",
+                "done\n",
+                "if [ ! -e {start} ]; then\n",
+                "  echo '━━━ Start signal missing — stopping worker ━━━'\n",
+                "  touch {worker_done}\n",
+                "  exit 1\n",
+                "fi\n",
+            ),
+            start = shell_escape(&path.to_string_lossy()),
+            ticks = WORKER_START_WAIT_TICKS,
+            worker_done = worker_done,
+        ),
+        None => String::new(),
+    };
 
     format!(
         concat!(
             "#!/bin/bash\n",
             "CURRENT_FAILED_MARKER=\"\"\n",
             "CANCELLED=0\n",
+            // trap は印を立てるだけにする。マーカーはタスクスクリプトがパイプラインの直後に
+            // CANCELLED を見て作る（`cancel_check`）。bash は前面のパイプラインが終わってから
+            // trap を実行するので、ここでマーカーを作ると、続く分岐が done / retry も作り、
+            // 1 タスクに 2 つのマーカーができる（モニターが早くセッションを閉じる）。
             "handle_cancel() {{\n",
             "  CANCELLED=1\n",
-            "  if [ -n \"$CURRENT_FAILED_MARKER\" ]; then touch \"$CURRENT_FAILED_MARKER\"; fi\n",
             "}}\n",
             "trap handle_cancel INT TERM\n",
             // ワーカーペインは無人で動く。端末の IXON（XON/XOFF フロー制御）が有効だと、誤って
@@ -576,6 +637,7 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             // 出力を遡って読むには tmux のコピーモードがあり、^S で止める必要は無い。stdin が
             // 端末でない場合（テスト等）は stty が失敗するだけなので無視する。
             "stty -ixon 2>/dev/null || true\n",
+            "{start_wait}",
             "\n",
             "QUEUE_DIR={queue_dir}\n",
             "TASK_DIR={task_dir}\n",
@@ -661,6 +723,7 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
         worker_done = worker_done,
         gate_line = gate_line,
         gate_claim_cmd = ctx.gate_claim_cmd,
+        start_wait = start_wait,
     )
 }
 
@@ -787,11 +850,11 @@ pub(super) fn build_statusline_cmd(
     if !replaced {
         parts.extend(statusline_args.iter().map(|s| s.to_string()));
     }
-    // 実行中アカウント行を強調する active 指定（email 非依存の profile/provider）。
-    parts.push("--active-profile".to_string());
-    parts.push(profile.to_string());
-    parts.push("--active-provider".to_string());
-    parts.push(provider.to_string());
+    // 実行中アカウント行を強調する active 指定（email 非依存の profile/provider）。値は
+    // `--<名前>=<値>` の 1 引数で渡す（`-` で始まる名前を ai-usage の clap が別のフラグと
+    // 読まないように）。
+    parts.push(format!("--active-profile={profile}"));
+    parts.push(format!("--active-provider={provider}"));
     // 選択 agent の env を前置きし、statusline の実行文脈を揃える。
     let mut all = env_prefix_parts(env);
     all.extend(parts.iter().map(|s| shell_escape(s)));
@@ -1107,6 +1170,7 @@ mod tests {
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
             gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
+            start_file: None,
             usage_gate_cmd: None,
         });
 
@@ -1138,6 +1202,7 @@ mod tests {
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
             gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
+            start_file: None,
             usage_gate_cmd: None,
         });
         let stty = script
@@ -1160,6 +1225,7 @@ mod tests {
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
             gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
+            start_file: None,
             usage_gate_cmd: None,
         });
 
@@ -1205,6 +1271,7 @@ mod tests {
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
             gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
+            start_file: None,
             usage_gate_cmd: Some("tb usage-gate --profile P --provider claude"),
         });
         let source_idx = script
@@ -1230,6 +1297,7 @@ mod tests {
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
             gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
+            start_file: None,
             usage_gate_cmd: Some("tb usage-gate --profile P --provider claude"),
         });
         // 非ゼロ終了で break する分岐を持つこと
@@ -1254,6 +1322,7 @@ mod tests {
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
             gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
+            start_file: None,
             usage_gate_cmd: None,
         });
         assert!(!script.contains("usage-gate"));
@@ -1271,6 +1340,7 @@ mod tests {
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
             gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
+            start_file: None,
             usage_gate_cmd: None,
         });
 
@@ -1295,6 +1365,7 @@ mod tests {
             task_dir: std::path::Path::new("/tmp/my tasks"),
             marker_dir: std::path::Path::new("/tmp/my markers"),
             gate_claim_cmd: "tb gate-claim --stop-file '/tmp/my stop'",
+            start_file: None,
             usage_gate_cmd: None,
         });
         assert!(script.contains("QUEUE_DIR='/tmp/my queue'"));
@@ -1313,6 +1384,7 @@ mod tests {
             task_dir: std::path::Path::new("/tmp/tasks"),
             marker_dir: std::path::Path::new("/tmp/markers"),
             gate_claim_cmd: "tb gate-claim --stop-file /tmp/stop",
+            start_file: None,
             usage_gate_cmd: None,
         });
         assert!(
@@ -1388,7 +1460,7 @@ mod tests {
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/cache.json' '--active-profile' 'Work' '--active-provider' 'claude'"
+            "'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/cache.json' '--active-profile=Work' '--active-provider=claude'"
         );
     }
 
@@ -1411,7 +1483,7 @@ mod tests {
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "'env' 'FOO=1' 'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile' 'Home' '--active-provider' 'codex'"
+            "'env' 'FOO=1' 'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile=Home' '--active-provider=codex'"
         );
     }
 
@@ -1427,7 +1499,7 @@ mod tests {
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile' 'Work' '--active-provider' 'claude'"
+            "'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile=Work' '--active-provider=claude'"
         );
     }
 
@@ -1464,7 +1536,7 @@ mod tests {
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "CLAUDE_CONFIG_DIR='/home/u/.claude' 'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile' 'Work' '--active-provider' 'claude'"
+            "CLAUDE_CONFIG_DIR='/home/u/.claude' 'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile=Work' '--active-provider=claude'"
         );
     }
 
@@ -1486,7 +1558,7 @@ mod tests {
         .expect("non-empty command");
         assert_eq!(
             cmd,
-            "env -u CLAUDE_CONFIG_DIR CODEX_HOME='/home/u/.codex' 'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile' 'Home' '--active-provider' 'codex'"
+            "env -u CLAUDE_CONFIG_DIR CODEX_HOME='/home/u/.codex' 'ai-usage' '--statusline' '--logos' '--compact' '--input' '/tmp/c.json' '--active-profile=Home' '--active-provider=codex'"
         );
     }
 
@@ -1775,6 +1847,7 @@ mod tests {
             task_dir: &tmp.join("tasks"),
             marker_dir: &tmp.join("markers"),
             gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop --deadline-epoch 123",
+            start_file: None,
             usage_gate_cmd: None,
         });
         assert!(
@@ -1827,6 +1900,7 @@ mod tests {
             marker_dir: &markers,
             gate_claim_cmd,
             usage_gate_cmd: None,
+            start_file: None,
         });
         let script_path = tmp.path().join("worker.sh");
         std::fs::write(&script_path, &script).unwrap();
@@ -1902,6 +1976,7 @@ mod tests {
             task_dir: &tasks,
             marker_dir: &markers,
             gate_claim_cmd: "exit 20",
+            start_file: None,
             usage_gate_cmd: None,
         });
         let script_path = tmp.path().join("worker.sh");
@@ -1927,6 +2002,7 @@ mod tests {
                 task_dir: &tmp.join("tasks"),
                 marker_dir: &tmp.join("markers"),
                 gate_claim_cmd: "tb gate-claim --stop-file /tmp/burn/stop",
+                start_file: None,
                 usage_gate_cmd: gate,
             });
             assert_valid_bash(&script, "worker script");
@@ -2714,5 +2790,218 @@ mod tests {
             "{script}"
         );
         assert_valid_bash(&script, "non-claude task script");
+    }
+
+    /// tmux のペインをすべて作り終えるまで（開始ファイルが現れるまで）、ワーカーはタスクを
+    /// 取りに行かない。分割の途中で失敗したら、先に起動したワーカーも 1 件も claim しないまま
+    /// セッションごと閉じられる。開始ファイルのパスはクォートする。
+    #[test]
+    fn worker_waits_for_the_start_file_before_claiming() {
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: std::path::Path::new("/tmp/queue"),
+            task_dir: std::path::Path::new("/tmp/tasks"),
+            marker_dir: std::path::Path::new("/tmp/markers"),
+            usage_gate_cmd: None,
+            gate_claim_cmd: "tb gate-claim",
+            start_file: Some(std::path::Path::new("/tmp/run dir/start")),
+        });
+        let wait = script
+            .find("while [ ! -e '/tmp/run dir/start' ]")
+            .expect("開始ファイルを待つ");
+        let claim = script.find("CLAIMED=$(tb gate-claim)").unwrap();
+        assert!(wait < claim, "{script}");
+        assert!(
+            script.contains("echo '━━━ Start signal missing — stopping worker ━━━'\n  touch '/tmp/markers/worker-done-0'\n  exit 1\n"),
+            "{script}"
+        );
+        assert_valid_bash(&script, "worker script with start file");
+
+        let without = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: std::path::Path::new("/tmp/queue"),
+            task_dir: std::path::Path::new("/tmp/tasks"),
+            marker_dir: std::path::Path::new("/tmp/markers"),
+            usage_gate_cmd: None,
+            gate_claim_cmd: "tb gate-claim",
+            start_file: None,
+        });
+        assert!(!without.contains("START_WAIT"), "{without}");
+    }
+
+    /// 開始ファイルが既にあれば待たずに処理する（実際に bash で 1 周させる）。
+    #[cfg(unix)]
+    #[test]
+    fn worker_proceeds_once_the_start_file_exists() {
+        if !bash_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (queue, tasks, markers) = (
+            tmp.path().join("queue"),
+            tmp.path().join("tasks"),
+            tmp.path().join("markers"),
+        );
+        for dir in [&queue, &tasks, &markers] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(queue.join("pending-0001"), "").unwrap();
+        std::fs::write(
+            tasks.join("task-0001.sh"),
+            format!(
+                "touch {}\n",
+                shell_escape(&markers.join("done-1").to_string_lossy())
+            ),
+        )
+        .unwrap();
+        let start = tmp.path().join("start");
+        std::fs::write(&start, "").unwrap();
+        let claim = format!(
+            "if mv {q}/pending-0001 {q}/claimed-0001 2>/dev/null; then echo 0001; else exit 20; fi",
+            q = shell_escape(&queue.to_string_lossy())
+        );
+        let script = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &queue,
+            task_dir: &tasks,
+            marker_dir: &markers,
+            usage_gate_cmd: None,
+            gate_claim_cmd: &format!("sh -c {}", shell_escape(&claim)),
+            start_file: Some(&start),
+        });
+        let path = tmp.path().join("worker.sh");
+        std::fs::write(&path, script).unwrap();
+        let output = std::process::Command::new("bash")
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(markers.join("done-1").exists(), "{output:?}");
+        assert!(markers.join("worker-done-0").exists(), "{output:?}");
+    }
+
+    /// ワーカー 1 つ・タスク 1 つを bash で実際に動かし、残ったタスクのマーカー名と
+    /// `mark` が呼ばれた回数を返す。`agent_script` はエージェントの代わりに `sh -c` で動く。
+    /// ワーカーは独立したプロセスグループで起動する（エージェントがグループ全体へ送る
+    /// シグナルがテストランナーへ届かないようにする）。
+    #[cfg(unix)]
+    fn run_worker_with_agent(agent_script: &str) -> (Vec<String>, usize, std::process::Output) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (queue, tasks, markers, run, repo) = (
+            root.join("queue"),
+            root.join("tasks"),
+            root.join("markers"),
+            root.join("run"),
+            root.join("repo"),
+        );
+        for dir in [&queue, &tasks, &markers, &run, &repo] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let executable = |name: &str, body: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // mark は呼ばれたことを記録して成功する。gate-claim は 1 件だけ claim し、次は
+        // pending 無し（20）で終わる。
+        let mark_log = root.join("mark.log");
+        let exe = executable(
+            "token-burn",
+            &format!(
+                "echo \"$1\" >> {}",
+                shell_escape(&mark_log.to_string_lossy())
+            ),
+        );
+        let claim = executable(
+            "gate-claim",
+            &format!(
+                "if mv {q}/pending-0001 {q}/claimed-0001 2>/dev/null; then echo 0001; else exit 20; fi",
+                q = shell_escape(&queue.to_string_lossy())
+            ),
+        );
+        let prompt = root.join("prompt.txt");
+        std::fs::write(&prompt, "review").unwrap();
+        let agent = agent_for_test("agent", &["sh", "-c", agent_script]);
+        let task = target_for_test(&repo.to_string_lossy());
+        let mut ctx = task_ctx_for_test(1, &agent, &task, &run, OutputPipeline::Raw);
+        ctx.marker_dir = &markers;
+        ctx.exe_path = &exe;
+        ctx.prompt_file = &prompt;
+        std::fs::write(tasks.join("task-0001.sh"), build_task_script(&ctx)).unwrap();
+        std::fs::write(queue.join("pending-0001"), "").unwrap();
+        let worker = build_worker_script(&WorkerCtx {
+            worker_id: 0,
+            queue_dir: &queue,
+            task_dir: &tasks,
+            marker_dir: &markers,
+            usage_gate_cmd: None,
+            gate_claim_cmd: &shell_escape(&claim.to_string_lossy()),
+            start_file: None,
+        });
+        let worker_path = root.join("worker-0.sh");
+        std::fs::write(&worker_path, worker).unwrap();
+
+        let output = std::process::Command::new("/bin/bash")
+            .arg(&worker_path)
+            .stdin(std::process::Stdio::null())
+            .process_group(0)
+            .output()
+            .unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&markers)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with("worker-done-") && !name.starts_with("error-"))
+            .collect();
+        names.sort();
+        let marks = std::fs::read_to_string(&mark_log)
+            .map(|log| log.lines().filter(|line| *line == "mark").count())
+            .unwrap_or(0);
+        (names, marks, output)
+    }
+
+    /// ペインでの Ctrl-C（プロセスグループ全体への SIGINT）で止めたタスクは、失敗として残し、
+    /// state.json へ処理済みと記録しない。macOS の `/bin/bash`（3.2）では trap の中の
+    /// コマンドが `PIPESTATUS` を上書きするため、終了コードで分岐していた頃は
+    /// `CMD_EXIT` が 0 に化けて `mark` され、`done` と `failed` の両方のマーカーができていた。
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_task_is_failed_and_not_marked_processed() {
+        if !std::path::Path::new("/bin/bash").exists() {
+            return;
+        }
+        let (names, marks, output) = run_worker_with_agent("kill -INT 0; sleep 1; echo never");
+        assert_eq!(names, ["failed-1"], "{output:?}");
+        assert_eq!(
+            marks, 0,
+            "キャンセルしたタスクを処理済みにしない: {output:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Cancelled"), "{output:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("integer expression expected"),
+            "{output:?}"
+        );
+    }
+
+    /// ワーカーのシェルだけにシグナルが届いた場合（`kill -TERM <ワーカーの PID>`）も、
+    /// 1 タスクのマーカーは 1 つだけにする。trap がその場で `failed-N` を作っていた頃は、
+    /// 続く分岐が `done-N` も作り、モニターがマーカーを名前の接頭辞で数えるため 1 タスクを
+    /// 2 件と数え、早くセッションを閉じて走行中のタスクを巻き添えで終わらせていた。
+    #[cfg(unix)]
+    #[test]
+    fn signal_to_the_worker_shell_leaves_exactly_one_marker_for_the_task() {
+        if !std::path::Path::new("/bin/bash").exists() {
+            return;
+        }
+        let (names, marks, output) =
+            run_worker_with_agent("kill -TERM $PPID; sleep 0.2; echo finished");
+        assert_eq!(names, ["failed-1"], "{output:?}");
+        assert_eq!(marks, 0, "{output:?}");
+        assert!(output.status.success(), "{output:?}");
     }
 }

@@ -895,6 +895,7 @@ async fn run(opts: RunOptions) -> Result<()> {
         (targets.into_iter().take(limit).collect(), truncated)
     };
 
+    let resumes = planned_resumes(resumes, &targets);
     display::print_targets(&targets, &modified, &resumes);
 
     if truncated > 0 {
@@ -1203,10 +1204,31 @@ fn resumable_directories(resumes: &HashMap<PathBuf, resume::ResumeDecision>) -> 
         .collect()
 }
 
+/// 再開の判定を、実行する対象（limit と TUI の後のターゲット）の分だけに絞る。
+///
+/// 判定は再開できるターゲットを先頭へ寄せるため limit と TUI より前の全候補で行うが、外れた
+/// ターゲットの記録は計画に使わない（再開も破棄もしない）。絞らずに [`resume_options`] へ
+/// 渡すと、使わない記録のために `[prompts] resume` の `.md` を読み、読めないことを理由に
+/// 実行全体が止まる。
+fn planned_resumes(
+    resumes: HashMap<PathBuf, resume::ResumeDecision>,
+    targets: &[scanner::ResolvedTarget],
+) -> HashMap<PathBuf, resume::ResumeDecision> {
+    let planned: HashSet<&std::path::Path> = targets
+        .iter()
+        .map(|target| target.directory.as_path())
+        .collect();
+    resumes
+        .into_iter()
+        .filter(|(dir, _)| planned.contains(dir.as_path()))
+        .collect()
+}
+
 /// 実行計画へ渡す再開の設定を組み立てる。
 ///
 /// 継続プロンプトは再開するタスクがあるときだけ解決する。使わない実行で `[prompts] resume`
-/// の `.md` が読めないことを理由に止めない。再開しないと判定した記録は、そのターゲットで
+/// の `.md` が読めないことを理由に止めない（そのため `resumes` は [`planned_resumes`] で
+/// 実行する対象に絞ってから渡す）。再開しないと判定した記録は、そのターゲットで
 /// 新しいセッションを始めた時点で破棄させる（`ResumeOptions::discard`）。
 fn resume_options(
     config: &config::Config,
@@ -3171,6 +3193,51 @@ mod tests {
             !resume_options(&conf, &codex, HashMap::new())
                 .unwrap()
                 .save_interrupted
+        );
+    }
+
+    /// limit や TUI で外れたターゲットの記録のために継続プロンプトを読まない。判定は limit の
+    /// 前の全候補で行うので、絞らずに渡すと、読めない `.md` を理由に実行全体が止まっていた。
+    #[test]
+    fn resume_options_ignore_records_of_targets_left_out_of_the_plan() {
+        let mut conf = dedup_test_config(&[("claude", Some("claude"))], None);
+        conf.prompts.resume = Some("missing-resume-prompt.md".to_string());
+        let claude = config::RuntimeAgent {
+            name: "claude".to_string(),
+            command: vec!["claude".to_string()],
+            ..Default::default()
+        };
+        let store = store_with(&[("claude", "/tmp/left-out", "review")]);
+        let entry = store
+            .get("claude", std::path::Path::new("/tmp/left-out"))
+            .unwrap()
+            .clone();
+        let resumes = HashMap::from([
+            (
+                PathBuf::from("/tmp/left-out"),
+                resume::ResumeDecision::Resume(entry),
+            ),
+            (
+                PathBuf::from("/tmp/planned"),
+                resume::ResumeDecision::Skip {
+                    session_id: SESSION.to_string(),
+                    reason: resume::SkipReason::Disabled("--no-resume".to_string()),
+                },
+            ),
+        ]);
+        let targets = vec![target_at("planned", scanner::Visibility::Unknown, false)];
+
+        let planned = planned_resumes(resumes, &targets);
+        assert_eq!(
+            planned.keys().collect::<Vec<_>>(),
+            [&PathBuf::from("/tmp/planned")]
+        );
+        let options = resume_options(&conf, &claude, planned)
+            .expect("外れたターゲットの記録のためにプロンプトを読まない");
+        assert!(options.sessions.is_empty());
+        assert_eq!(
+            options.discard,
+            HashMap::from([(PathBuf::from("/tmp/planned"), SESSION.to_string())])
         );
     }
 

@@ -166,7 +166,13 @@ pub enum StartGate {
     Proceed,
     /// 再開するセッションを止めた 5 時間枠が回復していたので、保存した再開時刻（`until`、
     /// Unix epoch 秒）まで待たずに始める。`evidence` は回復を確かめた根拠（表示用）。
-    Recovered { until: i64, evidence: String },
+    /// `pause` は待たずに済んだ一時停止（保存した記録をまとめたもの）で、解除した状態として
+    /// pause file に残す（`write_start_pause`）。
+    Recovered {
+        until: i64,
+        evidence: String,
+        pause: PauseState,
+    },
     /// `pause` の再開時刻まで一時停止した状態で始める。`why` は表示用の理由。
     Hold { pause: PauseState, why: String },
     /// この実行ではタスクを 1 件も始めない。デッドラインと同じ周期の枠（週次など）が
@@ -187,7 +193,9 @@ impl StartGate {
     fn plan_line(&self, recovery_checked: bool) -> Option<(&'static str, String)> {
         match self {
             StartGate::Proceed => None,
-            StartGate::Recovered { until, evidence } => Some((
+            StartGate::Recovered {
+                until, evidence, ..
+            } => Some((
                 "Hold:",
                 format!(
                     "none — {SAVED_HOLD_REASON} (until {}), but the window has already recovered: {evidence}",
@@ -195,10 +203,15 @@ impl StartGate {
                 ),
             )),
             StartGate::Hold { pause, why } => {
-                let early = if recovery_checked {
-                    "; the monitor resumes them earlier if the window recovers (e.g. a manual reset)"
-                } else {
-                    ""
+                // モニターが早期解除を確かめられない一時停止（根拠の使用率が無い・低すぎる等）で
+                // 「早めに再開し得る」と添えると、実際には見積もりどおりに待つのに待ち切れず
+                // 打ち直させてしまう。判定はモニターと同じ `not_liftable` で行う。
+                let early = match (recovery_checked, crate::monitor::not_liftable(pause)) {
+                    (false, _) => String::new(),
+                    (true, None) => "; the monitor resumes them earlier if the window recovers (e.g. a manual reset)".to_string(),
+                    (true, Some(reason)) => {
+                        format!("; the monitor cannot resume them earlier ({reason})")
+                    }
                 };
                 Some((
                     "Hold:",
@@ -413,16 +426,13 @@ fn decide_start<'a>(
                     why: format!("{SAVED_HOLD_REASON} ({detail})"),
                 };
             }
-            match evidence {
-                Some(evidence) => StartGate::Recovered {
-                    until: pending
-                        .iter()
-                        .filter_map(|entry| entry.retry_after)
-                        .max()
-                        .map_or(now, |at| at.timestamp()),
+            match (evidence, saved_pause(&pending)) {
+                (Some(evidence), Some(pause)) => StartGate::Recovered {
+                    until: pause.resume_at,
                     evidence,
+                    pause,
                 },
-                None => StartGate::Proceed,
+                _ => StartGate::Proceed,
             }
         }
     }
@@ -965,9 +975,39 @@ fn prepare_run_tmp_dir(tmp_dir: &std::path::Path) -> Result<()> {
 /// 抜けた直後」として扱い、再開前の再確認（usage-gate）を経てから 1 件目を始める。書かずに
 /// 始めると、保留を決めた根拠（閾値超過・未回復）を確かめ直さないまま始めてしまう。
 fn write_start_pause(start: &StartGate, stop_file: &Path) -> Result<()> {
-    if let StartGate::Hold { pause, .. } = start {
-        rate_control::write_pause(&rate_control::pause_path_for(stop_file), pause)
-            .context("failed to write the pause file to start the run paused")?;
+    let path = rate_control::pause_path_for(stop_file);
+    match start {
+        StartGate::Hold { pause, .. } => {
+            rate_control::write_pause(&path, pause)
+                .context("failed to write the pause file to start the run paused")?;
+        }
+        StartGate::Recovered {
+            pause, evidence, ..
+        } => {
+            // 実行中のモニターの早期解除と同じく、解除した一時停止として残す。何も書かずに
+            // 始めると、直後に API がまた拒否しても再発（`relapse`）の印が付かず、ai-usage が
+            // 別のアカウントを見ている構成では、同じ誤った値での解除と拒否を 1 巡余分に
+            // 繰り返していた（再発ガードが働かない）。解除できなかったら一時停止のまま始まり、
+            // モニターが同じ根拠で確かめ直して解除する（待つ側に倒れるだけ）。
+            rate_control::write_pause(&path, pause)
+                .context("failed to record the recovered pause before starting")?;
+            let lifted = match rate_control::read_pause(&path)? {
+                Some(state) => rate_control::lift_pause(
+                    &path,
+                    state.revision,
+                    evidence,
+                    Duration::from_secs(2),
+                )?,
+                None => false,
+            };
+            if !lifted {
+                eprintln!(
+                    "{}: could not record the early resume; workers wait until the monitor confirms the recovery again",
+                    "warning".yellow()
+                );
+            }
+        }
+        StartGate::Proceed | StartGate::Stop { .. } => {}
     }
     Ok(())
 }
@@ -1031,6 +1071,9 @@ struct RunLayout {
     task_dir: PathBuf,
     /// 恒久停止のシグナル。一時停止のファイルはこの隣に置かれる。
     stop_file: PathBuf,
+    /// tmux のペインをすべて作り終えたことをワーカーに知らせるファイル。ワーカーはこれが
+    /// 現れるまでタスクを取りに行かない（`start_tmux_session`）。
+    start_file: PathBuf,
     /// ワーカーとモニターが呼び直す token-burn の実行ファイル。
     exe_path: PathBuf,
 }
@@ -1048,11 +1091,10 @@ pub fn execute_plan_tmux(
 
     // 実行開始時の判定で始めないと決めたら、tmux もファイルも作らずに戻る（実行中の
     // token-burn セッションも閉じない）。理由は実行計画の Stop: 行に出してある。
-    if let StartGate::Stop { .. } = plan.start {
-        println!(
-            "{}",
-            "Not started: the usage is already at or over the stop threshold.".red()
-        );
+    if let StartGate::Stop { reason } = &plan.start {
+        // 理由は閾値の超過とは限らない（使用率を確認できない等）。固定の文言にしていた頃は、
+        // ai-usage の取得に失敗したときも「閾値以上」と出て、直前の Stop: 行と食い違っていた。
+        println!("{}", format!("Not started: {reason}").red());
         return Ok(());
     }
 
@@ -1126,7 +1168,13 @@ pub fn execute_plan_tmux(
         &layout,
     )?;
 
-    start_tmux_session(&tmux, &monitor_command, &script_paths, &layout.tmp_dir)?;
+    start_tmux_session(
+        &tmux,
+        &monitor_command,
+        &script_paths,
+        &layout,
+        ratatui::crossterm::terminal::size().ok(),
+    )?;
     configure_tmux_window(&tmux);
 
     attach_tmux_session(&tmux, deadline_epoch)?;
@@ -1166,6 +1214,7 @@ fn prepare_run_layout(tmp_dir: PathBuf, report_dir: &Path, agent_name: &str) -> 
     let exe_path =
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("token-burn"));
     let stop_file = tmp_dir.join("stop");
+    let start_file = tmp_dir.join("start");
 
     Ok(RunLayout {
         tmp_dir,
@@ -1175,6 +1224,7 @@ fn prepare_run_layout(tmp_dir: PathBuf, report_dir: &Path, agent_name: &str) -> 
         queue_dir,
         task_dir,
         stop_file,
+        start_file,
         exe_path,
     })
 }
@@ -1254,10 +1304,11 @@ fn build_usage_gate_cmd(
     parts.extend([
         shell_escape(&exe_path.to_string_lossy()),
         "usage-gate".to_string(),
-        "--profile".to_string(),
-        shell_escape(&gate.profile),
-        "--provider".to_string(),
-        shell_escape(&gate.provider),
+        // 値は `--<名前>=<値>` の 1 引数で渡す。2 引数にすると、`-` で始まる profile 名を
+        // usage-gate 自身の clap が別のフラグと読んで終了コード 2 で失敗し、ワーカーが
+        // 「usage-gate failed closed」で止まる（`usage::live_command` と同じ理由）。
+        shell_escape(&format!("--profile={}", gate.profile)),
+        shell_escape(&format!("--provider={}", gate.provider)),
         "--threshold".to_string(),
         rate_limit_threshold.to_string(),
         "--stop-file".to_string(),
@@ -1366,6 +1417,7 @@ fn write_worker_scripts(
             marker_dir: &layout.marker_dir,
             usage_gate_cmd,
             gate_claim_cmd,
+            start_file: Some(&layout.start_file),
         });
         std::fs::write(&script_path, &worker_script)?;
         ensure_executable(&script_path)?;
@@ -1396,28 +1448,42 @@ fn build_monitor_cmd(exe_path: &Path, manifest_path: &Path) -> String {
     ))
 }
 
-/// モニター（左ペイン）付きの tmux セッションを作り、ワーカーのペインを右側に足す。
+/// モニター（左ペイン）付きの tmux セッションを作り、ワーカーのペインを右側に足してから、
+/// 開始ファイルを書いてワーカーを動かし始める。
 ///
-/// 失敗したら実行用の一時ディレクトリを消してからエラーを返す。セッションを作った後の
-/// 失敗では、先にそのセッションを kill する。
+/// ワーカーは開始ファイルが現れるまでタスクを取りに行かないので、ペインを作り切れなかった
+/// ときは 1 件も claim されないまま終わる。失敗したら実行用の一時ディレクトリを消してから
+/// エラーを返す。セッションを作った後の失敗では、先にそのセッションを kill する。
+///
+/// `size` は呼び出し元の端末の大きさ（列, 行）。detached の `new-session` は `-x` / `-y` が
+/// 無いと tmux の `default-size`（既定 80x24）で作られ、ペインの分割をその大きさで計算する。
 fn start_tmux_session(
     tmux: &TmuxSession,
     monitor_command: &str,
     script_paths: &[PathBuf],
-    tmp_dir: &Path,
+    layout: &RunLayout,
+    size: Option<(u16, u16)>,
 ) -> Result<()> {
-    if let Err(error) = create_tmux_session(tmux, monitor_command) {
-        let _ = std::fs::remove_dir_all(tmp_dir);
+    if let Err(error) = create_tmux_session(tmux, monitor_command, size) {
+        let _ = std::fs::remove_dir_all(&layout.tmp_dir);
         return Err(error);
     }
-    if let Err(error) = add_worker_panes(tmux, script_paths) {
+    let started = add_worker_panes(tmux, script_paths).and_then(|()| {
+        std::fs::write(&layout.start_file, "").with_context(|| {
+            format!(
+                "Failed to write the worker start file: {}",
+                layout.start_file.display()
+            )
+        })
+    });
+    if let Err(error) = started {
         // セッション作成後にペイン初期化が失敗した場合、モニターだけが残って
         // デッドラインまで動き続けないよう、自分で起動したセッションを回収する。
         let _ = tmux
             .command()
             .args(["kill-session", "-t", &tmux.target])
             .status();
-        let _ = std::fs::remove_dir_all(tmp_dir);
+        let _ = std::fs::remove_dir_all(&layout.tmp_dir);
         return Err(error);
     }
     Ok(())
@@ -1428,10 +1494,18 @@ fn start_tmux_session(
 /// `.status()?` は tmux の起動失敗しか捕まえない（tmux が non-zero 終了しても Ok）。
 /// ここで ExitStatus を検証しないと、セッション/ペイン生成に失敗してもワーカーが
 /// 起動しないままモニターだけが走り、進捗が進まずデッドラインまでハングする。
-fn create_tmux_session(tmux: &TmuxSession, monitor_command: &str) -> Result<()> {
-    let new_session_status = tmux
-        .command()
-        .args(["new-session", "-d", "-s", tmux.name, monitor_command])
+fn create_tmux_session(
+    tmux: &TmuxSession,
+    monitor_command: &str,
+    size: Option<(u16, u16)>,
+) -> Result<()> {
+    let mut command = tmux.command();
+    command.args(["new-session", "-d", "-s", tmux.name]);
+    if let Some((columns, rows)) = size.filter(|(columns, rows)| *columns > 0 && *rows > 0) {
+        command.args(["-x", &columns.to_string(), "-y", &rows.to_string()]);
+    }
+    let new_session_status = command
+        .arg(monitor_command)
         .status()
         .context("Failed to create tmux session")?;
     anyhow::ensure!(
@@ -1444,6 +1518,10 @@ fn create_tmux_session(tmux: &TmuxSession, monitor_command: &str) -> Result<()> 
 
 /// ワーカーのペインをモニターの右側に足す（最初のワーカーは水平分割、残りは右側を垂直分割）。
 /// 分割も `create_tmux_session` と同じ理由で終了ステータスまで確かめる。
+///
+/// 分割のたびに `main-vertical` で右側を均等に並べ直す。`.right` は右列の縦中央のペインを
+/// 指すので、並べ直さないと同じ位置のペインだけが半分に割られ続け、80x24 では 5 つ目の
+/// ワーカーの分割が `no space for a new pane` で失敗していた（右列は 6 / 2 / 2 / 11 行）。
 fn add_worker_panes(tmux: &TmuxSession, script_paths: &[PathBuf]) -> Result<()> {
     // ワーカーはタスクを消化し切ると自分で終了してペインを閉じる。ユーザーの tmux 設定が
     // remain-on-exit を on にしていると終了済みペインが "Pane is dead" のまま画面に残り、
@@ -1486,10 +1564,11 @@ fn add_worker_panes(tmux: &TmuxSession, script_paths: &[PathBuf]) -> Result<()> 
         "tmux split-window failed (exit {:?})",
         split_status.code()
     );
+    balance_worker_panes(tmux);
 
     // 残りのワーカーを右エリアに垂直分割で追加
-    for script in &script_paths[1..] {
-        // 右側の最後のペインに垂直分割で追加
+    for (offset, script) in script_paths[1..].iter().enumerate() {
+        // 右側の縦中央のペインを垂直分割して追加
         let split_status = tmux
             .command()
             .args([
@@ -1501,13 +1580,28 @@ fn add_worker_panes(tmux: &TmuxSession, script_paths: &[PathBuf]) -> Result<()> 
             ])
             .status()
             .context("Failed to split tmux window for worker")?;
+        // ペインの高さが足りなくなると tmux は `no space for a new pane` で失敗する。何番目の
+        // ワーカーで足りなくなったかと、どうすれば走らせられるかを添える。
         anyhow::ensure!(
             split_status.success(),
-            "tmux split-window failed (exit {:?})",
+            "tmux could not add the pane for worker {} of {} (exit {:?}); \
+             the terminal may be too small for this many workers (use --workers to run fewer)",
+            offset + 2,
+            script_paths.len(),
             split_status.code()
         );
+        balance_worker_panes(tmux);
     }
     Ok(())
+}
+
+/// モニターを左に残し、右側のワーカーのペインを均等な高さに並べ直す（`main-vertical`）。
+/// 並べ直せなくても次の分割が成功すれば実行には差し支えないので、結果は確かめない。
+fn balance_worker_panes(tmux: &TmuxSession) {
+    let _ = tmux
+        .command()
+        .args(["select-layout", "-t", &tmux.window, "main-vertical"])
+        .status();
 }
 
 /// ウィンドウの見た目と操作を整える（ペインの配置・モニターの幅・スクロールバック・マウス・
@@ -2589,11 +2683,61 @@ mod tests {
             95,
             now,
         );
-        let StartGate::Recovered { until, evidence } = &gate else {
+        let StartGate::Recovered {
+            until, evidence, ..
+        } = &gate
+        else {
             panic!("expected to start without waiting, got {gate:?}");
         };
         assert_eq!(*until, now + 5400);
         assert_eq!(evidence, "five_hour dropped from 100% to 0%");
+    }
+
+    /// 待たずに始めた（`Recovered`）ことは、実行中のモニターの早期解除と同じく「解除した
+    /// 一時停止」として pause file に残す。直後に API がまた拒否したら再発の印が付き、
+    /// 取得元の違う ai-usage の値では解除しない（再発ガード）。何も書かずに始めていた頃は、
+    /// 直後の拒否が新しい一時停止（再発でない）になり、同じ誤った値での解除と拒否を 1 巡
+    /// 余分に繰り返していた。
+    #[test]
+    fn recovered_start_records_a_lifted_pause_so_a_relapse_is_detected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stop_file = tmp.path().join("stop");
+        let pause_file = rate_control::pause_path_for(&stop_file);
+        let now = rate_control::now_epoch();
+        let session = rejected_session(now, 360, 5400, Some(100.0));
+        let gate = decide_start(
+            [&session],
+            &live_at(
+                vec![five_hour(0.0, None), weekly(30.0, Some(now + 3 * 86_400))],
+                now,
+            ),
+            now,
+            95,
+            now,
+        );
+        assert!(matches!(gate, StartGate::Recovered { .. }), "{gate:?}");
+
+        write_start_pause(&gate, &stop_file).unwrap();
+        let state = rate_control::read_pause(&pause_file)
+            .unwrap()
+            .expect("解除した状態で残す");
+        assert!(state.is_lifted(), "{state:?}");
+        assert!(!state.blocks(now), "ワーカーは待たずに claim する");
+        assert_eq!(
+            state.lift_reason.as_deref(),
+            Some("five_hour dropped from 100% to 0%")
+        );
+
+        // 解除の後（次の秒以降）に API が拒否したら、再発として書かれる。
+        let rejected = PauseState::new(now + 1800, "five_hour", "request rejected (five_hour)")
+            .observed(PauseSource::Api, PauseCause::Rejected, now + 1)
+            .with_basis(100.0, Some(now + 1770));
+        let outcome = rate_control::write_pause(&pause_file, &rejected).unwrap();
+        assert_eq!(
+            outcome,
+            rate_control::PauseWrite::Started { relapse: true },
+            "解除の直後の拒否は再発として扱う"
+        );
     }
 
     #[test]
@@ -2914,6 +3058,18 @@ mod tests {
         let (_, text) = hold.plan_line(false).unwrap();
         assert!(text.ends_with(" before starting"), "{text}");
 
+        // 根拠の使用率が無い・低すぎる記録は、モニターも早期解除を確かめられない。
+        // 「早めに再開し得る」と添えず、その理由を出す。
+        for basis in [None, Some(8.0)] {
+            let hold = saved_hold(&[&rejected_session(now, 60, 3600, basis)], None);
+            let (_, text) = hold.plan_line(true).unwrap();
+            assert!(!text.contains("resumes them earlier"), "{basis:?}: {text}");
+            assert!(
+                text.contains("; the monitor cannot resume them earlier ("),
+                "{basis:?}: {text}"
+            );
+        }
+
         let (label, text) = StartGate::Stop {
             reason: "weekly 96% >= threshold 95% (ai-usage)".to_string(),
         }
@@ -2928,6 +3084,7 @@ mod tests {
         let (label, text) = StartGate::Recovered {
             until: now + 3600,
             evidence: "five_hour dropped from 100% to 0%".to_string(),
+            pause: PauseState::new(now + 3600, "five_hour", "saved"),
         }
         .plan_line(true)
         .unwrap();
@@ -3289,7 +3446,7 @@ mod tests {
         assert_eq!(
             cmd,
             "env -u EMPTY_PROBE CLAUDE_CONFIG_DIR='/home/u/.claude home' \
-             '/opt/token burn/token-burn' usage-gate --profile 'Work' --provider 'claude' \
+             '/opt/token burn/token-burn' usage-gate '--profile=Work' '--provider=claude' \
              --threshold 90 --stop-file '/tmp/tb run/stop' -- 'ai-usage' '--json'"
         );
     }
@@ -3306,7 +3463,7 @@ mod tests {
                 Path::new("/tmp/stop"),
             )
         };
-        let rest = "'/bin/token-burn' usage-gate --profile 'Work' --provider 'claude' \
+        let rest = "'/bin/token-burn' usage-gate '--profile=Work' '--provider=claude' \
                     --threshold 95 --stop-file '/tmp/stop' -- 'ai-usage' '--json'";
         assert_eq!(cmd_with(&[]), rest);
         assert_eq!(cmd_with(&[("A", "1")]), format!("A='1' {rest}"));
@@ -3336,10 +3493,8 @@ mod tests {
                 "CLAUDE_CONFIG_DIR=/home/it's me/$HOME",
                 "/opt/token burn/token-burn",
                 "usage-gate",
-                "--profile",
-                "Work 'A'",
-                "--provider",
-                "claude",
+                "--profile=Work 'A'",
+                "--provider=claude",
                 "--threshold",
                 "90",
                 "--stop-file",
@@ -3445,11 +3600,11 @@ mod tests {
                 refresh: format!("{prefix} '--json'"),
                 statusline: format!(
                     "{prefix} '--statusline' '--logos' '--compact' '--input' \
-                     '/tmp/tb run/ai-usage-cache.json' '--active-profile' 'Work' \
-                     '--active-provider' 'claude'"
+                     '/tmp/tb run/ai-usage-cache.json' '--active-profile=Work' \
+                     '--active-provider=claude'"
                 ),
                 disk: format!("{prefix} '--disk' '--json'"),
-                live: format!("{prefix} '--json' '--refresh' '--profile' 'Work' '--only' 'claude'"),
+                live: format!("{prefix} '--json' '--refresh' '--profile=Work' '--only=claude'"),
                 profile: "Work".to_string(),
                 provider: "claude".to_string(),
                 cache_file: cache_file.to_path_buf(),
@@ -3598,20 +3753,33 @@ mod tests {
         assert_eq!(tmux.window, "=token-burn:");
     }
 
-    /// セッションを作ってからワーカーのペインを足す。remain-on-exit はペインを分割する前に
-    /// off にし、2 人目以降のワーカーは右側を垂直分割する。成功したら一時ディレクトリは残す。
+    /// セッションを端末の大きさで作り、ワーカーのペインを足すたびに右側を均等に並べ直す。
+    /// すべて作り終えてから開始ファイルを書き、ワーカーを動かし始める。
     #[test]
     fn start_tmux_session_creates_the_monitor_and_worker_panes_in_order() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let run = tmp.path().join("run dir");
-        std::fs::create_dir_all(&run).unwrap();
+        let layout = prepare_run_layout(
+            tmp.path().join("run dir"),
+            &tmp.path().join("reports"),
+            "claude",
+        )
+        .unwrap();
         let (tmux, log) = fake_tmux(tmp.path(), "");
-        let scripts: Vec<PathBuf> = (0..3).map(|w| run.join(format!("worker-{w}.sh"))).collect();
+        let scripts: Vec<PathBuf> = (0..3)
+            .map(|w| layout.tmp_dir.join(format!("worker-{w}.sh")))
+            .collect();
         let panes: Vec<String> = scripts.iter().map(|path| tmux_script_arg(path)).collect();
 
-        start_tmux_session(&tmux, "env -u NO_COLOR 'monitor'", &scripts, &run)
-            .expect("tmux が成功すれば成功するべき");
+        start_tmux_session(
+            &tmux,
+            "env -u NO_COLOR 'monitor'",
+            &scripts,
+            &layout,
+            Some((120, 40)),
+        )
+        .expect("tmux が成功すれば成功するべき");
 
+        let balance = vec!["select-layout", "-t", "=token-burn:", "main-vertical"];
         assert_eq!(
             tmux_calls(&log),
             [
@@ -3620,6 +3788,10 @@ mod tests {
                     "-d",
                     "-s",
                     "token-burn",
+                    "-x",
+                    "120",
+                    "-y",
+                    "40",
                     "env -u NO_COLOR 'monitor'"
                 ],
                 vec![
@@ -3637,6 +3809,7 @@ mod tests {
                     "=token-burn:",
                     panes[0].as_str()
                 ],
+                balance.clone(),
                 vec![
                     "split-window",
                     "-v",
@@ -3644,6 +3817,7 @@ mod tests {
                     "=token-burn:.right",
                     panes[1].as_str()
                 ],
+                balance.clone(),
                 vec![
                     "split-window",
                     "-v",
@@ -3651,9 +3825,14 @@ mod tests {
                     "=token-burn:.right",
                     panes[2].as_str()
                 ],
+                balance,
             ]
         );
-        assert!(run.is_dir());
+        assert!(layout.tmp_dir.is_dir());
+        assert!(
+            layout.start_file.exists(),
+            "作り終えたらワーカーを動かし始める"
+        );
     }
 
     /// セッションを作れなかったら回収するセッションが無いので kill せず、実行用の一時
@@ -3661,54 +3840,126 @@ mod tests {
     #[test]
     fn start_tmux_session_removes_only_the_tmp_dir_when_new_session_fails() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let run = tmp.path().join("run");
-        std::fs::create_dir_all(&run).unwrap();
+        let layout = run_layout(tmp.path());
         let (tmux, log) = fake_tmux(tmp.path(), r#"[ "$1" = new-session ] && exit 1"#);
 
-        let error = start_tmux_session(&tmux, "monitor", &[run.join("worker-0.sh")], &run)
-            .expect_err("new-session の失敗はエラーにするべき");
+        let error = start_tmux_session(
+            &tmux,
+            "monitor",
+            &[layout.tmp_dir.join("worker-0.sh")],
+            &layout,
+            None,
+        )
+        .expect_err("new-session の失敗はエラーにするべき");
 
         assert_eq!(error.to_string(), "tmux new-session failed (exit Some(1))");
         assert_eq!(tmux_subcommands(&log), ["new-session"]);
-        assert!(!run.exists(), "実行用の一時ディレクトリは消す");
+        assert!(!layout.tmp_dir.exists(), "実行用の一時ディレクトリは消す");
+    }
+
+    /// 端末の大きさが分からない（0 を含む）ときは `-x` / `-y` を付けず、tmux の既定に任せる。
+    #[test]
+    fn start_tmux_session_omits_the_size_when_it_is_unknown() {
+        for size in [None, Some((0, 40)), Some((120, 0))] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let layout = run_layout(tmp.path());
+            let (tmux, log) = fake_tmux(tmp.path(), "");
+            start_tmux_session(
+                &tmux,
+                "monitor",
+                &[layout.tmp_dir.join("worker-0.sh")],
+                &layout,
+                size,
+            )
+            .unwrap();
+            assert_eq!(
+                tmux_calls(&log)[0],
+                ["new-session", "-d", "-s", "token-burn", "monitor"],
+                "{size:?}"
+            );
+        }
     }
 
     /// セッションを作った後にペインを足せなかったら、モニターだけが残らないよう自分で作った
-    /// セッションを kill してから、実行用の一時ディレクトリを消す。
+    /// セッションを kill してから、実行用の一時ディレクトリを消す。開始ファイルは書かないので、
+    /// 先に作ったペインのワーカーは 1 件も claim しないまま終わる。
     #[test]
     fn start_tmux_session_kills_its_session_before_removing_the_tmp_dir_when_a_split_fails() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let run = tmp.path().join("run");
-        std::fs::create_dir_all(&run).unwrap();
+        let layout = run_layout(tmp.path());
         let seen = tmp.path().join("tmp-dir-at-kill");
         let (tmux, log) = fake_tmux(
             tmp.path(),
             &format!(
                 "[ \"$1\" = split-window ] && [ \"$(grep -c '^split-window$' \"$CALLS\")\" -ge 2 ] && exit 1\n\
-                 [ \"$1\" = kill-session ] && [ -d {run} ] && touch {seen}",
-                run = shell_escape(&run.to_string_lossy()),
+                 [ \"$1\" = kill-session ] && [ -d {run} ] && [ ! -e {start} ] && touch {seen}",
+                run = shell_escape(&layout.tmp_dir.to_string_lossy()),
+                start = shell_escape(&layout.start_file.to_string_lossy()),
                 seen = shell_escape(&seen.to_string_lossy()),
             ),
         );
-        let scripts: Vec<PathBuf> = (0..3).map(|w| run.join(format!("worker-{w}.sh"))).collect();
+        let scripts: Vec<PathBuf> = (0..3)
+            .map(|w| layout.tmp_dir.join(format!("worker-{w}.sh")))
+            .collect();
 
-        let error = start_tmux_session(&tmux, "monitor", &scripts, &run)
+        let error = start_tmux_session(&tmux, "monitor", &scripts, &layout, None)
             .expect_err("split-window の失敗はエラーにするべき");
 
-        assert_eq!(error.to_string(), "tmux split-window failed (exit Some(1))");
+        assert_eq!(
+            error.to_string(),
+            "tmux could not add the pane for worker 2 of 3 (exit Some(1)); \
+             the terminal may be too small for this many workers (use --workers to run fewer)"
+        );
         assert_eq!(
             tmux_subcommands(&log),
             [
                 "new-session",
                 "set-option",
                 "split-window",
+                "select-layout",
                 "split-window",
                 "kill-session"
             ]
         );
-        assert_eq!(tmux_calls(&log)[4], ["kill-session", "-t", "=token-burn"]);
-        assert!(seen.exists(), "kill した時点では一時ディレクトリはまだある");
-        assert!(!run.exists(), "kill の後で一時ディレクトリを消す");
+        assert_eq!(tmux_calls(&log)[5], ["kill-session", "-t", "=token-burn"]);
+        assert!(
+            seen.exists(),
+            "kill した時点では一時ディレクトリがあり、開始ファイルはまだ無い"
+        );
+        assert!(
+            !layout.tmp_dir.exists(),
+            "kill の後で一時ディレクトリを消す"
+        );
+    }
+
+    /// 開始ファイルを書けなければ、ワーカーは動き出せない。セッションを kill して止める。
+    #[test]
+    fn start_tmux_session_kills_its_session_when_the_start_file_cannot_be_written() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut layout = run_layout(tmp.path());
+        layout.start_file = tmp.path().join("missing-dir").join("start");
+        let (tmux, log) = fake_tmux(tmp.path(), "");
+
+        let error = start_tmux_session(
+            &tmux,
+            "monitor",
+            &[layout.tmp_dir.join("worker-0.sh")],
+            &layout,
+            None,
+        )
+        .expect_err("開始ファイルを書けなければエラーにするべき");
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("Failed to write the worker start file"),
+            "{error:#}"
+        );
+        assert_eq!(
+            tmux_subcommands(&log).last().map(String::as_str),
+            Some("kill-session")
+        );
+        assert!(!layout.tmp_dir.exists());
     }
 
     /// remain-on-exit を off にできなくてもペインの分割へ進む（ペインが残り得るだけで、実行は
@@ -3716,18 +3967,24 @@ mod tests {
     #[test]
     fn start_tmux_session_continues_when_remain_on_exit_cannot_be_disabled() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let run = tmp.path().join("run");
-        std::fs::create_dir_all(&run).unwrap();
+        let layout = run_layout(tmp.path());
         let (tmux, log) = fake_tmux(tmp.path(), r#"[ "$1" = set-option ] && exit 1"#);
 
-        start_tmux_session(&tmux, "monitor", &[run.join("worker-0.sh")], &run)
-            .expect("remain-on-exit の失敗では止めないべき");
+        start_tmux_session(
+            &tmux,
+            "monitor",
+            &[layout.tmp_dir.join("worker-0.sh")],
+            &layout,
+            None,
+        )
+        .expect("remain-on-exit の失敗では止めないべき");
 
         assert_eq!(
             tmux_subcommands(&log),
-            ["new-session", "set-option", "split-window"]
+            ["new-session", "set-option", "split-window", "select-layout"]
         );
-        assert!(run.is_dir());
+        assert!(layout.tmp_dir.is_dir());
+        assert!(layout.start_file.exists());
     }
 
     /// ウィンドウの設定は、tmux が失敗しても残りの設定を続ける（結果は確かめない）。

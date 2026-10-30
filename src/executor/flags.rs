@@ -144,7 +144,12 @@ fn ensure_claude_required_flags(agent: &mut RuntimeAgent) {
 /// `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）は
 /// その意図を尊重し、何も付与しない。
 fn ensure_codex_unattended_flags(command: &mut Vec<String>) {
-    let executable = env_command_index(command);
+    // `env -S '<codex ...>'` は実行ファイルとその引数を 1 つの文字列に収めるので、承認方針を
+    // 挿せる独立した位置が無い。env の直後へ挿すと `env -c approval_policy=never -S ...` になり、
+    // env がオプションの誤りで起動に失敗する。この形では承認方針を文字列の中に自分で書く。
+    let Some(executable) = env_command_index(command) else {
+        return;
+    };
     if has_codex_approval_override(&command[executable..]) {
         return;
     }
@@ -155,9 +160,12 @@ fn ensure_codex_unattended_flags(command: &mut Vec<String>) {
 }
 
 /// env の前置きがある場合、実行ファイルが独立した引数になっている位置を返す。
-fn env_command_index(command: &[String]) -> usize {
+///
+/// `-S` / `--split-string` は実行ファイルを含む引数列を 1 つの文字列に収めるので、独立した
+/// 位置が無い（`None`）。
+fn env_command_index(command: &[String]) -> Option<usize> {
     if command_basename(command) != "env" {
-        return 0;
+        return Some(0);
     }
     let mut idx = 1;
     let mut options = true;
@@ -168,8 +176,7 @@ fn env_command_index(command: &[String]) -> usize {
         } else if options && matches!(arg.as_str(), "-u" | "--unset" | "-C" | "--chdir" | "-P") {
             idx += 2;
         } else if options && (arg.starts_with("-S") || arg.starts_with("--split-string")) {
-            // split-string 内の実行ファイルは独立した引数ではない。既存の扱いを維持する。
-            return 0;
+            return None;
         } else if options && arg.starts_with('-') {
             idx += 1;
         } else if arg.split_once('=').is_some_and(|(key, _)| {
@@ -181,10 +188,10 @@ fn env_command_index(command: &[String]) -> usize {
             options = false;
             idx += 1;
         } else {
-            return idx;
+            return Some(idx);
         }
     }
-    0
+    Some(0)
 }
 
 /// ユーザーが codex の承認方針を明示済みかを判定する。
@@ -293,7 +300,7 @@ fn ensure_codex_output_flags(command: &mut Vec<String>, mode: CodexOutput) -> Ou
 /// 飛ばす。`--` 以降は位置引数なのでサブコマンドではない（clap も `--` の後ろをサブコマンドと
 /// して解釈しない）。単独の `-` は clap と同じく位置引数として扱う。
 fn codex_exec_index(command: &[String]) -> Option<usize> {
-    let mut idx = env_command_index(command) + 1;
+    let mut idx = env_command_index(command)? + 1;
     while let Some(arg) = command.get(idx) {
         if arg == "--" {
             return None;
@@ -1002,6 +1009,29 @@ mod tests {
             ensure_codex_unattended_flags(&mut command);
             assert_eq!(command, once);
         }
+    }
+
+    /// `env -S '<codex ...>'` は実行ファイルとその引数を 1 つの文字列に収めるので、承認方針を
+    /// 挿せる独立した位置が無い。env の直後へ挿すと `env -c approval_policy=never -S ...` になり、
+    /// env がオプションの誤りで起動に失敗する（macOS: `env: illegal option -- c`）。
+    #[test]
+    fn codex_flags_leave_env_split_string_commands_untouched() {
+        for prefix in [
+            vec!["env", "-S"],
+            vec!["env", "-S", "--"],
+            vec!["/usr/bin/env", "--split-string"],
+            vec!["env", "-i", "-S"],
+        ] {
+            let mut command: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+            command.push("codex exec --sandbox read-only".to_string());
+            let original = command.clone();
+            ensure_codex_unattended_flags(&mut command);
+            assert_eq!(command, original, "{prefix:?}");
+        }
+        let mut joined = ["env", "-Scodex exec", "x"].map(String::from).to_vec();
+        let original = joined.clone();
+        ensure_codex_unattended_flags(&mut joined);
+        assert_eq!(joined, original);
     }
 
     #[test]

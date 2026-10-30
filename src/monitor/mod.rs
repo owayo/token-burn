@@ -21,6 +21,9 @@ pub mod manifest;
 mod process;
 mod recovery;
 mod system;
+
+// 実行計画の表示（executor）も、モニターが一時停止を早期解除できるかを同じ条件で判定する。
+pub(crate) use recovery::not_liftable;
 mod ui;
 mod usage;
 

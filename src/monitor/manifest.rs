@@ -50,7 +50,7 @@ pub struct AiUsageCommands {
     /// `ai-usage --disk --json`。ディスク容量は使用量のキャッシュに混ぜず、別に取る。
     pub disk: String,
     /// 実行中のアカウントだけを ai-usage の共有キャッシュを通さずに取り直すコマンド
-    /// （`--refresh --profile <profile> --only <provider>` 付き）。一時停止中に、手動リセット等で
+    /// （`--refresh --profile=<profile> --only=<provider>` 付き）。一時停止中に、手動リセット等で
     /// 枠が戻ったかを確かめるのに使う。出力は 1 アカウント分なので、全アカウント分の
     /// キャッシュ（`cache_file`）を置き換えない。
     pub live: String,
@@ -102,7 +102,7 @@ mod tests {
                 refresh: "'ai-usage' '--json'".into(),
                 statusline: "'ai-usage' '--statusline'".into(),
                 disk: "'ai-usage' '--disk' '--json'".into(),
-                live: "'ai-usage' '--json' '--refresh' '--profile' 'Work' '--only' 'claude'".into(),
+                live: "'ai-usage' '--json' '--refresh' '--profile=Work' '--only=claude'".into(),
                 profile: "Work".into(),
                 provider: "claude".into(),
                 cache_file: tmp.path().join("cache.json"),
