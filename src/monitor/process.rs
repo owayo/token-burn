@@ -274,6 +274,41 @@ mod tests {
         }
     }
 
+    /// 出力が止まらない壊れたコマンドも、期限で打ち切ってグループごと止める（登録表からも外れる）。
+    /// 読み取りは `MAX_OUTPUT` で止まり、その後はパイプが詰まって子が終わらないので、出力を
+    /// 読み切るのを待つ形だと期限まで戻らないうえにメモリを使い切る。
+    #[tokio::test]
+    async fn a_command_that_floods_stdout_is_cut_off_at_the_deadline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pid_file = tmp.path().join("flood.pid");
+        let command = format!(
+            "echo $$ > '{}'; while :; do printf '%01024d' 0; done",
+            pid_file.to_string_lossy()
+        );
+        let start = Instant::now();
+        let result = Runner::default()
+            .run(&command, Duration::from_millis(500))
+            .await;
+        assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
+        assert!(start.elapsed() < Duration::from_secs(8));
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!RUNNING.lock().unwrap().contains(&pid));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: シグナル 0 は存在確認だけで、プロセスに影響しない。
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(Instant::now() < deadline, "flooding command {pid} survived");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     #[tokio::test]
     async fn running_groups_are_recorded_until_reaped_and_can_be_stopped_at_exit() {
         // 登録表はテスト全体で共有されるので、自分のグループだけを止めて確かめる
