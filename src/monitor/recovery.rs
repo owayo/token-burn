@@ -420,6 +420,18 @@ mod tests {
         read_pause(pause_file).unwrap().unwrap()
     }
 
+    /// 取得の最中に pause file へ書かれる内容を、別のファイル（`staged`）に前もって作る。
+    /// 取得のコマンドがこれを `cp` で pause file へ置き換える。
+    ///
+    /// 本番では新しい観測は同じ pause file へ書かれ、世代は「直前の世代 + 1」以上に進む。
+    /// それと同じになるよう、いまの pause file を写してから書く。空のファイルへ書くと、
+    /// 世代は現在時刻（ミリ秒）だけで決まる。fsync の速い環境（Linux の CI）では 2 回の
+    /// 書き込みが同じミリ秒に収まり、元の世代と同じ値になっていた。
+    fn staged_rewrite(pause_file: &Path, staged: &Path, state: &PauseState) -> PauseState {
+        std::fs::copy(pause_file, staged).unwrap();
+        paused(staged, state)
+    }
+
     fn setup() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let tmp = tempfile::TempDir::new().unwrap();
         let stop = tmp.path().join("stop");
@@ -614,7 +626,8 @@ mod tests {
         let before = paused(&pause_file, &api_pause(100.0));
         let newer = tmp.path().join("newer-pause.json");
         let now = rate_control::now_epoch();
-        paused(
+        staged_rewrite(
+            &pause_file,
             &newer,
             &PauseState::new(now + 3600, "five_hour", "rejected again")
                 .observed(PauseSource::Api, PauseCause::Rejected, now)
@@ -634,7 +647,8 @@ mod tests {
         };
         assert_eq!(check.detail, "the usage may predate the pause");
         let state = read_pause(&pause_file).unwrap().unwrap();
-        assert_ne!(state.revision, before.revision);
+        assert!(state.revision > before.revision);
+        assert!(state.observed_at > before.observed_at);
         assert!(!state.is_lifted());
         assert!(state.blocks(rate_control::now_epoch()));
     }
@@ -647,8 +661,9 @@ mod tests {
         let state = api_pause(100.0);
         let before = paused(&pause_file, &state);
         let rewritten = tmp.path().join("rewritten-pause.json");
-        let after = paused(&rewritten, &state);
-        assert_ne!(after.revision, before.revision);
+        let after = staged_rewrite(&pause_file, &rewritten, &state);
+        assert!(after.revision > before.revision);
+        assert_eq!(after.observed_at, before.observed_at);
         let command = format!(
             "cp {} {}; {}",
             quote_path(&rewritten),
