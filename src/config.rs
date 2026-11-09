@@ -284,8 +284,19 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
-        let mut config: Config = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+        Self::parse(&content, path)
+    }
+
+    /// Parse and validate an unsaved configuration with the same rules as `load`.
+    pub fn parse(content: &str, path: &Path) -> Result<Self> {
+        let mut config: Config = toml::from_str(content).map_err(|error: toml::de::Error| {
+            // The error's Display includes source lines, which can contain credentials.
+            anyhow::anyhow!(
+                "Failed to parse config: {}: {}",
+                path.display(),
+                error.message()
+            )
+        })?;
         config.config_dir = path
             .canonicalize()
             .unwrap_or_else(|_| path.to_path_buf())

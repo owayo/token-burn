@@ -2,7 +2,40 @@
 
 Default config location: `~/.config/token-burn/config.toml`
 
-Run `token-burn init` to generate a config template. The [README](../README.md#configuration) shows a minimal config; this page describes every section.
+Run `token-burn config` to open the settings editor, or `token-burn init` to generate templates for editing TOML directly. The [README](../README.md#configuration) shows a minimal config; this page describes every section.
+
+## Settings TUI
+
+```bash
+token-burn config
+token-burn --config ./config.toml config
+```
+
+Edit execution settings, agents, scan sources, explicit targets, ai-usage integration, profiles, and prompts by category. Unlike the temporary settings in `run -i`, this editor saves to the configuration file. The interface uses Japanese labels and explanations.
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `Left` `Right` | Switch between categories and fields |
+| `Up` `Down` / `j` `k` | Move |
+| `Enter` / `Space` | Edit a field or toggle a boolean |
+| `a` | Add an entry; agents offer Claude, Codex, and custom presets |
+| `d` | Delete the current agent, scan source, target, or profile (`y` confirms) |
+| `x` | Show or hide advanced fields |
+| `Delete` / `Backspace` | Clear an optional field |
+| `u` | Undo the last change (up to 64 operations) |
+| `s` / `F2` | Validate and review changes; `Enter` saves and exits |
+| `Esc` | Cancel an input or selection, or return to categories |
+| `q` / `Ctrl-C` | Quit, prompting to save or discard unsaved changes |
+
+Weekdays and policy values use selection lists. Register profiles first, then select them in each agent's profile picker with `Space` and apply with `Enter`. Renaming a profile updates its references; remove those references before deleting a profile.
+
+For commands, enter the executable on the first line and one argument per subsequent line. Arguments containing spaces stay on one line. Represent empty arguments, arguments containing newlines, or arguments starting with a double quote as JSON strings. Environment variables use one `KEY = "value"` per line. Prompts accept inline text or a `.md` path. In these multiline inputs, `Enter` inserts a newline and `Ctrl-S` applies the edit.
+
+Files change only when you confirm saving. A new configuration starts with one agent, one scan source, and an inline prompt. Change the placeholder reset schedule (Monday at 09:00 UTC) and scan directory (`~/GitHub`) to match your setup. Existing prompt files are referenced without editing their contents.
+
+Saving uses the same validation as normal configuration loading, backs up the existing file as `config.toml.bak.<random suffix>`, and replaces it atomically. Unedited settings, comments, unknown keys, and existing line endings are preserved. Symlinks are followed when saving. Changes made by another editor cause a conflict instead of being overwritten. The review masks environment values and authentication options in commands; environment values remain visible in their editing dialog.
+
+Both stdin and stdout must be terminals. Opening the editor does not start agents, invoke ai-usage, or scan repositories. Repair TOML syntax errors in a text editor before opening the TUI.
 
 ## Settings
 

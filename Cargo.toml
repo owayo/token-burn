@@ -26,8 +26,7 @@ anyhow = "1.0.104"
 fs2 = "0.4.3"
 ratatui = "0.30.2"
 unicode-width = "0.2.2"
-
-[dev-dependencies]
+toml_edit = "0.25.19"
 tempfile = "3.27.0"
 
 [profile.release]

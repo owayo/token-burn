@@ -10,9 +10,12 @@ Every command and option of `token-burn`. The [README](../README.md#usage) shows
 | `list` | List target directories in processing order (ignores `--limit`, does not execute) |
 | `status` | Show agent reset status |
 | `init` | Initialize config file and prompt templates |
+| `config` | Create, edit, and save configuration in a TUI (requires a TTY) |
 | `clean` | Clean up old report directories |
 
 `init` also accepts `--force` (`-f`) to overwrite existing files without confirmation.
+
+`config` edits the file selected by `--config <PATH>`, creating one if needed. It validates the draft and shows changes before saving. See [Settings TUI](configuration.md#settings-tui) for controls.
 
 `clean` accepts `--older-than` to override the configured `cleanup_after` duration (e.g., `--older-than 3d`). A directory that cannot be removed is reported with its path and the rest are still removed; `clean` then exits with a non-zero status.
 

@@ -1,6 +1,7 @@
 mod classify;
 mod cleanup;
 mod config;
+mod config_editor;
 mod display;
 mod executor;
 mod format_codex;
@@ -146,6 +147,8 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+    /// TUI で設定ファイルを編集・保存する
+    Config,
     /// 古いレポートディレクトリを削除する
     Clean {
         /// この期間より古いレポートを削除する（config の cleanup_after より優先）
@@ -395,6 +398,11 @@ async fn main() -> Result<()> {
         return init::run_init(&config_path, force);
     }
 
+    if let Commands::Config = command {
+        let config_path = cli.config.unwrap_or_else(config::default_config_path);
+        return config_editor::run(&config_path);
+    }
+
     if let Commands::FormatStream {
         raw_output,
         stop_file,
@@ -549,6 +557,7 @@ async fn main() -> Result<()> {
         }
         Commands::Mark { .. } => unreachable!(),
         Commands::Init { .. } => unreachable!(),
+        Commands::Config => unreachable!(),
         Commands::FormatStream { .. } => unreachable!(),
         Commands::FormatCodex { .. } => unreachable!(),
         Commands::ClassifyResult { .. } => unreachable!(),

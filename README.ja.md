@@ -41,6 +41,7 @@ Claude Code / Codex CLI のトークンは週次でリセットされますが�
 - **リポジトリの自動探索**: 複数の `[[scan]]` 設定でディレクトリを走査して Git リポジトリを集め、remote のオーナーがユーザー名と一致するものに絞ります。同じディレクトリは 1 回だけ処理します
 - **処理順**: 公開リポジトリを非公開リポジトリより前に置き、各グループの中は最終変更が古い順に並べます。最近処理したターゲットは `skip_within` の期間スキップします
 - **対象選択 TUI**: `-i` / `--interactive` で対象と実行順を選び、`Tab` でワーカー数・停止閾値・ドライランも変更できます
+- **設定 TUI**: `token-burn config` でエージェント、探索先、プロンプト、ai-usage 連携を編集・保存できます。項目の説明と選択肢を表示し、保存前に検証します
 - **Claude Code・Codex CLI・任意のエージェント**: 無人実行に要るフラグを自動で付けます。Claude Code には stream-json 出力と `AskUserQuestion` の禁止、Codex CLI には `approval_policy=never` と `--json` です
 - **ai-usage による実際のリセット時刻**: 各アカウントのリセット時刻と使用率を `ai-usage --json` から読めます (任意)。読めないときは曜日固定のスケジュールに戻ります
 - **複数アカウント**: 1 つのエージェントをアカウントごと (`claude-work` / `claude-home`) に展開し、環境変数と処理済み履歴を分けて持ちます。`dedup_scope` を使うと、別のアカウントが止まった所から続けられます
@@ -100,18 +101,20 @@ make install
 
 ## クイックスタート
 
-設定ファイルと既定のプロンプトを作ります (`~/.config/token-burn/config.toml` と、その隣の `prompts/`)。
+設定画面を開きます。設定ファイルが無ければ新規作成、あれば既存の設定を編集します。
 
 ```bash
-token-burn init
+token-burn config
 ```
 
-`config.toml` を開き、`[[scan]]` の `base_dirs` と `username`、`[[agents]]` の各エージェントの `command` とリセットの予定を書き換えます。初めて実行する前に、リセット時刻と実行計画を確かめます。
+エージェントのコマンドとリセット日時、探索先を設定し、`s` で変更を確認して保存します。新規作成時のリセット日時は仮の月曜 09:00 UTC なので、実際の予定に変更してください。初めて実行する前に、リセット時刻と実行計画を確かめます。
 
 ```bash
 token-burn status
 token-burn run -n
 ```
+
+TOML を直接編集する場合は、`token-burn init` で設定とプロンプトファイルの雛形を生成できます。設定画面の操作は [設定 TUI](docs/configuration.ja.md#設定-tui) を参照してください。
 
 ## 使い方
 

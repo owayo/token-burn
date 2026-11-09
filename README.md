@@ -41,6 +41,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Repository discovery**: Scans directories for git repositories from several `[[scan]]` sources, keeps those whose remote owner matches your username, and processes each directory once
 - **Processing order**: Puts public repositories ahead of private ones, orders each group least-recently-modified first, and skips targets processed recently (`skip_within`)
 - **Interactive target picker**: `-i` / `--interactive` opens a TUI to choose targets and their order; press `Tab` to change workers, the stop threshold, and dry-run mode
+- **Settings TUI**: `token-burn config` edits and saves agents, scan sources, prompts, and ai-usage integration, with field explanations, selection lists, and validation before saving
 - **Claude Code, Codex CLI and custom agents**: Adds the flags an unattended run needs, such as stream-json output and a disallowed `AskUserQuestion` for Claude Code and `approval_policy=never` and `--json` for Codex CLI
 - **Real reset times from ai-usage**: Optionally reads each account's reset time and utilization from `ai-usage --json`, falling back to the fixed weekly schedule
 - **Multiple accounts**: Expands one agent across accounts (`claude-work` / `claude-home`), each with its own environment and history, and `dedup_scope` lets one account continue where another stopped
@@ -100,18 +101,20 @@ make install
 
 ## Quickstart
 
-Create the config file and the default prompts (`~/.config/token-burn/config.toml` and `prompts/` next to it):
+Open the settings editor. It creates a new configuration if none exists, or edits the existing file:
 
 ```bash
-token-burn init
+token-burn config
 ```
 
-Edit `config.toml`: set `base_dirs` and `username` in `[[scan]]`, and the `command` and reset schedule of each agent in `[[agents]]`. Then check the reset times and preview the plan before the first run:
+Set the agent commands, reset schedules, and scan directories, then press `s` to review and save. The starter schedule is a placeholder (Monday at 09:00 UTC); change it to your actual reset schedule. Check the reset times and preview the plan before the first run:
 
 ```bash
 token-burn status
 token-burn run -n
 ```
+
+To edit TOML directly, use `token-burn init` to generate configuration and prompt templates. See [Settings TUI](docs/configuration.md#settings-tui) for editor controls.
 
 ## Usage
 
