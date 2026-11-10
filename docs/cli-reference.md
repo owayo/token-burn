@@ -10,6 +10,7 @@ Every command and option of `token-burn`. The [README](../README.md#usage) shows
 | `list` | List target directories in processing order (ignores `--limit`, does not execute) |
 | `status` | Show agent reset status |
 | `init` | Initialize config file and prompt templates |
+| `attach [SESSION]` | Reattach to the latest run or a specified session |
 | `config` | Create, edit, and save configuration in a TUI (requires a TTY) |
 | `clean` | Clean up old report directories |
 

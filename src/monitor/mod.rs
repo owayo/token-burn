@@ -1,4 +1,4 @@
-//! tmux のモニターペイン（隠しサブコマンド `token-burn monitor`）。
+//! バックグラウンド実行プロセス内のモニター。画面を閉じても判定と計測を続ける。
 //!
 //! 実行全体の進捗・停止・一時停止を見張り、ai-usage の使用量、マシン負荷のグラフ、
 //! ディスクの空き容量を描く。以前は Rust が生成する bash スクリプトだったが、負荷のグラフには
@@ -12,13 +12,13 @@
 //!   早期解除する（別タスク。ai-usage 連携があるときだけ）
 //! - [`ui`] は描画（描画に失敗しても判定と終了処理は続ける）
 
-mod ansi;
+pub(crate) mod ansi;
 mod controller;
 mod disk;
 mod history;
 mod load;
 pub mod manifest;
-mod process;
+pub(crate) mod process;
 mod recovery;
 mod system;
 
@@ -27,13 +27,10 @@ pub(crate) use recovery::not_liftable;
 mod ui;
 mod usage;
 
-use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -49,12 +46,6 @@ pub use ui::summary_text;
 pub enum Event {
     Usage(Vec<Line<'static>>),
     Disk(disk::Update),
-    /// Ctrl-C（raw mode ではキー入力として届く）。
-    Interrupt,
-    /// ペインの大きさが変わった。
-    Redraw,
-    /// 端末からの入力を読めなくなった。raw mode のままだと Ctrl-C が届かないので解除する。
-    InputClosed,
     /// stop file の書き込みが終わった（失敗なら理由）。
     StopWritten(Result<(), String>),
     /// 一時停止中の回復の確認の結果（早期解除を含む）。
@@ -65,46 +56,15 @@ pub enum Event {
 /// 通常は待たない。握ったプロセスが止まっていても、これを過ぎたらロック無しで書く。
 const STOP_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub async fn run(manifest_path: &Path) -> Result<()> {
+/// Monitor control stays in the detached runner even when no UI is attached.
+pub async fn run(
+    manifest_path: &Path,
+    mut interrupts: mpsc::UnboundedReceiver<()>,
+) -> Result<bool> {
     let manifest = Manifest::read(manifest_path)?;
-    // ペインの枠のタイトル（pane-border-format が #{pane_title} を出す）。
-    print!("\x1b]2;token-burn\x1b\\");
-    let _ = std::io::stdout().flush();
-    let terminal = match ratatui::try_init() {
-        Ok(terminal) => Some(terminal),
-        Err(error) => {
-            // raw mode に入った後の段階（代替画面・端末サイズの取得）で失敗すると、raw mode の
-            // まま残り、Ctrl-C が SIGINT にならない。描かずに続けるので、端末を元に戻す。
-            ratatui::restore();
-            // 描けなくても、デッドラインでの停止と全タスク完了時の終了は続ける。
-            eprintln!("token-burn monitor: cannot draw the monitor: {error}");
-            None
-        }
-    };
-    let result = event_loop(terminal, &manifest).await;
-    ratatui::restore();
-    result
-}
-
-struct Screen {
-    terminal: Option<DefaultTerminal>,
-}
-
-impl Screen {
-    fn draw(&mut self, view: &ui::View) {
-        let Some(terminal) = self.terminal.as_mut() else {
-            return;
-        };
-        if terminal.draw(|frame| ui::draw(frame, view)).is_err() {
-            // 端末に書けなくなったら描画だけをやめる（停止判定と終了処理は続ける）。
-            self.terminal = None;
-        }
-    }
-}
-
-async fn event_loop(terminal: Option<DefaultTerminal>, manifest: &Manifest) -> Result<()> {
+    let manifest = &manifest;
     let pause_file = rate_control::pause_path_for(&manifest.stop_file);
-    let mut screen = Screen { terminal };
+    let directory = manifest_path.parent().unwrap_or(Path::new("."));
     let mut controller = Controller::new(
         manifest.total,
         manifest.worker_count,
@@ -137,12 +97,6 @@ async fn event_loop(terminal: Option<DefaultTerminal>, manifest: &Manifest) -> R
             .map(|commands| commands.disk.clone()),
         events_tx.clone(),
     ));
-    if screen.terminal.is_some() && !spawn_input_reader(events_tx.clone()) {
-        // 入力を読めないまま raw mode にいると Ctrl-C を受け取れない。描くのをやめて端末を戻す
-        // （戻せば Ctrl-C は SIGINT として届く）。
-        screen.terminal = None;
-        ratatui::restore();
-    }
     let mut sigint = signal(SignalKind::interrupt()).context("failed to watch SIGINT")?;
     let mut sigterm = signal(SignalKind::terminate()).context("failed to watch SIGTERM")?;
     // tmux がセッションを閉じたとき（外から kill-session された場合を含む）はペインに SIGHUP が
@@ -167,11 +121,6 @@ async fn event_loop(terminal: Option<DefaultTerminal>, manifest: &Manifest) -> R
             Some(event) = events.recv() => match event {
                 Event::Usage(lines) => usage = lines,
                 Event::Disk(update) => disk.apply(update, Instant::now()),
-                Event::Interrupt => actions.push(controller.interrupt()),
-                Event::Redraw => {}
-                Event::InputClosed => {
-                    let _ = ratatui::crossterm::terminal::disable_raw_mode();
-                }
                 Event::StopWritten(Err(error)) => {
                     // 書けないとワーカーは次のタスクへ進んでしまう。黙らず画面に出す。
                     alerts.push(format!(
@@ -193,10 +142,8 @@ async fn event_loop(terminal: Option<DefaultTerminal>, manifest: &Manifest) -> R
             },
             _ = sigint.recv() => actions.push(controller.interrupt()),
             _ = sigterm.recv() => actions.push(controller.interrupt()),
-            _ = sighup.recv() => {
-                process::terminate_all();
-                std::process::exit(0);
-            }
+            _ = sighup.recv() => {}
+            Some(()) = interrupts.recv() => actions.push(controller.interrupt()),
         }
 
         for action in &actions {
@@ -215,7 +162,7 @@ async fn event_loop(terminal: Option<DefaultTerminal>, manifest: &Manifest) -> R
             }
         }
 
-        screen.draw(&ui::View {
+        let view = ui::View {
             manifest,
             controller: &controller,
             usage: &usage,
@@ -224,16 +171,29 @@ async fn event_loop(terminal: Option<DefaultTerminal>, manifest: &Manifest) -> R
             alerts: &alerts,
             recovery: &recovery_status,
             now: Instant::now(),
-        });
-
+        };
+        let (rows, cols) =
+            crate::runtime::read_json::<(u16, u16)>(&directory.join("monitor-size.json"))
+                .unwrap_or((40, 40));
+        let lines = ui::layout(
+            &view,
+            usize::from(cols.clamp(1, 500)),
+            usize::from(rows.clamp(1, 300)),
+        );
+        if let Err(error) = crate::runtime::atomic_json(
+            &directory.join("monitor-view.json"),
+            &crate::runtime::ansi_lines(&lines),
+        ) {
+            eprintln!("Cannot publish monitor view: {error:#}");
+        }
         if actions.contains(&Action::ForceKill) {
-            force_kill(&mut screen, manifest);
+            return Ok(true);
         }
         if actions
             .iter()
             .any(|action| matches!(action, Action::Finish(_)))
         {
-            close_session(&mut screen, &manifest.session);
+            return Ok(false);
         }
     }
 }
@@ -247,69 +207,4 @@ fn observe(controller: &mut Controller, manifest: &Manifest, pause_file: &Path) 
         rate_control::now_epoch(),
     );
     controller.observe(observation)
-}
-
-/// Ctrl-C とペインの大きさの変化を受け取る。raw mode では Ctrl-C は SIGINT ではなく
-/// キー入力として届くので、ここで中断として扱う（SIGINT / SIGTERM は別に受ける）。
-/// スレッドを起動できなければ false。
-fn spawn_input_reader(events: mpsc::Sender<Event>) -> bool {
-    std::thread::Builder::new()
-        .name("monitor-input".into())
-        .spawn(move || {
-            loop {
-                let event = match event::read() {
-                    Ok(event::Event::Key(key))
-                        if key.kind == KeyEventKind::Press
-                            && key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        Event::Interrupt
-                    }
-                    Ok(event::Event::Resize(..)) => Event::Redraw,
-                    Ok(_) => continue,
-                    Err(_) => {
-                        let _ = events.blocking_send(Event::InputClosed);
-                        return;
-                    }
-                };
-                if events.blocking_send(event).is_err() {
-                    return;
-                }
-            }
-        })
-        .is_ok()
-}
-
-/// 完了・停止時はセッションごと閉じて token-burn を終了する。Ctrl-C 待ちはしない。
-///
-/// 画面に出した集計とログパスは Rust 側（execute_plan_tmux）が attach から戻った直後に
-/// 出し直すので、読み返すために tmux を開いたままにする必要はない。モニターが自分だけ
-/// 終了する方式は採らない。ワーカーが worker-done を作れずに死んだ場合（ユーザーがペインを
-/// 手動で閉じた等）にセッションが残り、デッドラインまで token-burn が終わらなくなる。
-/// kill-session はモニター自身のペインも道連れに終了させるため、後続には基本到達しない。
-/// セッション名の解決に失敗して空振りした場合に取り残されないよう、明示的に終了する。
-fn close_session(screen: &mut Screen, session: &str) -> ! {
-    screen.terminal = None;
-    ratatui::restore();
-    // 取得中の ai-usage は別のプロセスグループなので、セッションを閉じても止まらない。
-    // exit は Drop を動かさないので、ここで止める。
-    process::terminate_all();
-    let _ = std::process::Command::new("tmux")
-        .args(["kill-session", "-t", &format!("={session}")])
-        .status();
-    std::process::exit(0);
-}
-
-/// 停止済みの状態での中断。走行中のタスクを待たずにセッションを閉じる。
-fn force_kill(screen: &mut Screen, manifest: &Manifest) -> ! {
-    screen.terminal = None;
-    ratatui::restore();
-    println!();
-    println!(" 📁 Logs: {}", manifest.report_dir.display());
-    println!(" Force killing session...");
-    process::terminate_all();
-    let _ = std::process::Command::new("tmux")
-        .args(["kill-session", "-t", &format!("={}", manifest.session)])
-        .status();
-    std::process::exit(0);
 }

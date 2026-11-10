@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveDateTime};
 use colored::Colorize;
+use fs2::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::state::parse_duration;
@@ -75,6 +76,32 @@ pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<CleanupRe
         };
 
         if ts < cutoff {
+            // Keep the session lock through deletion so an active detached run is preserved.
+            let _session_lock = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path.join(".runtime/runner.lock"))
+            {
+                Ok(lock) => match lock.try_lock_exclusive() {
+                    Ok(()) => Some(lock),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => {
+                        report.failures.push(format!(
+                            "cannot check active run {}: {error}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    report.failures.push(format!(
+                        "cannot check active run {}: {error}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => report.deleted.push(path),
                 Err(e) => report

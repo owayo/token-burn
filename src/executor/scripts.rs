@@ -122,7 +122,11 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
         shell_escape(&ctx.state_file.to_string_lossy()),
     );
 
-    let mut script = String::new();
+    let mut script = format!("CURRENT_TASK_LOG={log_file}\n");
+    let last_line_cmd = format!(
+        "{} last-log-line \"$CURRENT_TASK_LOG\" 2>/dev/null",
+        shell_escape(&ctx.exe_path.to_string_lossy())
+    );
     // 現在処理中のタスクをシグナルハンドラから参照できるようにする
     script += &format!("CURRENT_FAILED_MARKER={failed_marker}\n");
     script += &build_task_header_script(ctx.idx, ctx.total, &ctx.task.display_name);
@@ -386,7 +390,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "        touch {failed}\n",
                 "        echo '━━━ Cancelled ━━━'\n",
                 "      else\n",
-                "        ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+                "        ERROR_MSG=$({last_line_cmd})\n",
                 "        printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
                 // 起動前の一時的な失敗。エージェントは動いていないので、失敗として数えずに
                 // 次の実行で処理し直す（保存済みのセッションもそのまま残す）。
@@ -431,6 +435,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             save_line = save_line,
             fail_line = fail_line,
             crash_fail_line = crash_fail_line,
+            last_line_cmd = last_line_cmd,
             tempfail = LAUNCH_TEMPFAIL_EXIT,
             tempfail_notice = tempfail_notice,
         );
@@ -443,7 +448,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "    touch {failed}\n",
                 "    echo '━━━ Cancelled ━━━'\n",
                 "  else\n",
-                "    ERROR_MSG=$(tmux capture-pane -t \"$TMUX_PANE\" -p -J -S -10 | grep -v '^$' | tail -1)\n",
+                "    ERROR_MSG=$({last_line_cmd})\n",
                 "    printf '%s%s\\n' {prefix} \"$ERROR_MSG\" > {error}\n",
                 // 起動前の一時的な失敗は claude と同じく、失敗にせず次の実行で処理し直す。
                 "    if [ \"$CMD_EXIT\" -eq {tempfail} ]; then\n",
@@ -471,6 +476,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             mark = mark_cmd,
             tempfail = LAUNCH_TEMPFAIL_EXIT,
             tempfail_notice = tempfail_notice,
+            last_line_cmd = last_line_cmd,
         );
     }
     script += "echo ''\n";
@@ -516,6 +522,7 @@ struct ClaudeAttempt<'a> {
 impl ClaudeAttempt<'_> {
     fn script(&self, cmd_str: &str, jsonl_file: &str, log_file: &str) -> String {
         let mut script = String::new();
+        script += &format!("CURRENT_TASK_LOG={log_file}\n");
         script += &format!("JSONL={jsonl_file}\n");
         script += &format!(
             "{cmd_str} 2>&1 | {tb} format-stream --raw-output {jsonl_file} --stop-file {stop} --threshold {threshold} 2>&1 | tee {log_file}\n",
@@ -2260,6 +2267,7 @@ mod tests {
                     "#!/bin/bash\n",
                     "case \"$1\" in\n",
                     "  format-stream) tee \"$3\" ;;\n",
+                    "  last-log-line) tail -n 1 \"$2\" ;;\n",
                     "  classify-result)\n",
                     "    if grep -q CLASSIFIER_CRASH \"$2\"; then exit 101; fi\n",
                     "    if grep -q NOT_FOUND \"$2\"; then echo 'No conversation found'; exit 4; fi\n",

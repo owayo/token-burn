@@ -9,9 +9,11 @@ use std::cmp::Reverse;
 use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone};
+#[cfg(test)]
 use ratatui::Frame;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+#[cfg(test)]
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
@@ -73,6 +75,7 @@ pub struct View<'a> {
     pub now: Instant,
 }
 
+#[cfg(test)]
 pub fn draw(frame: &mut Frame, view: &View) {
     let area = frame.area();
     let lines = layout(view, usize::from(area.width), usize::from(area.height));

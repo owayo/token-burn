@@ -1,5 +1,18 @@
 # token-burn
 
+## 現行の実行方式
+
+実行画面は `src/runtime/` の ratatui TUI に移行した。tmux は使わない。
+`executor::execute_plan` が実行ごとの private な `.runtime/` を作り、隠し `runner` を独立セッションで起動する。
+`runtime::runner` は portable-pty のワーカーを管理し、`monitor::run` が停止・回復確認・計測を続ける。
+`runtime::ui` は原子的なスナップショットを読み、操作をファイルのキューへ送る。UI の終了・切断は実行を止めない。
+公開コマンド `attach [SESSION]` で再接続し、Tab で選択、z で拡大、PageUp/Down で履歴、d でデタッチする。
+入力は i で有効化し、Ctrl-G で通常操作へ戻る。通常操作で Ctrl-C は穏当な停止、再度押すと強制終了。
+既存の gate-claim、rate_control、resume、task/worker スクリプトの意味を維持する。
+エラーの最終行はタスク自身のログから取り、再開不能時の fresh 試行では fresh のログを使う。
+全 PTY の準備と起動の確認が済むまでワーカーは claim しない。レポートの削除は動作中の runner のロックを尊重する。
+以下に残る tmux のペイン・セッション固有の説明は旧実装の履歴として読む。
+
 週次リセット前にAIコーディングアシスタントのトークンを消費するCLIツール。
 
 ## プロジェクト構成

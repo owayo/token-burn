@@ -10,6 +10,7 @@ mod init;
 mod monitor;
 mod rate_control;
 mod resume;
+mod runtime;
 mod scanner;
 mod schedule;
 mod state;
@@ -133,6 +134,19 @@ enum Commands {
         #[arg(value_name = "PATH")]
         paths: Vec<PathBuf>,
     },
+    /// 実行中または完了済みの分割画面へ再接続する
+    Attach {
+        #[arg(value_name = "SESSION")]
+        session: Option<PathBuf>,
+    },
+    #[command(hide = true)]
+    Runner {
+        #[arg(long)]
+        session: PathBuf,
+    },
+    /// タスクのエラー表示用にログ末尾の空でない行を取り出す
+    #[command(hide = true)]
+    LastLogLine { path: PathBuf },
     /// エージェントのリセット状況を表示する
     Status,
     /// 処理する順番でターゲットディレクトリを一覧する（limit 無視、実行しない）
@@ -215,13 +229,6 @@ enum Commands {
         /// 一時停止から再開する直前に実行する再検証コマンド（usage-gate）
         #[arg(long)]
         revalidate: Option<String>,
-    },
-    /// tmux のモニターペインで進捗・使用量・マシン負荷を表示する（execute_plan_tmux 専用）
-    #[command(hide = true)]
-    Monitor {
-        /// 実行用の一時ディレクトリに書かれた起動情報
-        #[arg(long)]
-        manifest: PathBuf,
     },
     /// ai-usage の使用率をチェックし閾値超過なら stop file を作成する（ワーカースクリプト専用）
     #[command(hide = true, name = "usage-gate")]
@@ -393,6 +400,11 @@ async fn main() -> Result<()> {
 
     let command = cli.command.unwrap_or(Commands::Run { paths: vec![] });
 
+    if let Commands::LastLogLine { path } = &command {
+        println!("{}", executor::last_log_line(path)?);
+        return Ok(());
+    }
+
     if let Commands::Init { force } = command {
         let config_path = cli.config.unwrap_or_else(config::default_config_path);
         return init::run_init(&config_path, force);
@@ -480,8 +492,23 @@ async fn main() -> Result<()> {
         std::process::exit(outcome.exit_code());
     }
 
-    if let Commands::Monitor { manifest } = &command {
-        return monitor::run(manifest).await;
+    if let Commands::Runner { session } = &command {
+        return runtime::run(session).await;
+    }
+    if let Commands::Attach { session } = &command {
+        let config_path = cli.config.unwrap_or_else(config::default_config_path);
+        let config_path = config_path.canonicalize().unwrap_or(config_path);
+        let path = match session {
+            Some(path) => path.clone(),
+            None => runtime::read_json::<PathBuf>(
+                &config_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("active-run.json"),
+            )?,
+        };
+        runtime::attach(&path)?;
+        return Ok(());
     }
 
     if let Commands::UsageGate {
@@ -558,11 +585,15 @@ async fn main() -> Result<()> {
         Commands::Mark { .. } => unreachable!(),
         Commands::Init { .. } => unreachable!(),
         Commands::Config => unreachable!(),
+        Commands::LastLogLine { .. } => unreachable!(),
         Commands::FormatStream { .. } => unreachable!(),
         Commands::FormatCodex { .. } => unreachable!(),
         Commands::ClassifyResult { .. } => unreachable!(),
         Commands::ResumeEntry { .. } => unreachable!(),
-        Commands::UsageGate { .. } | Commands::GateClaim { .. } | Commands::Monitor { .. } => {
+        Commands::UsageGate { .. }
+        | Commands::GateClaim { .. }
+        | Commands::Runner { .. }
+        | Commands::Attach { .. } => {
             unreachable!()
         }
     }
@@ -965,7 +996,7 @@ async fn run(opts: RunOptions) -> Result<()> {
     // スキャン・TUI・起動時のキャッシュ取得にかかった時間で期限がずれないよう、
     // 残り秒数ではなく、解決したリセット時刻をそのまま全ワーカーとモニターへ渡す。
     let report_dir = resolve_report_dir(&config.settings);
-    executor::execute_plan_tmux(
+    if !executor::execute_plan(
         plan,
         run_settings.workers,
         sched.next_reset.timestamp(),
@@ -973,7 +1004,9 @@ async fn run(opts: RunOptions) -> Result<()> {
         &reset_info,
         &report_dir,
         run_settings.rate_limit_threshold,
-    )?;
+    )? {
+        return Ok(());
+    }
 
     // 古いレポートディレクトリを自動クリーンアップ。実行そのものは済んでいるので、
     // 消せなかったものは警告に留める（print_cleanup_result がパスと理由を出す）。

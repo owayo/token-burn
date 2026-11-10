@@ -36,7 +36,7 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 ## Features
 
 - **Deadline-aware scheduling**: Picks the agent whose reset deadline is closest, stops starting new tasks when the reset time arrives, and waits for the running tasks to finish
-- **Parallel runs in tmux**: Runs several prompts at once in split panes with a progress monitor; workers close their own panes when the queue is empty, and detaching leaves the run going
+- **Native split-screen execution**: Shows the monitor and workers in a ratatui interface, with pane focus, zoom, and scrollback. Detaching leaves execution running; reconnect with `token-burn attach`
 - **Machine load and disk in the monitor**: The monitor pane graphs CPU and memory utilization over the last 5 minutes and shows memory pressure, swap activity, and free disk space, measured the way Finder does when ai-usage supports `--disk`
 - **Repository discovery**: Scans directories for git repositories from several `[[scan]]` sources, keeps those whose remote owner matches your username, and processes each directory once
 - **Processing order**: Puts public repositories ahead of private ones, orders each group least-recently-modified first, and skips targets processed recently (`skip_within`)
@@ -48,12 +48,11 @@ Claude Code / Codex CLI tokens reset weekly with no rollover. Inspired by the Ja
 - **Rate-limit aware**: Stops for good when the weekly window reaches `rate_limit_threshold`, but pauses until the reset when the five-hour window does; workers recheck usage after every extended pause before taking a task, with ai-usage integration a manual reset ends the pause early, and the monthly overage window never stops a run
 - **Resume interrupted sessions**: Continues a Claude Code session cut off by a rate limit with `claude --resume` on the next run instead of starting over. When a wrapper script exits with code 75 before starting the agent, the task is retried on the next run instead of being counted as a failure. The footer of a resumed run reports what that run consumed, with the session total alongside
 - **Readable live monitor**: Renders Claude Code's stream-json as readable lines — including the thinking narration (the short progress summaries Claude Code shows instead of the thinking itself), responses missing stream events after an API retry, tool calls, subagent activity and task names on status updates, permission denial reasons, results omitted from model context, hook feedback, context compaction, command cancellation, token usage, cost per model, and API errors. Codex CLI's JSON events get one line per command and changed file instead of a cumulative diff reprinted after every edit, plus a heartbeat while Codex is silent. Escape sequences in tool output are removed, so a command's output cannot clear or retitle the pane
-- **Safe state and logs**: Updates `state.json` atomically under a lock and numbers per-task logs so they never overwrite each other. If a formatter loses its log or display output, it keeps reading to EOF and marks the task failed; Claude's formatter also continues checking rate limits. After the tmux session closes, the reasons for failed tasks are printed on the terminal you started from and kept in `errors.txt` in the logs directory
-- **Dry run and safe command display**: `-n` / `--dry-run` previews the plan; both the plan and tmux monitor redact environment assignments and credential option values as `<redacted>`
+- **Safe state and logs**: Updates `state.json` atomically under a lock and numbers per-task logs so they never overwrite each other. If a formatter loses its log or display output, it keeps reading to EOF and marks the task failed; Claude's formatter also continues checking rate limits. After the split screen closes, the reasons for failed tasks are printed on the terminal you started from and kept in `errors.txt` in the logs directory
+- **Dry run and safe command display**: `-n` / `--dry-run` previews the plan; both the plan and monitor redact environment assignments and credential option values as `<redacted>`
 
 ## Requirements
 
-- **tmux**: Required for split-pane execution
 - **Claude Code** and/or **Codex CLI**: At least one agent must be installed
 - **gh CLI**: Required for repository visibility detection
 - **ai-usage** (optional): Needed only for the [ai-usage integration](docs/configuration.md#ai-usage-integration-optional)
@@ -125,6 +124,9 @@ token-burn run
 # Choose the targets and their order in a TUI first
 token-burn run -i
 
+# Reattach to a detached run
+token-burn attach
+
 # Run only specific repositories (scan and skip rules are bypassed)
 token-burn run ~/GitHub/repo-a ./repo-b
 
@@ -142,7 +144,7 @@ When the reset time arrives, token-burn stops starting new tasks and waits for t
 More detail:
 
 - [CLI reference](docs/cli-reference.md): every command and option
-- [Usage details](docs/usage.md): processing order, resuming interrupted sessions, the tmux runtime, logs and state
+- [Usage details](docs/usage.md): processing order, resuming interrupted sessions, the native runtime, logs and state
 - [Rate limits](docs/rate-limits.md): when a run stops and when it only pauses
 - [Live monitor](docs/monitor.md): what the worker and monitor panes show
 

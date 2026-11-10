@@ -30,6 +30,25 @@ pub(super) fn strip_ansi_from_dir(dir: &std::path::Path) {
     }
 }
 
+/// Read a bounded tail, including logs containing invalid UTF-8 or ANSI-only lines.
+pub(crate) fn last_log_line(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let offset = file.metadata()?.len().saturating_sub(65536);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.take(65536).read_to_end(&mut bytes)?;
+    let text = strip_ansi(&String::from_utf8_lossy(&bytes));
+    Ok(text
+        .rsplit(['\r', '\n'])
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(500)
+        .collect())
+}
+
 fn strip_ansi(s: &str) -> String {
     fn is_csi_final(c: char) -> bool {
         ('\u{40}'..='\u{7e}').contains(&c)
@@ -97,6 +116,18 @@ pub(super) fn truncate(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_tail_skips_ansi_only_lines_and_handles_binary_bytes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"old\nactual failure\xff\r\n\x1b[0m\n \n").unwrap();
+        assert_eq!(
+            last_log_line(file.path()).unwrap(),
+            "actual failure\u{fffd}"
+        );
+        std::fs::write(file.path(), "日本語".repeat(50000)).unwrap();
+        assert_eq!(last_log_line(file.path()).unwrap().chars().count(), 500);
+    }
 
     #[test]
     fn strip_ansi_removes_escape_sequences() {
