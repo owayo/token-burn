@@ -183,10 +183,16 @@ fn check_alive(directory: &Path) -> Result<()> {
         .write(true)
         .open(directory.join("runner.lock"))?;
     match lock.try_lock_exclusive() {
-        Ok(()) => anyhow::bail!(
-            "The runner is no longer running. Logs: {}",
-            directory.display()
-        ),
+        Ok(()) => {
+            // 直前に読んだ画面が実行中でも、ロック解放前に完了が公開されている場合がある。
+            let snapshot: Snapshot = read_json(&directory.join("snapshot.json"))?;
+            anyhow::ensure!(
+                snapshot.finished,
+                "The runner is no longer running. Logs: {}",
+                directory.display()
+            );
+            Ok(())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -363,5 +369,31 @@ mod tests {
             .unwrap(),
             "語".as_bytes()
         );
+    }
+    #[test]
+    fn liveness_check_reloads_completion_after_the_runner_unlocks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join("runner.lock"))
+            .unwrap();
+        super::super::atomic_json(&directory.join("snapshot.json"), &Snapshot::default()).unwrap();
+        assert!(check_alive(directory).is_err());
+        lock.lock_exclusive().unwrap();
+        assert!(check_alive(directory).is_ok());
+        drop(lock);
+        super::super::atomic_json(
+            &directory.join("snapshot.json"),
+            &Snapshot {
+                finished: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(check_alive(directory).is_ok());
     }
 }

@@ -71,7 +71,7 @@ directory = {}
             .unwrap()
     }
     fn directory(&self) -> PathBuf {
-        let path = self.temporary.path().join("active-run.json");
+        let path = self.config.with_file_name("active-run.json");
         wait_until(|| path.exists());
         let session: PathBuf = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         session.parent().unwrap().to_path_buf()
@@ -94,7 +94,7 @@ directory = {}
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let path = self.temporary.path().join("active-run.json");
+        let path = self.config.with_file_name("active-run.json");
         if let Ok(data) = fs::read(path)
             && let Ok(path) = serde_json::from_slice::<PathBuf>(&data)
         {
@@ -217,6 +217,154 @@ fn active_run_rejects_duplicate_launch_and_ignores_malformed_controls() {
     assert!(String::from_utf8_lossy(&second.stderr).contains("Another run is already active"));
     fixture.stop();
     assert!(wait_child(&mut first).success());
+}
+
+#[test]
+fn large_paste_keeps_interrupts_and_resize_working() {
+    let fixture = Fixture::new("stty -echo -icanon\necho running\nsleep 60");
+    let mut client = fixture.start();
+    let directory = fixture.directory();
+    for index in 0..64 {
+        fs::write(
+            directory
+                .join("controls")
+                .join(format!("input-{index:04}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "Input": {"worker": 0, "bytes": vec![b'x'; 4096]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    fs::write(
+        directory.join("controls/resize.json"),
+        r#"{"Resize":{"worker":1,"rows":17,"cols":53}}"#,
+    )
+    .unwrap();
+    fixture.stop();
+    let start = Instant::now();
+    let mut status = None;
+    while start.elapsed() < Duration::from_secs(20) {
+        status = client.try_wait().unwrap();
+        if status.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stopped_by_controls = status.is_some();
+    if !stopped_by_controls {
+        // 回帰時も runner のシグナル経路で片付け、ワーカーを残さない。
+        let pid = json(&directory.join("snapshot.json"))["pid"]
+            .as_u64()
+            .unwrap() as i32;
+        for _ in 0..2 {
+            unsafe { libc::kill(pid, libc::SIGINT) };
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    assert!(wait_child(&mut client).success());
+    assert!(stopped_by_controls, "入力待ちで停止要求が遮断された");
+    let snapshot = fixture.state();
+    assert_eq!(snapshot["finished"], true);
+    assert_eq!(
+        snapshot["workers"][1]["lines"].as_array().unwrap().len(),
+        17
+    );
+}
+
+#[test]
+fn errors_file_failure_does_not_discard_the_run_summary() {
+    let fixture = Fixture::new("sleep 1\necho task-failure\nexit 1");
+    let mut client = fixture.start();
+    let directory = fixture.directory();
+    fs::create_dir(directory.parent().unwrap().join("errors.txt")).unwrap();
+    assert!(wait_child(&mut client).success());
+    let snapshot = fixture.state();
+    assert_eq!(snapshot["finished"], true);
+    assert!(snapshot["failure"].is_null(), "{snapshot}");
+    let summary = snapshot["summary"].as_array().unwrap();
+    assert!(
+        summary
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("2 failed")),
+        "{snapshot}"
+    );
+    assert!(
+        summary
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("task-failure")),
+        "{snapshot}"
+    );
+    assert!(
+        !summary
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("see errors.txt"))
+    );
+    let log = fs::read_to_string(directory.join("runner.log")).unwrap();
+    assert!(log.contains("errors.txt"), "{log}");
+    wait_until(|| !directory.join("tasks").exists() && !directory.join("queue").exists());
+}
+
+#[test]
+fn default_attach_uses_the_same_directory_for_a_symlinked_config() {
+    let mut fixture = Fixture::new("sleep 1\necho completed");
+    let linked = fixture.temporary.path().join("linked");
+    fs::create_dir(&linked).unwrap();
+    std::os::unix::fs::symlink(&fixture.config, linked.join("config.toml")).unwrap();
+    fixture.config = linked.join("config.toml");
+    let mut client = fixture.start();
+    fixture.directory();
+    let output = Command::new(env!("CARGO_BIN_EXE_token-burn"))
+        .arg("--config")
+        .arg(&fixture.config)
+        .arg("attach")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("All 2/2 tasks completed"));
+    assert!(wait_child(&mut client).success());
+}
+
+#[test]
+fn snapshot_write_failure_keeps_workers_running_and_retries_publication() {
+    let fixture = Fixture::new("echo began\nsleep 3\necho completed");
+    let mut client = fixture.start();
+    let directory = fixture.directory();
+    let snapshot = directory.join("snapshot.json");
+    let backup = directory.join("snapshot-backup.json");
+    wait_until(|| json(&snapshot)["ready"] == true);
+    fs::copy(&snapshot, &backup).unwrap();
+    fs::remove_file(&snapshot).unwrap();
+    fs::create_dir(&snapshot).unwrap();
+    fs::write(
+        directory.join("controls/resize.json"),
+        r#"{"Resize":{"worker":0,"rows":25,"cols":80}}"#,
+    )
+    .unwrap();
+    wait_until(|| {
+        fs::read_to_string(directory.join("runner.log"))
+            .is_ok_and(|text| text.contains("snapshot.json"))
+    });
+    let log = fs::read_to_string(directory.join("runner.log")).unwrap();
+    fs::remove_dir(&snapshot).unwrap();
+    fs::rename(&backup, &snapshot).unwrap();
+    assert!(log.contains("Cannot publish snapshot"), "{log}");
+    wait_until(|| json(&snapshot)["finished"] == true);
+    let state = json(&snapshot);
+    assert!(state["failure"].is_null(), "{state}");
+    assert!(
+        state["summary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("All 2/2 tasks completed")),
+        "{state}"
+    );
+    assert!(wait_child(&mut client).success());
 }
 
 #[test]

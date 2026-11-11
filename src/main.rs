@@ -497,14 +497,10 @@ async fn main() -> Result<()> {
     }
     if let Commands::Attach { session } = &command {
         let config_path = cli.config.unwrap_or_else(config::default_config_path);
-        let config_path = config_path.canonicalize().unwrap_or(config_path);
         let path = match session {
             Some(path) => path.clone(),
             None => runtime::read_json::<PathBuf>(
-                &config_path
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join("active-run.json"),
+                &state::state_path(&config_path).with_file_name("active-run.json"),
             )?,
         };
         runtime::attach(&path)?;
