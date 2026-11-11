@@ -57,6 +57,7 @@ struct Editor {
     notice: String,
     saved: bool,
     advanced: bool,
+    compact: bool,
     undo: Vec<toml_edit::DocumentMut>,
 }
 
@@ -77,6 +78,7 @@ impl Editor {
             notice,
             saved: false,
             advanced: false,
+            compact: false,
             undo: Vec::new(),
         }
     }
@@ -115,6 +117,22 @@ impl Editor {
     }
 
     fn key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.compact {
+            if key.kind == KeyEventKind::Release {
+                return Ok(false);
+            }
+            // 確認内容を描けない間は変更・保存を受け付けず、終了と取り消しだけを扱う。
+            return Ok(match key.code {
+                KeyCode::Char('d') if matches!(self.dialog, Some(Dialog::Quit)) => true,
+                KeyCode::Char('q') => self.quit(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit(),
+                KeyCode::Esc => {
+                    self.dialog = None;
+                    false
+                }
+                _ => false,
+            });
+        }
         if key.kind != KeyEventKind::Release
             && self.dialog.is_none()
             && key.code == KeyCode::Char('u')
@@ -444,14 +462,17 @@ pub fn run(path: &Path) -> Result<()> {
         let mut nav_state = ratatui::widgets::ListState::default();
         let mut field_state = ratatui::widgets::ListState::default();
         loop {
-            terminal.draw(|frame| ui::draw(frame, &editor, &mut nav_state, &mut field_state))?;
+            terminal.draw(|frame| {
+                editor.compact = frame.area().width < 60 || frame.area().height < 18;
+                ui::draw(frame, &editor, &mut nav_state, &mut field_state);
+            })?;
             match event::read()? {
                 Event::Key(key) => match editor.key(key) {
                     Ok(true) => break,
                     Ok(false) => {}
                     Err(error) => editor.notice = format!("操作できませんでした: {error:#}"),
                 },
-                Event::Paste(text) => {
+                Event::Paste(text) if !editor.compact => {
                     if let Some(Dialog::Edit { field, input }) = &mut editor.dialog {
                         input.insert(&if field.multiline() {
                             text.replace("\r\n", "\n").replace('\r', "\n")

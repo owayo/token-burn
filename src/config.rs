@@ -287,14 +287,31 @@ impl Config {
         Self::parse(&content, path)
     }
 
-    /// Parse and validate an unsaved configuration with the same rules as `load`.
+    /// 未保存の設定も `load` と同じ規則で読み込み、検証する。
     pub fn parse(content: &str, path: &Path) -> Result<Self> {
         let mut config: Config = toml::from_str(content).map_err(|error: toml::de::Error| {
-            // The error's Display includes source lines, which can contain credentials.
+            // Display だけでなく message() も型不一致や未知の列挙値を引用する。
+            // 設定値には認証情報が入り得るため、内容を出さず位置だけで案内する。
+            let location = error
+                .span()
+                .map(|span| {
+                    let (line, column) = content
+                        .char_indices()
+                        .take_while(|(offset, _)| *offset < span.start)
+                        .fold((1, 1), |(line, column), (_, character)| {
+                            if character == '\n' {
+                                (line + 1, 1)
+                            } else {
+                                (line, column + 1)
+                            }
+                        });
+                    format!(" at line {line}, column {column}")
+                })
+                .unwrap_or_default();
             anyhow::anyhow!(
-                "Failed to parse config: {}: {}",
+                "Failed to parse config: {}{}: invalid TOML or field value",
                 path.display(),
-                error.message()
+                location
             )
         })?;
         config.config_dir = path
@@ -1221,6 +1238,25 @@ mod tests {
     fn load_nonexistent_file_returns_error() {
         let result = Config::load(Path::new("/nonexistent/config.toml"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_errors_do_not_echo_string_values_or_enum_variants() {
+        for field in ["parallelism", "dedup_scope"] {
+            let content = format!("[settings]\n{field} = \"confidential-value\"\n");
+            let error = Config::parse(&content, Path::new("config.toml")).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(!message.contains("confidential-value"), "{message}");
+            assert!(message.contains("config.toml"), "{message}");
+            assert!(message.contains("line 2, column"), "{message}");
+        }
+    }
+
+    #[test]
+    fn parse_errors_locate_the_value_after_multibyte_text() {
+        let content = "# 日本語の設定\n[settings]\nparallelism = \"confidential-value\"\n";
+        let error = Config::parse(content, Path::new("config.toml")).unwrap_err();
+        assert!(error.to_string().contains("line 3, column 15"), "{error:#}");
     }
 
     #[test]

@@ -208,6 +208,71 @@ fn rendering_supports_normal_small_and_japanese_terminals() {
 }
 
 #[test]
+fn a_small_settings_screen_shows_how_to_discard_unsaved_changes() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut editor = Editor::new(Draft::open(&tmp.path().join("config.toml")).unwrap());
+    editor
+        .key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(50, 10)).unwrap();
+    terminal
+        .draw(|frame| {
+            ui::draw(
+                frame,
+                &editor,
+                &mut Default::default(),
+                &mut Default::default(),
+            )
+        })
+        .unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    let compact_text: String = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    assert!(compact_text.contains("破棄して終了"), "{text}");
+    editor.compact = true;
+    assert!(
+        editor
+            .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .unwrap()
+    );
+    assert!(!editor.saved);
+}
+
+#[test]
+fn a_small_settings_screen_blocks_saving_until_the_preview_is_visible() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    let mut editor = Editor::new(Draft::open(&path).unwrap());
+    editor.prepare_save();
+    assert!(matches!(editor.dialog, Some(Dialog::Save { .. })));
+    editor.compact = true;
+    assert!(
+        !editor
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap()
+    );
+    assert!(!editor.saved);
+    assert!(!path.exists());
+    assert!(matches!(editor.dialog, Some(Dialog::Save { .. })));
+    editor.compact = false;
+    assert!(
+        editor
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap()
+    );
+    assert!(path.exists());
+}
+
+#[test]
 fn nested_tables_stay_with_their_agents_after_edits_and_deletions() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("config.toml");

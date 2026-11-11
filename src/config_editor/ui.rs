@@ -16,7 +16,18 @@ pub(super) fn draw(
 ) {
     let area = frame.area();
     if area.width < 60 || area.height < 18 {
-        frame.render_widget(Paragraph::new("設定画面には 60 列 × 18 行以上が必要です。\n端末を広げてください。q / Esc で終了。"), area);
+        let message = match editor.dialog {
+            Some(Dialog::Quit) => {
+                "d: 破棄して終了\nEsc: 戻る\n未保存の変更があります。\n保存するには端末を広げてください。"
+            }
+            Some(_) => {
+                "Esc: 取り消す\nq: 終了を確認\n確認画面を表示できません。\n端末を 60 列 × 18 行以上に広げてください。"
+            }
+            None => {
+                "q / Ctrl-C: 終了\n未保存の変更は確認します。\n設定画面には 60 列 × 18 行以上が必要です。\n端末を広げてください。"
+            }
+        };
+        frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), area);
         return;
     }
     let [header, body, notice, footer] = Layout::vertical([
