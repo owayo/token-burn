@@ -852,6 +852,35 @@ fn tool_result_metadata_commit_without_sha_is_omitted() {
 }
 
 #[test]
+fn tool_result_metadata_preserves_the_commit_branch_from_actual_jsonl() {
+    let value = serde_json::json!({
+        "gitOperation": {"commit": {
+            "sha": "abc1234", "kind": "cherry-picked", "branch": "feature/example"
+        }}
+    });
+    assert_eq!(
+        tool_result_metadata(&value),
+        "commit:abc1234 cherry-picked branch:feature/example"
+    );
+}
+
+#[test]
+fn tool_result_metadata_sanitizes_every_external_text_field() {
+    let dangerous = "\u{1b}[2Jbad\nvalue\u{1b}]52;c;clipboard\u{7}";
+    let value = serde_json::json!({
+        "gitOperation": {"commit": {"sha": dangerous, "kind": dangerous, "branch": dangerous}},
+        "code": 200, "codeText": dangerous, "mode": dangerous, "commandName": dangerous,
+        "statusChange": {"from": dangerous, "to": dangerous},
+        "updatedFields": [dangerous], "agentType": dangerous,
+        "task": {"id": dangerous, "subject": "example"}, "retrieval_status": dangerous
+    });
+    let metadata = tool_result_metadata(&value);
+    assert!(!metadata.chars().any(char::is_control), "{metadata:?}");
+    assert!(!metadata.contains("clipboard"), "{metadata:?}");
+    assert!(metadata.contains("bad value"), "{metadata:?}");
+}
+
+#[test]
 fn tool_result_metadata_preserves_attr_order() {
     // 複数フィールドが ", " で連結され、実装の評価順（truncated → limit → files ...）を保つ
     let value = serde_json::json!({

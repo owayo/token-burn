@@ -161,17 +161,26 @@ fn append_git_and_count_metadata(
         let sha = commit
             .get("sha")
             .and_then(|value| value.as_str())
-            .unwrap_or("");
+            .map(|sha| truncate_inline(sha, 40))
+            .unwrap_or_default();
         let kind = commit
             .get("kind")
             .and_then(|value| value.as_str())
-            .unwrap_or("");
+            .map(|kind| truncate_inline(kind, 40))
+            .unwrap_or_default();
         if !sha.is_empty() {
-            if kind.is_empty() {
-                attrs.push(format!("commit:{sha}"));
-            } else {
-                attrs.push(format!("commit:{sha} {kind}"));
+            let mut operation = format!("commit:{sha}");
+            if !kind.is_empty() {
+                operation.push_str(&format!(" {kind}"));
             }
+            // 実ログの cherry-pick はブランチも返す。どこへ反映されたかを残す。
+            if let Some(branch) = commit.get("branch").and_then(|value| value.as_str()) {
+                let branch = truncate_inline(branch, 60);
+                if !branch.is_empty() {
+                    operation.push_str(&format!(" branch:{branch}"));
+                }
+            }
+            attrs.push(operation);
         }
     }
     if let Some(limit) = obj.get("appliedLimit").and_then(|value| value.as_u64()) {
@@ -309,7 +318,7 @@ fn append_search_metadata(
             .and_then(|value| value.as_str())
             .filter(|text| !text.is_empty())
         {
-            attrs.push(format!("http:{code} {code_text}"));
+            attrs.push(format!("http:{code} {}", truncate_inline(code_text, 60)));
         } else {
             attrs.push(format!("http:{code}"));
         }
@@ -322,7 +331,7 @@ fn append_search_metadata(
         .and_then(|value| value.as_str())
         .filter(|mode| !mode.is_empty())
     {
-        attrs.push(format!("mode:{mode}"));
+        attrs.push(format!("mode:{}", truncate_inline(mode, 40)));
     }
     if let Some(deferred) = obj
         .get("total_deferred_tools")
@@ -335,7 +344,7 @@ fn append_search_metadata(
         .and_then(|value| value.as_str())
         .filter(|name| !name.is_empty())
     {
-        attrs.push(format!("command:{command_name}"));
+        attrs.push(format!("command:{}", truncate_inline(command_name, 60)));
     }
     // Workflow: 起動したワークフロー名。どのワークフローが走ったかの判断材料になる。
     // runId は内部識別子でユーザ操作に使えないため出さず、name のみ表示する。
@@ -376,7 +385,11 @@ fn append_status_metadata(
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if !from.is_empty() && !to.is_empty() {
-            attrs.push(format!("status:{from}->{to}"));
+            attrs.push(format!(
+                "status:{}->{}",
+                truncate_inline(from, 30),
+                truncate_inline(to, 30)
+            ));
         }
     }
     // TaskUpdate の updatedFields: 変更されたフィールド一覧。
@@ -391,7 +404,10 @@ fn append_status_metadata(
         non_status.sort();
         non_status.dedup();
         if !non_status.is_empty() {
-            attrs.push(format!("updated:{}", non_status.join(",")));
+            attrs.push(format!(
+                "updated:{}",
+                truncate_inline(&non_status.join(","), 100)
+            ));
         }
     }
 }
@@ -447,7 +463,7 @@ fn append_agent_metadata(
         .and_then(|value| value.as_str())
         .filter(|agent_type| !agent_type.is_empty())
     {
-        attrs.push(format!("agent:{agent_type}"));
+        attrs.push(format!("agent:{}", truncate_inline(agent_type, 40)));
     }
     // Skill / Agent が解決したモデル名（モデルによりトークン消費が変わるため判断材料になる）。
     if let Some(model) = obj
@@ -522,7 +538,8 @@ fn append_task_metadata(
         let id = task
             .get("id")
             .and_then(|value| value.as_str())
-            .unwrap_or("");
+            .map(|id| truncate_inline(id, 40))
+            .unwrap_or_default();
         let subject = task
             .get("subject")
             .and_then(|value| value.as_str())
@@ -544,7 +561,7 @@ fn append_runtime_metadata(
         .and_then(|value| value.as_str())
         .filter(|status| !status.is_empty())
     {
-        attrs.push(format!("retrieval:{status}"));
+        attrs.push(format!("retrieval:{}", truncate_inline(status, 40)));
     }
     if obj
         .get("outputFile")
