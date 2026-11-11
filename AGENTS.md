@@ -11,6 +11,20 @@
 既存の gate-claim、rate_control、resume、task/worker スクリプトの意味を維持する。
 エラーの最終行はタスク自身のログから取り、再開不能時の fresh 試行では fresh のログを使う。
 全 PTY の準備と起動の確認が済むまでワーカーは claim しない。レポートの削除は動作中の runner のロックを尊重する。
+入力キューの適用は `runtime::runner::process_controls` にまとめる。入力チャネルが満杯でも
+停止・リサイズ・他ワーカーの入力を遮断しない。同じワーカーの保留入力は追い越さず、
+保留した後続入力を 1 回の処理件数上限に数えない（128 件以上残っても停止要求へ到達するため）。
+`errors.txt` の保存失敗は警告として記録し、最終集計の公開と実行資産の削除は続ける。
+動作中の画面スナップショットの保存失敗は警告して再試行し、PTY を終了させない。
+開始ファイルは monitor.json と初期画面の保存後に発行し、実行資産は異常終了時も片付ける。
+既定の再接続先は `state::state_path` と同じ位置から解決し、設定の symlink を独自に辿らない。
+runner のロックが解放されていたら最終画面を読み直して完了を確認する。
+設定 TUI は 60 列 × 18 行未満では終了・取り消しだけを受け付け、保存を保留する。
+ツール結果のメタデータも外部入力なので、識別子・種別・状態・コマンド名を含めて
+`truncate_inline` で制御文字を除去し、1 行に収める。`gitOperation.commit.branch` は
+コミットの反映先として表示する。
+`Config::parse` のエラーには TOML の値を引用せず、ファイル名と行・列だけを添える。
+`toml::de::Error::message()` も型不一致や未知の列挙値を引用するため、そのまま表示しない。
 以下に残る tmux のペイン・セッション固有の説明は旧実装の履歴として読む。
 
 週次リセット前にAIコーディングアシスタントのトークンを消費するCLIツール。
@@ -24,17 +38,23 @@ token-burn/
 │   ├── main.rs             # エントリポイント、clap CLI定義
 │   ├── init.rs             # config/prompt 雛形の初期化
 │   ├── config.rs           # TOML設定ファイルの読み込み・バリデーション
+│   ├── config_editor/      # 設定 TUI（文書編集・入力・項目定義・描画）
+│   ├── runtime/            # 独立 runner と再接続可能な分割 TUI
+│   │   ├── mod.rs          # セッション・スナップショット・操作キュー・起動
+│   │   ├── runner.rs       # PTY ワーカーの監督・操作適用・最終集計
+│   │   ├── pty.rs          # portable-pty と vt100 による入出力・端末画面
+│   │   └── ui.rs           # 接続・デタッチ・ペイン操作・キー入力
 │   ├── scanner.rs          # ディレクトリスキャン・リポジトリ探索・gh CLI連携
 │   ├── schedule.rs         # 固定リセット計算（曜日ベース）・AgentSchedule/ScheduleSource
 │   ├── usage.rs            # ai-usage --json 連携・ScheduleResolver（スケジュール解決・最寄り選択）
 │   ├── executor/           # プロセス起動・並列実行管理（tokio、モジュール分割）
-│   │   ├── mod.rs          # ExecutionPlan / build_plan / print_plan / execute_plan_tmux / ai-usage 同期起動 / tmux 終了後の最終集計（RunSummary・errors.txt）
+│   │   ├── mod.rs          # ExecutionPlan / build_plan / print_plan / execute_plan / ai-usage 同期起動 / 実行後の最終集計（RunSummary・errors.txt）
 │   │   ├── flags.rs        # claude/codex 判定と必須フラグ・env（CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS 等）の自動注入
-│   │   ├── scripts.rs      # tmux 用シェルスクリプト生成（task/worker、ai-usage の statusline/refresh/disk コマンド、shell_escape/env 前置き）
+│   │   ├── scripts.rs      # ワーカー用シェルスクリプト生成（task/worker、ai-usage の statusline/refresh/disk コマンド、shell_escape/env 前置き）
 │   │   └── util.rs         # sanitize_filename / task_log_base / strip_ansi / truncate
-│   ├── monitor/            # tmux のモニターペイン（隠しサブコマンド `monitor`。ratatui の常駐プロセス）
-│   │   ├── mod.rs          # pub run（イベントループ。描画に失敗しても停止判定と終了処理は続ける）
-│   │   ├── manifest.rs     # Manifest（execute_plan_tmux が書く起動情報 monitor.json）
+│   ├── monitor/            # runner 内で動く監視処理とモニターペインの描画
+│   │   ├── mod.rs          # pub run（監視ループ。画面の公開に失敗しても停止判定を続ける）
+│   │   ├── manifest.rs     # Manifest（runner が書く起動情報 monitor.json）
 │   │   ├── controller.rs   # マーカー・stop/pause file・デッドラインから停止の発行と終了を決める（error-* の読み取り read_errors は最終集計と共有）
 │   │   ├── system.rs       # CPU・メモリ・スワップ・ロードアベレージの計測（差分と換算。どの OS でもテストする）
 │   │   ├── system/         # OS 固有の読み取り: macos.rs（Mach・sysctl）/ linux.rs / procfs.rs（/proc の解析。どの OS でもテスト）/ unix.rs（getloadavg 等）

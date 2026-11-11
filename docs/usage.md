@@ -63,7 +63,7 @@ Saved sessions are stored in `resume.json` next to `state.json` (default `~/.con
 | `d` / `q` | Detach and keep execution running |
 | `Ctrl-C` | Stop starting tasks and wait for running tasks; press again while stopped to force termination |
 
-In input mode, keys and pasted text go to the selected worker, including `Ctrl-C`. Use `Ctrl-G` first to stop the whole run. Codex stdin remains `/dev/null`.
+In input mode, keys and pasted text go to the selected worker, including `Ctrl-C`. Use `Ctrl-G` first to stop the whole run. Codex stdin remains `/dev/null`. If a worker stops accepting input, its pending input stays in order while stop requests and controls for other workers continue to be processed.
 
 ```bash
 # Reattach to the last run started with the default configuration
@@ -80,7 +80,9 @@ Execution runs independently of the screen. Detaching or losing the terminal lea
 
 Tasks start only after all pseudo-terminals are ready. Startup failure terminates workers already created. Every run uses its own directory, leaving other runs and queues alone. Workers and the monitor share the original reset timestamp, so startup work cannot extend the deadline.
 
-Completion prints the final tally and log path. Up to 20 failure or retry reasons follow it; all reasons are saved to `errors.txt`. Session metadata and the last screen are retained in `.runtime/` within the report directory; prompts and executable scripts are deleted after completion. Report cleanup skips active runs. With redirected stdin or stdout, the client waits without drawing and prints the final summary.
+Completion prints the final tally and log path. Up to 20 failure or retry reasons follow it; all reasons are saved to `errors.txt`. A failure to save that file produces a warning and does not prevent the summary or cleanup. Session metadata and the last screen are retained in `.runtime/` within the report directory; prompts and executable scripts are deleted after completion. Report cleanup skips active runs. With redirected stdin or stdout, the client waits without drawing and prints the final summary.
+
+A temporary failure to publish a screen snapshot leaves workers running and is retried. Startup metadata is saved before workers can claim tasks. Execution scripts and prompts are cleaned up after errors as well as successful completion. A symlinked configuration uses the same session lookup for `run` and `attach`.
 
 Only one run can be active for a configuration at a time. Use `token-burn attach` to return to its screen.
 

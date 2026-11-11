@@ -37,6 +37,10 @@ Saving uses the same validation as normal configuration loading, backs up the ex
 
 Both stdin and stdout must be terminals. Opening the editor does not start agents, invoke ai-usage, or scan repositories. Repair TOML syntax errors in a text editor before opening the TUI.
 
+Configuration loading errors identify the file, line, and column without quoting field values. This also applies to wrong types and unknown policy values, which could otherwise expose a string entered into the wrong field.
+
+The settings editor requires at least 60 columns and 18 rows for editing and save previews. In a smaller terminal, only quit, discard confirmation, and cancel remain available. Enlarge the terminal to continue editing or confirm a save.
+
 ## Settings
 
 ```toml
