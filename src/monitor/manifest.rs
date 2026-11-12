@@ -16,6 +16,9 @@ pub struct Manifest {
     pub agent: String,
     /// 表示用のコマンド（認証情報は伏せ済み）。
     pub command: String,
+    /// 起動時の明示指定と、実行中セッションのモデル・effort を読む設定。
+    #[serde(default)]
+    pub inference: super::inference::Configuration,
     /// 表示用のリセット時刻とその導出元。
     pub reset: String,
     /// タスク数。
@@ -89,6 +92,7 @@ mod tests {
         let manifest = Manifest {
             agent: "claude".into(),
             command: "claude -p".into(),
+            inference: Default::default(),
             reset: "2026/10/27 09:00".into(),
             total: 3,
             deadline_epoch: 1_792_000_000,
@@ -109,6 +113,10 @@ mod tests {
             }),
         };
         manifest.write(&path).unwrap();
+        assert_eq!(Manifest::read(&path).unwrap(), manifest);
+        let mut legacy = serde_json::to_value(&manifest).unwrap();
+        legacy.as_object_mut().unwrap().remove("inference");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert_eq!(Manifest::read(&path).unwrap(), manifest);
     }
 

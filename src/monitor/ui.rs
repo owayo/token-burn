@@ -188,6 +188,11 @@ fn error_lines(errors: &[String], budget: usize) -> Vec<Line<'static>> {
 
 fn header(manifest: &Manifest) -> Vec<Line<'static>> {
     let rule = "━".repeat(24);
+    let pending = if manifest.inference.provider.is_some() {
+        "collecting..."
+    } else {
+        "not reported"
+    };
     let field = |label: &str, value: String| {
         Line::from(vec![
             Span::styled(format!(" {label:<9}"), Style::new().fg(LABEL)),
@@ -203,6 +208,30 @@ fn header(manifest: &Manifest) -> Vec<Line<'static>> {
         Line::from(rule),
         Line::default(),
         field("Agent:", manifest.agent.clone()),
+        field(
+            "Model:",
+            crate::format_stream::util::truncate_inline(
+                manifest
+                    .inference
+                    .settings
+                    .model
+                    .as_deref()
+                    .unwrap_or(pending),
+                160,
+            ),
+        ),
+        field(
+            "Effort:",
+            crate::format_stream::util::truncate_inline(
+                manifest
+                    .inference
+                    .settings
+                    .effort
+                    .as_deref()
+                    .unwrap_or(pending),
+                80,
+            ),
+        ),
         field("Command:", manifest.command.clone()),
         field("Reset:", manifest.reset.clone()),
         field("Tasks:", manifest.total.to_string()),
@@ -1063,6 +1092,7 @@ mod tests {
         Manifest {
             agent: "claude".into(),
             command: "claude -p".into(),
+            inference: Default::default(),
             reset: "2026/10/27 09:00".into(),
             total: 10,
             deadline_epoch: NOW + 3 * 86_400 + 3_661,
@@ -1074,6 +1104,19 @@ mod tests {
             threshold: 95,
             ai_usage: None,
         }
+    }
+
+    #[test]
+    fn header_displays_observed_model_and_effort_as_separate_fields() {
+        let mut manifest = manifest();
+        manifest.inference.settings = super::super::inference::Settings {
+            model: Some("actual-\n\u{1b}[31mmodel".into()),
+            effort: Some("xhigh".into()),
+        };
+        let lines: Vec<String> = header(&manifest).iter().map(ToString::to_string).collect();
+        assert_eq!(find(&lines, "Model:"), " Model:   actual- model");
+        assert_eq!(find(&lines, "Effort:"), " Effort:  xhigh");
+        assert!(lines.iter().all(|line| !line.contains(['\n', '\u{1b}'])));
     }
 
     fn controller(counts: Counts) -> Controller {

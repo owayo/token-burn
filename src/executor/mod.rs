@@ -17,6 +17,7 @@ use crate::scanner::{ResolvedTarget, Visibility};
 use crate::usage::LiveError;
 
 mod flags;
+mod inference;
 mod scripts;
 mod util;
 pub(crate) use util::last_log_line;
@@ -1097,6 +1098,7 @@ pub fn execute_plan(
         monitor: crate::monitor::Manifest {
             agent: plan.agent.name.clone(),
             command: display::format_command(&plan.agent.command),
+            inference: inference::configuration(&plan.agent),
             reset: reset_info.into(),
             total: plan.tasks.len(),
             deadline_epoch,

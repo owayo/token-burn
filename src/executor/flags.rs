@@ -163,7 +163,7 @@ fn ensure_codex_unattended_flags(command: &mut Vec<String>) {
 ///
 /// `-S` / `--split-string` は実行ファイルを含む引数列を 1 つの文字列に収めるので、独立した
 /// 位置が無い（`None`）。
-fn env_command_index(command: &[String]) -> Option<usize> {
+pub(super) fn env_command_index(command: &[String]) -> Option<usize> {
     if command_basename(command) != "env" {
         return Some(0);
     }

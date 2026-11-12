@@ -298,6 +298,7 @@ mod tests {
             monitor: crate::monitor::Manifest {
                 agent: "test".into(),
                 command: "test-agent".into(),
+                inference: Default::default(),
                 reset: String::new(),
                 total: 1,
                 worker_count: 1,

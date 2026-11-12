@@ -16,6 +16,7 @@ pub(crate) mod ansi;
 mod controller;
 mod disk;
 mod history;
+pub(crate) mod inference;
 mod load;
 pub mod manifest;
 pub(crate) mod process;
@@ -50,6 +51,7 @@ pub enum Event {
     StopWritten(Result<(), String>),
     /// 一時停止中の回復の確認の結果（早期解除を含む）。
     Recovery(recovery::Update),
+    Inference(inference::Settings),
 }
 
 /// stop file のロックを待つ上限。ロックを握る処理（pause の読み書きと claim）は短いので
@@ -61,8 +63,8 @@ pub async fn run(
     manifest_path: &Path,
     mut interrupts: mpsc::UnboundedReceiver<()>,
 ) -> Result<bool> {
-    let manifest = Manifest::read(manifest_path)?;
-    let manifest = &manifest;
+    let mut manifest = Manifest::read(manifest_path)?;
+    let manifest = &mut manifest;
     let pause_file = rate_control::pause_path_for(&manifest.stop_file);
     let directory = manifest_path.parent().unwrap_or(Path::new("."));
     let mut controller = Controller::new(
@@ -73,6 +75,14 @@ pub async fn run(
     );
 
     let (events_tx, mut events) = mpsc::channel::<Event>(64);
+    if manifest.inference.provider.is_some() {
+        tokio::spawn(inference::run(
+            manifest.inference.clone(),
+            manifest.report_dir.clone(),
+            manifest.marker_dir.clone(),
+            events_tx.clone(),
+        ));
+    }
     if let Some(commands) = manifest.ai_usage.clone() {
         tokio::spawn(usage::run(commands, events_tx.clone()));
     }
@@ -120,6 +130,7 @@ pub async fn run(
             }
             Some(event) = events.recv() => match event {
                 Event::Usage(lines) => usage = lines,
+                Event::Inference(settings) => manifest.inference.settings = settings,
                 Event::Disk(update) => disk.apply(update, Instant::now()),
                 Event::StopWritten(Err(error)) => {
                     // 書けないとワーカーは次のタスクへ進んでしまう。黙らず画面に出す。

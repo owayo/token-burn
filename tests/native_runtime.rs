@@ -167,6 +167,43 @@ fn native_workers_have_ttys_run_in_parallel_and_record_success_without_tmux() {
 }
 
 #[test]
+fn monitor_shows_the_sessions_actual_model_and_effort() {
+    let fixture = Fixture::new(
+        r#"
+root=$(dirname "$0")
+case "$(basename "$PWD")" in
+  first) session=018cc251-f400-7000-8000-000000000001 ;;
+  *) session=018cc251-f400-7000-8000-000000000002 ;;
+esac
+mkdir -p "$CODEX_HOME/sessions/2024/01/01"
+printf '%s\n' '{"type":"turn_context","payload":{"model":"actual-session-model","effort":"xhigh"}}' > "$CODEX_HOME/sessions/2024/01/01/rollout-example-$session.jsonl"
+printf '{"type":"thread.started","thread_id":"%s"}\n' "$session"
+while [ ! -e "$root/release" ]; do sleep 0.05; done
+"#,
+    );
+    let root = fixture.temporary.path();
+    let settings = fs::read_to_string(&fixture.config).unwrap().replace(
+        "name = \"test\"",
+        &format!(
+            "name = \"test\"\nprovider = \"codex\"\ncodex_output = \"json\"\nenv = {{ CODEX_HOME = {} }}",
+            serde_json::to_string(&root.join("config-home").to_string_lossy()).unwrap()
+        ),
+    );
+    fs::write(&fixture.config, settings).unwrap();
+    let mut client = fixture.start();
+    let directory = fixture.directory();
+    wait_until(|| {
+        let view = json(&directory.join("monitor-view.json")).to_string();
+        view.contains("Model:")
+            && view.contains("actual-session-model")
+            && view.contains("Effort:")
+            && view.contains("xhigh")
+    });
+    fs::write(root.join("release"), "").unwrap();
+    assert!(wait_child(&mut client).success());
+}
+
+#[test]
 fn failing_tasks_keep_their_actual_error_without_terminal_capture_commands() {
     let fixture = Fixture::new("echo actual-agent-failure >&2\nexit 7");
     let mut client = fixture.start();

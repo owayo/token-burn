@@ -6,13 +6,15 @@ What token-burn shows while it runs. Each worker pane renders Claude Code's stre
 
 The monitor pane shows the progress of the whole run along with ai-usage limits, machine load, and free disk space. From top to bottom:
 
-- **Header**: agent, command, reset time, task count, worker count, and log location
+- **Header**: agent, model, reasoning effort, command, reset time, task count, worker count, and log location
 - **AI Usage**: With ai-usage integration, `ai-usage --statusline --logos` (each account's 5h / weekly utilization bars), refreshed every 10 seconds. The monitor updates the cache with `ai-usage --json` and renders it with `--input`. This display goes through ai-usage's shared cache (120 seconds by default); the stop decisions (usage-gate) refetch the running account with `--refresh` instead. Each command has a 30-second timeout; a failed refresh keeps the previous display. Progress and load keep updating while a refresh runs
 - **System**: CPU and memory utilization over the last 5 minutes as graphs, plus swap and disk as numbers and bars (see below)
 - **Errors**: why tasks failed. When the pane is too short, the list collapses into `+N more errors`. After the session closes, the same list is printed on the terminal you started from, and every reason is kept in `errors.txt` in the logs directory (see [usage.md](usage.md#native-split-screen-execution))
 - **Notices and progress**: pause and stop notices, the time left until the deadline, the progress bar, and the counts. The progress bar shrinks to fit narrow panes without dropping the counts. A pause notice states the condition recorded for the pause, for example `Paused: request rejected (five_hour); five_hour at 42% — resuming at 13:10`, rather than always reading as a threshold crossing. In a very short pane, the blank line above the progress line is the first thing dropped, so the errors keep their row
 
 While a pause is in effect and ai-usage integration is enabled, the monitor refetches the running account's usage with `--refresh` about every 30 seconds. The first check waits until 35 seconds after the observation that caused the pause (usage fetched earlier might predate it); a pause carried over from an earlier run is checked right away. When it can tell that a manual reset (or anything else) has refilled the window that caused the pause, it lifts the pause and shows a notice that the recovery was confirmed; the workers take their next task without waiting for the estimated resume time (the conditions are in [Rate limits](rate-limits.md#resuming-early-after-a-manual-reset)). With an older ai-usage that does not support `--refresh`, the monitor stops checking, shows a warning, and the workers wait until the estimated time.
+
+`Model:` and `Effort:` initially show explicit command options, then update from the running session's records. Claude's transcript supplies its effort; Codex's rollout supplies its model and effort. Records must match the session ID emitted by the running task. If active workers use different values, the panel lists them together. An unknown value reads `collecting...` rather than an assumed default. Session records must remain accessible; custom configuration directories outside the home directory should be supplied through `CLAUDE_CONFIG_DIR` or `CODEX_HOME` in the agent's environment.
 
 The System panel at 70 columns:
 
