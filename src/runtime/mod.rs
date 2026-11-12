@@ -112,6 +112,7 @@ pub fn send(directory: &Path, control: &Control) -> Result<()> {
 }
 
 pub fn launch(path: &Path) -> Result<()> {
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     let directory = path.parent().context("Missing session directory")?;
     fs::create_dir_all(directory.join("controls"))?;
@@ -124,7 +125,10 @@ pub fn launch(path: &Path) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    #[cfg(windows)]
+    command.current_dir(directory);
     // SAFETY: setsid is async-signal-safe; the child has not created any threads.
+    #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -133,9 +137,11 @@ pub fn launch(path: &Path) -> Result<()> {
             Ok(())
         });
     }
-    let mut child = command
-        .spawn()
-        .context("Cannot start the background runner")?;
+    #[cfg(windows)]
+    let child = crate::platform::windows::spawn_detached(&mut command);
+    #[cfg(not(windows))]
+    let child = command.spawn();
+    let mut child = child.context("Cannot start the background runner")?;
     let startup = (|| -> Result<()> {
         let started = std::time::Instant::now();
         loop {

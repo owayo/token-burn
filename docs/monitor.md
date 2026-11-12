@@ -33,13 +33,15 @@ The System panel at 70 columns:
 | `Swap` | Swap in use and the recent swap-out rate; on macOS also the amount of compressed memory |
 | `Disk` | A bar of used, purgeable, and free space, and the available space (see below) |
 
+On Windows, CPU, physical memory, and disk capacity come from Win32 APIs. Load averages, swap counters, and compressed memory are unavailable. Native disk readings describe the drive containing the runner's working directory. See [Running on Windows](windows.md) for the runtime requirements.
+
 With ai-usage integration, the monitor runs `ai-usage --disk --json` every 30 seconds and shows available, free, and purgeable space measured the way Finder does, including the volumes listed in ai-usage's `[tui].disk_mounts`. Without ai-usage integration, or with an ai-usage that predates `--disk`, it reads the startup disk from the OS and leaves out the purgeable part, which the OS does not report. After a failed read, the previous values stay with their age (`3m ago`).
 
 The graphs always cover the last 5 minutes on a fixed 0–100% scale, whatever the pane width. Until 5 minutes have been recorded, their left part stays blank, which keeps it distinct from 0% (the lowest `▁`).
 
 Press Ctrl-C once to stop starting new tasks and wait for the running ones. Pressing it again once the run has stopped closes the session without waiting.
 
-Startup cache collection also has a 30-second timeout, covering both child exit and stdout/stderr EOF. On Unix, timeout cleanup terminates descendants in the same process group. A failed collection produces a warning and leaves subsequent refreshes to the monitor.
+Startup cache collection also has a 30-second timeout, covering both child exit and stdout/stderr EOF. On Unix, timeout cleanup terminates descendants in the same process group; on Windows it terminates the Job Object. A failed collection produces a warning and leaves subsequent refreshes to the monitor.
 
 ## Sessions and results
 

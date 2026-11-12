@@ -84,7 +84,7 @@ pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<CleanupRe
             {
                 Ok(lock) => match lock.try_lock_exclusive() {
                     Ok(()) => Some(lock),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) if crate::platform::lock_contended(&error) => continue,
                     Err(error) => {
                         report.failures.push(format!(
                             "cannot check active run {}: {error}",

@@ -3,6 +3,7 @@
 ## 現行の実行方式
 
 実行画面は `src/runtime/` の ratatui TUI に移行した。tmux は使わない。
+Windows x64 では ConPTY と Git for Windows の Bash を使う。`platform` が Bash の探索・パス変換・終了通知を扱い、Job Object に属した後で開始ゲートを開いて子孫プロセスを管理する。`TOKEN_BURN_BASH` で Git Bash の場所を上書きできる。
 `executor::execute_plan` が実行ごとの private な `.runtime/` を作り、隠し `runner` を独立セッションで起動する。
 `runtime::runner` は portable-pty のワーカーを管理し、`monitor::run` が停止・回復確認・計測を続ける。
 `runtime::ui` は原子的なスナップショットを読み、操作をファイルのキューへ送る。UI の終了・切断は実行を止めない。
@@ -124,7 +125,7 @@ make ci       # CI の quality ジョブと同じ検査 (check + test)
 make release  # リリースビルド
 ```
 
-CI (`.github/workflows/ci.yml`) の quality ジョブは Linux と macOS で `make setup` と `make ci` だけを実行します。検査を足すときは Makefile の `ci` に足します。
+CI (`.github/workflows/ci.yml`) の quality ジョブは Linux と macOS で `make setup` と `make ci` だけを実行します。検査を足すときは Makefile の `ci` に足します。Windows は build ジョブで MSVC バイナリをビルドし、clippy と `cargo test --no-fail-fast` を実行します。
 
 ## 設定ファイル
 

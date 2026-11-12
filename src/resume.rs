@@ -182,9 +182,9 @@ impl ResumeStore {
     }
 }
 
-/// `state.json` のキーと同じ形（`to_string_lossy`）で揃える。
+/// `state.json` と同じパス表記で揃える。
 fn directory_key(directory: &Path) -> String {
-    directory.to_string_lossy().to_string()
+    crate::platform::path_key(directory)
 }
 
 /// `state.json` と同じディレクトリに置く `resume.json` のパス。

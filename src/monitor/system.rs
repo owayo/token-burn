@@ -4,11 +4,11 @@
 //! OS の累積カウンタと現在値を読むだけ）。CPU 使用率とスワップアウト量は累積カウンタの差分から
 //! 求めるので、[`Sampler`] が前回の値を持つ。
 //!
-//! 依存クレートは増やさない。macOS は Mach（`host_statistics` / `host_statistics64`）と
+//! macOS は Mach（`host_statistics` / `host_statistics64`）と
 //! `sysctlbyname`、Linux は `/proc` を読む。`unsafe` を含む OS 固有の呼び出しは `macos.rs` /
 //! `linux.rs` / `unix.rs` に閉じ込め、差分と換算の計算はここに置いてどの OS でもテストする。
 //! `/proc` の解析も純粋関数として `procfs.rs` に分け、Linux 以外でもコンパイル・テストする。
-//! macOS と Linux 以外では全項目が None になる。
+//! Windows は Win32 API で CPU と物理メモリを読む。未対応の項目は None にする。
 
 use std::time::Instant;
 
@@ -23,14 +23,18 @@ mod unix;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(target_os = "linux")]
 use linux as os;
 #[cfg(target_os = "macos")]
 use macos as os;
+#[cfg(windows)]
+use windows as os;
 
 /// macOS と Linux 以外では何も読まない（全項目 None）。コンパイルが通ることだけを保証する。
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod os {
     use super::Reading;
 

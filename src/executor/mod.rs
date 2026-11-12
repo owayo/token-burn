@@ -27,6 +27,7 @@ use flags::{agent_is_claude, claude_session_flag, ensure_required_flags};
 use scripts::{
     TaskCtx, TaskResume, WorkerCtx, build_disk_cmd, build_live_cmd, build_refresh_cmd,
     build_statusline_cmd, build_task_script, build_worker_script, env_prefix_parts, shell_escape,
+    shell_escape_path,
 };
 use util::{sanitize_filename, strip_ansi_from_dir, truncate};
 
@@ -751,8 +752,25 @@ fn run_ai_usage_sync(
                     .context("failed to create ai-usage runtime")?;
                 runtime.block_on(async {
                     use tokio::io::AsyncReadExt;
-                    let mut builder = tokio::process::Command::new(&command[0]);
-                    builder.args(&command[1..]);
+                    #[cfg(not(windows))]
+                    let mut builder = {
+                        let mut builder = tokio::process::Command::new(&command[0]);
+                        builder.args(&command[1..]);
+                        builder
+                    };
+                    #[cfg(windows)]
+                    let gate = crate::platform::windows::Gate::new()?;
+                    #[cfg(windows)]
+                    let mut builder = {
+                        let mut builder = tokio::process::Command::new(crate::platform::bash()?);
+                        let payload = scripts::quote_command(command).join(" ");
+                        builder.args(["-c", &gate.wrap(&payload)]);
+                        builder.envs(crate::platform::shell_environment()?);
+                        builder.creation_flags(
+                            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+                        );
+                        builder
+                    };
                     for (key, value) in env {
                         if value.is_empty() {
                             builder.env_remove(key);
@@ -775,6 +793,21 @@ fn run_ai_usage_sync(
                                 display::format_command(command)
                             )
                         })?;
+                    #[cfg(windows)]
+                    let _job = {
+                        let result = crate::platform::windows::Job::assign(
+                            child.id().context("Missing ai-usage PID")?,
+                        );
+                        let job = match result {
+                            Ok(job) => job,
+                            Err(error) => {
+                                let _ = child.kill().await;
+                                return Err(error.into());
+                            }
+                        };
+                        gate.release()?;
+                        job
+                    };
                     #[cfg(unix)]
                     let group_pid = child.id();
                     let mut stdout = child
@@ -808,6 +841,8 @@ fn run_ai_usage_sync(
                             stderr,
                         }),
                         failure => {
+                            #[cfg(windows)]
+                            _job.terminate();
                             #[cfg(unix)]
                             if let Some(pid) = group_pid {
                                 // pid は process_group(0) で作った自分の子のグループ ID。負値でグループ全体を指定する。
@@ -841,15 +876,24 @@ fn run_ai_usage_sync(
 /// `chmod` の非ゼロ終了は無視されないことを保証し、tmux ワーカー起動時の
 /// 「permission denied」を未然に検知できるようにする。
 fn ensure_executable(path: &Path) -> Result<()> {
-    let output = std::process::Command::new("chmod")
-        .args(["+x", &path.to_string_lossy()])
-        .output()
-        .with_context(|| format!("Failed to run chmod on {}", path.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("chmod +x {} failed: {}", path.display(), stderr.trim());
+    #[cfg(windows)]
+    {
+        // Windows workers explicitly invoke Bash; there is no executable permission bit.
+        std::fs::metadata(path)?;
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        let output = std::process::Command::new("chmod")
+            .args(["+x", &path.to_string_lossy()])
+            .output()
+            .with_context(|| format!("Failed to run chmod on {}", path.display()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("chmod +x {} failed: {}", path.display(), stderr.trim());
+        }
+        Ok(())
+    }
 }
 
 pub fn print_plan(plan: &ExecutionPlan, parallelism: usize) {
@@ -1261,7 +1305,7 @@ fn build_usage_gate_cmd(
     // 入れると hidden CLI が実行ファイルと誤認するため、サブコマンドより前に置く。
     let mut parts = env_prefix_parts(&gate.env);
     parts.extend([
-        shell_escape(&exe_path.to_string_lossy()),
+        shell_escape_path(exe_path),
         "usage-gate".to_string(),
         // 値は `--<名前>=<値>` の 1 引数で渡す。2 引数にすると、`-` で始まる profile 名を
         // usage-gate 自身の clap が別のフラグと読んで終了コード 2 で失敗し、ワーカーが
@@ -1271,7 +1315,7 @@ fn build_usage_gate_cmd(
         "--threshold".to_string(),
         rate_limit_threshold.to_string(),
         "--stop-file".to_string(),
-        shell_escape(&stop_file.to_string_lossy()),
+        shell_escape_path(stop_file),
         "--".to_string(),
     ]);
     parts.extend(gate.command.iter().map(|s| shell_escape(s)));
@@ -1344,9 +1388,9 @@ fn build_gate_claim_cmd(
 ) -> String {
     let mut gate_claim_cmd = format!(
         "{} gate-claim --stop-file {} --queue-dir {} --deadline-epoch {}",
-        shell_escape(&exe_path.to_string_lossy()),
-        shell_escape(&stop_file.to_string_lossy()),
-        shell_escape(&queue_dir.to_string_lossy()),
+        shell_escape_path(exe_path),
+        shell_escape_path(stop_file),
+        shell_escape_path(queue_dir),
         deadline_epoch,
     );
     // 一時停止から再開する直前に、実データで使用率を確かめ直す。待機の根拠は停止時点の
@@ -2687,8 +2731,8 @@ mod tests {
         };
         let script = format!(
             "printf '%s\\n' \"$*\" >> {}; {refuse}cat {}",
-            shell_escape(&log.to_string_lossy()),
-            shell_escape(&output.to_string_lossy())
+            shell_escape_path(&log),
+            shell_escape_path(&output)
         );
         let gate = UsageGateConfig {
             profile: "Work".to_string(),
@@ -3323,7 +3367,7 @@ mod tests {
             state_file,
         ] {
             assert!(
-                script.contains(&shell_escape(&path.to_string_lossy())),
+                script.contains(&shell_escape_path(&path)),
                 "{}: {script}",
                 path.display()
             );
@@ -3363,7 +3407,7 @@ mod tests {
 
         let resume_prompt = layout.tmp_dir.join("resume-prompt.txt");
         assert_eq!(std::fs::read_to_string(&resume_prompt).unwrap(), "continue");
-        let quoted = shell_escape(&resume_prompt.to_string_lossy());
+        let quoted = shell_escape_path(&resume_prompt);
         let resumed = std::fs::read_to_string(layout.task_dir.join("task-0002.sh")).unwrap();
         assert!(resumed.contains(&quoted), "{resumed}");
         let fresh = std::fs::read_to_string(layout.task_dir.join("task-0001.sh")).unwrap();

@@ -6,3 +6,7 @@
 # GitHub Actions の minimal profile には rustfmt / clippy が無いため `make ci` が失敗する。
 # minimal に Makefile で使うコンポーネントだけを追加する。
 rust = { version = "1.99.1", profile = "minimal", components = ["rustfmt", "clippy"] }
+
+[env]
+# Ship the Windows CRT in the executable; the ZIP does not require a separate runtime installer.
+CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"

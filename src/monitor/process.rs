@@ -30,6 +30,10 @@ const REAP_GRACE: Duration = Duration::from_secs(2);
 /// 起動中のプロセスグループ（期限切れで止めた後の回収待ちを含む）。
 static RUNNING: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
+#[cfg(windows)]
+static JOBS: Mutex<Vec<(i32, std::sync::Arc<crate::platform::windows::Job>)>> =
+    Mutex::new(Vec::new());
+
 /// [`RUNNING`] への登録。プロセスを回収し終えたら（このガードを捨てたら）外す。
 struct Registration(Option<i32>);
 
@@ -47,6 +51,12 @@ impl Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(pid) = self.0 {
+            JOBS.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(id, _)| *id != pid);
+        }
         if let Some(pid) = self.0
             && let Ok(mut running) = RUNNING.lock()
         {
@@ -127,9 +137,32 @@ impl Runner {
         }
         self.reaping = None;
 
+        #[cfg(windows)]
+        let gate = crate::platform::windows::Gate::new().map_err(RunError::Spawn)?;
+        #[cfg(windows)]
+        let command = &gate.wrap(command);
         let mut child = spawn(command).map_err(RunError::Spawn)?;
         let pid = child.id();
         let registration = Registration::new(pid);
+        #[cfg(windows)]
+        {
+            let result = (|| {
+                let job = crate::platform::windows::Job::assign(
+                    pid.ok_or_else(|| std::io::Error::other("Missing monitor child PID"))?,
+                )?;
+                JOBS.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    registration
+                        .0
+                        .ok_or_else(|| std::io::Error::other("Invalid monitor child PID"))?,
+                    job,
+                ));
+                gate.release()
+            })();
+            if let Err(error) = result {
+                let _ = child.kill().await;
+                return Err(RunError::Spawn(error));
+            }
+        }
         let mut stdout = child.stdout.take().expect("stdout is piped");
         let finished = tokio::time::timeout(timeout, async {
             let mut bytes = Vec::new();
@@ -150,6 +183,8 @@ impl Runner {
             Err(_) => {
                 if !terminate(&mut child, pid).await {
                     self.reaping = Some(tokio::spawn(async move {
+                        #[cfg(windows)]
+                        let _gate = gate;
                         let _ = child.wait().await;
                         drop(registration);
                     }));
@@ -161,7 +196,12 @@ impl Runner {
 }
 
 fn spawn(command: &str) -> std::io::Result<Child> {
-    let mut builder = Command::new("bash");
+    let mut builder = Command::new(crate::platform::bash()?);
+    #[cfg(windows)]
+    {
+        builder.envs(crate::platform::shell_environment()?);
+        builder.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
     builder
         .arg("-c")
         .arg(command)
@@ -211,7 +251,17 @@ fn signal_group(pid: Option<u32>, signal: Signal) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn signal_group(pid: Option<u32>, _signal: Signal) {
+    if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
+        let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, job)) = jobs.iter().find(|(id, _)| *id == pid) {
+            job.terminate();
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn signal_group(_pid: Option<u32>, _signal: Signal) {}
 
 #[cfg(test)]
@@ -241,6 +291,7 @@ mod tests {
         assert_eq!(output.stdout, b"partial\n");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stops_a_hanging_command_and_its_children_at_the_deadline() {
         // 孫（バックグラウンドの sleep）が stdout を握っていても、期限で戻る。
@@ -277,6 +328,7 @@ mod tests {
     /// 出力が止まらない壊れたコマンドも、期限で打ち切ってグループごと止める（登録表からも外れる）。
     /// 読み取りは `MAX_OUTPUT` で止まり、その後はパイプが詰まって子が終わらないので、出力を
     /// 読み切るのを待つ形だと期限まで戻らないうえにメモリを使い切る。
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_command_that_floods_stdout_is_cut_off_at_the_deadline() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -309,6 +361,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn running_groups_are_recorded_until_reaped_and_can_be_stopped_at_exit() {
         // 登録表はテスト全体で共有されるので、自分のグループだけを止めて確かめる

@@ -8,6 +8,7 @@ mod format_codex;
 mod format_stream;
 mod init;
 mod monitor;
+mod platform;
 mod rate_control;
 mod resume;
 mod runtime;
@@ -396,6 +397,8 @@ fn parse_positive_workers(value: &str) -> Result<usize, String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(windows)]
+    platform::windows::initialize()?;
     let cli = Cli::parse();
 
     let command = cli.command.unwrap_or(Commands::Run { paths: vec![] });

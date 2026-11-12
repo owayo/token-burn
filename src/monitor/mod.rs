@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::text::Line;
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -107,11 +106,7 @@ pub async fn run(
             .map(|commands| commands.disk.clone()),
         events_tx.clone(),
     ));
-    let mut sigint = signal(SignalKind::interrupt()).context("failed to watch SIGINT")?;
-    let mut sigterm = signal(SignalKind::terminate()).context("failed to watch SIGTERM")?;
-    // tmux がセッションを閉じたとき（外から kill-session された場合を含む）はペインに SIGHUP が
-    // 届く。取得中の ai-usage は別のプロセスグループなので、止めてから終わる。
-    let mut sighup = signal(SignalKind::hangup()).context("failed to watch SIGHUP")?;
+    let mut termination = crate::platform::Signals::new().context("failed to watch termination")?;
 
     let mut sampler = system::Sampler::new();
     let mut load = load::LoadHistory::default();
@@ -151,9 +146,7 @@ pub async fn run(
                     }
                 }
             },
-            _ = sigint.recv() => actions.push(controller.interrupt()),
-            _ = sigterm.recv() => actions.push(controller.interrupt()),
-            _ = sighup.recv() => {}
+            _ = termination.recv() => actions.push(controller.interrupt()),
             Some(()) = interrupts.recv() => actions.push(controller.interrupt()),
         }
 

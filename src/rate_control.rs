@@ -1197,12 +1197,16 @@ fn clear_expired_pause(pause_file: &Path) {
 /// マーカーも残さず失われる。診断は stderr に出るのでワーカーペインからは見える。
 fn run_revalidation(cmd: &str, stop_file: &Path) -> bool {
     eprintln!("\x1b[33m  \u{21bb} 再開前に使用率を再確認します\x1b[0m");
-    match std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .stdout(std::process::Stdio::null())
-        .status()
-    {
+    let status = (|| -> std::io::Result<std::process::ExitStatus> {
+        let mut command = std::process::Command::new(crate::platform::bash()?);
+        #[cfg(windows)]
+        command.envs(crate::platform::shell_environment()?);
+        command
+            .args(["-c", cmd])
+            .stdout(std::process::Stdio::null())
+            .status()
+    })();
+    match status {
         Ok(status) if status.success() => true,
         Ok(status) => {
             // usage-gate は fail-closed で非ゼロ終了する。停止シグナルは既に書かれて

@@ -10,6 +10,9 @@
 .DEFAULT_GOAL := help
 
 BINARY_NAME := token-burn
+ifeq ($(OS),Windows_NT)
+BINARY_NAME := $(BINARY_NAME).exe
+endif
 INSTALL_PATH ?= /usr/local/bin
 # Cargo.lock をコミットするため、CI と同じ依存関係に固定して解決する。
 CARGO_FLAGS ?= --locked

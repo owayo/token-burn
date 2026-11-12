@@ -76,56 +76,32 @@ const WORKER_START_WAIT_TICKS: u32 = 600;
 /// キューから claim したワーカーが source して実行する、タスク単位のシェルスクリプトを生成する。
 pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
     let log_base = task_log_base(ctx.idx, &ctx.task.display_name);
-    let log_file = shell_escape(
-        &ctx.run_dir
-            .join(format!("{log_base}.log"))
-            .to_string_lossy(),
-    );
-    let jsonl_file = shell_escape(
-        &ctx.run_dir
-            .join(format!("{log_base}.jsonl"))
-            .to_string_lossy(),
-    );
-    let done_marker = shell_escape(
-        &ctx.marker_dir
-            .join(format!("done-{}", ctx.idx))
-            .to_string_lossy(),
-    );
-    let failed_marker = shell_escape(
-        &ctx.marker_dir
-            .join(format!("failed-{}", ctx.idx))
-            .to_string_lossy(),
-    );
-    let retry_marker = shell_escape(
-        &ctx.marker_dir
-            .join(format!("retry-{}", ctx.idx))
-            .to_string_lossy(),
-    );
-    let error_file = shell_escape(
-        &ctx.marker_dir
-            .join(format!("error-{}", ctx.idx))
-            .to_string_lossy(),
-    );
+    let log_file = shell_escape_path(&ctx.run_dir.join(format!("{log_base}.log")));
+    let jsonl_file = shell_escape_path(&ctx.run_dir.join(format!("{log_base}.jsonl")));
+    let done_marker = shell_escape_path(&ctx.marker_dir.join(format!("done-{}", ctx.idx)));
+    let failed_marker = shell_escape_path(&ctx.marker_dir.join(format!("failed-{}", ctx.idx)));
+    let retry_marker = shell_escape_path(&ctx.marker_dir.join(format!("retry-{}", ctx.idx)));
+    let error_file = shell_escape_path(&ctx.marker_dir.join(format!("error-{}", ctx.idx)));
     let error_prefix = shell_escape(&format!("[{}] ", ctx.task.display_name));
     // 起動前の一時的な失敗（LAUNCH_TEMPFAIL_EXIT）の表示。リトライ可能エラー（分類 3）と
     // 同じ言い回しにそろえる。
     let tempfail_notice = shell_escape(&format!(
         "━━━ Temporary launch failure (will retry next run): exit {LAUNCH_TEMPFAIL_EXIT} ━━━"
     ));
-    let stop_file_escaped = shell_escape(&ctx.stop_file.to_string_lossy());
+    let stop_file_escaped = shell_escape_path(ctx.stop_file);
     let cmd_str = build_shell_command(&ctx.agent.command, &ctx.agent.env, ctx.prompt_file);
     let mark_cmd = format!(
         "{} mark {} {} {}",
-        shell_escape(&ctx.exe_path.to_string_lossy()),
+        shell_escape_path(ctx.exe_path),
         shell_escape(&ctx.agent.name),
-        shell_escape(&ctx.task.directory.to_string_lossy()),
-        shell_escape(&ctx.state_file.to_string_lossy()),
+        shell_escape_path(&ctx.task.directory),
+        shell_escape_path(ctx.state_file),
     );
 
     let mut script = format!("CURRENT_TASK_LOG={log_file}\n");
     let last_line_cmd = format!(
         "{} last-log-line \"$CURRENT_TASK_LOG\" 2>/dev/null",
-        shell_escape(&ctx.exe_path.to_string_lossy())
+        shell_escape_path(ctx.exe_path)
     );
     // 現在処理中のタスクをシグナルハンドラから参照できるようにする
     script += &format!("CURRENT_FAILED_MARKER={failed_marker}\n");
@@ -147,19 +123,19 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             "  return 0\n",
             "}}\n",
         ),
-        dir = shell_escape(&ctx.task.directory.to_string_lossy()),
+        dir = shell_escape_path(&ctx.task.directory),
         prefix = error_prefix,
         error = error_file,
         failed = failed_marker,
     );
 
-    let tb_cmd = shell_escape(&ctx.exe_path.to_string_lossy());
+    let tb_cmd = shell_escape_path(ctx.exe_path);
     // resume-entry に渡す「どのエージェントの、どのターゲットか」。mark と同じ並び。
     let entry_args = format!(
         "{} {} {}",
         shell_escape(&ctx.agent.name),
-        shell_escape(&ctx.task.directory.to_string_lossy()),
-        shell_escape(&ctx.state_file.to_string_lossy()),
+        shell_escape_path(&ctx.task.directory),
+        shell_escape_path(ctx.state_file),
     );
 
     let is_claude = ctx.output == OutputPipeline::ClaudeStreamJson;
@@ -195,16 +171,10 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 // まま元のプロンプトで新規セッションを始める。次回の実行でも結局同じ新規起動に
                 // なるだけなので、ここで 1 実行ぶん待たせる理由が無い。会話は 1 ターンも
                 // 始まっていない（num_turns:0）ので二重実行にもならない。試行ごとにログを分ける。
-                let fresh_jsonl = shell_escape(
-                    &ctx.run_dir
-                        .join(format!("{log_base}.fresh.jsonl"))
-                        .to_string_lossy(),
-                );
-                let fresh_log = shell_escape(
-                    &ctx.run_dir
-                        .join(format!("{log_base}.fresh.log"))
-                        .to_string_lossy(),
-                );
+                let fresh_jsonl =
+                    shell_escape_path(&ctx.run_dir.join(format!("{log_base}.fresh.jsonl")));
+                let fresh_log =
+                    shell_escape_path(&ctx.run_dir.join(format!("{log_base}.fresh.log")));
                 script += &format!(
                     concat!(
                         "if [ \"$CLASS_CODE\" -eq {unavailable} ] && [ \"$CANCELLED\" -eq 0 ]; then\n",
@@ -319,7 +289,7 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
                 "    {tb} resume-entry save {args} --jsonl \"$JSONL\" --prompt-file {prompt} || echo {warn}\n",
                 tb = tb_cmd,
                 args = entry_args,
-                prompt = shell_escape(&ctx.prompt_file.to_string_lossy()),
+                prompt = shell_escape_path(ctx.prompt_file),
                 warn = shell_escape(
                     "  ⚠ could not save the session for resuming — the next run starts a new session"
                 ),
@@ -580,17 +550,15 @@ impl ClaudeAttempt<'_> {
 /// 共通ワーカースクリプト: queue_dir/pending-* をアトミックに claim しつつタスクを逐次実行する。
 pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
     let w = ctx.worker_id + 1;
-    let queue_dir = shell_escape(&ctx.queue_dir.to_string_lossy());
-    let task_dir = shell_escape(&ctx.task_dir.to_string_lossy());
-    let worker_done = shell_escape(
+    let queue_dir = shell_escape_path(ctx.queue_dir);
+    let task_dir = shell_escape_path(ctx.task_dir);
+    let worker_done = shell_escape_path(
         &ctx.marker_dir
-            .join(format!("worker-exit-{}", ctx.worker_id))
-            .to_string_lossy(),
+            .join(format!("worker-exit-{}", ctx.worker_id)),
     );
-    let worker_task = shell_escape(
+    let worker_task = shell_escape_path(
         &ctx.marker_dir
-            .join(format!("worker-task-{}", ctx.worker_id))
-            .to_string_lossy(),
+            .join(format!("worker-task-{}", ctx.worker_id)),
     );
     // ai-usage 連携時は各タスク完了後（次の pending を claim する前）に usage-gate を実行する。
     // 未設定なら空文字列で、ワーカースクリプトに行は追加されない。
@@ -622,7 +590,7 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
                 "  exit 1\n",
                 "fi\n",
             ),
-            start = shell_escape(&path.to_string_lossy()),
+            start = shell_escape_path(path),
             ticks = WORKER_START_WAIT_TICKS,
             worker_done = worker_done,
         ),
@@ -769,11 +737,7 @@ fn build_shell_command(
     // 環境変数を `KEY='val' cmd ...` の形で前置する。key は設定読み込み時に
     // [A-Za-z_][A-Za-z0-9_]* へ制限済みなのでエスケープ不要、値のみ shell_escape する。
     let env_prefix = env_prefix_parts(env).join(" ");
-    let cmd_joined = cmd_parts
-        .iter()
-        .map(|s| shell_escape(s))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let cmd_joined = quote_command(cmd_parts).join(" ");
     let run = if env_prefix.is_empty() {
         cmd_joined
     } else {
@@ -781,15 +745,35 @@ fn build_shell_command(
     };
     // プロンプトをコマンド置換 $(cat file) で引数として渡す
     // stdin パイプは claude -p で確実に動作しないため
-    format!(
-        "{} \"$(cat {})\"",
-        run,
-        shell_escape(&prompt_file.to_string_lossy())
-    )
+    format!("{} \"$(cat {})\"", run, shell_escape_path(prompt_file))
 }
 
 pub(super) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+pub(super) fn quote_command(command: &[String]) -> Vec<String> {
+    let executable = super::flags::env_command_index(command);
+    command
+        .iter()
+        .enumerate()
+        .map(|(index, arg)| {
+            if index == 0 || Some(index) == executable {
+                shell_escape_path(Path::new(arg))
+            } else {
+                shell_escape(arg)
+            }
+        })
+        .collect()
+}
+
+pub(super) fn shell_escape_path(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        shell_escape(&crate::platform::shell_path(path))
+    }
+    #[cfg(not(windows))]
+    shell_escape(&path.to_string_lossy())
 }
 
 /// env マップをシェル前置きトークン列にする。key は設定読み込み時に
@@ -876,7 +860,7 @@ pub(super) fn build_statusline_cmd(
     parts.push(format!("--active-provider={provider}"));
     // 選択 agent の env を前置きし、statusline の実行文脈を揃える。
     let mut all = env_prefix_parts(env);
-    all.extend(parts.iter().map(|s| shell_escape(s)));
+    all.extend(quote_command(&parts));
     Some(all.join(" "))
 }
 
@@ -894,7 +878,7 @@ pub(super) fn build_refresh_cmd(
         return None;
     }
     let mut all = env_prefix_parts(env);
-    all.extend(command.iter().map(|s| shell_escape(s)));
+    all.extend(quote_command(command));
     Some(all.join(" "))
 }
 
@@ -911,11 +895,9 @@ pub(super) fn build_live_cmd(
         return None;
     }
     let mut all = env_prefix_parts(env);
-    all.extend(
-        crate::usage::live_command(command, profile, provider)
-            .iter()
-            .map(|s| shell_escape(s)),
-    );
+    all.extend(quote_command(&crate::usage::live_command(
+        command, profile, provider,
+    )));
     Some(all.join(" "))
 }
 
@@ -945,12 +927,31 @@ pub(super) fn build_disk_cmd(
         parts.push("--json".to_string());
     }
     let mut all = env_prefix_parts(env);
-    all.extend(parts.iter().map(|s| shell_escape(s)));
+    all.extend(quote_command(&parts));
     Some(all.join(" "))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_escaping_preserves_windows_regexes_and_other_argument_values() {
+        assert_eq!(shell_escape(r"C:\d+"), r"'C:\d+'");
+        #[cfg(windows)]
+        assert_eq!(
+            quote_command(&[r"C:\Tools\agent.exe".into(), r"C:\d+".into()]),
+            ["'C:/Tools/agent.exe'", r"'C:\d+'"]
+        );
+    }
+
+    fn test_bash() -> std::process::Command {
+        let mut command = std::process::Command::new(crate::platform::bash().unwrap());
+        #[cfg(windows)]
+        command.envs(crate::platform::shell_environment().unwrap());
+        #[cfg(not(windows))]
+        let _ = &mut command;
+        command
+    }
+
     use super::*;
     use crate::scanner::Visibility;
 
@@ -1265,7 +1266,7 @@ mod tests {
                 "printf 'paused message\\n0001'",
             )
             .replace("/tmp/burn/markers", "/tmp/burn-test-markers");
-        let output = std::process::Command::new("bash")
+        let output = test_bash()
             .arg("-c")
             .arg(&harness)
             .output()
@@ -1700,7 +1701,7 @@ mod tests {
 
     /// bash が無い環境ではスクリプト実行系テストをスキップするための判定。
     fn bash_available() -> bool {
-        std::process::Command::new("bash")
+        test_bash()
             .args(["-c", "exit 0"])
             .status()
             .map(|s| s.success())
@@ -1733,7 +1734,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir should be created");
         let path = dir.path().join("script.sh");
         std::fs::write(&path, script).expect("script should be written");
-        let status = std::process::Command::new("bash")
+        let status = test_bash()
             .arg("-n")
             .arg(&path)
             .status()
@@ -1926,7 +1927,7 @@ mod tests {
         });
         let script_path = tmp.path().join("worker.sh");
         std::fs::write(&script_path, &script).unwrap();
-        let out = std::process::Command::new("bash")
+        let out = test_bash()
             .arg(&script_path)
             .output()
             .expect("bash must run the worker script");
@@ -2012,10 +2013,7 @@ mod tests {
         });
         let script_path = tmp.path().join("worker.sh");
         std::fs::write(&script_path, &script).unwrap();
-        let out = std::process::Command::new("bash")
-            .arg(&script_path)
-            .output()
-            .unwrap();
+        let out = test_bash().arg(&script_path).output().unwrap();
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(!stdout.contains("Stopped"), "{stdout}");
@@ -2277,7 +2275,7 @@ mod tests {
                     "case $OUT in NOT_FOUND|CRASH) exit 1 ;; esac\n",
                     "exit 0\n",
                 ),
-                prompts = shell_escape(&prompts.to_string_lossy()),
+                prompts = shell_escape_path(&prompts),
                 resume_out = shell_escape(resume_out),
                 fresh_out = shell_escape(fresh_out),
             ),
@@ -2303,11 +2301,12 @@ mod tests {
                     "    echo \"$*\" >> {calls} ;;\n",
                     "esac\n",
                 ),
-                calls = shell_escape(&calls.to_string_lossy()),
-                failed = shell_escape(&markers.join("failed-1").to_string_lossy()),
+                calls = shell_escape_path(&calls),
+                failed = shell_escape_path(&markers.join("failed-1")),
             ),
         )
         .unwrap();
+        #[cfg(unix)]
         for exe in [&claude, &tb] {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2350,11 +2349,11 @@ mod tests {
         });
         let script_path = root.join("task.sh");
         std::fs::write(&script_path, &script).unwrap();
-        let out = std::process::Command::new("bash")
+        let out = test_bash()
             .arg("-c")
             .arg(format!(
                 "CANCELLED=0; source {}",
-                shell_escape(&script_path.to_string_lossy())
+                shell_escape_path(&script_path)
             ))
             .output()
             .unwrap();
@@ -2615,6 +2614,7 @@ mod tests {
         agent_exit: u8,
     ) -> (tempfile::TempDir, String, String) {
         use std::io::Write;
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2637,7 +2637,7 @@ mod tests {
                     "printf '%s\\n' '{{\"type\":\"thread.started\"}}'\n",
                     "exit {agent_exit}\n",
                 ),
-                stdin_log = shell_escape(&stdin_log.to_string_lossy()),
+                stdin_log = shell_escape_path(&stdin_log),
                 agent_exit = agent_exit,
             ),
         )
@@ -2654,11 +2654,13 @@ mod tests {
                     "esac\n",
                 ),
                 format_exit = format_exit,
-                calls = shell_escape(&calls.to_string_lossy()),
+                calls = shell_escape_path(&calls),
             ),
         )
         .unwrap();
+        #[cfg(unix)]
         for exe in [&agent_exe, &tb] {
+            #[cfg(unix)]
             std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let prompt_file = root.join("prompt-1.txt");
@@ -2693,11 +2695,11 @@ mod tests {
         });
         let script_path = root.join("task.sh");
         std::fs::write(&script_path, &script).unwrap();
-        let mut child = std::process::Command::new("bash")
+        let mut child = test_bash()
             .arg("-c")
             .arg(format!(
                 "CANCELLED=0; source {}",
-                shell_escape(&script_path.to_string_lossy())
+                shell_escape_path(&script_path)
             ))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -2880,17 +2882,14 @@ mod tests {
         std::fs::write(queue.join("pending-0001"), "").unwrap();
         std::fs::write(
             tasks.join("task-0001.sh"),
-            format!(
-                "touch {}\n",
-                shell_escape(&markers.join("done-1").to_string_lossy())
-            ),
+            format!("touch {}\n", shell_escape_path(&markers.join("done-1"))),
         )
         .unwrap();
         let start = tmp.path().join("start");
         std::fs::write(&start, "").unwrap();
         let claim = format!(
             "if mv {q}/pending-0001 {q}/claimed-0001 2>/dev/null; then echo 0001; else exit 20; fi",
-            q = shell_escape(&queue.to_string_lossy())
+            q = shell_escape_path(&queue)
         );
         let script = build_worker_script(&WorkerCtx {
             worker_id: 0,
@@ -2903,7 +2902,7 @@ mod tests {
         });
         let path = tmp.path().join("worker.sh");
         std::fs::write(&path, script).unwrap();
-        let output = std::process::Command::new("bash")
+        let output = test_bash()
             .arg(&path)
             .stdin(std::process::Stdio::null())
             .output()
@@ -2919,6 +2918,7 @@ mod tests {
     /// シグナルがテストランナーへ届かないようにする）。
     #[cfg(unix)]
     fn run_worker_with_agent(agent_script: &str) -> (Vec<String>, usize, std::process::Output) {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::CommandExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -2944,16 +2944,13 @@ mod tests {
         let mark_log = root.join("mark.log");
         let exe = executable(
             "token-burn",
-            &format!(
-                "echo \"$1\" >> {}",
-                shell_escape(&mark_log.to_string_lossy())
-            ),
+            &format!("echo \"$1\" >> {}", shell_escape_path(&mark_log)),
         );
         let claim = executable(
             "gate-claim",
             &format!(
                 "if mv {q}/pending-0001 {q}/claimed-0001 2>/dev/null; then echo 0001; else exit 20; fi",
-                q = shell_escape(&queue.to_string_lossy())
+                q = shell_escape_path(&queue)
             ),
         );
         let prompt = root.join("prompt.txt");
@@ -2972,7 +2969,7 @@ mod tests {
             task_dir: &tasks,
             marker_dir: &markers,
             usage_gate_cmd: None,
-            gate_claim_cmd: &shell_escape(&claim.to_string_lossy()),
+            gate_claim_cmd: &shell_escape_path(&claim),
             start_file: None,
         });
         let worker_path = root.join("worker-0.sh");

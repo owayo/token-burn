@@ -1910,6 +1910,7 @@ dependencies = [
  "toml_edit",
  "unicode-width",
  "vt100",
+ "windows-sys",
 ]
 
 [[package]]

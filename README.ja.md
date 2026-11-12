@@ -5,7 +5,7 @@
 <h1 align="center">token-burn</h1>
 
 <p align="center">
-  プロンプトを複数のリポジトリで並列に実行し、余った Claude Code / Codex CLI のトークンを週次リセットの前に使い切る CLI ツール
+  リセット前の Claude Code / Codex CLI の残りトークンで、複数のリポジトリにプロンプトを並列実行する CLI
 </p>
 
 <!-- standard:badges:start -->
@@ -13,6 +13,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-000000?logo=apple&amp;logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/Windows-0078D6" alt="Windows">
 </p>
 
 <p align="center">
@@ -29,33 +30,31 @@
 
 ---
 
-Claude Code / Codex CLI のトークンは週次でリセットされますが、未使用分は繰り越されません。「もったいない」精神で、**token-burn** はリセット直前の残りトークンを有効活用します。コードレビュー、バグ修正、リファクタリング、テスト改善など、自由に定義したプロンプトをリポジトリ群に対して並列実行します。リセット時刻が来ると、新規タスクの開始を止め、実行中のタスクが完了するまで待機します。
+**token-burn** は、週次リセット前の Claude Code / Codex CLI の残りトークンで、リポジトリ群にプロンプトを並列実行する CLI です。「もったいない」精神で、コードレビュー、バグ修正、リファクタリング、テスト改善などに活用します。リセット時刻が来ると、新しいタスクの開始を止め、実行中のタスクが終わるのを待ちます。
+
+[ai-usage](https://github.com/owayo/ai-usage) と連携すると、アカウントごとの実際のリセット時刻と使用率を取得し、実行するエージェントと実行期限を自動で決められます。曜日・時刻を指定する固定スケジュールにも対応しています。
 
 <p align="center"><img src="docs/images/screenshot.png" width="800" alt="token-burn 実行中"></p>
 
 ## 機能
 
-- **デッドラインに合わせた実行**: リセット期限が最も近いエージェントを選びます。リセット時刻が来たら新しいタスクを始めず、実行中のタスクが終わるのを待ちます
-- **分割画面での並列実行**: ratatui の画面にモニターとワーカーを配置します。ペインの切替・拡大・スクロールに対応し、デタッチ後も実行が続きます。`token-burn attach` で再接続できます。ワーカーへの入力が詰まっても、停止要求と他ワーカーの操作は処理します
-- **負荷とディスクの表示**: モニターのペインに、直近 5 分の CPU とメモリの使用率のグラフ、メモリの逼迫度、スワップ、ディスクの空き容量を出します。ai-usage が `--disk` に対応していれば、ディスクは Finder と同じ基準で測ります
-- **リポジトリの自動探索**: 複数の `[[scan]]` 設定でディレクトリを走査して Git リポジトリを集め、remote のオーナーがユーザー名と一致するものに絞ります。同じディレクトリは 1 回だけ処理します
-- **処理順**: 公開リポジトリを非公開リポジトリより前に置き、各グループの中は最終変更が古い順に並べます。最近処理したターゲットは `skip_within` の期間スキップします
-- **対象選択 TUI**: `-i` / `--interactive` で対象と実行順を選び、`Tab` でワーカー数・停止閾値・ドライランも変更できます
-- **設定 TUI**: `token-burn config` でエージェント、探索先、プロンプト、ai-usage 連携を編集・保存できます。項目の説明と選択肢を表示し、保存前に検証します
-- **Claude Code・Codex CLI・任意のエージェント**: 無人実行に要るフラグを自動で付けます。Claude Code には stream-json 出力と `AskUserQuestion` の禁止、Codex CLI には `approval_policy=never` と `--json` です
-- **ai-usage による実際のリセット時刻**: 各アカウントのリセット時刻と使用率を `ai-usage --json` から読めます (任意)。読めないときは曜日固定のスケジュールに戻ります
-- **複数アカウント**: 1 つのエージェントをアカウントごと (`claude-work` / `claude-home`) に展開し、環境変数と処理済み履歴を分けて持ちます。`dedup_scope` を使うと、別のアカウントが止まった所から続けられます
-- **レート制限への対応**: 週次枠が `rate_limit_threshold` に達したら恒久停止し、5 時間枠ならリセットまで一時停止します。一時停止が延長された場合も、再開前に使用率を確かめ直します。ai-usage 連携があれば、一時停止中も使用率を取り直し、手動リセットで枠が戻ればリセット時刻を待たずに再開します。月次の追加課金枠 (overage) では止まりません
-- **中断セッションの再開**: レート制限で切られた Claude Code のセッションを、次の実行で `claude --resume` により続きから再開します。ラッパースクリプトがエージェントを起動する前に終了コード 75 で終わった場合は、失敗として数えずに次の実行で処理し直します。再開した実行のフッターには、その実行で使った量をセッション全体の累計と並べて出します
-- **読みやすいライブモニター**: Claude Code の stream-json を読める行に整形します。思考のナレーション（思考の本文の代わりに Claude Code が見せる短い進捗の要約）を残し、API リトライ後にストリームが欠けた応答も補い、ツール呼び出し、サブエージェントの動き、タスク名付きの状態更新、権限拒否の理由、モデルの文脈に含まれない結果、フックの差し戻し、文脈圧縮、コマンドのキャンセル、トークン使用量、モデルごとのコスト、API エラーを表示します。Codex CLI の JSON イベントは、編集のたびに出し直される累積 diff の代わりに、コマンドと変更したファイルを 1 行ずつ表示し、Codex が黙っている間はハートビートを出します。Git コミットの結果には反映先のブランチも表示します。ツールの出力と結果メタデータに含まれるエスケープシーケンスは取り除くので、コマンドの出力でペインが消去されたりタイトルを書き換えられたりしません
-- **状態とログの保全**: `state.json` はロックを取ってアトミックに更新し、タスクごとのログには連番を付けて上書きを防ぎます。整形器がログや表示先へ書けなくても入力を最後まで読み、タスクは失敗として記録します。Claude の整形器はレート制限の検査も続けます。分割画面が終了した後も、失敗したタスクの理由を起動元の端末に表示し、ログのディレクトリの `errors.txt` に残します。保存できない場合も警告を出し、端末への集計表示を続けます
-- **ドライランと安全なコマンド表示**: `-n` / `--dry-run` で実行計画を確かめられます。実行計画と モニターのどちらも、環境変数代入と認証オプションの値は `<redacted>` に伏せます
+- ai-usage から実際のリセット時刻を取得し、実行期限を自動管理します。週次枠・5 時間枠・最も近い枠を選べます。取得に失敗した場合の動作は、固定スケジュール・対象エージェントの除外・エラー終了から指定できます。
+- Claude Code、Codex CLI、任意のエージェントを並列実行できます。Claude と Codex には、無人実行と出力整形に必要なフラグを自動で付与します。
+- 分割 TUI のワーカー見出しに対象パスを表示します。モニターには、取得できたモデルと effort、連携時の使用率、CPU・メモリのグラフ、スワップ、ディスクの空き容量が並びます。
+- 実行中に `a` で対象ディレクトリを追加できます。`d` でデタッチしても処理は続き、`token-burn attach` で再接続できます。
+- `run -i` で対象と実行順を選び、ワーカー数・停止閾値・ドライランも変更してから実行できます。
+- `token-burn config` でエージェント、プロンプト、探索先、ai-usage 連携を編集し、保存前に検証します。
+- 複数の探索先から Git リポジトリを集め、最終変更が古い順に処理します。最近の処理をスキップする期間と、公開リポジトリを優先するかどうかを設定できます。
+- 複数アカウントの環境変数と履歴を分離できます。`dedup_scope` を使うと、アカウント間や同じプロバイダー内で処理済み履歴を共有できます。
+- 長い周期の利用枠が閾値に達したら後続タスクを停止し、短い周期の枠ならリセットまで一時停止します。連携時は手動リセット後の回復を確認して早めに再開でき、レート制限で中断した Claude Code セッションも次回の実行で引き継げます。
+- Claude と Codex の出力を整形し、ツール呼び出し、サブエージェント、使用トークン、コスト、エラーを表示します。タスクごとのログを保存し、失敗理由は `errors.txt` にまとめます。実行計画とモニターのコマンド表示では、環境変数代入と認証オプションの値を伏せます。
 
 ## 動作環境
 
-- **Claude Code** および/または **Codex CLI**: 少なくとも1つのエージェントが必要
-- **gh CLI**: リポジトリ可視性の検出に必要
-- **ai-usage** (任意): [ai-usage 連携](docs/configuration.ja.md#ai-usage-連携任意)を使うときだけ必要
+- Windows は Windows 10 バージョン 1809 以降、または Windows 11 の x64 環境と [Git for Windows](https://gitforwindows.org/) が必要です。Windows Terminal や PowerShell から実行できます。Bash の探索先とパスの設定は [Windows での実行](docs/windows.ja.md) を参照してください。
+- Claude Code や Codex CLI など、実行するエージェントの CLI が必要です。
+- 探索設定に `username` を指定して GitHub のリポジトリ情報と可視性を取得する場合は、`gh` CLI も使います。
+- リセット時刻の自動取得と使用率の確認には [ai-usage](https://github.com/owayo/ai-usage) が必要です。固定スケジュールだけで使う場合は省略できます。
 
 ## インストール
 
@@ -68,7 +67,7 @@ brew install owayo/token-burn/token-burn
 
 ### Cargo
 
-Rust 1.98 以上が必要です。
+Rust 1.99 以上が必要です。
 
 ```bash
 cargo install --git https://github.com/owayo/token-burn --locked
@@ -82,6 +81,7 @@ cargo install --git https://github.com/owayo/token-burn --locked
 |---|---|
 | macOS (Intel) | `token-burn-x86_64-apple-darwin.tar.gz` |
 | macOS (Apple Silicon) | `token-burn-aarch64-apple-darwin.tar.gz` |
+| Windows (x86_64) | `token-burn-x86_64-pc-windows-msvc.zip` |
 
 macOS でブラウザから取得した場合は、実行の前に隔離属性を外します: `xattr -d com.apple.quarantine token-burn`。
 
@@ -106,7 +106,7 @@ make install
 token-burn config
 ```
 
-エージェントのコマンドとリセット日時、探索先を設定し、`s` で変更を確認して保存します。新規作成時のリセット日時は仮の月曜 09:00 UTC なので、実際の予定に変更してください。初めて実行する前に、リセット時刻と実行計画を確かめます。
+エージェントのコマンドと探索先を設定し、[ai-usage 連携](#ai-usage-でリセット時刻を自動管理する)か固定スケジュールを選びます。`s` で変更を確認して保存してください。固定スケジュールを使う場合は、仮の月曜 09:00 UTC を実際の曜日・時刻・タイムゾーンに変更します。初めて実行する前に、リセット時刻と取得元、実行計画を確かめます。
 
 ```bash
 token-burn status
@@ -137,6 +137,20 @@ token-burn list
 token-burn clean --older-than 3d
 ```
 
+実行画面の通常操作で使う主なキーです。
+
+| キー | 操作 |
+|---|---|
+| `Tab` / `Shift-Tab` | ペインを選ぶ |
+| `z` | 選択したペインを拡大・元に戻す |
+| `a` | ディレクトリを追加する。Enter で確定、Esc で取り消す |
+| `PageUp` / `PageDown` | ワーカーの出力をスクロールする |
+| `i` / `Ctrl-G` | ワーカーの入力モードに入る・通常操作へ戻る |
+| `d` / `q` | デタッチする。実行は継続する |
+| `Ctrl-C` | 新しいタスクの開始を止め、実行中のタスクを待つ。再度押すと強制終了する |
+
+ワーカーの見出しには対象パスを表示します。モニターではモデルと effort の取得値を確認でき、ai-usage 連携時は使用率も表示されます。マシンの負荷も同じ画面で確認できます。対象の追加と入力操作の詳細は [分割画面での実行](docs/usage.ja.md#分割画面での実行) を参照してください。
+
 リセット時刻が来ると、token-burn は新しいタスクの開始を止め、実行中のタスクが終わるまで待ちます。
 
 <p align="center"><img src="docs/images/deadline.png" width="800" alt="デッドライン到達 — タスク完了を待機中"></p>
@@ -150,9 +164,11 @@ token-burn clean --older-than 3d
 
 ## 設定
 
-設定ファイルの既定の場所は `~/.config/token-burn/config.toml` です (別のファイルを使うときは `-c` / `--config` を渡します)。`state.json` (処理済みのターゲット) と `resume.json` (中断したセッション) も同じディレクトリに置かれます。
+設定ファイルの既定の場所は `~/.config/token-burn/config.toml` です。別のファイルを使うときは `-c` / `--config` を渡します。`state.json`（処理済みのターゲット）と `resume.json`（中断したセッション）も同じディレクトリに置かれます。
 
-エージェント 1 つとスキャン設定 1 つだけの最小の設定:
+### ai-usage でリセット時刻を自動管理する
+
+`ai-usage --json` を実行し、使いたいアカウントの `profile` を確認します。次の例の `profile = "Work"` を、その値と大文字小文字まで一致させてください。この例では週次リセットの時刻を取得するので、`reset_weekday`・`reset_time`・`timezone` の指定は不要です。
 
 ```toml
 [settings]
@@ -161,23 +177,48 @@ skip_within = "1d"
 limit = 10
 
 [prompts]
-default = "prompts/default.md"
+default = "Review this repository and improve its tests."
 
+[ai_usage]
+enabled = true
+window = "weekly"
+fallback = "error"
+
+[[ai_usage.profiles]]
+name = "work"
+profile = "Work"
+
+[[agents]]
+name = "claude"
+provider = "claude"
+command = ["claude", "--dangerously-skip-permissions", "--model", "opus"]
+[agents.ai_usage]
+profiles = ["work"]
+
+[[scan]]
+base_dirs = ["~/GitHub"]
+```
+
+`name = "work"` は `profiles = ["work"]` から参照する名前で、`profile = "Work"` は ai-usage 上のアカウントを指定します。CLI のログイン先も同じアカウントにそろえてください。切り替えが必要な場合は、profile の `env` で `CLAUDE_CONFIG_DIR` や `CODEX_HOME` を指定します。
+
+取得した時刻と取得元は `status` と `run` に表示されます。この例の `fallback = "error"` は、リセット時刻を取得できなければエラーで終了する設定です。固定スケジュールへ戻す場合は `fallback = "fixed"` に変更し、連携するエージェントに `reset_weekday`・`reset_time`・`timezone` を追加します。対象エージェントを除外する場合は `fallback = "skip"` を使います。複数 profile、アカウントごとの環境変数、使用する枠の指定は [ai-usage 連携](docs/configuration.ja.md#ai-usage-連携任意) で説明しています。
+
+### 固定スケジュールを使う
+
+ai-usage を使わない場合は、上の例から `[ai_usage]`・`[[ai_usage.profiles]]`・`[agents.ai_usage]` を削除し、エージェントの定義を次に置き換えます。
+
+```toml
 [[agents]]
 name = "claude"
 command = ["claude", "--dangerously-skip-permissions", "--model", "opus"]
 reset_weekday = "monday"
 reset_time = "09:00"
 timezone = "Asia/Tokyo"
-
-[[scan]]
-base_dirs = ["~/GitHub"]
-username = "yourname"
 ```
 
-`.md` で終わるプロンプトの値は、設定ファイルのディレクトリからの相対パスとして読み込みます。**プロンプト優先順位**: `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default`
+`.md` で終わるプロンプトの値は Markdown ファイルを読み込みます。相対パスの基準は設定ファイルのディレクトリです。優先順位は `[[targets]].prompt` > `[[agents]].prompt` > `[prompts].default` です。
 
-すべてのセクション (`[settings]`、`[[agents]]`、実際のリセット時刻と複数アカウントのための `[ai_usage]`、`[[scan]]`、`[prompts]`、`[[targets]]`) は [docs/configuration.ja.md](docs/configuration.ja.md) で説明しています。
+すべてのセクションと設定項目は [docs/configuration.ja.md](docs/configuration.ja.md) を参照してください。
 
 ## 開発
 

@@ -1,7 +1,7 @@
 # token-burn のリリース。GitHub の画面の「Run workflow」1 回で、版の更新からコミットとタグ、ビルド、
 # Release の作成、Homebrew の tap の更新までを行う。
 #
-# 配るのは macOS (Apple Silicon と Intel) だけで、配布の経路は Homebrew の tap (owayo/homebrew-token-burn)。
+# macOS (Apple Silicon と Intel) と Windows (x64) を配る。macOS は Homebrew の tap も更新する。
 # build の matrix は ci.yml の build と同じ組にする (dry_run では build が走らないので、配布物を
 # 作れることは ci.yml の build で確かめる)。
 name: Release
@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v7
 
       # cargo update を mise.toml の版の Rust で実行する (無いとランナーに最初から入っている Rust で動く)
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
         with:
           minimum_release_age: 14d
           cache: false
@@ -136,7 +136,13 @@ jobs:
             target: aarch64-apple-darwin
           - os: macos-latest
             target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
+      - name: Preserve LF line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare-release.outputs.tag }}
@@ -144,7 +150,7 @@ jobs:
 
       # ビルドのキャッシュ (rust-cache) は使わない。配布物を作るジョブがキャッシュを読むと、キャッシュを
       # 書けるほかのジョブの汚染が配布物に入る。Rust の版と mise.toml の [env] は mise-action が渡す
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
         with:
           minimum_release_age: 14d
           cache: false
@@ -156,9 +162,10 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      # 添付の名前は <bin>-<target>.tar.gz。中身はバイナリだけを最上位に置く
+      # macOS は tar.gz、Windows は zip。バイナリを最上位に置く
       # (Homebrew の formula がこの形を前提にする)
       - name: Package
+        if: runner.os != 'Windows'
         id: package
         shell: bash
         env:
@@ -170,11 +177,22 @@ jobs:
           tar -czf "../../../${TAR_GZ}" "${BINARY_NAME}"
           echo "asset=${TAR_GZ}" >> "$GITHUB_OUTPUT"
 
+      - name: Package Windows
+        id: package-windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $asset = "$env:BINARY_NAME-$env:TARGET.zip"
+          Compress-Archive -Path "target/$env:TARGET/release/$env:BINARY_NAME.exe" -DestinationPath $asset
+          "asset=$asset" >> $env:GITHUB_OUTPUT
+
       # archive: false で添付のファイルをそのまま上げる (artifact の名前はファイル名になる)。zip を展開させない
       # ため、release のジョブは skip-decompress: true で落とす
       - uses: actions/upload-artifact@v7
         with:
-          path: ${{ steps.package.outputs.asset }}
+          path: ${{ steps.package.outputs.asset || steps.package-windows.outputs.asset }}
           archive: false
           if-no-files-found: error
 
@@ -256,6 +274,8 @@ jobs:
             ```
 
             If you downloaded the archive with a browser, remove the quarantine attribute before running it: `xattr -d com.apple.quarantine ${{ env.BINARY_NAME }}`.
+
+            On Windows 10 (1809+) or Windows 11 x64, download `${{ env.BINARY_NAME }}-x86_64-pc-windows-msvc.zip`, extract it and put `${{ env.BINARY_NAME }}.exe` on your `PATH`. Install Git for Windows (Bash is required), then run in Windows Terminal or PowerShell. `TOKEN_BURN_BASH` can point to a custom Git installation's `bin/bash.exe`.
           generate_release_notes: true
           files: release/*
           fail_on_unmatched_files: true

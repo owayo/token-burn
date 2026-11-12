@@ -108,7 +108,7 @@ impl State {
     fn last_processed(&self, agent_name: &str, directory: &Path) -> Option<DateTime<Utc>> {
         self.agents
             .get(agent_name)
-            .and_then(|m| m.get(&directory.to_string_lossy().to_string()))
+            .and_then(|m| m.get(&crate::platform::path_key(directory)))
             .copied()
     }
 
@@ -123,7 +123,7 @@ impl State {
         directory: &Path,
         in_scope: impl Fn(&str) -> bool,
     ) -> Option<LastProcessed> {
-        let key = directory.to_string_lossy().to_string();
+        let key = crate::platform::path_key(directory);
         self.agents
             .iter()
             .filter(|(name, _)| in_scope(name))
@@ -141,7 +141,7 @@ impl State {
         self.agents
             .entry(agent_name.to_string())
             .or_default()
-            .insert(directory.to_string_lossy().to_string(), Utc::now());
+            .insert(crate::platform::path_key(directory), Utc::now());
     }
 }
 

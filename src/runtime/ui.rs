@@ -244,7 +244,7 @@ fn check_alive(directory: &Path) -> Result<()> {
             );
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(error) if crate::platform::lock_contended(&error) => Ok(()),
         Err(error) => Err(error.into()),
     }
 }

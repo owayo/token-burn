@@ -116,6 +116,9 @@ fn cleanup_keeps_a_locked_native_run() {
             .deleted
             .is_empty()
     );
+    // Parallel PTY tests may fork while this lock is held. Explicit unlock also releases
+    // an inherited descriptor before the child reaches exec and closes it.
+    FileExt::unlock(&lock).unwrap();
     drop(lock);
     assert_eq!(
         crate::cleanup::cleanup_old_reports(temporary.path(), "1d")

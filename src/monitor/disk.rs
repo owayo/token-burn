@@ -337,7 +337,38 @@ fn read_statvfs(path: &str) -> Reading {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn read_statvfs(_path: &str) -> Reading {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("C:/"));
+    let target = path.to_string_lossy().into_owned();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let (mut available, mut total, mut free) = (0, 0, 0);
+    // The NUL-terminated path and output counters remain valid throughout the call.
+    let result =
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) };
+    if result == 0 || total == 0 {
+        return Reading {
+            target,
+            status: Status::Error(std::io::Error::last_os_error().to_string()),
+            volume: None,
+        };
+    }
+    Reading {
+        target: target.clone(),
+        status: Status::Ok,
+        volume: Some(Volume {
+            name: target,
+            total,
+            free: available.min(total),
+            available: available.min(total),
+            purgeable: None,
+        }),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn read_statvfs(path: &str) -> Reading {
     Reading {
         target: path.to_string(),

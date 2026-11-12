@@ -12,12 +12,17 @@ use std::{
 };
 
 pub(super) struct Worker {
-    master: Box<dyn MasterPty + Send>,
+    master: Option<Box<dyn MasterPty + Send>>,
+    size: PtySize,
     child: Box<dyn Child + Send + Sync>,
     input: std::sync::mpsc::SyncSender<Vec<u8>>,
     terminal: Arc<Mutex<vt100::Parser<TerminalReplies>>>,
     eof: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
+    #[cfg(windows)]
+    job: Arc<crate::platform::windows::Job>,
+    #[cfg(windows)]
+    _gate: crate::platform::windows::Gate,
     pub finished: bool,
 }
 
@@ -27,30 +32,52 @@ fn dimension(value: u16) -> NonZeroU16 {
 
 impl Worker {
     pub fn respawn(&mut self, script: &Path) -> Result<()> {
-        let size = self.master.get_size()?;
-        let mut next = Self::spawn(script)?;
-        next.resize(size.rows, size.cols)?;
+        let next = Self::spawn_sized(script, self.size)?;
         *self = next;
         Ok(())
     }
 
     pub fn spawn(script: &Path) -> Result<Self> {
-        let pair = portable_pty::native_pty_system().openpty(PtySize {
-            rows: 24,
-            cols: 100,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-        let mut command = CommandBuilder::new("/bin/bash");
+        Self::spawn_sized(
+            script,
+            PtySize {
+                rows: 24,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+    }
+
+    fn spawn_sized(script: &Path, size: PtySize) -> Result<Self> {
+        let pair = portable_pty::native_pty_system().openpty(size)?;
+        let mut command = CommandBuilder::new(crate::platform::bash()?);
+        #[cfg(not(windows))]
         command.arg(script);
+        #[cfg(windows)]
+        let gate = {
+            // portable-pty's base environment includes registry values. Keep this run's
+            // inherited credentials and environment overrides instead.
+            command.env_clear();
+            for (key, value) in std::env::vars_os() {
+                command.env(key, value);
+            }
+            let gate = crate::platform::windows::Gate::new()?;
+            let script = crate::platform::shell_path(script).replace('\'', "'\\''");
+            command.args(["-c", &gate.wrap(&format!("exec bash '{script}'"))]);
+            for (key, value) in crate::platform::shell_environment()? {
+                command.env(key, value);
+            }
+            gate
+        };
         command.env("TERM", "xterm-256color");
         command.env_remove("NO_COLOR");
         command.env_remove("TMUX");
         command.env_remove("TMUX_PANE");
         command.env_remove("COLUMNS");
         command.env_remove("LINES");
-        let child = pair.slave.spawn_command(command)?;
-        drop(pair.slave);
+        // ConPTY can ask for the inherited cursor while creating the client process.
+        // Start the terminal pumps first so the request can be answered during spawn.
         let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
         let (input, pending) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
@@ -64,8 +91,8 @@ impl Worker {
                 }
             })?;
         let terminal = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
-            dimension(24),
-            dimension(100),
+            dimension(size.rows),
+            dimension(size.cols),
             5000,
             TerminalReplies(input.clone()),
         )));
@@ -104,13 +131,30 @@ impl Worker {
                 }
                 closed.store(true, Ordering::Release);
             })?;
+        #[allow(unused_mut)]
+        let mut child = pair.slave.spawn_command(command)?;
+        #[cfg(windows)]
+        let job = crate::platform::windows::Job::assign(
+            child.process_id().context("Missing worker PID")?,
+        )
+        .inspect_err(|_| {
+            let _ = child.kill();
+        })?;
+        #[cfg(windows)]
+        gate.release()?;
+        drop(pair.slave);
         Ok(Self {
-            master: pair.master,
+            master: Some(pair.master),
+            size,
             child,
             input,
             terminal,
             eof,
             dirty,
+            #[cfg(windows)]
+            job,
+            #[cfg(windows)]
+            _gate: gate,
             finished: false,
         })
     }
@@ -121,6 +165,12 @@ impl Worker {
         }
         if let Some(status) = self.child.try_wait()? {
             self.finished = true;
+            #[cfg(windows)]
+            {
+                self.job.terminate();
+                // ConPTY owns the output pipe until ClosePseudoConsole, even after child exit.
+                drop(self.master.take());
+            }
             self.dirty.store(true, Ordering::Release);
             return Ok(Some(status.success()));
         }
@@ -133,12 +183,16 @@ impl Worker {
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
         let (rows, cols) = (rows.clamp(1, 300), cols.clamp(1, 500));
-        self.master.resize(PtySize {
+        let size = PtySize {
             rows,
             cols,
             pixel_width: 0,
             pixel_height: 0,
-        })?;
+        };
+        if let Some(master) = &self.master {
+            master.resize(size)?;
+        }
+        self.size = size;
         self.terminal
             .lock()
             .unwrap()
@@ -186,9 +240,12 @@ impl Worker {
     }
 
     pub fn kill(&mut self) {
+        #[cfg(windows)]
+        self.job.terminate();
         if !self.finished {
             // Every worker is a separate controlling-terminal session. Kill its process group,
             // including the active pipeline, before collecting the shell.
+            #[cfg(unix)]
             if let Some(pid) = self
                 .child
                 .process_id()
@@ -210,6 +267,8 @@ impl Worker {
             }
             self.finished = true;
         }
+        #[cfg(windows)]
+        drop(self.master.take());
     }
 }
 
