@@ -16,6 +16,7 @@ use crate::resume::ResumeEntry;
 use crate::scanner::{ResolvedTarget, Visibility};
 use crate::usage::LiveError;
 
+pub(crate) mod append;
 mod flags;
 mod inference;
 mod scripts;
@@ -35,6 +36,7 @@ use util::{sanitize_filename, strip_ansi_from_dir, truncate};
 const AI_USAGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct ExecutionPlan {
+    pub append: Option<append::Settings>,
     pub agent: RuntimeAgent,
     pub tasks: Vec<ResolvedTarget>,
     pub usage_gate: Option<UsageGateConfig>,
@@ -54,7 +56,7 @@ pub struct ExecutionPlan {
 /// 付与したフラグと出力の処理は対応していなければならない（`--json` を付けたのに素通しする、
 /// 付けていないのに JSONL として整形する、を起こさない）ため、フラグを付与する
 /// `ensure_required_flags` が返し、`build_plan` が計画に保存する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OutputPipeline {
     /// claude の stream-json を `format-stream` で整形し、`classify-result` で結果を分類する。
     ClaudeStreamJson,
@@ -688,6 +690,7 @@ pub fn build_plan(
     // 記録による保留は失わない。
     let start = start_from_saved(sessions.values(), rate_control::now_epoch());
     ExecutionPlan {
+        append: None,
         agent,
         tasks: targets,
         usage_gate,
@@ -1065,6 +1068,9 @@ pub fn execute_plan(
     }
     let worker_count = worker_count(parallelism, plan.tasks.len());
     prepare_task_queue(&plan, &layout, state_file, rate_limit_threshold)?;
+    if let Some(settings) = &plan.append {
+        crate::runtime::atomic_json(&layout.tmp_dir.join("append.json"), settings)?;
+    }
     let usage_gate_cmd = plan.usage_gate.as_ref().map(|gate| {
         build_usage_gate_cmd(
             gate,

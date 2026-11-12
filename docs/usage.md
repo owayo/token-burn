@@ -56,12 +56,15 @@ Saved sessions are stored in `resume.json` next to `state.json` (default `~/.con
 |-----|--------|
 | `Tab` / `Shift-Tab` / `Left` `Right` | Select a pane |
 | `z` | Zoom or restore the selected pane |
+| `a` | Enter a directory path to add to the current run; Enter adds it, Esc cancels |
 | `PageUp` / `PageDown`, `k` / `j` | Scroll the selected worker (up to 5,000 lines) |
 | `End` | Return to live output |
 | `i` | Forward input to the selected worker |
 | `Ctrl-G` | Leave input mode |
 | `d` / `q` | Detach and keep execution running |
 | `Ctrl-C` | Stop starting tasks and wait for running tasks; press again while stopped to force termination |
+
+Added directories join the end of the queue with the current agent and prompt settings, including a dedicated prompt from `[[targets]]` if configured. Relative paths use the directory from which you attached the TUI; `~` and paths containing spaces are supported. Invalid and duplicate directories leave the input open with an error. The run waits while this input is open, even if its existing tasks finish. A disconnected client releases that wait automatically. Stopping, expired, and `--public-only` runs do not accept additional directories.
 
 In input mode, keys and pasted text go to the selected worker, including `Ctrl-C`. Use `Ctrl-G` first to stop the whole run. Codex stdin remains `/dev/null`. If a worker stops accepting input, its pending input stays in order while stop requests and controls for other workers continue to be processed.
 

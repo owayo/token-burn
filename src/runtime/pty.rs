@@ -26,6 +26,14 @@ fn dimension(value: u16) -> NonZeroU16 {
 }
 
 impl Worker {
+    pub fn respawn(&mut self, script: &Path) -> Result<()> {
+        let size = self.master.get_size()?;
+        let mut next = Self::spawn(script)?;
+        next.resize(size.rows, size.cols)?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn spawn(script: &Path) -> Result<Self> {
         let pair = portable_pty::native_pty_system().openpty(PtySize {
             rows: 24,

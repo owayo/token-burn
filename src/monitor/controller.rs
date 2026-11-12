@@ -163,6 +163,13 @@ struct PauseKey {
 }
 
 impl Controller {
+    pub fn extend(&mut self, total: usize) {
+        if total > self.total {
+            self.total = total;
+            self.finished = None;
+        }
+    }
+
     pub fn new(total: usize, worker_count: usize, deadline_epoch: i64, now: i64) -> Self {
         Self {
             total,
@@ -325,7 +332,7 @@ impl Controller {
 
 /// マーカーと停止・一時停止のファイルを読む。
 ///
-/// worker-done は各ワーカーが自分の done-* / failed-* / retry-* を書き切った後に作る。
+/// worker-done は runner がワーカーの終了を確認し、done-* / failed-* / retry-* の保存後に作る。
 /// 先に worker-done を数えてからタスクマーカーを数えれば、「worker-done が見えているのに
 /// そのワーカーのタスクマーカーが見えていない」状態は起こらない。1 回の走査で両方を
 /// 数えると、走査中に作られたファイルが見えるかどうかは順序次第なので、全件成功でも
@@ -480,6 +487,23 @@ mod tests {
             retry,
             workers_done,
         }
+    }
+
+    #[test]
+    fn extending_a_run_prevents_completion_at_the_previous_total() {
+        let mut controller = Controller::new(2, 2, DEADLINE, START);
+        controller.extend(3);
+        assert!(
+            controller
+                .observe(observe(START, counts(2, 0, 0, 0)))
+                .is_empty()
+        );
+        assert_eq!(controller.total(), 3);
+        assert_eq!(controller.percent(), 66);
+        assert_eq!(
+            controller.observe(observe(START, counts(3, 0, 0, 2))),
+            vec![Action::Finish(Finish::Completed)]
+        );
     }
 
     #[test]

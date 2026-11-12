@@ -405,6 +405,217 @@ fn snapshot_write_failure_keeps_workers_running_and_retries_publication() {
 }
 
 #[test]
+fn tui_adds_a_directory_and_restarts_an_idle_worker_with_the_same_prompt() {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::Write;
+    let fixture = Fixture::new(
+        r#"
+root=$(dirname "$0")
+name=$(basename "$PWD")
+printf '%s' "${!#}" > "$root/prompt-$name"
+if [ "$name" = first ]; then
+  while [ ! -e "$root/release" ]; do sleep 0.05; done
+fi
+if [ "$name" = '追加 project' ]; then
+  while [ ! -e "$root/release-added" ]; do sleep 0.05; done
+fi
+echo "completed $name"
+"#,
+    );
+    let root = fixture.temporary.path();
+    let added = root.join("追加 project");
+    fs::create_dir(&added).unwrap();
+    let prompt = root.join("additional-prompt.md");
+    fs::write(&prompt, "specific additional prompt").unwrap();
+    let original = fs::read_to_string(&fixture.config).unwrap();
+    fs::write(
+        &fixture.config,
+        format!(
+            "{original}\n[[targets]]\ndirectory = {}\nprompt = {}\n",
+            serde_json::to_string(&added.to_string_lossy()).unwrap(),
+            serde_json::to_string(&prompt.to_string_lossy()).unwrap()
+        ),
+    )
+    .unwrap();
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_token-burn"));
+    command.args([
+        "--config",
+        fixture.config.to_str().unwrap(),
+        "run",
+        root.join("first").to_str().unwrap(),
+        root.join("second").to_str().unwrap(),
+    ]);
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let screen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let observed = screen.clone();
+    let thread = std::thread::spawn(move || {
+        let mut parser = vt100::Parser::new(
+            std::num::NonZeroU16::new(30).unwrap(),
+            std::num::NonZeroU16::new(120).unwrap(),
+            0,
+        );
+        let mut bytes = [0; 4096];
+        while let Ok(count) = reader.read(&mut bytes) {
+            if count == 0 {
+                break;
+            }
+            parser.process(&bytes[..count]);
+            *observed.lock().unwrap() = parser.screen().contents();
+        }
+    });
+    let directory = fixture.directory();
+    wait_until(|| {
+        screen.lock().unwrap().contains("a: add directory")
+            && fixture.state()["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|worker| worker["finished"] == true)
+    });
+    let sizes = fixture.state()["workers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|worker| worker["lines"].as_array().unwrap().len())
+        .collect::<Vec<_>>();
+    let mut writer = pair.master.take_writer().unwrap();
+    writer.write_all(b"a").unwrap();
+    wait_until(|| screen.lock().unwrap().contains("Add directory to this run"));
+    writer
+        .write_all(format!("{}\r", root.join("missing").display()).as_bytes())
+        .unwrap();
+    wait_until(|| {
+        fixture.state()["addition"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Cannot open directory"))
+    });
+    wait_until(|| screen.lock().unwrap().contains("Cannot open directory"));
+    fs::write(root.join("release"), "").unwrap();
+    wait_until(|| {
+        fixture.state()["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|worker| worker["finished"] == true)
+    });
+    assert_ne!(fixture.state()["finished"], true);
+    writer
+        .write_all(format!("\x15\x1b[200~{}\x1b[201~\r", added.display()).as_bytes())
+        .unwrap();
+    wait_until(|| {
+        screen
+            .lock()
+            .unwrap()
+            .contains("Directory added to the run")
+    });
+    wait_until(|| {
+        fs::read_to_string(root.join("prompt-追加 project"))
+            .is_ok_and(|prompt| prompt == "specific additional prompt")
+    });
+    assert_eq!(
+        fs::read_to_string(root.join("prompt-追加 project")).unwrap(),
+        "specific additional prompt"
+    );
+    let session = json(&directory.join("session.json"));
+    assert_eq!(session["monitor"]["total"], 3);
+    assert_eq!(session["targets"].as_array().unwrap().len(), 3);
+    fs::write(
+        directory.join("controls/duplicate.json"),
+        serde_json::json!({"AddTarget":{"id":99,"path":added}}).to_string(),
+    )
+    .unwrap();
+    wait_until(|| fixture.state()["addition"]["id"] == 99);
+    assert!(
+        fixture.state()["addition"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("already in the run")
+    );
+    assert_eq!(json(&directory.join("session.json"))["monitor"]["total"], 3);
+    for (worker, size) in fixture.state()["workers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(sizes)
+    {
+        assert_eq!(worker["lines"].as_array().unwrap().len(), size);
+    }
+    fs::write(root.join("release-added"), "").unwrap();
+    wait_until(|| child.try_wait().unwrap().is_some());
+    assert!(
+        fixture.state()["summary"][0]
+            .as_str()
+            .unwrap()
+            .contains("All 3/3")
+    );
+    assert!(fixture.state()["failure"].is_null(), "{}", fixture.state());
+    wait_until(|| !directory.join("append.json").exists());
+    drop(writer);
+    drop(pair.master);
+    thread.join().unwrap();
+}
+
+#[test]
+fn failed_addition_rolls_back_the_total_and_does_not_publish_a_partial_task() {
+    let fixture = Fixture::new(
+        "root=$(dirname \"$0\")\nwhile [ ! -e \"$root/release\" ]; do sleep 0.05; done",
+    );
+    let root = fixture.temporary.path();
+    let added = root.join("third");
+    fs::create_dir(&added).unwrap();
+    let mut client = fixture.start();
+    let directory = fixture.directory();
+    wait_until(|| {
+        fs::read_dir(directory.join("queue"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("claimed-"))
+            .count()
+            == 2
+    });
+    fs::rename(directory.join("queue"), directory.join("queue-backup")).unwrap();
+    fs::write(directory.join("queue"), "unavailable").unwrap();
+    fs::write(
+        directory.join("controls/add.json"),
+        serde_json::json!({"AddTarget":{"id":1,"path":added}}).to_string(),
+    )
+    .unwrap();
+    wait_until(|| fixture.state()["addition"]["id"] == 1);
+    assert!(fixture.state()["addition"]["error"].is_string());
+    assert_eq!(json(&directory.join("session.json"))["monitor"]["total"], 2);
+    assert!(!directory.join("tasks/task-0003.sh").exists());
+    assert!(!directory.join("prompt-3.txt").exists());
+    fs::remove_file(directory.join("queue")).unwrap();
+    fs::rename(directory.join("queue-backup"), directory.join("queue")).unwrap();
+    fs::write(directory.join("controls/000-stop.json"), "\"Interrupt\"").unwrap();
+    fs::write(
+        directory.join("controls/001-add.json"),
+        serde_json::json!({"AddTarget":{"id":2,"path":added}}).to_string(),
+    )
+    .unwrap();
+    wait_until(|| fixture.state()["addition"]["id"] == 2);
+    assert!(
+        fixture.state()["addition"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("stopping")
+    );
+    assert_eq!(json(&directory.join("session.json"))["monitor"]["total"], 2);
+    fs::write(root.join("release"), "").unwrap();
+    assert!(wait_child(&mut client).success());
+}
+
+#[test]
 fn detached_tui_can_reattach_and_wait_for_the_same_run() {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     let fixture = Fixture::new("echo detached-worker\nsleep 3");

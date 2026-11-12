@@ -39,7 +39,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::rate_control;
 pub use controller::read_errors;
-use controller::{Action, Controller};
+use controller::{Action, Controller, Finish};
 pub use manifest::{AiUsageCommands, Manifest};
 pub use ui::summary_text;
 
@@ -157,6 +157,7 @@ pub async fn run(
             Some(()) = interrupts.recv() => actions.push(controller.interrupt()),
         }
 
+        refresh_workload(&mut controller, manifest);
         for action in &actions {
             if let Action::WriteStop(reason) = action {
                 // ロック待ちでループを止めない（描画と 2 回目の Ctrl-C を受け付け続ける）。
@@ -200,17 +201,23 @@ pub async fn run(
         if actions.contains(&Action::ForceKill) {
             return Ok(true);
         }
-        if actions
-            .iter()
-            .any(|action| matches!(action, Action::Finish(_)))
-        {
+        let adding = controller.finished() == Some(Finish::Completed)
+            && crate::runtime::read_json::<i64>(&directory.join("add-lease.json"))
+                .is_ok_and(|until| until > rate_control::now_epoch())
+            && !manifest.stop_file.try_exists().unwrap_or(true)
+            && rate_control::now_epoch() < manifest.deadline_epoch
+            && !actions
+                .iter()
+                .any(|action| matches!(action, Action::WriteStop(_)));
+        if controller.finished().is_some() && !adding {
             return Ok(false);
         }
     }
 }
 
 /// マーカーと停止・一時停止のファイルを読んで判定へ反映し、行うべきことを返す。
-fn observe(controller: &mut Controller, manifest: &Manifest, pause_file: &Path) -> Vec<Action> {
+fn observe(controller: &mut Controller, manifest: &mut Manifest, pause_file: &Path) -> Vec<Action> {
+    refresh_workload(controller, manifest);
     let observation = controller::read_observation(
         &manifest.marker_dir,
         &manifest.stop_file,
@@ -218,4 +225,15 @@ fn observe(controller: &mut Controller, manifest: &Manifest, pause_file: &Path) 
         rate_control::now_epoch(),
     );
     controller.observe(observation)
+}
+
+fn refresh_workload(controller: &mut Controller, manifest: &mut Manifest) {
+    if let Some(directory) = manifest.marker_dir.parent()
+        && let Ok(session) =
+            crate::runtime::read_json::<crate::runtime::Session>(&directory.join("session.json"))
+        && session.monitor.total > manifest.total
+    {
+        manifest.total = session.monitor.total;
+        controller.extend(manifest.total);
+    }
 }

@@ -16,8 +16,11 @@ use ratatui::{
 };
 use std::{fs::OpenOptions, io::IsTerminal, path::Path, time::Duration};
 
+mod add;
+
 #[derive(Default)]
 struct ViewState {
+    add: Option<add::Editor>,
     focus: usize,
     zoom: bool,
     input: bool,
@@ -56,9 +59,30 @@ pub(super) fn attach(path: &Path) -> Result<bool> {
     let result = (|| -> Result<bool> {
         execute!(std::io::stdout(), EnableBracketedPaste)?;
         let mut view = ViewState::default();
+        let base = std::env::current_dir()?;
         let mut old_sizes = Vec::new();
+        let mut lease_until = 0;
         loop {
             let snapshot: Snapshot = read_json(&directory.join("snapshot.json"))?;
+            if let Some(editor) = &mut view.add
+                && let Some(reply) = &snapshot.addition
+                && editor.pending == Some(reply.id)
+            {
+                editor.pending = None;
+                if let Some(error) = &reply.error {
+                    editor.error = error.clone();
+                } else {
+                    view.notice = "Directory added to the run".into();
+                    view.add = None;
+                }
+            }
+            let now = crate::rate_control::now_epoch();
+            if (view.add.is_some() && lease_until <= now + 3)
+                || (view.add.is_none() && lease_until != 0)
+            {
+                lease_until = if view.add.is_some() { now + 6 } else { 0 };
+                send(directory, &Control::AddLease { until: lease_until })?;
+            }
             let monitor: Vec<String> =
                 read_json(&directory.join("monitor-view.json")).unwrap_or_default();
             let layout = areas(terminal.size()?.into(), snapshot.workers.len(), &view);
@@ -86,7 +110,21 @@ pub(super) fn attach(path: &Path) -> Result<bool> {
             }
             check_alive(directory)?;
             if event::poll(Duration::from_millis(100))? {
-                let action = match event::read()? {
+                let event = event::read()?;
+                if let Some(editor) = &mut view.add {
+                    match editor.event(event, &base) {
+                        add::Outcome::Cancel => view.add = None,
+                        add::Outcome::Send(control) => {
+                            if let Err(error) = send(directory, &control) {
+                                editor.error = format!("{error:#}");
+                                editor.pending = None;
+                            }
+                        }
+                        add::Outcome::Continue => {}
+                    }
+                    continue;
+                }
+                let action = match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         if view.input {
                             if key.code == KeyCode::Char('g')
@@ -107,6 +145,19 @@ pub(super) fn attach(path: &Path) -> Result<bool> {
                             Some(Control::Interrupt)
                         } else {
                             match key.code {
+                                KeyCode::Char('a') => {
+                                    if snapshot.can_add {
+                                        view.add = Some(add::Editor::default());
+                                        view.notice.clear();
+                                        lease_until = crate::rate_control::now_epoch() + 6;
+                                        send(directory, &Control::AddLease { until: lease_until })?;
+                                    } else {
+                                        view.notice =
+                                            "This session is not accepting additional directories"
+                                                .into();
+                                    }
+                                    None
+                                }
                                 KeyCode::Char('d' | 'q') => return Ok(false),
                                 KeyCode::Tab | KeyCode::Right => {
                                     view.focus = (view.focus + 1) % (snapshot.workers.len() + 1);
@@ -283,7 +334,7 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, monitor: &[String], view: &ViewS
     let hint = if view.input {
         "INPUT → worker | Ctrl-G: return to navigation"
     } else {
-        "Tab/←→: focus  z: zoom  PgUp/PgDn: scroll  End: live  i: input\nd/q: detach  Ctrl-C: stop after running tasks / again: force stop"
+        "Tab/←→: focus  z: zoom  PgUp/PgDn: scroll  End: live  i: input\na: add directory  d/q: detach  Ctrl-C: stop / again: force stop"
     };
     frame.render_widget(
         Paragraph::new(if view.notice.is_empty() {
@@ -293,6 +344,9 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, monitor: &[String], view: &ViewS
         }),
         footer,
     );
+    if let Some(editor) = &view.add {
+        editor.draw(frame);
+    }
 }
 
 fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {

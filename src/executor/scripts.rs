@@ -584,7 +584,7 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
     let task_dir = shell_escape(&ctx.task_dir.to_string_lossy());
     let worker_done = shell_escape(
         &ctx.marker_dir
-            .join(format!("worker-done-{}", ctx.worker_id))
+            .join(format!("worker-exit-{}", ctx.worker_id))
             .to_string_lossy(),
     );
     let worker_task = shell_escape(
@@ -712,6 +712,7 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "done\n",
             "\n",
             "if [ \"$WORKER_FINISHED\" = 1 ]; then\n",
+            "  touch \"$QUEUE_DIR/idle-{worker_id}\"\n",
             "  printf '\\033]2;Worker {w} done\\033\\\\'\n",
             "  echo '━━━ All tasks completed ━━━'\n",
             "else\n",
@@ -736,6 +737,7 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
         queue_dir = queue_dir,
         task_dir = task_dir,
         w = w,
+        worker_id = ctx.worker_id,
         worker_done = worker_done,
         worker_task = worker_task,
         gate_line = gate_line,
@@ -1203,7 +1205,7 @@ mod tests {
         // source で個別タスクを取り込む
         assert!(script.contains("source \"$TASK_SCRIPT\""));
         // ワーカー完了マーカー
-        assert!(script.contains("worker-done-0"));
+        assert!(script.contains("worker-exit-0"));
         // 停止シグナル対応
         assert!(script.contains("trap handle_cancel INT TERM"));
     }
@@ -1326,7 +1328,7 @@ mod tests {
         let gate_break = script
             .find("failed closed — stopping")
             .expect("gate break branch missing");
-        let worker_done = script.find("worker-done-0").expect("worker-done missing");
+        let worker_done = script.find("worker-exit-0").expect("worker-done missing");
         assert!(gate_break < worker_done);
     }
 
@@ -1388,7 +1390,7 @@ mod tests {
         assert!(script.contains("QUEUE_DIR='/tmp/my queue'"));
         assert!(script.contains("TASK_DIR='/tmp/my tasks'"));
         assert!(script.contains("'/tmp/my stop'"));
-        assert!(script.contains("'/tmp/my markers/worker-done-1'"));
+        assert!(script.contains("'/tmp/my markers/worker-exit-1'"));
     }
 
     #[test]
@@ -1414,7 +1416,7 @@ mod tests {
         );
         // worker-done マーカーは終了前に必ず作る（モニターの停止判定がこれを見る）。
         assert!(
-            script.contains("touch '/tmp/markers/worker-done-1'\n"),
+            script.contains("touch '/tmp/markers/worker-exit-1'\n"),
             "worker must create its done marker before exiting: {script}"
         );
         // 終了直前にキャンセル trap を外し、その直前に届いた INT/TERM でも直前タスクの
@@ -1962,7 +1964,7 @@ mod tests {
             claim_stub(2)
         );
         let (tmp, markers, output) = run_worker_script(&gate, 2);
-        assert_eq!(markers, "done-1,done-2,worker-done-0");
+        assert_eq!(markers, "done-1,done-2,worker-exit-0");
         assert!(
             output.contains("current task: 0001\ncurrent task: 0002\n"),
             "{output}"
@@ -1975,14 +1977,14 @@ mod tests {
     fn worker_script_stops_when_the_gate_reports_a_permanent_stop() {
         // 恒久停止（10）ではタスクを 1 件も処理せず、ワーカー終了マーカーだけを残す。
         let (_tmp, markers, output) = run_worker_script("exit 10", 2);
-        assert_eq!(markers, "worker-done-0");
+        assert_eq!(markers, "worker-exit-0");
         assert!(!output.contains("All tasks completed"), "{output}");
     }
 
     #[test]
     fn worker_script_reports_gate_failure_without_claiming_a_task() {
         let (tmp, markers, output) = run_worker_script("exit 1", 1);
-        assert_eq!(markers, "worker-done-0");
+        assert_eq!(markers, "worker-exit-0");
         assert!(tmp.path().join("queue/pending-0001").exists());
         assert!(output.contains("Gate claim failed (exit 1)"), "{output}");
         assert!(!output.contains("All tasks completed"), "{output}");
@@ -2017,7 +2019,7 @@ mod tests {
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(!stdout.contains("Stopped"), "{stdout}");
-        assert!(markers.join("worker-done-0").exists());
+        assert!(markers.join("worker-exit-0").exists());
     }
 
     #[test]
@@ -2842,7 +2844,7 @@ mod tests {
         let claim = script.find("CLAIMED=$(tb gate-claim)").unwrap();
         assert!(wait < claim, "{script}");
         assert!(
-            script.contains("echo '━━━ Start signal missing — stopping worker ━━━'\n  touch '/tmp/markers/worker-done-0'\n  exit 1\n"),
+            script.contains("echo '━━━ Start signal missing — stopping worker ━━━'\n  touch '/tmp/markers/worker-exit-0'\n  exit 1\n"),
             "{script}"
         );
         assert_valid_bash(&script, "worker script with start file");
@@ -2908,7 +2910,7 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(markers.join("done-1").exists(), "{output:?}");
-        assert!(markers.join("worker-done-0").exists(), "{output:?}");
+        assert!(markers.join("worker-exit-0").exists(), "{output:?}");
     }
 
     /// ワーカー 1 つ・タスク 1 つを bash で実際に動かし、残ったタスクのマーカー名と
@@ -2985,7 +2987,7 @@ mod tests {
         let mut names: Vec<String> = std::fs::read_dir(&markers)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| !name.starts_with("worker-done-") && !name.starts_with("error-"))
+            .filter(|name| !name.starts_with("worker-exit-") && !name.starts_with("error-"))
             .collect();
         names.sort();
         let marks = std::fs::read_to_string(&mark_log)

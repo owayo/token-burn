@@ -992,6 +992,19 @@ async fn run(opts: RunOptions) -> Result<()> {
     // スキャン・TUI・起動時のキャッシュ取得にかかった時間で期限がずれないよう、
     // 残り秒数ではなく、解決したリセット時刻をそのまま全ワーカーとモニターへ渡す。
     let report_dir = resolve_report_dir(&config.settings);
+    let peers = dedup_peers(dedup_scope, agent, &runtime_agents);
+    plan.append = Some(executor::append::Settings::new(
+        &config,
+        &plan,
+        resume_disabled_reason(&config, agent, fresh, no_resume).is_none(),
+        runtime_agents
+            .iter()
+            .filter(|peer| peers.contains(&peer.name))
+            .map(|peer| peer.name.clone())
+            .collect(),
+        dedup_scope == config::DedupScope::Global,
+        public_only,
+    ));
     if !executor::execute_plan(
         plan,
         run_settings.workers,

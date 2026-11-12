@@ -25,7 +25,7 @@ pub struct Manifest {
     pub total: usize,
     /// 実行全体のデッドライン（Unix epoch 秒）。ワーカーの gate-claim と同じ絶対時刻。
     pub deadline_epoch: i64,
-    /// ワーカーが done-* / failed-* / retry-* / error-* / worker-done-* を書くディレクトリ。
+    /// ワーカーの結果と、runner の worker-done-* を置くディレクトリ。
     pub marker_dir: PathBuf,
     /// tmux のセッション名（`=` を付けない素の名前）。
     pub session: String,

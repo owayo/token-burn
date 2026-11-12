@@ -16,7 +16,7 @@ use std::{
 
 pub use runner::run;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub monitor: crate::monitor::Manifest,
     pub workers: Vec<PathBuf>,
@@ -28,12 +28,22 @@ pub struct Session {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub can_add: bool,
+    #[serde(default)]
+    pub addition: Option<Addition>,
     pub pid: u32,
     pub ready: bool,
     pub finished: bool,
     pub failure: Option<String>,
     pub summary: Vec<String>,
     pub workers: Vec<Panel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Addition {
+    pub id: u64,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -50,6 +60,8 @@ pub struct Panel {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Control {
+    AddLease { until: i64 },
+    AddTarget { id: u64, path: PathBuf },
     Interrupt,
     Resize { worker: usize, rows: u16, cols: u16 },
     Input { worker: usize, bytes: Vec<u8> },

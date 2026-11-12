@@ -31,6 +31,8 @@ pub async fn run(path: &Path) -> Result<()> {
 }
 
 async fn supervise(directory: &Path, session: &Session) -> Result<()> {
+    let mut session = session.clone();
+    let session = &mut session;
     let active = OpenOptions::new()
         .read(true)
         .write(true)
@@ -45,6 +47,7 @@ async fn supervise(directory: &Path, session: &Session) -> Result<()> {
         workers.push(Worker::spawn(script)?);
     }
     let mut state = Snapshot {
+        can_add: directory.join("append.json").try_exists()?,
         pid: std::process::id(),
         ready: true,
         workers: worker_snapshots(&workers, session),
@@ -64,6 +67,7 @@ async fn supervise(directory: &Path, session: &Session) -> Result<()> {
     let mut monitor_finished = false;
     let mut finished_at = None;
     let mut snapshot_pending = false;
+    let mut accepting = true;
     loop {
         tokio::select! {
             result = &mut monitor, if !monitor_finished => {
@@ -76,7 +80,27 @@ async fn supervise(directory: &Path, session: &Session) -> Result<()> {
         let mut changed = false;
         process_controls(directory, |action| {
             let result = match action {
+                Control::AddLease { until } => {
+                    let now = crate::rate_control::now_epoch();
+                    atomic_json(&directory.join("add-lease.json"), &until.clamp(0, now + 10))
+                }
+                Control::AddTarget { id, path } => {
+                    if state.addition.as_ref().is_none_or(|reply| reply.id != id) {
+                        let result = if monitor_finished || !accepting || !state.can_add {
+                            Err(anyhow::anyhow!("This run is stopping or has finished"))
+                        } else {
+                            crate::executor::append::add(directory, session, &path)
+                        };
+                        state.addition = Some(super::Addition {
+                            id,
+                            error: result.err().map(|error| format!("{error:#}")),
+                        });
+                    }
+                    changed = true;
+                    Ok(())
+                }
                 Control::Interrupt => {
+                    accepting = false;
                     let _ = interrupts.send(());
                     Ok(())
                 }
@@ -103,6 +127,13 @@ async fn supervise(directory: &Path, session: &Session) -> Result<()> {
             };
             result.map(|()| true)
         })?;
+        let can_add = accepting
+            && !monitor_finished
+            && !session.monitor.stop_file.try_exists()?
+            && crate::rate_control::now_epoch() < session.monitor.deadline_epoch
+            && directory.join("append.json").try_exists()?;
+        changed |= state.can_add != can_add;
+        state.can_add = can_add;
         for (index, worker) in workers.iter_mut().enumerate() {
             if let Some(success) = worker.poll()? {
                 let marker = session
@@ -121,6 +152,27 @@ async fn supervise(directory: &Path, session: &Session) -> Result<()> {
                 changed = true;
             }
             changed |= worker.changed();
+            let idle = directory.join("queue").join(format!("idle-{index}"));
+            if worker.finished
+                && !monitor_finished
+                && idle.try_exists()?
+                && !session.monitor.stop_file.try_exists()?
+                && crate::rate_control::now_epoch() < session.monitor.deadline_epoch
+                && fs::read_dir(directory.join("queue"))?
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with("pending-"))
+            {
+                fs::remove_file(
+                    session
+                        .monitor
+                        .marker_dir
+                        .join(format!("worker-done-{index}")),
+                )?;
+                fs::remove_file(idle)?;
+                worker.respawn(&session.workers[index])?;
+                finished_at = None;
+                changed = true;
+            }
             changed |=
                 state.workers[index].target != current_target(session, index, worker.finished);
         }
@@ -223,7 +275,11 @@ fn cleanup_run_files(directory: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with("prompt-") || name == "resume-prompt.txt" || name.starts_with("worker-")
+        if name.starts_with("prompt-")
+            || name == "resume-prompt.txt"
+            || name == "append.json"
+            || name == "add-lease.json"
+            || name.starts_with("worker-")
         {
             let _ = fs::remove_file(entry.path());
         }
