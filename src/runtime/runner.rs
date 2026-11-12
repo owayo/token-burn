@@ -47,7 +47,7 @@ async fn supervise(directory: &Path, session: &Session) -> Result<()> {
     let mut state = Snapshot {
         pid: std::process::id(),
         ready: true,
-        workers: workers.iter().map(Worker::snapshot).collect(),
+        workers: worker_snapshots(&workers, session),
         ..Default::default()
     };
     // 全 PTY の準備が済んでから claim を許可する。起動元の端末が切断されても
@@ -121,6 +121,8 @@ async fn supervise(directory: &Path, session: &Session) -> Result<()> {
                 changed = true;
             }
             changed |= worker.changed();
+            changed |=
+                state.workers[index].target != current_target(session, index, worker.finished);
         }
         let all_finished = workers.iter().all(|worker| worker.finished);
         if all_finished {
@@ -132,7 +134,7 @@ async fn supervise(directory: &Path, session: &Session) -> Result<()> {
             }
         }
         if changed || snapshot_pending {
-            state.workers = workers.iter().map(Worker::snapshot).collect();
+            state.workers = worker_snapshots(&workers, session);
             snapshot_pending = match atomic_json(&directory.join("snapshot.json"), &state) {
                 Ok(()) => false,
                 Err(error) => {
@@ -177,11 +179,38 @@ async fn supervise(directory: &Path, session: &Session) -> Result<()> {
             ));
         }
     }
-    state.workers = workers.iter().map(Worker::snapshot).collect();
+    state.workers = worker_snapshots(&workers, session);
     state.finished = true;
     crate::executor::finish_logs(&session.monitor.report_dir);
     atomic_json(&directory.join("snapshot.json"), &state)?;
     Ok(())
+}
+
+fn current_target(session: &Session, worker: usize, finished: bool) -> Option<std::path::PathBuf> {
+    if finished {
+        return None;
+    }
+    let task = fs::read_to_string(
+        session
+            .monitor
+            .marker_dir
+            .join(format!("worker-task-{worker}")),
+    )
+    .ok()?;
+    let index = task.parse::<usize>().ok()?.checked_sub(1)?;
+    session.targets.get(index).cloned()
+}
+
+fn worker_snapshots(workers: &[Worker], session: &Session) -> Vec<super::Panel> {
+    workers
+        .iter()
+        .enumerate()
+        .map(|(index, worker)| {
+            let mut panel = worker.snapshot();
+            panel.target = current_target(session, index, worker.finished);
+            panel
+        })
+        .collect()
 }
 
 fn cleanup_run_files(directory: &Path) {
@@ -264,18 +293,8 @@ fn process_controls(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn startup_preparation_failure_does_not_release_workers() {
-        let temporary = tempfile::tempdir().unwrap();
-        let directory = temporary.path();
-        let script = directory.join("worker-0.sh");
-        fs::write(
-            &script,
-            "while [ ! -f \"$(dirname \"$0\")/start\" ]; do sleep 0.01; done\n",
-        )
-        .unwrap();
-        fs::create_dir(directory.join("monitor.json")).unwrap();
-        let session = Session {
+    fn test_session(directory: &Path) -> Session {
+        Session {
             monitor: crate::monitor::Manifest {
                 agent: "test".into(),
                 command: "test-agent".into(),
@@ -290,14 +309,52 @@ mod tests {
                 threshold: 95,
                 ai_usage: None,
             },
-            workers: vec![script],
+            workers: vec![directory.join("worker-0.sh")],
             state_file: directory.join("state.json"),
             started_at: chrono::Local::now().fixed_offset(),
             targets: Vec::new(),
             save_interrupted: false,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_preparation_failure_does_not_release_workers() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+        let session = test_session(directory);
+        fs::write(
+            &session.workers[0],
+            "while [ ! -f \"$(dirname \"$0\")/start\" ]; do sleep 0.01; done\n",
+        )
+        .unwrap();
+        fs::create_dir(directory.join("monitor.json")).unwrap();
         assert!(supervise(directory, &session).await.is_err());
         assert!(!directory.join("start").exists());
+    }
+
+    #[test]
+    fn worker_targets_follow_task_numbers_and_clear_on_completion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut session = test_session(temporary.path());
+        session.targets = vec!["/work/first".into(), "/work/日本語 project".into()];
+        fs::create_dir(&session.monitor.marker_dir).unwrap();
+        let marker = session.monitor.marker_dir.join("worker-task-0");
+        assert_eq!(current_target(&session, 0, false), None);
+        for (task, expected) in [
+            ("0001", Some(session.targets[0].clone())),
+            ("0002", Some(session.targets[1].clone())),
+            ("0", None),
+            ("0003", None),
+            ("invalid", None),
+        ] {
+            fs::write(&marker, task).unwrap();
+            assert_eq!(current_target(&session, 0, false), expected);
+        }
+        fs::write(&marker, "0001").unwrap();
+        assert_eq!(current_target(&session, 0, true), None);
+        assert_eq!(current_target(&session, 1, false), None);
+        fs::remove_file(marker).unwrap();
+        assert_eq!(current_target(&session, 0, false), None);
     }
 
     #[test]

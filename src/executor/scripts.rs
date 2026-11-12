@@ -587,6 +587,11 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             .join(format!("worker-done-{}", ctx.worker_id))
             .to_string_lossy(),
     );
+    let worker_task = shell_escape(
+        &ctx.marker_dir
+            .join(format!("worker-task-{}", ctx.worker_id))
+            .to_string_lossy(),
+    );
     // ai-usage 連携時は各タスク完了後（次の pending を claim する前）に usage-gate を実行する。
     // 未設定なら空文字列で、ワーカースクリプトに行は追加されない。
     // usage-gate が非ゼロ終了した場合（使用率確認不能や stop file 作成失敗による
@@ -648,6 +653,7 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "\n",
             "QUEUE_DIR={queue_dir}\n",
             "TASK_DIR={task_dir}\n",
+            "WORKER_TASK_FILE={worker_task}\n",
             "WORKER_ABORT=0\n",
             "WORKER_FINISHED=0\n",
             "\n",
@@ -691,8 +697,11 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
             "    echo \"━━━ Missing task script: $TASK_SCRIPT ━━━\"\n",
             "    continue\n",
             "  fi\n",
+            // PTY のタイトルは子プロセスも書き換えるので、対象の識別は専用ファイルで渡す。
+            "  printf '%s' \"$CLAIMED\" > \"$WORKER_TASK_FILE.tmp\" && mv -f -- \"$WORKER_TASK_FILE.tmp\" \"$WORKER_TASK_FILE\"\n",
             "  # shellcheck disable=SC1090\n",
             "  source \"$TASK_SCRIPT\"\n",
+            "  rm -f -- \"$WORKER_TASK_FILE\"\n",
             // 停止シグナルを書けなかったタスクはワーカーごと止める。閾値を超えたのに
             // 後続を止める手段が無い状態で走り続けると、クォータを使い切ってしまう。
             "  if [ \"$WORKER_ABORT\" = 1 ]; then\n",
@@ -728,6 +737,7 @@ pub(super) fn build_worker_script(ctx: &WorkerCtx<'_>) -> String {
         task_dir = task_dir,
         w = w,
         worker_done = worker_done,
+        worker_task = worker_task,
         gate_line = gate_line,
         gate_claim_cmd = ctx.gate_claim_cmd,
         start_wait = start_wait,
@@ -1896,7 +1906,10 @@ mod tests {
             std::fs::write(queue.join(format!("pending-{idx:04}")), "").unwrap();
             std::fs::write(
                 tasks.join(format!("task-{idx:04}.sh")),
-                format!("touch {}\n", markers.join(format!("done-{idx}")).display()),
+                format!(
+                    "printf 'current task: %s\\n' \"$(cat \"$WORKER_TASK_FILE\")\"\ntouch {}\n",
+                    markers.join(format!("done-{idx}")).display()
+                ),
             )
             .unwrap();
         }
@@ -1944,8 +1957,17 @@ mod tests {
     #[test]
     fn worker_script_runs_the_tasks_the_gate_hands_it() {
         // ゲートが番号を返す限りタスクを処理し、pending が尽きたら（20）静かに終わる。
-        let (_tmp, markers, output) = run_worker_script(&claim_stub(2), 2);
+        let gate = format!(
+            "if [ -e \"$WORKER_TASK_FILE\" ]; then exit 1; fi; {}",
+            claim_stub(2)
+        );
+        let (tmp, markers, output) = run_worker_script(&gate, 2);
         assert_eq!(markers, "done-1,done-2,worker-done-0");
+        assert!(
+            output.contains("current task: 0001\ncurrent task: 0002\n"),
+            "{output}"
+        );
+        assert!(!tmp.path().join("markers/worker-task-0").exists());
         assert!(output.contains("All tasks completed"), "{output}");
     }
 

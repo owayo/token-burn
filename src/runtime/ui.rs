@@ -228,8 +228,16 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, monitor: &[String], view: &ViewS
             "token-burn · Monitor".into()
         } else {
             let worker = &snapshot.workers[index - 1];
+            let target = worker.target.as_ref().map_or_else(String::new, |path| {
+                let path: String = path
+                    .to_string_lossy()
+                    .chars()
+                    .map(|ch| if ch.is_control() { ' ' } else { ch })
+                    .collect();
+                format!(" ({path})")
+            });
             format!(
-                "Worker {index}{}{}",
+                "Worker {index}{target}{}{}",
                 if worker.finished { " · done" } else { "" },
                 if worker.scrollback > 0 {
                     " · scroll"
@@ -327,6 +335,52 @@ fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_title_shows_the_current_target_in_split_and_zoomed_views() {
+        for zoom in [false, true] {
+            let view = ViewState {
+                focus: 1,
+                zoom,
+                ..Default::default()
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 24)).unwrap();
+            let mut snapshot = Snapshot {
+                workers: vec![super::super::Panel::default()],
+                ..Default::default()
+            };
+            for (target, expected) in [
+                (Some("/work/first"), "Worker 1 (/work/first)"),
+                (
+                    Some("/work/日本語 project"),
+                    "Worker 1 (/work/日本語 project)",
+                ),
+                (
+                    Some("/work/line\nbreak\u{1b}"),
+                    "Worker 1 (/work/line break )",
+                ),
+                (None, "Worker 1 · done · scroll"),
+            ] {
+                let worker = &mut snapshot.workers[0];
+                worker.target = target.map(Into::into);
+                worker.finished = target.is_none();
+                worker.scrollback = usize::from(target.is_none());
+                terminal
+                    .draw(|frame| draw(frame, &snapshot, &[], &view))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let mut heading = String::new();
+                let mut x = 0;
+                while x < buffer.area.width {
+                    let symbol = buffer[(x, 0)].symbol();
+                    heading.push_str(symbol);
+                    x += unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
+                }
+                assert!(heading.contains(expected), "{heading}");
+            }
+        }
+    }
+
     #[test]
     fn narrow_and_crowded_screens_keep_the_focused_worker_visible() {
         for (width, height) in [(20, 5), (80, 24), (180, 50)] {

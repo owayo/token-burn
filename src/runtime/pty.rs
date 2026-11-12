@@ -162,6 +162,7 @@ impl Worker {
         let parser = self.terminal.lock().unwrap();
         let screen = parser.screen();
         Panel {
+            target: None,
             lines: terminal_lines(screen),
             cursor: (!screen.hide_cursor() && screen.scrollback() == 0)
                 .then(|| screen.cursor_position()),

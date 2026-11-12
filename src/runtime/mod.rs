@@ -38,6 +38,8 @@ pub struct Snapshot {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Panel {
+    #[serde(default)]
+    pub target: Option<PathBuf>,
     pub lines: Vec<String>,
     pub cursor: Option<(u16, u16)>,
     pub finished: bool,
