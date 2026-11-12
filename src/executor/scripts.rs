@@ -1898,7 +1898,10 @@ mod tests {
         gate_claim_cmd: &str,
         task_count: usize,
     ) -> (tempfile::TempDir, String, String) {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("worker tasks '")
+            .tempdir()
+            .unwrap();
         let queue = tmp.path().join("queue");
         let tasks = tmp.path().join("tasks");
         let markers = tmp.path().join("markers");
@@ -1911,7 +1914,7 @@ mod tests {
                 tasks.join(format!("task-{idx:04}.sh")),
                 format!(
                     "printf 'current task: %s\\n' \"$(cat \"$WORKER_TASK_FILE\")\"\ntouch {}\n",
-                    markers.join(format!("done-{idx}")).display()
+                    shell_escape_path(&markers.join(format!("done-{idx}")))
                 ),
             )
             .unwrap();

@@ -1725,7 +1725,11 @@ mod tests {
         .expect_err("存在しないコマンドの起動は失敗するべき");
         let message = error.to_string();
 
-        assert!(message.contains("--api-key <redacted>"));
+        // Windows starts Bash successfully, then reports the missing inner command.
+        // Bash omits the arguments in that error; native spawn errors print the redacted command.
+        assert!(message.contains(&command[0]), "{message}");
+        #[cfg(not(windows))]
+        assert!(message.contains("--api-key <redacted>"), "{message}");
         assert!(!message.contains(secret));
     }
 

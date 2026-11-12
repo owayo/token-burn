@@ -25,6 +25,14 @@ mod test_support {
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
 
+    pub fn shell_path(path: &Path) -> String {
+        #[cfg(windows)]
+        let path = crate::platform::shell_path(path);
+        #[cfg(not(windows))]
+        let path = path.to_string_lossy();
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+
     pub struct CwdGuard {
         original: PathBuf,
         _lock: MutexGuard<'static, ()>,

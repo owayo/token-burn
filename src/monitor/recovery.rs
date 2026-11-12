@@ -559,7 +559,14 @@ mod tests {
             // まだ閾値を超えている。
             (prints(&usage_json(99.0)), "five_hour at 99%"),
             // 取得の失敗。
-            ("exit 1".to_string(), "ai-usage failed (exit status: 1)"),
+            (
+                "exit 1".to_string(),
+                if cfg!(windows) {
+                    "ai-usage failed (exit code: 1)"
+                } else {
+                    "ai-usage failed (exit status: 1)"
+                },
+            ),
             (
                 "printf 'not json'".to_string(),
                 "cannot parse the ai-usage output",

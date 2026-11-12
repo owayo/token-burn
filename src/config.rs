@@ -1153,8 +1153,10 @@ mod tests {
 
     #[test]
     fn resolve_directory_absolute_path_unchanged() {
-        let path = resolve_directory("/tmp/some-repo").expect("絶対パスは解決されるべき");
-        assert_eq!(path, std::path::PathBuf::from("/tmp/some-repo"));
+        let absolute = std::env::temp_dir().join("some repo");
+        let path =
+            resolve_directory(&absolute.to_string_lossy()).expect("絶対パスは解決されるべき");
+        assert_eq!(path, absolute);
         assert!(path.is_absolute());
     }
 

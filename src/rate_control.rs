@@ -2389,7 +2389,7 @@ mod tests {
         let queue = queue_with(tmp.path(), 2);
         let stop = tmp.path().join("stop");
         let probe = tmp.path().join("revalidated");
-        let cmd = format!("touch {}", probe.display());
+        let cmd = format!("touch {}", crate::test_support::shell_path(&probe));
 
         // 一時停止が無ければ再検証しない（毎 claim で外部コマンドを叩かない）。
         assert!(matches!(
@@ -2433,7 +2433,7 @@ mod tests {
 
         // 2 件目の claim では再検証コマンドを起動しない（pause が無いため）。
         let probe = tmp.path().join("revalidated");
-        let cmd = format!("touch {}", probe.display());
+        let cmd = format!("touch {}", crate::test_support::shell_path(&probe));
         assert!(matches!(
             run_gate_claim(&stop, &queue, None, Some(&cmd))
                 .await
@@ -2481,7 +2481,7 @@ mod tests {
         let cmd = format!(
             "printf 'resume_at=%s\\nwindow=five_hour\\nreason=still over\\n' {} > {}",
             now_epoch() + 3600,
-            pause_file.display()
+            crate::test_support::shell_path(&pause_file)
         );
         assert_eq!(
             run_gate_claim(&stop, &queue, Some(now_epoch() + 2), Some(&cmd))
@@ -2503,7 +2503,7 @@ mod tests {
         pause_at(&pause_file, now_epoch() + 3600);
         let revision = read_pause(&pause_file).unwrap().unwrap().revision;
         let probe = tmp.path().join("revalidated");
-        let cmd = format!("touch {}", probe.display());
+        let cmd = format!("touch {}", crate::test_support::shell_path(&probe));
         let gate = run_gate_claim(&stop, &queue, None, Some(&cmd));
         tokio::pin!(gate);
         tokio::select! {
@@ -2540,7 +2540,7 @@ mod tests {
         let pause_file = pause_path_for(&stop);
         lifted_pause(&pause_file, now_epoch() + 3600, now_epoch() - 10);
         let probe = tmp.path().join("revalidated");
-        let cmd = format!("touch {}", probe.display());
+        let cmd = format!("touch {}", crate::test_support::shell_path(&probe));
         let started = std::time::Instant::now();
         assert_eq!(
             run_gate_claim(&stop, &queue, None, Some(&cmd))
