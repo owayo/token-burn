@@ -47,7 +47,7 @@ pub(crate) fn handle_system_event(
         "compact_boundary" => write_compact_boundary(v, out)?,
         "task_started" => write_task_started(v, out)?,
         "task_progress" => write_task_progress(v, out)?,
-        "task_notification" => write_task_notification(v, out)?,
+        "task_notification" => write_task_notification(v, out, task_descriptions)?,
         "task_updated" => write_task_updated(v, out, task_descriptions)?,
         "notification" => write_notification(v, out)?,
         "ui_log" => write_ui_log(v, out)?,
@@ -330,9 +330,23 @@ fn write_task_progress(v: &serde_json::Value, out: &mut impl Write) -> Result<()
 }
 
 /// `task_notification`: completed / failed / stopped を usage 付きで表示する。
-fn write_task_notification(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
+///
+/// `summary` は通常、タスクの説明（`task_started` の description と同じ文）を持つ。
+/// ところが `summary_is_report: true` の通知では、サブエージェントの最終報告の本文
+/// そのもの（複数行で数百〜数千文字）が入る（Claude Code 2.1.32x の実データで 10 件）。
+/// これを先頭 60 文字で切ると、報告の書き出し（`Task done: I checked the 260 ...` や
+/// `[harness: subagent output matched ...]` の注記）だけが残り、どのタスクが終わったのかを
+/// 読み取れなかった。報告の本文はサブエージェントの最終メッセージとして
+/// `💬 @<タスク名>` の行に既に出ているので、この場合は `task_started` / `task_progress` で
+/// 覚えたタスクの説明を見出しにする（[`report_task_description`]）。
+fn write_task_notification(
+    v: &serde_json::Value,
+    out: &mut impl Write,
+    task_descriptions: &TaskDescriptions,
+) -> Result<()> {
     let status = v["status"].as_str().unwrap_or("");
-    let summary = v["summary"].as_str().unwrap_or("");
+    let report_description = report_task_description(v, task_descriptions);
+    let summary = report_description.unwrap_or_else(|| v["summary"].as_str().unwrap_or(""));
     let usage_attrs = task_notification_usage_attrs(&v["usage"]);
     let usage_text = if usage_attrs.is_empty() {
         String::new()
@@ -355,7 +369,18 @@ fn write_task_notification(v: &serde_json::Value, out: &mut impl Write) -> Resul
             )?;
         }
     } else if status == "failed" {
-        if !summary.is_empty() {
+        let report = v["summary"].as_str().unwrap_or("");
+        if let Some(description) = report_description.filter(|_| !report.trim().is_empty()) {
+            // 報告の本文は失敗の理由を含み得るので、説明を見出しにしたうえで本文の先頭も添える
+            // （task_updated の `Task failed (<説明>): <理由>` と同じ形）。
+            writeln!(
+                out,
+                "\x1b[31m  \u{274c} Task failed ({}): {}{}\x1b[0m",
+                description,
+                truncate_inline(report, 100),
+                usage_text
+            )?;
+        } else if !summary.is_empty() {
             writeln!(
                 out,
                 "\x1b[31m  \u{274c} Task failed: {}{}\x1b[0m",
@@ -379,6 +404,26 @@ fn write_task_notification(v: &serde_json::Value, out: &mut impl Write) -> Resul
         }
     }
     Ok(())
+}
+
+/// `summary_is_report: true` の通知について、見出しにするタスクの説明を返す。
+///
+/// 報告ではない通知と、説明を覚えていない通知（開始・進捗を含まない抜粋ログ）は `None`
+/// を返し、呼び出し側は従来どおり `summary` を出す。
+fn report_task_description<'a>(
+    v: &serde_json::Value,
+    task_descriptions: &'a TaskDescriptions,
+) -> Option<&'a str> {
+    if v["summary_is_report"].as_bool() != Some(true) {
+        return None;
+    }
+    let id = v["task_id"].as_str().filter(|id| !id.trim().is_empty())?;
+    task_descriptions
+        .get(&(
+            v["session_id"].as_str().unwrap_or("").to_string(),
+            id.to_string(),
+        ))
+        .map(String::as_str)
 }
 
 /// `task_updated`: 対象タスクの説明、状態遷移、失敗時の原因を表示する。
@@ -566,11 +611,20 @@ fn task_notification_usage_attrs(usage: &serde_json::Value) -> Vec<String> {
 /// 失敗時は stderr にだけ内容が入る。空文字を飛ばして次の候補へ進まないと
 /// フック失敗の診断が最も欲しい場面で "no output" にしかならない。
 fn handle_hook_output(v: &serde_json::Value, out: &mut impl Write) -> Result<()> {
-    let detail = first_non_empty_string(v, &["output", "stderr", "stdout"]);
     let outcome = v["outcome"].as_str().unwrap_or("");
     let exit_code = v["exit_code"].as_i64();
     let has_failure =
         outcome != "success" && !outcome.is_empty() || exit_code.is_some_and(|code| code != 0);
+    // 成功したフックの「中身の無い JSON」は出力が無いのと同じに扱う。失敗したフックでは
+    // 何が出たかが診断の手掛かりなので、そのまま残す。
+    let detail = ["output", "stderr", "stdout"]
+        .iter()
+        .find_map(|key| {
+            v[*key]
+                .as_str()
+                .filter(|s| !s.trim().is_empty() && (has_failure || !is_empty_hook_json(s)))
+        })
+        .unwrap_or("");
 
     if detail.is_empty() && !has_failure {
         return Ok(());
@@ -602,4 +656,18 @@ fn handle_hook_output(v: &serde_json::Value, out: &mut impl Write) -> Result<()>
         color, hook, attr_text, message
     )?;
     Ok(())
+}
+
+/// フックの出力が中身の無い JSON（`{}` / `[]`）だけか。
+///
+/// Claude Code のフックは標準出力へ JSON を返して動作を指示でき、`{}` は「指示なし」を表す。
+/// 実データでは SessionStart フックの応答 28 件のうち 7 件が `{}\n` だけを出しており、
+/// 成功しているのに、どの実行でも冒頭に `⚠ Hook SessionStart:startup (outcome:success,
+/// exit:0): {}` という警告の行が出ていた。
+fn is_empty_hook_json(text: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(text.trim()) {
+        Ok(serde_json::Value::Object(map)) => map.is_empty(),
+        Ok(serde_json::Value::Array(items)) => items.is_empty(),
+        _ => false,
+    }
 }

@@ -174,6 +174,40 @@ fn hook_output_takes_priority_over_stderr() {
 }
 
 #[test]
+fn hook_success_with_an_empty_json_object_is_silent() {
+    // 実データ: SessionStart フックが `{}`（指示なし）だけを返した成功。毎回の冒頭に
+    // `⚠ Hook SessionStart:startup (outcome:success, exit:0): {}` が出ていた。
+    for output in [r#""{}\n""#, r#""  [ ] ""#] {
+        let out = render(&format!(
+            r#"{{"type":"system","subtype":"hook_response","hook_name":"SessionStart:startup","hook_event":"SessionStart","output":{output},"stdout":{output},"stderr":"","exit_code":0,"outcome":"success"}}"#
+        ));
+        assert!(out.is_empty(), "{output}: {out:?}");
+    }
+}
+
+#[test]
+fn hook_with_an_empty_json_object_still_shows_its_stderr_or_failure() {
+    // 中身の無い JSON を読み飛ばしても、stderr の診断や失敗は落とさない。
+    let out = render(
+        r#"{"type":"system","subtype":"hook_response","hook_name":"SessionStart:startup","output":"{}\n","stdout":"{}\n","stderr":"cache is stale","exit_code":0,"outcome":"success"}"#,
+    );
+    assert!(out.contains("cache is stale"), "{out:?}");
+    let failed = render(
+        r#"{"type":"system","subtype":"hook_response","hook_name":"Stop","output":"{}","stdout":"{}","stderr":"","exit_code":1,"outcome":"error"}"#,
+    );
+    assert!(failed.contains("outcome:error"), "{failed:?}");
+    assert!(
+        failed.contains(": {}"),
+        "失敗時は出力をそのまま残す: {failed:?}"
+    );
+    // 中身のある JSON は従来どおり表示する。
+    let decision = render(
+        r#"{"type":"system","subtype":"hook_response","hook_name":"SessionStart:startup","output":"{\"additionalContext\":\"x\"}","stdout":"","stderr":"","exit_code":0,"outcome":"success"}"#,
+    );
+    assert!(decision.contains("additionalContext"), "{decision:?}");
+}
+
+#[test]
 fn hook_name_empty_falls_back_to_hook_event() {
     // hook 名も同じ空文字スキップが必要。hook_name:"" が常設される実データで
     // フック種別が空欄になるのを防ぐ。
@@ -481,6 +515,54 @@ fn task_descriptions_survive_completion_notifications_and_blank_progress() {
     ].join("\n");
     let out = super::strip_ansi(&super::run_process(&input));
     assert!(out.contains("Task completed (Keep this task)"), "{out}");
+}
+
+#[test]
+fn a_report_notification_is_headed_by_the_task_description() {
+    // `summary_is_report: true` の summary はサブエージェントの最終報告の本文（実データ）。
+    // 先頭 60 文字に切ると報告の書き出しだけが残り、どのタスクが終わったか分からない。
+    let input = [
+        r#"{"type":"system","subtype":"task_started","task_id":"task-a","session_id":"s1","description":"Review the help entries","task_type":"local_agent"}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"task-a","session_id":"s1","status":"completed","summary":"Task done: I checked the 260 existing entries against the official text.\n\n**11 fixes:**\n- `instructions`: reserved","summary_is_report":true,"usage":{"total_tokens":259891,"tool_uses":40,"duration_ms":429000}}"#,
+    ].join("\n");
+    let out = super::strip_ansi(&super::run_process(&input));
+    let done = out.lines().find(|line| line.contains('\u{2705}')).unwrap();
+    assert!(done.contains("Review the help entries"), "{done}");
+    assert!(
+        !done.contains("Task done"),
+        "報告の本文は見出しにしない: {done}"
+    );
+    assert!(done.contains("259,891 tokens"), "{done}");
+}
+
+#[test]
+fn a_report_notification_without_a_known_task_keeps_the_report_head() {
+    // 開始を含まない抜粋ログでは説明が分からないので、従来どおり本文の先頭を出す。
+    // 別セッションの同じ task_id の説明を取り違えない。
+    let input = [
+        r#"{"type":"system","subtype":"task_started","task_id":"task-a","session_id":"other","description":"Unrelated task"}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"task-a","session_id":"s1","status":"completed","summary":"Task done: all checks passed","summary_is_report":true}"#,
+    ].join("\n");
+    let out = super::strip_ansi(&super::run_process(&input));
+    let done = out.lines().find(|line| line.contains('\u{2705}')).unwrap();
+    assert!(done.contains("Task done: all checks passed"), "{done}");
+    assert!(!done.contains("Unrelated task"), "{done}");
+}
+
+#[test]
+fn a_failed_report_notification_keeps_the_report_as_the_reason() {
+    // 失敗した報告の本文は理由を含み得るので、説明を見出しにして本文の先頭も添える。
+    let input = [
+        r#"{"type":"system","subtype":"task_started","task_id":"task-a","description":"Fetch the release notes"}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"task-a","status":"failed","summary":"Could not reach the archive.\nTried twice.","summary_is_report":true}"#,
+    ].join("\n");
+    let out = super::strip_ansi(&super::run_process(&input));
+    assert!(
+        out.contains(
+            "Task failed (Fetch the release notes): Could not reach the archive. Tried twice."
+        ),
+        "{out}"
+    );
 }
 
 #[test]
