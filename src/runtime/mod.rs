@@ -69,11 +69,18 @@ pub enum Control {
     MonitorSize { rows: u16, cols: u16 },
 }
 
+/// `value` を JSON にして、同じディレクトリの一時ファイルから rename で置き換える。
+///
+/// 先にメモリ上で JSON を組み立て、1 回の `write_all` で書く。`serde_json::to_writer` を
+/// バッファの無いファイルへ直接使うと、キー・引用符・文字列の断片ごとに `write(2)` が
+/// 呼ばれる。runner は変化があるたびに（最短 100ms ごとに）画面のスナップショットを書くため、
+/// 4 ワーカーの実行では毎秒数千回のシステムコールになり、常駐する runner の CPU 時間の
+/// 大半を占めていた。
 pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec(value)?;
     let mut file =
         tempfile::NamedTempFile::new_in(path.parent().context("Missing snapshot directory")?)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.flush()?;
+    file.write_all(&bytes)?;
     file.persist(path)
         .with_context(|| format!("Cannot write {}", path.display()))?;
     Ok(())
