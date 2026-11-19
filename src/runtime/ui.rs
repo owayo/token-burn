@@ -124,6 +124,11 @@ pub(super) fn attach(path: &Path) -> Result<bool> {
                     }
                     continue;
                 }
+                // 通知は一度きりの知らせ。次のキー操作で消し、操作の案内を出し直す（消す手段が
+                // 入力欄を開くことしか無かった頃は、追加できなくなった後ずっと案内が隠れていた）。
+                if matches!(event, Event::Key(key) if key.kind != KeyEventKind::Release) {
+                    view.notice.clear();
+                }
                 let action = match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         if view.input {
@@ -336,8 +341,10 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, monitor: &[String], view: &ViewS
     } else {
         "Tab/←→: focus  z: zoom  PgUp/PgDn: scroll  End: live  i: input\na: add directory  d/q: detach  Ctrl-C: stop / again: force stop"
     };
+    // 入力モードの間は、通知があっても案内（INPUT → worker）を出す。通知で隠れていた頃は、
+    // 通常操作のつもりで押した Ctrl-C がワーカーへ送られ、そのタスクがキャンセルされていた。
     frame.render_widget(
-        Paragraph::new(if view.notice.is_empty() {
+        Paragraph::new(if view.notice.is_empty() || view.input {
             hint
         } else {
             &view.notice
@@ -389,6 +396,44 @@ fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_mode_footer_is_not_hidden_by_a_notice() {
+        // 通知がフッターを置き換え続け、入力モードかどうかを画面で見分けられなかった。
+        let snapshot = Snapshot {
+            workers: vec![super::super::Panel::default()],
+            ..Default::default()
+        };
+        let footer = |view: &ViewState| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &[], view))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (22..24)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut view = ViewState {
+            focus: 1,
+            input: true,
+            notice: "Directory added to the run".into(),
+            ..Default::default()
+        };
+        assert!(footer(&view).contains("INPUT"), "{}", footer(&view));
+        view.input = false;
+        assert!(
+            footer(&view).contains("Directory added"),
+            "{}",
+            footer(&view)
+        );
+    }
+
     #[test]
     fn worker_title_shows_the_current_target_in_split_and_zoomed_views() {
         for zoom in [false, true] {

@@ -20,13 +20,16 @@ pub async fn run(path: &Path) -> Result<()> {
         .context("This session already has a runner")?;
     let result = supervise(directory, &session).await;
     crate::monitor::process::terminate_all();
+    // 片付けは失敗を公開する前に終える。起動元の `launch()` は失敗の公開を見た時点で runner を
+    // SIGKILL するので、公開を先にすると片付けの途中で止まり、プロンプト・タスクのスクリプト・
+    // env を含む append.json が残っていた（別の実行が動いている設定で run を打つだけで起きる）。
+    cleanup_run_files(directory);
     if let Err(error) = &result {
         let mut state = read_json::<Snapshot>(&directory.join("snapshot.json")).unwrap_or_default();
         state.finished = true;
         state.failure = Some(format!("{error:#}"));
         let _ = atomic_json(&directory.join("snapshot.json"), &state);
     }
-    cleanup_run_files(directory);
     result
 }
 

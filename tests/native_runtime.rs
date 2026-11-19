@@ -703,3 +703,53 @@ fn startup_usage_deadline_cache_redaction_and_pause_are_preserved() {
     fixture.stop();
     assert!(wait_child(&mut client).success());
 }
+
+#[test]
+fn a_rejected_duplicate_run_cleans_up_its_task_files() {
+    // 別の実行が動いている設定で run を打つと、2 本目の runner は起動に失敗する。起動元が
+    // 失敗の公開を見て runner を SIGKILL するため、公開を片付けより先にしていた頃は、
+    // プロンプト・タスクのスクリプト・env を含む append.json が 2 本目の .runtime に残っていた
+    // （対象が多いほど片付けに時間がかかり、40 件ではほぼ毎回残った）。
+    let fixture = Fixture::new("echo running\nsleep 60");
+    let mut config = fs::read_to_string(&fixture.config).unwrap();
+    for index in 0..40 {
+        let directory = fixture.temporary.path().join(format!("extra-{index}"));
+        fs::create_dir(&directory).unwrap();
+        config.push_str(&format!(
+            "[[targets]]\ndirectory = {}\n",
+            serde_json::to_string(&directory.to_string_lossy()).unwrap()
+        ));
+    }
+    fs::write(&fixture.config, config).unwrap();
+    let mut first = fixture.start();
+    let active = fixture.directory();
+    let reports = active.parent().unwrap().parent().unwrap().to_path_buf();
+    let mut leftovers = Vec::new();
+    for _ in 0..3 {
+        let second = fixture.command().arg("--no-limit").output().unwrap();
+        assert!(!second.status.success());
+        assert!(
+            String::from_utf8_lossy(&second.stderr).contains("Another run is already active"),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        for entry in fs::read_dir(&reports).unwrap().flatten() {
+            let runtime = entry.path().join(".runtime");
+            if runtime == active {
+                continue;
+            }
+            for file in fs::read_dir(&runtime).into_iter().flatten().flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                if ["tasks", "queue", "append.json"].contains(&name.as_str())
+                    || name.starts_with("prompt-")
+                    || name.starts_with("worker-")
+                {
+                    leftovers.push(file.path());
+                }
+            }
+        }
+    }
+    fixture.stop();
+    assert!(wait_child(&mut first).success());
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
