@@ -52,6 +52,45 @@ pub fn shell_path(path: &Path) -> String {
     windows_path(&path)
 }
 
+/// Windows で AltGr を使って打った文字か。
+///
+/// Windows のコンソールは AltGr を右 Alt と左 Ctrl の同時押しとして報告し、crossterm はそれを
+/// `CONTROL | ALT` に変換する（AltGr と区別しない）。ドイツ語やフランス語の配列では
+/// `@ \ ~ { } [ ]` などをこの組み合わせで打つので、Ctrl・Alt 付きの文字を捨てる入力欄では
+/// それらを入力できず、ワーカーへの入力では Ctrl の制御文字（`@` なら NUL）に変わっていた。
+/// AltGr で英字（ASCII）を打つ配列は無いので、英字は本物の Ctrl+Alt の組み合わせとして残す。
+pub fn is_alt_gr_char(key: &ratatui::crossterm::event::KeyEvent) -> bool {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    cfg!(windows)
+        && key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char(ch) if !ch.is_ascii_alphabetic() && !ch.is_control())
+}
+
+/// Git Bash（msys2）へコマンドラインで渡す引数を、msys2-runtime の解析規則で引用する。
+///
+/// Rust の `Command::arg` は Windows では MSVC（`CommandLineToArgvW`）の規則で引用し、`"` の
+/// 直前にない `\` はそのまま書く。ところが msys2-runtime は、親がネイティブのプロセスのときは
+/// 独自の規則でコマンドラインを読み、`"..."` の中の `\\` を `\` に、`\"` を `"` に戻す
+/// （winsup/cygwin/dcrt0.cc の `quoted` / `globify`）。そのため `bash -c` に渡したスクリプトの
+/// 中の連続した `\`（UNC パスの `\\server\share` など）が半分になり、statusline のキャッシュの
+/// パスや env の値が別のパスとして届いていた。全体を `"` で囲み、`\` と `"` の前に `\` を置いた
+/// うえで、`raw_arg` でそのまま渡す（引用符の中なので glob の展開もされない）。
+#[cfg(any(windows, test))]
+pub fn msys2_arg(arg: &str) -> String {
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    for ch in arg.chars() {
+        if matches!(ch, '\\' | '"') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
 #[cfg(any(windows, test))]
 fn windows_path(path: &str) -> String {
     let path = path.strip_prefix(r"\\?\").unwrap_or(path);
@@ -143,6 +182,36 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alt_gr_characters_count_as_text_only_on_windows() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let alt_gr =
+            |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        assert_eq!(is_alt_gr_char(&alt_gr('@')), cfg!(windows));
+        assert_eq!(is_alt_gr_char(&alt_gr('ą')), cfg!(windows));
+        // 英字は本物の Ctrl+Alt の組み合わせとして残す。Ctrl だけ・Alt だけも文字ではない。
+        assert!(!is_alt_gr_char(&alt_gr('x')));
+        assert!(!is_alt_gr_char(&KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_alt_gr_char(&KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::ALT
+        )));
+    }
+
+    #[test]
+    fn msys2_arguments_escape_backslashes_and_quotes_inside_quotes() {
+        // msys2 は引用符の中の `\\` と `\"` を戻す。ほかの文字はそのまま残す。
+        assert_eq!(
+            msys2_arg(r"printf '%s' '\\server\share'"),
+            r#""printf '%s' '\\\\server\\share'""#
+        );
+        assert_eq!(msys2_arg(r#"a "b" \"#), r#""a \"b\" \\""#);
+        assert_eq!(msys2_arg("日本語 *{a,b}~\n"), "\"日本語 *{a,b}~\n\"");
+    }
 
     #[test]
     fn bash_paths_preserve_spaces_unicode_and_unc_roots() {

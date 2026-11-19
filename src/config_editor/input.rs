@@ -39,7 +39,10 @@ impl TextInput {
                 self.text.drain(start..self.cursor);
                 self.cursor = start;
             }
-            KeyCode::Char(ch) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Char(ch)
+                if crate::platform::is_alt_gr_char(&key)
+                    || (!control && !key.modifiers.contains(KeyModifiers::ALT)) =>
+            {
                 self.insert(&ch.to_string())
             }
             KeyCode::Enter => self.insert("\n"),

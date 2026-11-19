@@ -764,7 +764,10 @@ fn run_ai_usage_sync(
                     let mut builder = {
                         let mut builder = tokio::process::Command::new(crate::platform::bash()?);
                         let payload = scripts::quote_command(command).join(" ");
-                        builder.args(["-c", &gate.wrap(&payload)]);
+                        // msys2 の規則で引用して渡す（`platform::msys2_arg` 参照）。
+                        builder
+                            .arg("-c")
+                            .raw_arg(crate::platform::msys2_arg(&gate.wrap(&payload)));
                         builder.envs(crate::platform::shell_environment()?);
                         builder.creation_flags(
                             windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,

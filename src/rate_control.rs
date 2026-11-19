@@ -1199,12 +1199,17 @@ fn run_revalidation(cmd: &str, stop_file: &Path) -> bool {
     eprintln!("\x1b[33m  \u{21bb} 再開前に使用率を再確認します\x1b[0m");
     let status = (|| -> std::io::Result<std::process::ExitStatus> {
         let mut command = std::process::Command::new(crate::platform::bash()?);
+        command.arg("-c");
         #[cfg(windows)]
-        command.envs(crate::platform::shell_environment()?);
-        command
-            .args(["-c", cmd])
-            .stdout(std::process::Stdio::null())
-            .status()
+        {
+            use std::os::windows::process::CommandExt;
+            command.envs(crate::platform::shell_environment()?);
+            // msys2 の規則で引用して渡す（`platform::msys2_arg` 参照）。
+            command.raw_arg(crate::platform::msys2_arg(cmd));
+        }
+        #[cfg(not(windows))]
+        command.arg(cmd);
+        command.stdout(std::process::Stdio::null()).status()
     })();
     match status {
         Ok(status) if status.success() => true,

@@ -367,6 +367,10 @@ fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
         }
     }
     if let KeyCode::Char(ch) = key.code {
+        // AltGr で打った文字は Ctrl+Alt として届く（`platform::is_alt_gr_char`）。文字のまま送る。
+        if crate::platform::is_alt_gr_char(&key) {
+            return Some(ch.to_string().into_bytes());
+        }
         let mut bytes = if key.modifiers.contains(KeyModifiers::CONTROL) && ch.is_ascii() {
             vec![(ch as u8) & 0x1f]
         } else {
@@ -521,6 +525,21 @@ mod tests {
             )
             .unwrap(),
             "語".as_bytes()
+        );
+        // AltGr の文字（Windows では Ctrl+Alt として届く）は文字のまま送る。Ctrl+Alt+英字は
+        // 従来どおり ESC と制御文字にする。
+        let alt_gr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Char('@'), alt_gr), false).unwrap(),
+            if cfg!(windows) {
+                b"@".to_vec()
+            } else {
+                vec![0x1b, 0]
+            }
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Char('x'), alt_gr), false).unwrap(),
+            [0x1b, 0x18]
         );
     }
     #[test]

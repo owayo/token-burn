@@ -202,9 +202,13 @@ fn spawn(command: &str) -> std::io::Result<Child> {
         builder.envs(crate::platform::shell_environment()?);
         builder.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
+    builder.arg("-c");
+    // Windows では msys2 の規則で引用して渡す（`platform::msys2_arg` 参照）。
+    #[cfg(windows)]
+    builder.raw_arg(crate::platform::msys2_arg(command));
+    #[cfg(not(windows))]
+    builder.arg(command);
     builder
-        .arg("-c")
-        .arg(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // 診断はペインに出さない（ratatui の描画を壊す）。失敗は終了コードと出力で判断する。
@@ -279,6 +283,21 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"ready");
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn backslashes_and_quotes_reach_the_shell_unchanged() {
+        // Windows の msys2 は引用符の中の `\\` と `\"` を戻すので、MSVC の規則で渡すと
+        // UNC パスの `\\` が半分になっていた（`platform::msys2_arg`）。
+        let output = Runner::default()
+            .run(
+                r#"printf '%s' '\\server\share\cache.json' "a\"b""#,
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, br#"\\server\share\cache.jsona"b"#);
     }
 
     #[tokio::test]

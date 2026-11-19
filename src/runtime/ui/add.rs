@@ -52,9 +52,10 @@ impl Editor {
                     self.cursor = 0;
                 }
                 KeyCode::Char(ch)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    if (crate::platform::is_alt_gr_char(&key)
+                        || !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
                         && !ch.is_control() =>
                 {
                     self.insert(&ch.to_string())

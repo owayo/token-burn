@@ -591,3 +591,17 @@ fn invalid_numeric_edit_shows_its_error_in_the_dialog() {
             .contains("入力を確認してください")
     );
 }
+
+#[test]
+fn alt_gr_characters_reach_the_input_field_on_windows() {
+    // Windows では AltGr が Ctrl+Alt として届く。ドイツ語の配列の `@`（AltGr+Q）や `\` が
+    // 入力できなかった。ほかの OS の Ctrl+Alt 付きの文字は従来どおり入れない。
+    let mut input = input::TextInput::new(String::new());
+    for ch in ['@', '\\', '{'] {
+        input.key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+    }
+    assert_eq!(input.text, if cfg!(windows) { "@\\{" } else { "" });
+}

@@ -26,21 +26,35 @@ pub fn bash() -> io::Result<PathBuf> {
             });
         }
     }
+    let bases = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"].map(std::env::var_os);
+    bash_candidates(std::env::var_os("PATH"), &bases).into_iter().find_map(|path| git_bash(&path)).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
+        "Git for Windows Bash was not found. Install Git for Windows or set TOKEN_BURN_BASH to its bin/bash.exe"))
+}
+
+/// Git Bash の候補（PATH の各ディレクトリとその 2 つ上までの親、既定のインストール先）。
+///
+/// 絶対パスの候補だけを残す。`split_paths` は `;;` や末尾の `;` を空のパスとして返し、PATH には
+/// `.` や `node_modules\.bin` のような相対の要素も入り得る。これらを残すと `usr\bin\bash.exe` が
+/// カレントディレクトリ（対象リポジトリなど）から探され、そこに置かれた bash.exe を起動し得た
+/// （[`initialize`] で対象リポジトリから DLL を読ませないようにしている方針と矛盾する）。
+/// Rust std の Windows の実行ファイル探索も空の要素を除いている。
+fn bash_candidates(
+    path: Option<std::ffi::OsString>,
+    bases: &[Option<std::ffi::OsString>],
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+    for directory in std::env::split_paths(&path.unwrap_or_default()) {
         for ancestor in directory.ancestors().take(3) {
             candidates.push(ancestor.join("usr/bin/bash.exe"));
         }
     }
-    for variable in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
-        if let Some(base) = std::env::var_os(variable) {
-            let base = PathBuf::from(base);
-            candidates.push(base.join("Git/usr/bin/bash.exe"));
-            candidates.push(base.join("Programs/Git/usr/bin/bash.exe"));
-        }
+    for base in bases.iter().flatten() {
+        let base = PathBuf::from(base);
+        candidates.push(base.join("Git/usr/bin/bash.exe"));
+        candidates.push(base.join("Programs/Git/usr/bin/bash.exe"));
     }
-    candidates.into_iter().find_map(|path| git_bash(&path)).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
-        "Git for Windows Bash was not found. Install Git for Windows or set TOKEN_BURN_BASH to its bin/bash.exe"))
+    candidates.retain(|candidate| candidate.is_absolute());
+    candidates
 }
 
 pub fn spawn_detached(command: &mut std::process::Command) -> io::Result<std::process::Child> {
@@ -168,5 +182,21 @@ impl Gate {
     }
     pub fn release(&self) -> io::Result<()> {
         std::fs::write(self.0.path().join("ready"), b"")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bash_candidates_ignore_empty_and_relative_path_entries() {
+        // 空の要素や相対の要素から、カレントディレクトリ基準の候補を作らない。
+        let path =
+            std::env::join_paths([r"C:\Program Files\Git\cmd", "", r"relative\bin", "."]).unwrap();
+        let candidates = super::bash_candidates(Some(path), &[None]);
+        assert!(!candidates.is_empty());
+        assert!(
+            candidates.iter().all(|candidate| candidate.is_absolute()),
+            "{candidates:?}"
+        );
     }
 }
