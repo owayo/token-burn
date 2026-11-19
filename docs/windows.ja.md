@@ -6,7 +6,7 @@ Windows 版は x64 MSVC 向けです。ワーカーの端末に ConPTY、タス�
 
 Git for Windows と、利用するエージェントの CLI を用意します。エージェントへログインし、対象リポジトリで実行できることを確認してください。token-burn は Windows Terminal や PowerShell から実行できます。tmux の導入は不要です。
 
-Git Bash は `TOKEN_BURN_BASH`、`CLAUDE_CODE_GIT_BASH_PATH`、`PATH` 上の絶対パスのディレクトリ（空の要素と相対パスの要素は読み飛ばすので、カレントディレクトリの下の `bash.exe` は使いません）、通常のシステム向けインストール先、ユーザー向けインストール先の順に探します。使用するのは Git に付属する `usr/bin/bash.exe` です。`System32` にある WSL の `bash.exe` は使いません。
+Git Bash は `TOKEN_BURN_BASH`、`CLAUDE_CODE_GIT_BASH_PATH`、`PATH` 上の絶対パスのディレクトリ、通常のシステム向けインストール先、ユーザー向けインストール先の順に探します。`PATH` の空の要素と相対パスの要素は読み飛ばすので、カレントディレクトリの下の `bash.exe` は使いません。使用するのは Git に付属する `usr/bin/bash.exe` です。`System32` にある WSL の `bash.exe` は使いません。
 
 Git を別の場所へ入れた場合は、実行前に `TOKEN_BURN_BASH` へ `bin/bash.exe` または `usr/bin/bash.exe` のパスを指定してください。
 

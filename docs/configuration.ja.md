@@ -129,7 +129,7 @@ timezone = "Asia/Tokyo"
 
 **Claude 環境変数の自動付与**: Claude プロセスの環境にはデフォルトで `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` が追加されます。これが無いと `claude -p` はメインターン終了後にバックグラウンドタスク（background 起動のサブエージェント / ワークフロー）を最大 600 秒しか待たず、"Background tasks still running after 600s; terminating." と共に全タスクを強制終了し、仕事が未完のまま成功として報告されます。`0` は無期限待機を意味し、バックグラウンドエージェントの完了通知でメインループが再開して完走できるようになります。agent / profile の `env` で明示すれば上書きできます（空文字を指定すると unset され、Claude 既定の 600 秒に戻ります）。
 
-**Codex 必須フラグの自動付与**: エージェントが Codex（`provider = "codex"`、または実行ファイル名が `codex` / `codex-*` / `codex_*`）の場合、無人実行が承認待ちで止まらないよう `-c approval_policy=never` を実行ファイルの直後に挿入します（`env` の前置きは、`-iu NAME` のような束ねた短いオプションや `--argv0 NAME` の値ごと読み飛ばします）。承認方針を指定済み（`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）なら挿入しません。`env -S '<codex ...>'` の形で起動するコマンドは codex とその引数を 1 つの文字列に収めるので、挿入する位置が無く、何も足しません。この形では文字列の中に承認方針を自分で書いてください。Codex の標準入力は `/dev/null` にするため、ワーカーのペインで打ったキーが Codex へ届くことはありません。
+**Codex 必須フラグの自動付与**: エージェントが Codex（`provider = "codex"`、または実行ファイル名が `codex` / `codex-*` / `codex_*`）の場合、無人実行が承認待ちで止まらないよう `-c approval_policy=never` を実行ファイルの直後に挿入します。`env` の前置きは、`-iu NAME` のような束ねた短いオプションや `--argv0 NAME` の値ごと読み飛ばします。承認方針を指定済み（`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）なら挿入しません。`env -S '<codex ...>'` の形で起動するコマンドは codex とその引数を 1 つの文字列に収めるので、挿入する位置が無く、何も足しません。この形では文字列の中に承認方針を自分で書いてください。Codex の標準入力は `/dev/null` にするため、ワーカーのペインで打ったキーが Codex へ届くことはありません。
 
 **Codex の出力（`codex_output`）**: Codex の人間向けの出力は、ファイルを変更するたびにターン全体の diff を出し直し、ペインとログを埋め尽くします（9 時間のタスクで 141MB のログのうち 126MB）。そのため既定では `codex exec --json` で起動し、イベントを token-burn が整形します（[monitor.ja.md](monitor.ja.md#codex-cli) を参照）。
 
