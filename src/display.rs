@@ -12,8 +12,9 @@ use crate::usage::ScheduleResolver;
 const REDACTED_COMMAND_VALUE: &str = "<redacted>";
 
 /// `env` の短いオプションのうち値を取るもの。`-u` / `-C` / `-S` は GNU と BSD、`-P` は BSD、
-/// `-a`（`--argv0`）は GNU coreutils の env にある。
-const ENV_SHORT_OPTIONS_WITH_VALUE: [char; 5] = ['u', 'C', 'P', 'S', 'a'];
+/// `-a`（`--argv0`）は GNU coreutils の env にある。表示の伏せ字と、実行時に実行ファイルの
+/// 位置を探す `executor::flags::env_command_index` が同じ規則で読むよう共有する。
+pub(crate) const ENV_SHORT_OPTIONS_WITH_VALUE: [char; 5] = ['u', 'C', 'P', 'S', 'a'];
 
 /// ログや実行計画へ表示するコマンドから、秘密値になり得る引数を伏せる。
 pub fn format_command(command: &[String]) -> String {

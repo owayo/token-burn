@@ -152,8 +152,12 @@ pub(super) fn build_task_script(ctx: &TaskCtx<'_>) -> String {
             Some(resume) => {
                 let session = shell_escape(&resume.entry.session_id);
                 let mut resume_command = ctx.agent.command.clone();
-                resume_command.push("--resume".to_string());
-                resume_command.push(resume.entry.session_id.clone());
+                // `--` より後ろは位置引数になるので、その手前に入れる（必須フラグと同じ）。
+                let end = super::flags::claude_option_range(&resume_command).end;
+                resume_command.splice(
+                    end..end,
+                    ["--resume".to_string(), resume.entry.session_id.clone()],
+                );
                 let resume_cmd =
                     build_shell_command(&resume_command, &ctx.agent.env, resume.prompt_file);
                 // RESUMING はワーカーのシェルに残る。再開しないタスクでも必ず値を入れ直す。

@@ -1,4 +1,5 @@
 use crate::config::{CodexOutput, RuntimeAgent, agent_runs_cli, command_basename};
+use crate::display::ENV_SHORT_OPTIONS_WITH_VALUE;
 
 use super::OutputPipeline;
 
@@ -79,16 +80,19 @@ fn ensure_claude_required_flags(agent: &mut RuntimeAgent) {
         .env
         .entry(CLAUDE_PRINT_BG_WAIT_ENV.to_string())
         .or_insert_with(|| "0".to_string());
-    let needs_print = !agent.command.iter().any(|s| s == "-p" || s == "--print");
-    let needs_verbose = !agent.command.iter().any(|s| s == "--verbose");
-    let needs_partial = !agent
-        .command
-        .iter()
-        .any(|s| s == "--include-partial-messages");
+    let options = claude_option_range(&agent.command);
+    let present = |flags: &[&str]| {
+        agent.command[options.clone()]
+            .iter()
+            .any(|arg| flags.contains(&arg.as_str()))
+    };
+    let needs_print = !present(&["-p", "--print"]);
+    let needs_verbose = !present(&["--verbose"]);
+    let needs_partial = !present(&["--include-partial-messages"]);
 
     let mut has_output_format = false;
-    let mut idx = 0usize;
-    while idx < agent.command.len() {
+    let mut idx = options.start;
+    while idx < options.end {
         let arg = &agent.command[idx];
         if arg == "--output-format" {
             has_output_format = true;
@@ -116,20 +120,43 @@ fn ensure_claude_required_flags(agent: &mut RuntimeAgent) {
         idx += 1;
     }
 
+    let mut missing = Vec::new();
     if needs_print {
-        agent.command.push("-p".to_string());
+        missing.push("-p".to_string());
     }
     if needs_verbose {
-        agent.command.push("--verbose".to_string());
+        missing.push("--verbose".to_string());
     }
     if !has_output_format {
-        agent.command.push("--output-format".to_string());
-        agent.command.push("stream-json".to_string());
+        missing.push("--output-format".to_string());
+        missing.push("stream-json".to_string());
     }
     if needs_partial {
-        agent.command.push("--include-partial-messages".to_string());
+        missing.push("--include-partial-messages".to_string());
     }
+    // `--output-format` の値を足した場合に備えて、範囲を求め直してから入れる。
+    let end = claude_option_range(&agent.command).end;
+    agent.command.splice(end..end, missing);
     ensure_disallowed_tool(&mut agent.command, CLAUDE_BLOCKED_INTERACTIVE_TOOL);
+}
+
+/// claude のオプションとして読まれる範囲（実行ファイルの直後から、`--` の手前まで）。
+///
+/// claude（commander）は `--` より後ろをオプションとして読まず、位置引数（プロンプト）として
+/// 扱う。末尾に足していた頃は、`["claude", "--model=opus", "--"]` のような command で
+/// `-p` / `--output-format stream-json` などがすべて `--` の後ろの位置引数になり、print モード
+/// にも stream-json にもならず、AskUserQuestion の禁止も効かなかった。足すフラグは範囲の
+/// 末尾（`--` の手前。無ければ command の末尾）に入れる。env の前置きは読み飛ばす
+/// （`env -S` のように実行ファイルの位置が無い形では、従来どおり command 全体を見る）。
+pub(super) fn claude_option_range(command: &[String]) -> std::ops::Range<usize> {
+    let start = env_command_index(command)
+        .map_or(1, |index| index + 1)
+        .min(command.len());
+    let end = command[start..]
+        .iter()
+        .position(|arg| arg == "--")
+        .map_or(command.len(), |offset| start + offset);
+    start..end
 }
 
 /// codex は無人バッチ実行のため、コマンド承認待ちで停止しないよう
@@ -163,6 +190,13 @@ fn ensure_codex_unattended_flags(command: &mut Vec<String>) {
 ///
 /// `-S` / `--split-string` は実行ファイルを含む引数列を 1 つの文字列に収めるので、独立した
 /// 位置が無い（`None`）。
+///
+/// 短いオプションは束ね得る（`-iu NAME` / `-vC/tmp` / `-iS STRING`）。getopt と同じく、最初に
+/// 現れた値を取るオプション（[`ENV_SHORT_OPTIONS_WITH_VALUE`]）の後ろが値で、それが空なら次の
+/// 引数が値になる。表示の伏せ字（`display::format_command`）と同じ規則で読む。単独の `-u` /
+/// `-C` / `-P` しか値を取るものとして扱っていなかった頃は、`env -iu NAME codex exec` の `NAME` を
+/// 実行ファイルとみなし、承認方針を `env -iu NAME -c approval_policy=never codex exec` の位置へ
+/// 挿していた（env が `illegal option -- c` で起動に失敗し、codex のタスクがすべて失敗する）。
 pub(super) fn env_command_index(command: &[String]) -> Option<usize> {
     if command_basename(command) != "env" {
         return Some(0);
@@ -173,10 +207,19 @@ pub(super) fn env_command_index(command: &[String]) -> Option<usize> {
         if options && arg == "--" {
             idx += 1;
             options = false;
-        } else if options && matches!(arg.as_str(), "-u" | "--unset" | "-C" | "--chdir" | "-P") {
-            idx += 2;
-        } else if options && (arg.starts_with("-S") || arg.starts_with("--split-string")) {
+        } else if options && arg.starts_with("--split-string") {
             return None;
+        } else if options && matches!(arg.as_str(), "--unset" | "--chdir" | "--argv0") {
+            idx += 2;
+        } else if let Some(cluster) = arg
+            .strip_prefix('-')
+            .filter(|cluster| options && !cluster.is_empty() && !cluster.starts_with('-'))
+        {
+            match cluster.find(ENV_SHORT_OPTIONS_WITH_VALUE) {
+                Some(at) if cluster[at..].starts_with('S') => return None,
+                Some(at) if at + 1 == cluster.len() => idx += 2,
+                _ => idx += 1,
+            }
         } else if options && arg.starts_with('-') {
             idx += 1;
         } else if arg.split_once('=').is_some_and(|(key, _)| {
@@ -317,8 +360,10 @@ fn codex_exec_index(command: &[String]) -> Option<usize> {
 }
 
 fn ensure_disallowed_tool(command: &mut Vec<String>, tool: &str) {
-    let mut idx = 0usize;
-    while idx < command.len() {
+    // `--` より後ろは位置引数なので、探すのも足すのもその手前まで（[`claude_option_range`]）。
+    let options = claude_option_range(command);
+    let mut idx = options.start;
+    while idx < options.end {
         if let Some((flag, tools)) = command[idx].split_once('=')
             && is_disallowed_tools_flag(flag)
         {
@@ -333,7 +378,7 @@ fn ensure_disallowed_tool(command: &mut Vec<String>, tool: &str) {
             let flag = command[idx].clone();
             let value_start = idx + 1;
             let mut value_end = value_start;
-            while value_end < command.len() && !command[value_end].starts_with('-') {
+            while value_end < options.end && !command[value_end].starts_with('-') {
                 value_end += 1;
             }
 
@@ -349,7 +394,7 @@ fn ensure_disallowed_tool(command: &mut Vec<String>, tool: &str) {
         idx += 1;
     }
 
-    command.push(format!("--disallowedTools={tool}"));
+    command.insert(options.end, format!("--disallowedTools={tool}"));
 }
 
 fn is_disallowed_tools_flag(flag: &str) -> bool {
@@ -392,10 +437,10 @@ const CLAUDE_SESSION_FLAGS: [&str; 8] = [
 /// シェル文字列の部分一致ではなく argv の要素として判定する（`--resume=<id>` 形式も拾う）。
 /// `--` 以降は位置引数なので見ない。
 pub(super) fn claude_session_flag(command: &[String]) -> Option<&str> {
-    command
+    // env の前置きは読み飛ばす。`env -- KEY=v claude --continue` の env の `--` で
+    // 走査を止めると、claude 側の `--continue` を見落とす。
+    command[claude_option_range(command)]
         .iter()
-        .skip(1)
-        .take_while(|arg| arg.as_str() != "--")
         .find_map(|arg| {
             let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
             CLAUDE_SESSION_FLAGS.contains(&flag).then_some(flag)
@@ -1032,6 +1077,73 @@ mod tests {
         let original = joined.clone();
         ensure_codex_unattended_flags(&mut joined);
         assert_eq!(joined, original);
+        // 束ねた短いオプションの中の -S も同じ（`-iS STRING`）。
+        let mut bundled = ["env", "-iS", "codex exec"].map(String::from).to_vec();
+        let original = bundled.clone();
+        ensure_codex_unattended_flags(&mut bundled);
+        assert_eq!(bundled, original);
+    }
+
+    #[test]
+    fn codex_flags_skip_bundled_env_options_and_their_values() {
+        // `-iu NAME` の NAME や `--argv0 NAME` の NAME は実行ファイルではない。取り違えると
+        // `env -iu NAME -c approval_policy=never codex exec` になり、env が `illegal option -- c`
+        // で起動に失敗していた（--json も付かず CodexRaw になっていた）。
+        for prefix in [
+            vec!["env", "-iu", "OLD_TOKEN"],
+            vec!["env", "-vC", "/tmp"],
+            vec!["env", "-iP", "/usr/local/bin"],
+            vec!["env", "--argv0", "codex"],
+            vec!["env", "-ia", "codex", "-uNAME", "-vC/tmp", "--unset=OTHER"],
+        ] {
+            let mut command: Vec<&str> = prefix.clone();
+            command.extend(["codex", "exec"]);
+            let mut agent = codex_agent(&command, CodexOutput::Auto);
+            assert_eq!(
+                ensure_required_flags(&mut agent),
+                OutputPipeline::CodexJson,
+                "{prefix:?}"
+            );
+            let mut expected: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+            expected.extend(
+                ["codex", "-c", "approval_policy=never", "exec", "--json"].map(String::from),
+            );
+            assert_eq!(agent.command, expected, "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn claude_flags_go_before_the_end_of_options() {
+        // claude は `--` より後ろをオプションとして読まない。末尾に足していた頃は、必須フラグが
+        // すべて位置引数になり、print モードにも stream-json にもならなかった。
+        let mut agent = make_agent(vec!["claude", "--model=opus", "--"]);
+        ensure_required_flags(&mut agent);
+        let delimiter = agent.command.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(delimiter, agent.command.len() - 1, "{:?}", agent.command);
+        for flag in [
+            "-p",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--disallowedTools=AskUserQuestion",
+        ] {
+            let at = agent.command.iter().position(|arg| arg == flag);
+            assert!(
+                at.is_some_and(|at| at < delimiter),
+                "{flag}: {:?}",
+                agent.command
+            );
+        }
+        // `--` の後ろの文字列（位置引数）は、付いているフラグとして数えない。
+        let mut agent = make_agent(vec!["claude", "--", "-p"]);
+        ensure_required_flags(&mut agent);
+        assert_eq!(agent.command[1], "-p", "{:?}", agent.command);
+        assert_eq!(agent.command.last().map(String::as_str), Some("-p"));
+        // env の前置きの `--` は claude の区切りではない。
+        let mut agent = make_agent(vec!["env", "--", "TOKEN=x", "claude", "--continue"]);
+        ensure_required_flags(&mut agent);
+        assert_eq!(claude_session_flag(&agent.command), Some("--continue"));
     }
 
     #[test]
