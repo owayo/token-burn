@@ -820,6 +820,11 @@ fn bash_edit_diff_summary(value: Option<&serde_json::Value>) -> Option<String> {
 }
 
 fn truncate_path_tail(path: &str, max_chars: usize) -> String {
+    // パスも外部入力（Bash で触れたファイル名は `changedFiles` にそのまま出る）。ほかの結果
+    // メタデータと同じく制御文字を除いて 1 行にしてから、末尾を残して切る。素通しにしていた頃は、
+    // 改行や ESC を含むファイル名で完了行が割れ、画面消去や OSC が端末を操作し得た。
+    let path = truncate_inline(path, usize::MAX);
+    let path = path.as_str();
     let char_count = path.chars().count();
     if char_count <= max_chars {
         return path.to_string();

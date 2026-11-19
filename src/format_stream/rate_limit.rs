@@ -507,19 +507,28 @@ fn format_timestamp_clock(info: &serde_json::Value, key: &str) -> Option<String>
 /// 復旧が 1 か月先でも `resets 09:00` としか出ていなかった。
 fn format_clock(ts: i64) -> Option<String> {
     let at = chrono::DateTime::from_timestamp(ts, 0)?.with_timezone(&chrono::Local);
-    Some(format_reset_datetime(at, chrono::Local::now()))
+    format_reset_datetime(at, chrono::Local::now())
 }
 
 /// リセット日時を「当日は時刻のみ / 別日は日付付き」で整形する。
-fn format_reset_datetime(
+///
+/// 現地時刻へ直すと chrono の範囲を超える値（UTC で +262142 年の末日の数時間。壊れた API の
+/// 値で起こり得る）は `None` を返す。`date_naive()` はその範囲で panic し、パイプの中段の
+/// format-stream が落ちると上流の claude を SIGPIPE で巻き添えにし、自動停止の行を書く途中なら
+/// 停止シグナルも書かれなかった。
+pub(super) fn format_reset_datetime(
     at: chrono::DateTime<chrono::Local>,
     now: chrono::DateTime<chrono::Local>,
-) -> String {
-    if at.date_naive() == now.date_naive() {
-        at.format("%H:%M").to_string()
+) -> Option<String> {
+    let local =
+        |dt: &chrono::DateTime<chrono::Local>| dt.naive_utc().checked_add_offset(*dt.offset());
+    let (at, today) = (local(&at)?, local(&now)?.date());
+    let format = if at.date() == today {
+        "%H:%M"
     } else {
-        at.format("%m/%d %H:%M").to_string()
-    }
+        "%m/%d %H:%M"
+    };
+    Some(at.format(format).to_string())
 }
 
 /// stop_file が指定されていれば冪等に作成する（全ワーカーの後続タスクを停止するシグナル）。

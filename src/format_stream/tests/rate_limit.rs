@@ -949,3 +949,28 @@ fn utilization_exactly_at_the_threshold_stops_despite_float_error() {
         assert!(stop_file.exists(), "fallback threshold {threshold}");
     }
 }
+
+#[test]
+fn reset_times_at_the_edge_of_the_calendar_do_not_panic() {
+    // 現地時刻へ直すと chrono の範囲を超える値で `date_naive()` が panic していた（壊れた
+    // resetsAt で format-stream が落ち、自動停止の途中なら停止シグナルも書かれない）。
+    // 時間帯に依存しないよう、+09:00 の Local の値を直接作る。
+    use crate::format_stream::rate_limit::format_reset_datetime;
+    let offset = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+    let local = |ts: i64| {
+        chrono::DateTime::<chrono::Local>::from_naive_utc_and_offset(
+            chrono::DateTime::from_timestamp(ts, 0).unwrap().naive_utc(),
+            offset,
+        )
+    };
+    let now = local(1_800_000_000); // 2027-01-15 17:00 (+09:00)
+    assert_eq!(format_reset_datetime(local(8_210_266_876_799), now), None);
+    assert_eq!(
+        format_reset_datetime(local(1_800_000_000 + 60), now).as_deref(),
+        Some("17:01")
+    );
+    assert_eq!(
+        format_reset_datetime(local(1_800_000_000 + 86_400), now).as_deref(),
+        Some("01/16 17:00")
+    );
+}

@@ -1059,13 +1059,16 @@ pub fn progress_line(controller: &Controller, width: usize) -> String {
 /// Unix 秒をローカル時刻の HH:MM へ。当日でなければ MM/DD HH:MM（待機が翌日まで続くのか
 /// 今日中に明けるのかを読めるようにする）。
 pub fn format_clock(timestamp: i64, now: i64) -> String {
-    let (Some(at), Some(today)) = (
-        Local.timestamp_opt(timestamp, 0).single(),
-        Local.timestamp_opt(now, 0).single(),
-    ) else {
+    // 現地時刻へ直すと chrono の範囲を超える値では `date_naive()` が panic する（runner の中の
+    // モニターが落ちる）。checked に直し、直せない値は数値のまま出す。
+    let local = |timestamp: i64| {
+        let at = Local.timestamp_opt(timestamp, 0).single()?;
+        at.naive_utc().checked_add_offset(*at.offset())
+    };
+    let (Some(at), Some(today)) = (local(timestamp), local(now)) else {
         return timestamp.to_string();
     };
-    if at.date_naive() == today.date_naive() {
+    if at.date() == today.date() {
         at.format("%H:%M").to_string()
     } else {
         at.format("%m/%d %H:%M").to_string()
@@ -1902,6 +1905,11 @@ mod tests {
             format_clock(tomorrow.timestamp(), now.timestamp()),
             tomorrow.format("%m/%d %H:%M").to_string()
         );
+        // 現地時刻へ直すと chrono の範囲を超える値でも panic しない（UTC より東の時間帯で
+        // `date_naive()` が panic していた）。直せる時間帯では日付付きで出る。
+        let edge = 8_210_266_876_799;
+        let text = format_clock(edge, now.timestamp());
+        assert!(text == edge.to_string() || text.contains(':'), "{text}");
     }
 
     #[test]

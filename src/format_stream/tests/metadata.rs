@@ -881,6 +881,23 @@ fn tool_result_metadata_sanitizes_every_external_text_field() {
 }
 
 #[test]
+fn tool_result_metadata_sanitizes_file_paths() {
+    // パスも外部入力。改行や ESC を含むファイル名で完了行が割れ、端末を操作し得た。
+    for value in [
+        serde_json::json!({"filePath": "/repo/a\nb\u{1b}]0;PWNED\u{7}c.rs"}),
+        serde_json::json!({"bashEditDiff": {"files": [], "moreFiles": 1,
+            "changedFiles": ["/repo/x\u{1b}[2J\u{1b}[3Jyc.rs"]}}),
+        serde_json::json!({"bashEditDiff": {"files": [{"filePath": "/repo/\u{1b}[31mzc.rs",
+            "structuredPatch": [{"lines": ["+x"]}]}], "changedFiles": ["/repo/\u{1b}[31mzc.rs"]}}),
+    ] {
+        let metadata = tool_result_metadata(&value);
+        assert!(!metadata.chars().any(char::is_control), "{metadata:?}");
+        assert!(!metadata.contains("PWNED"), "{metadata:?}");
+        assert!(metadata.contains("c.rs"), "{metadata:?}");
+    }
+}
+
+#[test]
 fn tool_result_metadata_preserves_attr_order() {
     // 複数フィールドが ", " で連結され、実装の評価順（truncated → limit → files ...）を保つ
     let value = serde_json::json!({
