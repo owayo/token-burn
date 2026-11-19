@@ -6,7 +6,7 @@ Windows 版は x64 MSVC 向けです。ワーカーの端末に ConPTY、タス�
 
 Git for Windows と、利用するエージェントの CLI を用意します。エージェントへログインし、対象リポジトリで実行できることを確認してください。token-burn は Windows Terminal や PowerShell から実行できます。tmux の導入は不要です。
 
-Git Bash は `TOKEN_BURN_BASH`、`CLAUDE_CODE_GIT_BASH_PATH`、`PATH` 上のディレクトリ、通常のシステム向けインストール先、ユーザー向けインストール先の順に探します。使用するのは Git に付属する `usr/bin/bash.exe` です。`System32` にある WSL の `bash.exe` は使いません。
+Git Bash は `TOKEN_BURN_BASH`、`CLAUDE_CODE_GIT_BASH_PATH`、`PATH` 上の絶対パスのディレクトリ（空の要素と相対パスの要素は読み飛ばすので、カレントディレクトリの下の `bash.exe` は使いません）、通常のシステム向けインストール先、ユーザー向けインストール先の順に探します。使用するのは Git に付属する `usr/bin/bash.exe` です。`System32` にある WSL の `bash.exe` は使いません。
 
 Git を別の場所へ入れた場合は、実行前に `TOKEN_BURN_BASH` へ `bin/bash.exe` または `usr/bin/bash.exe` のパスを指定してください。
 
@@ -21,6 +21,8 @@ runner はこの設定を引き継ぐため、デタッチ後も有効です。�
 エージェントにはネイティブの実行ファイルか、`.cmd`・`.bat` の拡張子がない Bash/npm の shim を使ってください。これらの拡張子を持つバッチファイルは `cmd.exe` を経由し、プロンプト内の文字を解釈し直す場合があります。また、Windows のプロセスのコマンドライン全体には、終端を含めて 32,767 UTF-16 単位の上限があります。引数で渡すプロンプトも、この範囲に収める必要があります。
 
 ワーカーでは、Git Bash がプロンプトの引数を書き換えないように `MSYS2_ARG_CONV_EXCL=*` を設定します。この設定はエージェントにも引き継がれます。エージェントが Bash から Windows の実行ファイルを呼ぶ場合は、`C:/Work/file.py` のような Windows のパスを使ってください。`/tmp/file.py` のような MSYS のパスは自動変換されません。
+
+token-burn 自身が Git Bash に渡すコマンド（ai-usage の呼び出しや、再開前の使用率の確認）は、MSYS2 の規則で引用します。環境変数やレポートの保存先に書いた `\\server\share` のような UNC パスも、そのまま Bash に届きます。Windows は AltGr を Ctrl+Alt として報告しますが、AltGr で打つ文字（ドイツ語配列の `@` や `\` など）も TUI の入力欄に入力でき、ワーカーへは文字として送ります。
 
 ## パスと設定
 

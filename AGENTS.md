@@ -24,11 +24,26 @@ Windows x64 では ConPTY と Git for Windows の Bash を使う。`platform` �
 既定の再接続先は `state::state_path` と同じ位置から解決し、設定の symlink を独自に辿らない。
 runner のロックが解放されていたら最終画面を読み直して完了を確認する。
 設定 TUI は 60 列 × 18 行未満では終了・取り消しだけを受け付け、保存を保留する。
-ツール結果のメタデータも外部入力なので、識別子・種別・状態・コマンド名を含めて
+ツール結果のメタデータも外部入力なので、識別子・種別・状態・コマンド名・ファイルのパスを含めて
 `truncate_inline` で制御文字を除去し、1 行に収める。`gitOperation.commit.branch` は
 コミットの反映先として表示する。
 `Config::parse` のエラーには TOML の値を引用せず、ファイル名と行・列だけを添える。
 `toml::de::Error::message()` も型不一致や未知の列挙値を引用するため、そのまま表示しない。
+スナップショット・モニター画面・操作キューの JSON は `runtime::atomic_json` が先にメモリ上で組み立て、1 回の `write_all` で一時ファイルへ書いてから rename する。
+`serde_json::to_writer` をバッファの無いファイルへ直接使っていた頃は、1 回の保存がトークンごとの `write(2)`（snapshot.json で約 700 回）に分かれ、
+最短 100ms ごとに保存する runner の CPU の大半を占めていた（4 ワーカーの計測で 9〜12% → 2〜3%）。
+`runtime::ansi_lines` は 1 文字列 = 1 行を保証し、中身の改行・制御文字を空白にする（改行を含む command でモニターの最下行の進捗が押し出されていた）。
+runner は失敗を公開する前に実行資産を片付ける。起動元の `launch()` は失敗の公開を見た時点で runner を SIGKILL するため、
+順序が逆だとプロンプト・タスクのスクリプト・env を含む append.json が残る（別の実行が動いている設定で run を打つだけで起きる）。
+UI のフッターは、入力モードの間は通知より案内（INPUT → worker）を優先し、通知は次のキー操作で消す。
+`monitor::inference` は Claude Code 自身が書く応答（`message.model` が `<synthetic>`）をモデルとして採らず、
+人向け出力の codex（`OutputPipeline::CodexRaw`）では推定を起動しない（`.log` しか書かずセッション ID を追えないため、明示指定の値と `not reported` を出す）。
+Windows では AltGr の文字が Ctrl+Alt として届くため、`platform::is_alt_gr_char` で文字として扱う（英字は本物の Ctrl+Alt として残す）。
+`bash -c` でスクリプトを渡す 3 か所（モニターの外部コマンド、実行開始時の ai-usage、再開前の再検証）は、`platform::msys2_arg` で msys2 の規則に引用して `raw_arg` で渡す
+（MSVC の規則のままだと、引用符の中の `\\` が msys2 で半分になり UNC パスが壊れる）。Git Bash の候補は PATH の絶対パスの要素からだけ作る。
+設定 TUI は、値を値で置き換えるときは `insert` を使わず値だけを差し替える（`insert` はキーの上のコメント行を消す）。
+インラインの親の中には InlineTable / インラインの配列を作り、プロファイルの改名では無いキーを作らずに辿る。
+TOML の構文エラーには `config::toml_error_location` でファイル名と行・列を添え、値は引用しない。
 以下に残る tmux のペイン・セッション固有の説明は旧実装の履歴として読む。
 
 週次リセット前にAIコーディングアシスタントのトークンを消費するCLIツール。
@@ -43,11 +58,15 @@ token-burn/
 │   ├── init.rs             # config/prompt 雛形の初期化
 │   ├── config.rs           # TOML設定ファイルの読み込み・バリデーション
 │   ├── config_editor/      # 設定 TUI（文書編集・入力・項目定義・描画）
+│   ├── platform.rs         # runner とモニターが共有するシェル（Bash の探索）・パス変換・終了通知
+│   ├── platform/windows.rs # Windows の Job Object・開始ゲート・Git for Windows の探索
 │   ├── runtime/            # 独立 runner と再接続可能な分割 TUI
-│   │   ├── mod.rs          # セッション・スナップショット・操作キュー・起動
+│   │   ├── mod.rs          # セッション・スナップショット（atomic_json）・操作キュー・起動
 │   │   ├── runner.rs       # PTY ワーカーの監督・操作適用・最終集計
 │   │   ├── pty.rs          # portable-pty と vt100 による入出力・端末画面
-│   │   └── ui.rs           # 接続・デタッチ・ペイン操作・キー入力
+│   │   ├── ui.rs           # 接続・デタッチ・ペイン操作・キー入力
+│   │   ├── ui/add.rs       # 実行中に対象ディレクトリを追加する入力欄（a キー）
+│   │   └── tests.rs        # runtime のテスト
 │   ├── scanner.rs          # ディレクトリスキャン・リポジトリ探索・gh CLI連携
 │   ├── schedule.rs         # 固定リセット計算（曜日ベース）・AgentSchedule/ScheduleSource
 │   ├── usage.rs            # ai-usage --json 連携・ScheduleResolver（スケジュール解決・最寄り選択）
@@ -55,13 +74,17 @@ token-burn/
 │   │   ├── mod.rs          # ExecutionPlan / build_plan / print_plan / execute_plan / ai-usage 同期起動 / 実行後の最終集計（RunSummary・errors.txt）
 │   │   ├── flags.rs        # claude/codex 判定と必須フラグ・env（CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS 等）の自動注入
 │   │   ├── scripts.rs      # ワーカー用シェルスクリプト生成（task/worker、ai-usage の statusline/refresh/disk コマンド、shell_escape/env 前置き）
+│   │   ├── append.rs       # 実行開始時の条件を固定し、TUI から追加された対象を検証して pending を公開する
+│   │   ├── inference.rs    # モニターに出すモデル・effort の初期値（明示指定だけから取る）
 │   │   └── util.rs         # sanitize_filename / task_log_base / strip_ansi / truncate
 │   ├── monitor/            # runner 内で動く監視処理とモニターペインの描画
 │   │   ├── mod.rs          # pub run（監視ループ。画面の公開に失敗しても停止判定を続ける）
 │   │   ├── manifest.rs     # Manifest（runner が書く起動情報 monitor.json）
 │   │   ├── controller.rs   # マーカー・stop/pause file・デッドラインから停止の発行と終了を決める（error-* の読み取り read_errors は最終集計と共有）
+│   │   ├── recovery.rs     # 一時停止中の回復の確認と早期解除（手動リセットの検知）
+│   │   ├── inference.rs    # 実行中セッションの記録から、ヘッダーに出すモデル・effort の実効値を読む
 │   │   ├── system.rs       # CPU・メモリ・スワップ・ロードアベレージの計測（差分と換算。どの OS でもテストする）
-│   │   ├── system/         # OS 固有の読み取り: macos.rs（Mach・sysctl）/ linux.rs / procfs.rs（/proc の解析。どの OS でもテスト）/ unix.rs（getloadavg 等）
+│   │   ├── system/         # OS 固有の読み取り: macos.rs（Mach・sysctl）/ linux.rs / procfs.rs（/proc の解析。どの OS でもテスト）/ unix.rs（getloadavg 等）/ windows.rs（CPU・物理メモリ）
 │   │   ├── history.rs      # 時間窓つきの時系列と、描画幅への集約
 │   │   ├── load.rs         # 負荷の履歴（直近 5 分）
 │   │   ├── usage.rs        # ai-usage --json のキャッシュ更新と statusline（10 秒ごと）
@@ -101,6 +124,7 @@ token-burn/
 │   ├── resume.rs           # 中断セッション（レート制限で終了）の session_id 保存・再開判定（resume.json）
 │   ├── tui.rs              # --interactive の対象選択 TUI（ratatui。選択・並べ替え）
 │   └── display.rs          # ステータス表示・プログレス出力
+├── tests/                  # 結合テスト（execution / native_runtime / windows_runtime / config_editor）
 ├── Makefile                # 開発コマンド (make help で一覧)
 ├── mise.toml               # ツールチェーンの版 (rust)。ローカルと CI の正
 ├── docs/                   # README から分けた詳細 (x.md と x.ja.md の対)
@@ -143,11 +167,11 @@ CI (`.github/workflows/ci.yml`) の quality ジョブは Linux と macOS で `ma
 
 展開後の `RuntimeAgent` 名は全体で一意でなければならず、重複すると設定読み込み時にエラーになります。`[[agents]]` の `name` 重複だけでなく、profile 展開名が別 agent の名前と衝突する場合（agent `claude` が profiles `["work", "home"]` を参照して `claude-home` へ展開され、かつ agent `claude-home` も定義されている場合）も同様です。展開名は `state.json` のキー・レポートディレクトリ名・`--agent` の指定子を兼ねるため、重複すると `--agent <name>` が常に先頭の 1 件しか選べず 2 件目が起動不能になり、別々のエージェントが同じ `state.json` キーへ書いて既定の `dedup_scope = "agent"`（エージェントごとに完全分離）が黙って破れます。
 
-実行ファイルが `claude` の場合、`-p`、`--verbose`、`--output-format stream-json`、`--include-partial-messages`、`--disallowedTools=AskUserQuestion` は自動付与されます。`--output-format` が既存でも値は `stream-json` に正規化されます。既存の `--disallowedTools` / `--disallowed-tools` がある場合は、必要に応じて equals 形式へ正規化して `AskUserQuestion` を追記します。さらに env に `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` をデフォルト注入します。`claude -p` はメインターン終了後にバックグラウンドタスク（background 起動のサブエージェント / Workflow）を既定 600 秒しか待たず強制終了し、未完のまま `is_error:false` で成功終了してしまうため、無期限待機に切り替えて完走させます。agent / profile の `env` に同キーが明示されていれば尊重します（空文字なら unset）。この注入はタスク実行コマンドだけに効かせ、usage-gate / monitor statusline に渡す env スナップショットには含めません。
+実行ファイルが `claude` の場合、`-p`、`--verbose`、`--output-format stream-json`、`--include-partial-messages`、`--disallowedTools=AskUserQuestion` は自動付与されます。`--output-format` が既存でも値は `stream-json` に正規化されます。既存の `--disallowedTools` / `--disallowed-tools` がある場合は、必要に応じて equals 形式へ正規化して `AskUserQuestion` を追記します。足すフラグ（再開時の `--resume <id>` を含む）は、command に `--` があればその手前に入れ、付いているかどうかも `--` の手前（`executor::flags::claude_option_range`。env の前置きは読み飛ばす）だけで判定します。末尾へ足していた頃は、`["claude", "--model=opus", "--"]` のような command で必須フラグがすべて `--` の後ろの位置引数になり、print モードにも stream-json にもなりませんでした。さらに env に `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` をデフォルト注入します。`claude -p` はメインターン終了後にバックグラウンドタスク（background 起動のサブエージェント / Workflow）を既定 600 秒しか待たず強制終了し、未完のまま `is_error:false` で成功終了してしまうため、無期限待機に切り替えて完走させます。agent / profile の `env` に同キーが明示されていれば尊重します（空文字なら unset）。この注入はタスク実行コマンドだけに効かせ、usage-gate / monitor statusline に渡す env スナップショットには含めません。
 
 実行ファイルが `codex` の場合、無人実行で承認待ちにより停止しないよう `-c approval_policy=never` を実行ファイル直後に自動付与します（`codex -c approval_policy=never exec ...`）。`codex exec` には `--ask-for-approval` フラグが無い（0.136.0）ため、サブコマンドのオプション表面に依存しない top-level の config override として挿入します。`--sandbox`（サンドボックス）とは独立した軸のため、サンドボックス指定の有無に関わらず付与します。ユーザーが承認方針を明示済みの場合（`-a` / `--ask-for-approval` / `-c approval_policy=...` / `--dangerously-bypass-approvals-and-sandbox`）は上書きしません。
 
-`provider = "codex"` のコマンドに通常の `env` 前置きがある場合は、オプションと代入を保ち、内側の実行ファイルの直後へ承認方針を挿入します。`env --` の区切りも Codex の `--` と混同せず、内側で指定済みの承認方針を尊重します。`env -S '<codex ...>'` / `--split-string` は実行ファイルとその引数を 1 つの文字列に収めるので、承認方針を挿せる独立した位置が無く、何も足しません（この形では文字列の中に自分で書く）。env の直後へ挿していた頃は `env -c approval_policy=never -S ...` になり、env がオプションの誤りで起動に失敗していました（macOS: `env: illegal option -- c`）。
+`provider = "codex"` のコマンドに通常の `env` 前置きがある場合は、オプションと代入を保ち、内側の実行ファイルの直後へ承認方針を挿入します。`env --` の区切りも Codex の `--` と混同せず、内側で指定済みの承認方針を尊重します。実行ファイルの位置（`executor::flags::env_command_index`）は、表示の伏せ字と同じ getopt の規則（共有の `display::ENV_SHORT_OPTIONS_WITH_VALUE`）で読みます。単独の `-u` / `-C` / `-P` しか値を取るものとして扱っていなかった頃は、`env -iu NAME codex exec` や `env --argv0 NAME codex exec` の `NAME` を実行ファイルとみなし、承認方針を env のオプションの位置へ挿していました（env が `illegal option -- c` で起動に失敗し、codex のタスクがすべて失敗する）。`env -S '<codex ...>'` / `--split-string` は実行ファイルとその引数を 1 つの文字列に収めるので、承認方針を挿せる独立した位置が無く、何も足しません（この形では文字列の中に自分で書く）。env の直後へ挿していた頃は `env -c approval_policy=never -S ...` になり、env がオプションの誤りで起動に失敗していました（macOS: `env: illegal option -- c`）。
 
 codex エージェントは既定で `codex exec --json` として起動し、イベントを `token-burn format-codex` で整形します（後述「codex の出力（format-codex）」）。`--json` は `exec`（別名 `e`）の直後に挿入します。`exec` の位置は、env の前置きと付与済みの承認方針を読み飛ばし、値を取る top-level オプション（`-c` / `-m` / `-p` / `-s` / `-a` / `-C` / `-i` / `--enable` / `--disable` / `--local-provider` / `--add-dir` / `--remote` / `--remote-auth-token-env` と各長形式）を値ごと飛ばして、最初の位置引数として探します。`--` 以降は探しません。`--json`（旧名 `--experimental-json`）が既にあれば足しません。`exec resume ...` でも `exec` の直後に置いた `--json` が効くことと、`e` が `exec` の別名であることは codex-cli 0.161.0 で確認済みです。`[[agents]]` の `codex_output`（`auto` | `json` | `human`、省略時 `auto`）で扱いを変えられます。`auto` は `exec` が見つかったときだけ整形し、見つからない構成（`exec` をラッパー自身が足す等）は従来どおり素通しします。JSONL でない出力を整形器へ流すと読めなくなるためです。`json` は `exec` が見つからなくても整形し（JSONL を出すというユーザーの申告に従う）、`human` は何も足さず素通しします。codex 以外のエージェントに `codex_output` を書くと設定読み込み時にエラーにします。効かない設定が黙って残ると、効いていると誤解したまま運用されるためです。codex かどうかの判定は、実行時のフラグ付与と同じ `config::agent_runs_cli` を使います（両者が食い違うと、検証を通った設定が実行時に無視される）。
 
@@ -532,13 +556,13 @@ jsonl ファイルが存在しない場合は result イベント無しと等価
 - `Monitor` の説明・タイムアウト・condition・persistent、`TaskStop` の task id / task ids / reason、`TaskList`、`TaskGet` の task id、`TaskOutput` の task id / `block` / `timeout`、`TaskCreate` の `subject` / `description` / `activeForm`、`TaskUpdate` の `taskId` / `status` / `owner` / `subject` / `description`、`SendMessage` の送信先/要約、`AskUserQuestion` の質問数・選択肢数、`SlashCommand` の実行コマンド文字列（`/<command> ...`）、Tavily search の query/max/time range/search depth/topic/days/start_date/end_date/include_domains/exclude_domains（`topic=news` はニュース索引への切り替え、`days` はその遡及日数で、いずれも検索対象そのものを変える。実データの `topic:news days:8` は `time_range` を伴わないため、落とすと通常の Web 検索と区別できない。`start_date` / `end_date` も同じ期間フィルタで、実データでは `time_range`(2 件)より `start_date`(13 件)の方が主流。ドメイン絞り込みは検索対象そのものを置き換える強いフィルタで、1 件ならドメイン名を `site=<domain>` / `-site=<domain>`、複数なら件数を `site=<n> domains` として出す。`WebSearch` では allowed/blocked の件数を既に出しているのに Tavily 側だけ落ちていた）と Tavily extract の先頭 URL/件数(+N more)/extract_depth（`mcp__tavily__tavily-search` / `mcp__tavily__tavily_search` のハイフン版・アンダースコア版いずれも対応）、Codex MCP の prompt/cwd/model/sandbox/approval-policy、Context7 MCP ツールの library/query を表示
 - `Workflow`（マルチエージェント・オーケストレーション）の起動対象を表示。名前指定（保存済みワークフロー）は `name`、インライン `script` は `export const meta = { name: ... }` から抽出したワークフロー名とスクリプト文字数（`<名前> (script:<n> chars)`。抽出できなければ `script:<n> chars`）、`scriptPath` 指定（再実行・resume）はファイル名を表示する
 - ツール入力（`input_json_delta` で蓄積した JSON）がパースできない場合は、詳細を空にせず生入力の文字数を `unparsed:<n> chars` として表示し、malformed / truncated を可視化する。これはモデルが不正な JSON をツール入力として出力したケース（`InputValidationError: ... could not be parsed as JSON`）や、レート制限・セッション切断でツール呼び出しがストリーム途中で打ち切られたケースで発生する。`format-stream` はストリーミング経路（`content_block_start` で空入力 → `input_json_delta` で生 JSON 蓄積 → `content_block_stop` で確定）で処理するため、assistant メッセージ最終形の `__unparsedToolInput.len`（`Read` 等の専用ハンドラが別途処理）はストリーミングには現れない。引数なしツールの空入力（`TaskList` 等）は従来どおり空表示を維持する
-- サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）。`task_started` は `task_type=local_agent` のような実行方式より、存在する場合は `subagent_type`（`general-purpose` / `Explore` 等）を優先表示し、`spawn_depth` が 2 以上なら `depth:<n>` を添える（入れ子起動は実行時間とトークン消費が指数的に膨らむ一方、`result.subagent_stats.max_depth` は最終集計しか持たないため、どのタスクが深いのかを追えない。深さ 1 は通常のトップレベル起動でノイズになるので出さない）。`owned_by_subagent:true` なら `nested` を添える。`spawn_depth` が付くのは `local_agent` だけ（実データ 30 件）で、サブエージェントが起動した background Bash は `owned_by_subagent:true` の `local_bash`（84 件）として届き深さの手掛かりを一切持たないため、`depth:` と同じ目的でこちらにも印を付ける。`task_progress` は `usage.total_tokens` を `tokens:<n>` として併記する（実データ 1,254 件すべてに入り 10 万トークン級が常態。token-burn はトークン消費の可視化そのものが目的である一方 `result.usage` はメインループ分しか持たないため、これが無いとどのサブエージェントが枠を食っているかを実行中に読み取れない。`tool_uses` / `duration_ms` は完了行の `duration:` / `tokens:` と重複するので出さない）。`is_backgrounded` は表示しない（Claude Code はサブエージェントを常に背景で起動するため実データの `local_agent` では全件 true で情報量が無く、長時間 Bash の自動バックグラウンド移行は完了行の `assistantAutoBackgrounded`、明示的な背景起動は `Agent` ツール行の `run_in_background` で既に見えている）。`task_notification` は `completed` / `failed` / `stopped` を表示し、`failed` の `summary` を失敗原因として併記する。`usage` が無い場合は duration/token を 0 として表示しない。`task_updated` の `killed` は `failed` / `cancelled` と同じ失敗状態として強調表示し、`patch.error`（例: `Agent terminated early due to an API error: ...`）があれば失敗理由として併記する。これを落とすと `Task failed` だけが残り、無人実行でサブエージェントが死んだ理由を後から追えない。`status` を伴わず `patch.is_backgrounded:true` だけの更新は `Task backgrounded` として表示する（以降そのタスクの出力がインラインに出なくなる理由そのもののため）
+- サブエージェントの開始・進捗・状態更新・完了通知（`task_started` / `task_progress` / `task_updated` / `task_notification`）。`task_started` は `task_type=local_agent` のような実行方式より、存在する場合は `subagent_type`（`general-purpose` / `Explore` 等）を優先表示し、`spawn_depth` が 2 以上なら `depth:<n>` を添える（入れ子起動は実行時間とトークン消費が指数的に膨らむ一方、`result.subagent_stats.max_depth` は最終集計しか持たないため、どのタスクが深いのかを追えない。深さ 1 は通常のトップレベル起動でノイズになるので出さない）。`owned_by_subagent:true` なら `nested` を添える。`spawn_depth` が付くのは `local_agent` だけ（実データ 30 件）で、サブエージェントが起動した background Bash は `owned_by_subagent:true` の `local_bash`（84 件）として届き深さの手掛かりを一切持たないため、`depth:` と同じ目的でこちらにも印を付ける。`task_progress` は `usage.total_tokens` を `tokens:<n>` として併記する（実データ 1,254 件すべてに入り 10 万トークン級が常態。token-burn はトークン消費の可視化そのものが目的である一方 `result.usage` はメインループ分しか持たないため、これが無いとどのサブエージェントが枠を食っているかを実行中に読み取れない。`tool_uses` / `duration_ms` は完了行の `duration:` / `tokens:` と重複するので出さない）。`is_backgrounded` は表示しない（Claude Code はサブエージェントを常に背景で起動するため実データの `local_agent` では全件 true で情報量が無く、長時間 Bash の自動バックグラウンド移行は完了行の `assistantAutoBackgrounded`、明示的な背景起動は `Agent` ツール行の `run_in_background` で既に見えている）。`task_notification` は `completed` / `failed` / `stopped` を表示し、`failed` の `summary` を失敗原因として併記する。`summary_is_report: true` の通知（Claude Code 2.1.32x 以降。実データ 10 件）では `summary` がタスクの説明ではなくサブエージェントの最終報告の本文（複数行・数百〜数千文字）になるため、`task_started` / `task_progress` で覚えたタスクの説明を見出しにする（`report_task_description`）。報告の書き出し（`Task done: I checked ...` や `[harness: ...]` の注記）を 60 文字で切って出していた頃は、どのタスクが終わったのかを読み取れなかった。報告の本文はサブエージェントの最終メッセージとして `💬 @<タスク名>` の行に出ている。`failed` のときは `Task failed (<説明>): <本文の先頭>` として理由も残し、説明を覚えていない抜粋ログでは従来どおり本文の先頭を出す。`usage` が無い場合は duration/token を 0 として表示しない。`task_updated` の `killed` は `failed` / `cancelled` と同じ失敗状態として強調表示し、`patch.error`（例: `Agent terminated early due to an API error: ...`）があれば失敗理由として併記する。これを落とすと `Task failed` だけが残り、無人実行でサブエージェントが死んだ理由を後から追えない。`status` を伴わず `patch.is_backgrounded:true` だけの更新は `Task backgrounded` として表示する（以降そのタスクの出力がインラインに出なくなる理由そのもののため）
 - `background_tasks_changed` は実行中バックグラウンドタスク一覧の高頻度スナップショットで、個々の開始・進捗・完了は上記タスクイベントにより表示済みのため、重複ノイズとして明示的に無視する
 - `commands_changed` は利用可能なスキル/コマンド一覧のスナップショット通知で、1 件で数百 KB（実データで 414KB）に達する。一覧の中身はセッションの実行内容と無関係なため明示的に無視する
 - `vcs_state_changed` は git hook（`git-sc` 等）による自動 commit / push の通知で、`⎇ VCS <kind> (<branch>)` として表示する。無人実行中にコミットや push が作られた事実はセッション後の変更追跡の起点であり、落とすと「いつの間にかコミットが増えている」理由をログから追えない。`branch` は実データの `push` に付随し、`main` へ push したのか作業ブランチへ push したのかで影響範囲が全く違うため kind と併記する（`cwd` は対象リポジトリと重複するので表示しない）
 - 合成 user メッセージ（`isSynthetic: true`）のうち、フックの差し戻し（第 1 行が `<Event> hook feedback:`）を `⚠ Hook feedback (<Event>): <内容>` として表示する。Stop フックが exit 2 / タイムアウトで終わると Claude Code はその内容を合成 user メッセージとしてモデルへ差し戻すが、これは `system` の `hook_response` にも `notification` にも現れない（実データの `"Stop hook feedback:\n⏱ Stop hook timed out after 120s: cargo"`）。無人実行では Stop フックが自動コミット / push を担うため、落とすと「仕事は終わったのにコミットされていない」理由をログから追えない。同じ `isSynthetic` でもスキル本文の注入（`"Base directory for this skill: ..."`）は SKILL.md 全文を含んで巨大になり `Skill` ツール行と重複するため表示しない
 - プラグインが画面へ出すログ（`system` / `ui_log`）を `  ℹ <プラグイン名>: <本文>`（dim、本文は 1 行に畳んで 160 文字まで）として表示する。実データでは「its session.append hook was skipped. "<別のプラグイン>" runs first and sent the event on past it.」のように、プラグインのフックが実行されなかった事実を伝える。対話実行なら画面に出る内容だが、`-p` の無人実行ではこのイベントにしか残らず、未知の subtype として捨てていた頃はフックが動かなかった理由を追えなかった。利用者に対応を求める内容ではないので、警告色（`⚠ Notification`）にはしない
-- Claude Code のシステム通知（`notification`。例: stop hook エラー）と、出力を伴う hook 診断（`hook_progress` / `hook_response` の output / stderr / stdout）。候補キーの走査には `first_string` ではなく `first_non_empty_string` を使う。実データの `hook_response` は `output` / `stdout` / `stderr` を常に持ち、失敗時は stderr にだけ内容が入るため、値が文字列でありさえすれば空文字でも確定する `first_string` だと `output:""` が採用されてフォールバックが到達不能になり、診断が最も欲しい場面で "no output" にしかならなかった
+- Claude Code のシステム通知（`notification`。例: stop hook エラー）と、出力を伴う hook 診断（`hook_progress` / `hook_response` の output / stderr / stdout）。候補キーの走査には `first_string` ではなく `first_non_empty_string` を使う。実データの `hook_response` は `output` / `stdout` / `stderr` を常に持ち、失敗時は stderr にだけ内容が入るため、値が文字列でありさえすれば空文字でも確定する `first_string` だと `output:""` が採用されてフォールバックが到達不能になり、診断が最も欲しい場面で "no output" にしかならなかった。成功したフックが中身の無い JSON（`{}` / `[]`。フックの「指示なし」）だけを出したときは出力が無いのと同じに扱う（`is_empty_hook_json`）。実データでは SessionStart フックの応答 28 件中 7 件が `{}\n` で、成功しているのにどの実行でも冒頭に `⚠ Hook SessionStart:startup (outcome:success, exit:0): {}` が出ていた。失敗したフックでは出力をそのまま残す
 - JSON として解釈できない行（`codex` 等のプレーンテキスト出力、claude ラッパーのバナー、`2>&1` で合流した stderr）は内容をそのまま独立行へ出す（エスケープシーケンスと制御文字だけは除く。後述「制御文字の除去」）。JSON として読めても `type` を持つオブジェクトでない行（数値・文字列・配列・`null`・`type` の無いオブジェクト）はイベントではないので、同じく素通しで出す。イベントの分岐へ流していた頃は黙って捨てられ、stderr に合流したラッパーやフックの出力がペインにも `.log` にも残らなかった。このとき system / `rate_limit_event` / `user` / `tool_progress` と同じく、開きっぱなしの思考・テキスト行を閉じてから書く。タスクスクリプトは `claude ... 2>&1 | format-stream` で stderr を同じパイプへ合流させるため、`API Error: Connection closed mid-response.` のような stderr 行が思考ブロックの途中に到着し得る。直接書くと `💭 ..API Error: ...` の形で連結され、行末のリセットが dim を打ち消して以降の進捗ドット表示まで崩れる
 - 表示対象の system / `rate_limit_event` / `user`（ツール完了行） / `tool_progress` は先にバッファへ描画し、出力がある場合だけ開いている本文・思考行を閉じてから独立行へ書く。バックグラウンド/非同期ツールの完了とハートビートは次ターンのテキスト・思考 delta の途中にも到着するため、直接書くと開きっぱなしの行へ連結される（実ログの整形結果に `💭   ✓ WebFetch` の形が 38 件あった）。実ログでは text delta の `I` と `'ll` の間に rate-limit 通知が到着し、単語中へ通知が連結されていた。`thinking_tokens` / 詳細のない `allowed` など無視対象イベントではバッファが空なので、本文へ不要な改行を増やさない
 - `result.subagent_stats` の起動・完了・失敗・強制終了・起動拒否件数と、バックグラウンド/入れ子起動数、最大深度の集計表示。top-level success でも配下に失敗があれば警告色にする
@@ -684,6 +708,9 @@ remote URL は、有効な `scheme://`（git の `is_url` と同じ `[A-Za-z0-9]
 - **制御文字の除去。** 端末へ書く前に、外から来た文字列のエスケープシーケンス（CSI・OSC・DCS など）と C0/C1 制御文字を取り除きます（`util::sanitize`。format-codex と共通）。`truncate_str` は入口で除き（制御文字を含まない文字列は処理を通らない）、改行を残す経路（テキストのデルタ・ブロック開始時の本文・ストリームを伴わない本文・Edit の差分の行・JSON 以外の行）は `util::sanitize_fragment` を通します（断片の境目で `\r\n` が割れても空行を作らないよう CR は捨てる。ESC は必ず捨てるので、シーケンスが断片をまたいでも端末の操作にはならない）。API リトライのエラー文は `truncate_inline` で 1 行に畳みます。素通しにしていた頃は、実データで `make help` の色付きの出力が完了行にそのまま出ており、`clear` や TUI のコマンドの出力（画面消去・代替画面・tmux のスクロールバックを消す `CSI 3 J`）や MCP・WebFetch の結果に混ざった OSC（ペインのタイトル・OSC 52 のクリップボード）が端末を操作し得ました。CRLF は 1 つの改行として空白 1 つに畳みます。
 - 合成 user メッセージの hook feedback を切り出す `split_hook_feedback` は、`to_lowercase()` した文字列のバイト位置を元文字列へ流用しません。小文字化はバイト長を保存せず、`İ`(U+0130, 2 バイト) は 3 バイトへ伸び、`K`(U+212A KELVIN SIGN, 3 バイト) は 1 バイトへ縮むため、伸びた側では範囲外スライス、縮んだ側では非文字境界スライスで **panic** します。マーカーは純 ASCII なので、元文字列上で ASCII の大文字小文字だけ無視して探す（`find_ascii_case_insensitive`）と位置が常に正しく、UTF-8 では ASCII バイトが多バイト列の内部に現れないため結果は必ず文字境界になります。`format-stream` はパイプ中段なので、panic はパイプを閉じて上流の `claude` を SIGPIPE で道連れにし、数時間の実行を巻き添えにします。
 - レポートディレクトリのクリーンアップ (`cleanup.rs`) は 1 件の失敗で止めず、消せなかったディレクトリはパスと理由を添えて警告して残りの削除を続けます（`CleanupReport { deleted, failures }`）。`clean` は消せなかったものがあれば非ゼロで終わり、`run` の後の自動クリーンアップは警告だけです。最初の失敗で `Err` を返していた頃は、消せないディレクトリが 1 つあるだけで、それより後の古いログ（1 タスクで 100MB を超えることもある）が永久に残り、エラーにパスも出ませんでした。シンボリックリンクはスキップします。`Path::is_dir()` はリンクを追跡するため、リンク先のディレクトリを誤って削除しないよう `is_symlink()` で除外します。
-- デタッチ実行後のログを整形する `strip_ansi` (`executor/util.rs`) は、charset designation エスケープ（`\x1b(B` = G0 を ASCII 集合に指定、`\x1b(0` = DEC 罫線集合等）を introducer（`( ) * + - . /`）＋終端バイトの 3 バイトとして扱い両方を除去します。introducer だけをスキップする実装では終端バイト（`\x1b(B` の `B` 等）が通常文字としてログに漏れます。その他の 2 バイトエスケープ（`\x1b=` / `\x1b>` / `\x1bM` 等）は従来どおり ESC ＋ 1 文字だけスキップします。
+- デタッチ実行後のログを整形する `strip_ansi` (`executor/util.rs`) は、エスケープシーケンスの解析を整形器と同じ `format_stream::util::skip_escape` に任せます（改行・タブなどの制御文字は残す）。charset designation（`\x1b(B` / `\x1b(0`）は中間バイトと終端バイトまで読み飛ばし、終端バイト（`B` 等）を文字として漏らしません。以前は独自の解析を持っており、同じ種類の取りこぼしを 2 か所で別々に直していたうえ、閉じていない OSC が改行を越えてログの残りをすべて消す、ASCII の終端バイトが来ない CSI がその間の日本語を消す、DCS / APC の中身が本文として残る、という差が残っていました。
+- リセット時刻の整形（`format_stream::rate_limit::format_reset_datetime`、`monitor::ui::format_clock`）は `checked_add_offset` で現地時刻へ直します。`DateTime::date_naive()` は、現地時刻が chrono の範囲を超える値（UTC で +262142 年の末日の数時間）で panic し、壊れた resetsAt で format-stream が落ちて自動停止の停止シグナルも書かれませんでした。
+- 完了行のパス（`file:` / `bash-edits:`）も外部入力なので、`truncate_path_tail` は先に `truncate_inline` で制御文字を除いて 1 行にしてから末尾を残して切ります。
+- `rate_control` のテストで、早期解除より後の観測時刻は `after_lift(&lifted, n)`（解除時刻 + n 秒）で作ります。テストの冒頭で取った `now` から `now + 1` を作ると、`lift_pause` が解除時刻を取るまでに秒をまたいだとき解除と同じ秒になり、観測が無視されて並列の全テストの負荷の下でだけ失敗していました。
 - タスクスクリプトは対象ディレクトリへの `cd` をパイプラインと分けて発行します。`build_shell_command` は `cd` を含めず、`build_task_script` が手前で `cd <dir> || { ...; return 0; }` を出します。`cd X && cmd 2>&1 | format-stream | tee log` と書くと bash は `cd X && (3 要素パイプライン)` と解釈するため、cd 失敗時はパイプラインが実行されず `PIPESTATUS` が cd の 1 要素だけになります。すると `FORMAT_EXIT` / `TEE_EXIT` が空文字に展開されて `[ "" -ne 0 ]` が `integer expression expected` を吐き（ワーカーペインに漏れる）、記録されるエラーも真因と無関係な「logging pipeline failed」になっていました。スキャンから実行までの間に対象リポジトリが削除・リネームされると発生します。
 - 実行用一時ディレクトリの準備は `prepare_run_tmp_dir` (`executor/mod.rs`) が行い、`remove_dir_all` の失敗を（`NotFound` を除き）エラーとして伝播したうえで、作成後に unix では `0o700` を設定します。旧実装の `let _ = remove_dir_all(...)` は削除失敗を握り潰して、消せなかったディレクトリをそのまま再利用していました。`temp_dir()` が共有の `/tmp` になる環境（Linux。macOS は `TMPDIR` がユーザーごと）では、他ユーザーが先に `/tmp/token-burn` を作っておくと sticky bit により削除が失敗する一方 `create_dir_all` は成功するため、他人の所有ディレクトリへワーカースクリプトやプロンプトを書き込んでしまいます。

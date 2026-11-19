@@ -6,7 +6,7 @@ The Windows release targets x64 MSVC. It uses ConPTY for worker terminals and Gi
 
 Install Git for Windows and the agent CLI you want to use. Log in to the agent CLI and confirm it works in the target repository. Run token-burn from Windows Terminal or PowerShell. A separate tmux installation is unnecessary.
 
-token-burn finds Git Bash through `TOKEN_BURN_BASH`, `CLAUDE_CODE_GIT_BASH_PATH`, the directories on `PATH`, the usual system installation, and the per-user Git installation, in that order. It uses Git's `usr/bin/bash.exe`; it does not use the WSL `bash.exe` in `System32`.
+token-burn finds Git Bash through `TOKEN_BURN_BASH`, `CLAUDE_CODE_GIT_BASH_PATH`, the absolute directories on `PATH` (empty and relative entries are skipped, so a `bash.exe` under the current directory is never picked up), the usual system installation, and the per-user Git installation, in that order. It uses Git's `usr/bin/bash.exe`; it does not use the WSL `bash.exe` in `System32`.
 
 If Git is installed elsewhere, set `TOKEN_BURN_BASH` to its `bin/bash.exe` or `usr/bin/bash.exe` before starting a run:
 
@@ -21,6 +21,8 @@ The runner inherits this setting, so it remains effective after detaching. Git B
 Use a native executable or a Bash/npm shim without a `.cmd` or `.bat` extension for agent commands. Windows batch files pass arguments through `cmd.exe`, which can reinterpret prompt characters. Windows also limits the complete process command line to 32,767 UTF-16 units, including the terminator; prompts passed as arguments must fit within that limit.
 
 Workers set `MSYS2_ARG_CONV_EXCL=*` so Git Bash does not rewrite prompt arguments. Agent processes inherit this setting too. When an agent invokes a native Windows executable from Bash, use Windows paths such as `C:/Work/file.py`; MSYS paths such as `/tmp/file.py` will not be converted automatically.
+
+Commands that token-burn hands to Git Bash itself (ai-usage calls and the usage check before resuming) are quoted with MSYS2's own rules, so UNC paths such as `\\server\share` in environment values and report directories arrive unchanged. Characters typed with AltGr, which Windows reports as Ctrl+Alt (for example `@` and `\` on a German keyboard), can be entered in the TUI input fields and are sent to workers as text.
 
 ## Paths and configuration
 
