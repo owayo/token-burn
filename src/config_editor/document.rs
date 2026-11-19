@@ -56,14 +56,18 @@ impl Draft {
         let crlf = original
             .as_ref()
             .is_some_and(|text| text.contains("\r\n") && !text.replace("\r\n", "").contains('\n'));
-        let doc = original
-            .as_deref()
-            .unwrap_or(STARTER)
-            .parse::<DocumentMut>()
-            .map_err(|error| {
-                // Never quote source lines; they may include passwords.
-                anyhow::anyhow!("設定の TOML を読めません: {}", error.message())
-            })?;
+        let text = original.as_deref().unwrap_or(STARTER);
+        let doc = text.parse::<DocumentMut>().map_err(|error| {
+            // 元の行は引用しない（パスワードを含み得る）。代わりにファイル名と行・列で位置を
+            // 示す（`Config::parse` と同じ）。位置が無いと、大きな設定のどこが壊れているのかを
+            // 探せなかった。
+            anyhow::anyhow!(
+                "設定の TOML を読めません: {}{}: {}",
+                path.display(),
+                crate::config::toml_error_location(text, error.span()),
+                error.message()
+            )
+        })?;
         let baseline = doc.to_string();
         Ok(Self {
             path,
@@ -104,11 +108,19 @@ impl Draft {
             };
         }
         if section == Section::Profiles {
+            // `ai_usage = { ... }` のようにインラインで書いた親の中には、テーブルの配列
+            // （`[[ai_usage.profiles]]`）を置けない。置くと追加したプロファイルが保存されず
+            // に消えるので、インラインの配列にする。
+            let inline_parent = item.is_inline_table();
             let item = item
                 .get_mut("profiles")
                 .context("ai_usage がテーブルではありません")?;
             if item.is_none() {
-                *item = Item::ArrayOfTables(ArrayOfTables::new());
+                *item = if inline_parent {
+                    Item::Value(Value::Array(Array::new()))
+                } else {
+                    Item::ArrayOfTables(ArrayOfTables::new())
+                };
             }
             Ok(item)
         } else {
@@ -268,19 +280,26 @@ impl Draft {
         match field.kind {
             Kind::Bool(_) => if text == "true" { "オン" } else { "オフ" }.into(),
             Kind::Env => format!("{} 個の変数（Enter で編集）", text.lines().count()),
-            Kind::Lines if field.key == "command" => self
-                .item(page, field.key)
-                .and_then(Item::as_array)
-                .map(|array| {
-                    crate::display::format_command(
+            Kind::Lines if field.key == "command" => {
+                let item = self.item(page, field.key);
+                match item.and_then(Item::as_array) {
+                    Some(array) => crate::display::format_command(
                         &array
                             .iter()
                             .filter_map(Value::as_str)
                             .map(str::to_string)
                             .collect::<Vec<_>>(),
-                    )
-                })
-                .unwrap_or_else(|| "ai-usage --json".into()),
+                    ),
+                    // 省略時に既定のコマンドを使うのは ai-usage の command だけ。エージェントの
+                    // command が配列でない（文字列で書いた等）ときに `ai-usage --json` と出ていた。
+                    None if page.section == Section::Usage && item.is_none() => {
+                        "ai-usage --json".into()
+                    }
+                    None => item
+                        .and_then(Item::as_str)
+                        .map_or_else(|| "未設定".into(), str::to_string),
+                }
+            }
             _ => text.replace('\n', " / "),
         }
     }
@@ -382,13 +401,24 @@ impl Draft {
                     .as_table_like_mut()
                     .context("編集対象がテーブルではありません")?;
                 if let Some(mut replacement) = replacement {
-                    if let (Some(old), Some(new)) = (
-                        table.get(key).and_then(Item::as_value),
-                        replacement.as_value_mut(),
-                    ) {
-                        *new.decor_mut() = old.decor().clone();
+                    // 既存のキーに `insert` を使うと、キー側の書式（そのキーの上にあるコメント行・
+                    // 空行・字下げ）が作り直されて消える（toml_edit 0.25 の `Key::fmt`）。雛形の
+                    // 説明コメントが、値を 1 つ編集して保存しただけで消えていた。値を値で置き
+                    // 換えるときは値だけを差し替え、行末のコメント（値側の書式）も引き継ぐ。
+                    // サブテーブル（`[agents.env]`）を値に置き換えるときは書き直しが要るので
+                    // `insert` を使う。
+                    if table.get(key).is_some_and(Item::is_value)
+                        && let Some(slot) = table.get_mut(key)
+                    {
+                        if let (Some(old), Some(new)) =
+                            (slot.as_value(), replacement.as_value_mut())
+                        {
+                            *new.decor_mut() = old.decor().clone();
+                        }
+                        *slot = replacement;
+                    } else {
+                        table.insert(key, replacement);
                     }
-                    table.insert(key, replacement);
                 } else {
                     table.remove(key);
                 }
@@ -397,13 +427,21 @@ impl Draft {
             if item.get(key).is_none() && replacement.is_none() {
                 return Ok(());
             }
+            // インラインの親（`agents = [ { ... }, ]` の要素など）の中にテーブル（`[...]`）は
+            // 置けない。置くと文書を文字列にするときに toml_edit が panic するので、インラインの
+            // テーブルにする。
+            let inline_parent = item.is_inline_table();
             item = item
                 .get_mut(key)
                 .context("入れ子の設定がテーブルではありません")?;
             if item.is_none() {
-                let mut table = Table::new();
-                table.set_implicit(true);
-                *item = Item::Table(table);
+                *item = if inline_parent {
+                    Item::Value(Value::InlineTable(InlineTable::new()))
+                } else {
+                    let mut table = Table::new();
+                    table.set_implicit(true);
+                    Item::Table(table)
+                };
             }
         }
         if let (Some(old), Some(new)) = (old_name, text) {
@@ -418,13 +456,20 @@ impl Draft {
                 section: Section::Agents,
                 index: Some(index),
             }) && let Some(values) = agent
-                .get_mut("ai_usage")
-                .and_then(|item| item.get_mut("profiles"))
+                // `Item::get_mut` は無いキーを作る（`ai_usage` を持たないエージェントに
+                // `ai_usage = {}` が書かれていた）。作らずに辿る。
+                .as_table_like_mut()
+                .and_then(|agent| agent.get_mut("ai_usage"))
+                .and_then(Item::as_table_like_mut)
+                .and_then(|usage| usage.get_mut("profiles"))
                 .and_then(Item::as_array_mut)
             {
                 for item in values.iter_mut() {
                     if item.as_str() == Some(old) {
+                        // 要素の前後の空白・改行（書式）は残す。
+                        let decor = item.decor().clone();
                         *item = Value::from(new);
+                        *item.decor_mut() = decor;
                     }
                 }
             }

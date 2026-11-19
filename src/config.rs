@@ -292,26 +292,10 @@ impl Config {
         let mut config: Config = toml::from_str(content).map_err(|error: toml::de::Error| {
             // Display だけでなく message() も型不一致や未知の列挙値を引用する。
             // 設定値には認証情報が入り得るため、内容を出さず位置だけで案内する。
-            let location = error
-                .span()
-                .map(|span| {
-                    let (line, column) = content
-                        .char_indices()
-                        .take_while(|(offset, _)| *offset < span.start)
-                        .fold((1, 1), |(line, column), (_, character)| {
-                            if character == '\n' {
-                                (line + 1, 1)
-                            } else {
-                                (line, column + 1)
-                            }
-                        });
-                    format!(" at line {line}, column {column}")
-                })
-                .unwrap_or_default();
             anyhow::anyhow!(
                 "Failed to parse config: {}{}: invalid TOML or field value",
                 path.display(),
-                location
+                toml_error_location(content, error.span())
             )
         })?;
         config.config_dir = path
@@ -701,6 +685,27 @@ fn is_valid_env_key(k: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// TOML の誤りの位置を ` at line <行>, column <列>` の形にする（位置が無ければ空文字）。
+///
+/// 誤りの文言は値を引用し得るので、設定の読み込み（[`Config::parse`]）と設定 TUI の両方が、
+/// 内容の代わりにこの位置で案内する。列は文字（char）単位で数える。
+pub(crate) fn toml_error_location(content: &str, span: Option<std::ops::Range<usize>>) -> String {
+    span.map(|span| {
+        let (line, column) = content
+            .char_indices()
+            .take_while(|(offset, _)| *offset < span.start)
+            .fold((1, 1), |(line, column), (_, character)| {
+                if character == '\n' {
+                    (line + 1, 1)
+                } else {
+                    (line, column + 1)
+                }
+            });
+        format!(" at line {line}, column {column}")
+    })
+    .unwrap_or_default()
 }
 
 /// command の先頭要素（実行ファイル）の basename（拡張子なし）を返す。

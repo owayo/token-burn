@@ -43,7 +43,10 @@ enum Dialog {
     Delete,
     Save {
         lines: Vec<String>,
-        offset: u16,
+        /// 変更一覧のスクロール位置。折り返した後の行数は描画の幅で決まるので、描画が実際に
+        /// 使える位置へ詰めて書き戻す（`Cell`）。キーの側で増やすだけだと、末尾を過ぎて ↓ を
+        /// 押し続けた分だけ ↑ を押しても画面が動かなかった。
+        offset: std::cell::Cell<u16>,
     },
     Quit,
 }
@@ -244,7 +247,7 @@ impl Editor {
                 self.notice.clear();
                 self.dialog = Some(Dialog::Save {
                     lines: self.draft.changes(),
-                    offset: 0,
+                    offset: std::cell::Cell::new(0),
                 });
             }
             Ok(()) => self.notice = "変更はありません。".into(),
@@ -420,11 +423,11 @@ impl Editor {
                 }
                 return Ok(false);
             }
-            Dialog::Save { offset, .. } => {
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => *offset = offset.saturating_sub(1),
-                    KeyCode::Down | KeyCode::Char('j') => *offset = offset.saturating_add(1),
-                    KeyCode::Enter => match self.draft.save() {
+            Dialog::Save { offset, .. } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => offset.set(offset.get().saturating_sub(1)),
+                KeyCode::Down | KeyCode::Char('j') => offset.set(offset.get().saturating_add(1)),
+                KeyCode::Enter => {
+                    match self.draft.save() {
                         Ok(backup) => {
                             self.notice = backup.map(|path| format!("保存しました。バックアップ: {}", path.display())).unwrap_or_else(|| "設定を作成しました。token-burn run -n で実行計画を確認できます。".into());
                             self.saved = true;
@@ -434,10 +437,10 @@ impl Editor {
                             self.notice = format!("保存できません: {error:#}");
                             return Ok(false);
                         }
-                    },
-                    _ => {}
+                    }
                 }
-            }
+                _ => {}
+            },
             Dialog::Quit if key.code == KeyCode::Char('d') => return Ok(true),
             Dialog::Quit if key.code == KeyCode::Char('s') => {
                 self.prepare_save();

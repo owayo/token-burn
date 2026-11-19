@@ -263,10 +263,12 @@ fn draw_dialog(frame: &mut Frame, dialog: &Dialog, notice: &str) {
         }
         Dialog::Save { lines, offset } => {
             let lines = preview_lines(lines, body.width);
-            let offset = (*offset as usize)
+            let clamped = (offset.get() as usize)
                 .min(lines.len().saturating_sub(1))
                 .min(u16::MAX as usize) as u16;
-            frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), body);
+            // 実際に使った位置を書き戻す（次の ↑ がすぐ効くように）。
+            offset.set(clamped);
+            frame.render_widget(Paragraph::new(lines).scroll((clamped, 0)), body);
             "↑↓: スクロール  Enter: 保存して終了  Esc: 編集に戻る。既存ファイルはバックアップします。"
         }
         Dialog::Quit => {

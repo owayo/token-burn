@@ -593,6 +593,128 @@ fn invalid_numeric_edit_shows_its_error_in_the_dialog() {
 }
 
 #[test]
+fn editing_a_value_keeps_the_comment_lines_above_its_key() {
+    // 既存のキーへの `insert` はキー側の書式（上のコメント行）を作り直して消していた。
+    // `token-burn init` の雛形では、値を 1 つ編集して保存しただけで説明のコメントが消えた。
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    crate::init::run_init(&path, false).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+    let mut draft = Draft::open(&path).unwrap();
+    draft
+        .set(
+            page(Section::Settings, None),
+            field(Section::Settings, "cleanup_after"),
+            Some("14d"),
+        )
+        .unwrap();
+    draft
+        .set(
+            page(Section::Agents, Some(0)),
+            field(Section::Agents, "reset_weekday"),
+            Some("tuesday"),
+        )
+        .unwrap();
+    draft.save().unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let lost: Vec<_> = original
+        .lines()
+        .filter(|line| line.trim_start().starts_with('#') && !saved.contains(line))
+        .collect();
+    assert!(lost.is_empty(), "{lost:#?}");
+    let config = crate::config::Config::load(&path).unwrap();
+    assert_eq!(config.settings.cleanup_after.as_deref(), Some("14d"));
+}
+
+#[test]
+fn renaming_a_profile_does_not_add_ai_usage_to_other_agents() {
+    // `Item::get_mut` は無いキーを作るので、`ai_usage` を持たないエージェントに
+    // `ai_usage = {}` が書き込まれていた（変更一覧には出ない）。
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    let mut draft = Draft::open(&path).unwrap();
+    draft.add(Section::Profiles, "").unwrap();
+    draft.save().unwrap();
+    let mut draft = Draft::open(&path).unwrap();
+    draft
+        .set(
+            page(Section::Profiles, Some(0)),
+            field(Section::Profiles, "name"),
+            Some("home"),
+        )
+        .unwrap();
+    draft.save().unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("ai_usage = {"), "{saved}");
+    assert_eq!(draft.profile_options()[0].0, "home");
+}
+
+#[test]
+fn inline_tables_receive_inline_children_instead_of_panicking_or_dropping_them() {
+    // 末尾カンマ付きのインラインのエージェント（TOML 1.1）にプロファイルを選ぶと、
+    // 文書を文字列にする時点で toml_edit が panic していた。
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"agents = [
+  { name = "claude", provider = "claude", command = ["claude"], reset_weekday = "monday", reset_time = "09:00", timezone = "UTC", },
+]
+[settings]
+parallelism = 1
+[prompts]
+default = "x"
+[[targets]]
+directory = "/tmp"
+[ai_usage]
+enabled = true
+[[ai_usage.profiles]]
+name = "work"
+profile = "Work"
+"#,
+    )
+    .unwrap();
+    crate::config::Config::load(&path).unwrap();
+    let mut draft = Draft::open(&path).unwrap();
+    draft
+        .set(
+            page(Section::Agents, Some(0)),
+            field(Section::Agents, "ai_usage.profiles"),
+            Some("work"),
+        )
+        .unwrap();
+    let rendered = draft.doc.to_string();
+    let config = crate::config::Config::parse(&rendered, &path).unwrap();
+    let profiles = config.agents[0].ai_usage.as_ref().unwrap();
+    assert_eq!(profiles.profiles, ["work"]);
+
+    // インラインの `ai_usage` に足したプロファイルが、保存した文書から消えない。
+    std::fs::write(
+        &path,
+        r#"ai_usage = { enabled = false }
+[settings]
+parallelism = 1
+[prompts]
+default = "x"
+[[agents]]
+name = "claude"
+command = ["claude"]
+reset_weekday = "monday"
+reset_time = "09:00"
+timezone = "UTC"
+[[targets]]
+directory = "/tmp"
+"#,
+    )
+    .unwrap();
+    let mut draft = Draft::open(&path).unwrap();
+    draft.add(Section::Profiles, "").unwrap();
+    let rendered = draft.doc.to_string();
+    let config = crate::config::Config::parse(&rendered, &path).unwrap();
+    assert_eq!(config.ai_usage.unwrap().profiles.len(), 1, "{rendered}");
+}
+
+#[test]
 fn alt_gr_characters_reach_the_input_field_on_windows() {
     // Windows では AltGr が Ctrl+Alt として届く。ドイツ語の配列の `@`（AltGr+Q）や `\` が
     // 入力できなかった。ほかの OS の Ctrl+Alt 付きの文字は従来どおり入れない。
@@ -604,4 +726,59 @@ fn alt_gr_characters_reach_the_input_field_on_windows() {
         ));
     }
     assert_eq!(input.text, if cfg!(windows) { "@\\{" } else { "" });
+}
+
+#[test]
+fn a_broken_config_reports_its_position_without_quoting_values() {
+    // 構文の誤りにファイル名も行・列も出ず、大きな設定のどこが壊れているか探せなかった。
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[settings]\nparallelism = 3\napi_key = \"topsecret\n",
+    )
+    .unwrap();
+    let error = format!("{:#}", Draft::open(&path).err().unwrap());
+    assert!(error.contains("config.toml"), "{error}");
+    assert!(error.contains("at line 3"), "{error}");
+    assert!(!error.contains("topsecret"), "{error}");
+}
+
+#[test]
+fn scrolling_the_save_preview_past_its_end_still_scrolls_back_at_once() {
+    // ↓ を押した回数だけ位置が増え続け、末尾を過ぎた分だけ ↑ を押しても画面が動かなかった。
+    use ratatui::{Terminal, backend::TestBackend};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut editor = Editor::new(Draft::open(&tmp.path().join("config.toml")).unwrap());
+    editor.prepare_save();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut draw = |editor: &Editor| {
+        terminal
+            .draw(|frame| {
+                ui::draw(
+                    frame,
+                    editor,
+                    &mut Default::default(),
+                    &mut Default::default(),
+                )
+            })
+            .unwrap();
+    };
+    draw(&editor);
+    let offset = |editor: &Editor| match &editor.dialog {
+        Some(Dialog::Save { offset, .. }) => offset.get(),
+        _ => panic!("the save preview must stay open"),
+    };
+    for _ in 0..60 {
+        editor
+            .key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        draw(&editor);
+    }
+    let end = offset(&editor);
+    assert!(end < 60, "描画で使える位置へ詰める: {end}");
+    editor
+        .key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(offset(&editor), end.saturating_sub(1));
 }
