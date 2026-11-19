@@ -40,8 +40,9 @@ pub(crate) fn sanitize(s: &str) -> String {
 /// ESC の直後から、エスケープシーケンスの残りを読み飛ばす。
 ///
 /// 形が崩れたシーケンスでは、表示すべき文字まで食べないよう途中で止める（例えば CSI の
-/// 途中に日本語が来たら、そこから先は通常の文字として残す）。
-fn skip_escape(chars: &mut Peekable<Chars<'_>>) {
+/// 途中に日本語が来たら、そこから先は通常の文字として残す）。整形器の [`sanitize`] と、
+/// 実行後のログからエスケープシーケンスを除く `executor::util::strip_ansi` の両方が使う。
+pub(crate) fn skip_escape(chars: &mut Peekable<Chars<'_>>) {
     match chars.peek().copied() {
         Some('[') => {
             chars.next();

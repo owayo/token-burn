@@ -49,52 +49,22 @@ pub(crate) fn last_log_line(path: &std::path::Path) -> std::io::Result<String> {
         .collect())
 }
 
+/// 文字列からエスケープシーケンスだけを取り除く（改行・タブなどの制御文字は残す）。
+///
+/// シーケンスの解析は、整形器と同じ [`crate::format_stream::util::skip_escape`] に任せる。
+/// 以前は独自の解析を持っていたため、文字集合の指定（`ESC (B`）の終端バイトの漏れを
+/// 2 か所で別々に直していたうえ、こちらだけ次の取りこぼしが残っていた。
+///
+/// - 閉じていない OSC（`ESC ] ...` の後に BEL も ST も無い）が、改行を越えてログの残り
+///   すべてを消していた（整形器の解析は改行で止める）
+/// - CSI の途中に ASCII の終端バイトが来ないと、その間の日本語などの本文まで消していた
+/// - DCS / SOS / PM / APC（`ESC P` / `ESC X` / `ESC ^` / `ESC _`）の中身が本文として残っていた
 fn strip_ansi(s: &str) -> String {
-    fn is_csi_final(c: char) -> bool {
-        ('\u{40}'..='\u{7e}').contains(&c)
-    }
-
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            match chars.peek().copied() {
-                Some('[') => {
-                    // CSIシーケンス: \x1b[...終端バイト (0x40-0x7E)
-                    chars.next();
-                    for ch in chars.by_ref() {
-                        if is_csi_final(ch) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    // OSCシーケンス: \x1b]...ST (ST = \x1b\\ または \x07)
-                    chars.next();
-                    while let Some(ch) = chars.next() {
-                        if ch == '\x07' {
-                            break;
-                        }
-                        if ch == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                Some('(' | ')' | '*' | '+' | '-' | '.' | '/') => {
-                    // charset designation (例: \x1b(B = G0 を ASCII 集合に指定)。
-                    // introducer( ( ) * + - . / )＋終端バイトの 2 文字構成のため、
-                    // introducer だけ捨てると終端バイト(例: B)が通常文字として漏れる。
-                    // 両方スキップする。
-                    chars.next(); // 文字集合指定の開始文字
-                    chars.next(); // 終端バイト
-                }
-                Some(_) => {
-                    // その他の 2 バイトエスケープ (例: \x1b= / \x1b> / \x1bM) — 次の 1 文字をスキップ
-                    chars.next();
-                }
-                None => break,
-            }
+            crate::format_stream::util::skip_escape(&mut chars);
         } else {
             result.push(c);
         }
@@ -205,6 +175,26 @@ mod tests {
         // BEL/ST終端なしの不完全なOSCシーケンスは安全に除去される
         let input = "text\x1b]2;title";
         assert_eq!(strip_ansi(input), "text");
+    }
+
+    #[test]
+    fn strip_ansi_keeps_the_lines_after_an_unterminated_osc() {
+        // 閉じていない OSC（出力の途中で落ちた場合など）がログの残りを丸ごと消さない。
+        let input = "before\x1b]0;title\nnext line\x1b[31m red\x1b[0m\nlast";
+        assert_eq!(strip_ansi(input), "before\nnext line red\nlast");
+    }
+
+    #[test]
+    fn strip_ansi_keeps_text_inside_a_broken_csi() {
+        // ASCII の終端バイトが来ない壊れた CSI で、続く日本語の本文まで消さない。
+        assert_eq!(strip_ansi("前\x1b[1日本語Z"), "前日本語Z");
+    }
+
+    #[test]
+    fn strip_ansi_removes_string_sequences_with_their_payload() {
+        // DCS / APC の中身は本文ではない（以前は `ESC P` だけ捨てて中身を残していた）。
+        let input = "a\x1bPq#0;2;0;0;0\x1b\\b\x1b_payload\x07c";
+        assert_eq!(strip_ansi(input), "abc");
     }
 
     #[test]
