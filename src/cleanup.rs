@@ -76,7 +76,7 @@ pub fn cleanup_old_reports(report_dir: &Path, max_age: &str) -> Result<CleanupRe
         };
 
         if ts < cutoff {
-            // Keep the session lock through deletion so an active detached run is preserved.
+            // 削除が終わるまでセッションのロックを持ち続け、動作中の切り離された実行を消さない。
             let _session_lock = match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)

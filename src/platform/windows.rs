@@ -1,4 +1,4 @@
-//! Windows process ownership and Git for Windows discovery.
+//! Windows でのプロセスの所有（Job Object）と Git for Windows の探索。
 use std::{
     io,
     path::{Path, PathBuf},
@@ -85,14 +85,14 @@ pub fn initialize() -> io::Result<()> {
         },
     };
     unsafe {
-        // Do not load optional ConPTY DLLs from a target repository or its PATH.
+        // ConPTY が任意で読む DLL を、対象リポジトリやその PATH から読み込ませない。
         if SetDefaultDllDirectories(
             LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
         ) == 0
         {
             return Err(io::Error::last_os_error());
         }
-        // A detached process has no console; in that case there is no handler to reset.
+        // 切り離されたプロセスにはコンソールが無く、その場合は戻すハンドラも無い。
         SetConsoleCtrlHandler(None, 0);
     }
     Ok(())
@@ -117,7 +117,7 @@ fn git_bash(path: &Path) -> Option<PathBuf> {
 }
 
 pub struct Job(HANDLE);
-// Job handles are owned, never borrowed, and Windows permits access from any thread.
+// Job のハンドルは借用せずに所有しており、Windows はどのスレッドからの操作も許す。
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
@@ -169,7 +169,7 @@ impl Drop for Job {
     }
 }
 
-/// A shell cannot start its payload until it belongs to the job.
+/// シェルが Job に属するまで、本来のコマンドを始めさせない開始ゲート。
 pub struct Gate(tempfile::TempDir);
 
 impl Gate {

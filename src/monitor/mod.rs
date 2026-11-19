@@ -57,7 +57,7 @@ pub enum Event {
 /// 通常は待たない。握ったプロセスが止まっていても、これを過ぎたらロック無しで書く。
 const STOP_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Monitor control stays in the detached runner even when no UI is attached.
+/// 監視は切り離された runner の中で動き、UI が接続していなくても止まらない。
 pub async fn run(
     manifest_path: &Path,
     mut interrupts: mpsc::UnboundedReceiver<()>,

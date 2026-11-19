@@ -44,7 +44,7 @@ pub(super) struct Draft {
 
 impl Draft {
     pub fn open(path: &Path) -> Result<Self> {
-        // Follow existing symlinks so atomic replacement preserves the link itself.
+        // 既存のシンボリックリンクは辿る。原子的に置き換えてもリンク自体を残すため。
         let path = match fs::symlink_metadata(path) {
             Ok(_) => path
                 .canonicalize()
@@ -355,7 +355,7 @@ impl Draft {
                 }
             }),
         };
-        // Returning without assignment also preserves the original formatting on Enter.
+        // 値が変わらなければ代入せずに戻る。Enter だけ押したときも元の書式が保たれる。
         if let Some(text) = text {
             let typed = self
                 .item(page, field.key)

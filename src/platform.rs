@@ -1,4 +1,4 @@
-//! Host shell, paths and termination notifications shared by the runner and monitor.
+//! runner とモニターが共有する、ホストのシェル・パス・終了通知の扱い。
 #[cfg(windows)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -126,7 +126,7 @@ pub fn shell_environment() -> std::io::Result<Vec<(std::ffi::OsString, std::ffi:
     let mut environment = vec![
         ("PATH".into(), path),
         ("MSYSTEM".into(), "MINGW64".into()),
-        // All generated paths use C:/ or UNC syntax. Do not rewrite prompts or CLI arguments.
+        // 生成するパスはすべて C:/ か UNC の形にしてある。プロンプトや CLI の引数を書き換えさせない。
         ("MSYS2_ARG_CONV_EXCL".into(), "*".into()),
     ];
     if std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH").is_none_or(|value| value.is_empty()) {
@@ -168,7 +168,7 @@ impl Signals {
             tokio::select! {
                 _ = self.interrupt.recv() => return,
                 _ = self.terminate.recv() => return,
-                // A detached runner continues when a terminal sends SIGHUP.
+                // 端末から SIGHUP が届いても、切り離された runner は動き続ける。
                 _ = self.hangup.recv() => {},
             }
         }

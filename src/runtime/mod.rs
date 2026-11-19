@@ -1,4 +1,4 @@
-//! Detached execution and the native split-screen client share atomic snapshots.
+//! 切り離して動く実行（runner）と分割画面のクライアントは、原子的に置き換えるスナップショットを共有する。
 mod pty;
 mod runner;
 #[cfg(test)]

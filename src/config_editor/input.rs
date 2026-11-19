@@ -1,6 +1,6 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// UTF-8 byte cursor; all movement and deletion stays on character boundaries.
+/// UTF-8 のバイト位置で持つカーソル付きの入力欄。移動と削除は常に文字の境界に留まる。
 pub(super) struct TextInput {
     pub text: String,
     pub cursor: usize,

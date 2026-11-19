@@ -30,7 +30,7 @@ pub(super) fn strip_ansi_from_dir(dir: &std::path::Path) {
     }
 }
 
-/// Read a bounded tail, including logs containing invalid UTF-8 or ANSI-only lines.
+/// ログの末尾を上限付きで読み、最後の空でない行を返す（不正な UTF-8 や ANSI だけの行を含むログにも対応する）。
 pub(crate) fn last_log_line(path: &std::path::Path) -> std::io::Result<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;

@@ -1,4 +1,4 @@
-//! Persistent configuration editor. Draft changes never start agents or scan repositories.
+//! 設定ファイルを編集して保存する TUI。編集中の変更でエージェントを起動したりリポジトリを走査したりはしない。
 mod document;
 mod input;
 mod schema;

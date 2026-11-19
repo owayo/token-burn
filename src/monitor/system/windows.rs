@@ -1,4 +1,4 @@
-//! Windows CPU and physical memory counters. Unavailable Unix load/swap counters stay absent.
+//! Windows の CPU と物理メモリのカウンタ。Unix にしかないロードアベレージとスワップは欠測のままにする。
 use super::{CpuTicks, Memory, Pressure, Reading};
 use windows_sys::Win32::{
     Foundation::FILETIME,

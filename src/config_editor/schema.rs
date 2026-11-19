@@ -111,7 +111,7 @@ const WEEKDAY: &[(&str, &str)] = &[
 
 pub(super) fn fields(section: Section) -> Vec<Field> {
     use Kind::*;
-    // Schema is only presentation and input types. Config::parse owns cross-field validation.
+    // スキーマが持つのは表示と入力の型だけ。項目をまたぐ検証は Config::parse が担う。
     let definitions: &[(&str, &str, &str, Kind, bool)] = match section {
         Section::Settings => &[
             (

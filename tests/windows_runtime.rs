@@ -1,5 +1,5 @@
 #![cfg(windows)]
-//! Exercise the native executable, ConPTY and detached runner with Git for Windows.
+//! Git for Windows の上で、実行ファイル・ConPTY・切り離された runner を実際に動かして確かめる。
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -128,7 +128,7 @@ impl Drop for Run {
         if json(&directory.join("snapshot.json"))["finished"] == true {
             return;
         }
-        // Cleanup must also work during unwinding, without hiding the original failure.
+        // panic による巻き戻しの途中でも片付けを行い、元の失敗を隠さない。
         for index in 0..2 {
             let target = directory.join(format!("controls/cleanup-{index}.json"));
             let temporary = target.with_extension("tmp");

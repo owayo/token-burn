@@ -116,8 +116,8 @@ fn cleanup_keeps_a_locked_native_run() {
             .deleted
             .is_empty()
     );
-    // Parallel PTY tests may fork while this lock is held. Explicit unlock also releases
-    // an inherited descriptor before the child reaches exec and closes it.
+    // 並列に走る PTY のテストが、このロックを持っている間に fork し得る。明示的に解除すれば、
+    // 子が exec して記述子を閉じる前でも、受け継いだ記述子からロックが外れる。
     FileExt::unlock(&lock).unwrap();
     drop(lock);
     assert_eq!(

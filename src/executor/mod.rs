@@ -881,7 +881,7 @@ fn run_ai_usage_sync(
 fn ensure_executable(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        // Windows workers explicitly invoke Bash; there is no executable permission bit.
+        // Windows のワーカーは Bash を明示して起動するので、実行権限のビットは無い（存在だけ確かめる）。
         std::fs::metadata(path)?;
         Ok(())
     }
@@ -1728,8 +1728,8 @@ mod tests {
         .expect_err("存在しないコマンドの起動は失敗するべき");
         let message = error.to_string();
 
-        // Windows starts Bash successfully, then reports the missing inner command.
-        // Bash omits the arguments in that error; native spawn errors print the redacted command.
+        // Windows では Bash の起動自体は成功し、内側のコマンドが無いことを後から報告する。
+        // そのエラーに Bash は引数を含めない。ネイティブの起動エラーは伏せ字にしたコマンドを出す。
         assert!(message.contains(&command[0]), "{message}");
         #[cfg(not(windows))]
         assert!(message.contains("--api-key <redacted>"), "{message}");

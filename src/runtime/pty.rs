@@ -56,8 +56,8 @@ impl Worker {
         command.arg(script);
         #[cfg(windows)]
         let gate = {
-            // portable-pty's base environment includes registry values. Keep this run's
-            // inherited credentials and environment overrides instead.
+            // portable-pty の既定の環境はレジストリの値を含む。それを使わず、この実行が
+            // 受け継いだ認証情報と環境変数の上書きを保つ。
             command.env_clear();
             for (key, value) in std::env::vars_os() {
                 command.env(key, value);
@@ -76,8 +76,8 @@ impl Worker {
         command.env_remove("TMUX_PANE");
         command.env_remove("COLUMNS");
         command.env_remove("LINES");
-        // ConPTY can ask for the inherited cursor while creating the client process.
-        // Start the terminal pumps first so the request can be answered during spawn.
+        // ConPTY は子プロセスを作る途中で、受け継いだカーソル位置を問い合わせることがある。
+        // 起動中にも応答できるよう、端末の入出力の中継を先に始める。
         let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
         let (input, pending) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
@@ -109,7 +109,7 @@ impl Worker {
                         Ok(count) => {
                             let mut parser = parser.lock().unwrap();
                             let (rows, cols) = parser.screen().size();
-                            // Keep draining the PTY even if malformed output trips the parser.
+                            // 壊れた出力で解析器が panic しても、PTY からの読み出しは続ける。
                             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 parser.process(&buffer[..count]);
                             }))
@@ -168,7 +168,7 @@ impl Worker {
             #[cfg(windows)]
             {
                 self.job.terminate();
-                // ConPTY owns the output pipe until ClosePseudoConsole, even after child exit.
+                // 子が終了した後も、ClosePseudoConsole までは ConPTY が出力のパイプを持ち続ける。
                 drop(self.master.take());
             }
             self.dirty.store(true, Ordering::Release);
@@ -243,8 +243,8 @@ impl Worker {
         #[cfg(windows)]
         self.job.terminate();
         if !self.finished {
-            // Every worker is a separate controlling-terminal session. Kill its process group,
-            // including the active pipeline, before collecting the shell.
+            // ワーカーはそれぞれ別の制御端末のセッションで動く。シェルを回収する前に、
+            // 実行中のパイプラインを含むプロセスグループごと終了させる。
             #[cfg(unix)]
             if let Some(pid) = self
                 .child

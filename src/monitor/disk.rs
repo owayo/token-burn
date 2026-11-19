@@ -345,7 +345,7 @@ fn read_statvfs(_path: &str) -> Reading {
     let target = path.to_string_lossy().into_owned();
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let (mut available, mut total, mut free) = (0, 0, 0);
-    // The NUL-terminated path and output counters remain valid throughout the call.
+    // NUL で終わるパスと出力先の変数は、呼び出しの間ずっと有効なまま残る。
     let result =
         unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) };
     if result == 0 || total == 0 {
