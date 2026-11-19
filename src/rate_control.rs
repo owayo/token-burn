@@ -1779,6 +1779,16 @@ mod tests {
         read_pause(path).unwrap().unwrap()
     }
 
+    /// 早期解除の `secs` 秒後の時刻（解除より後に届いた観測の時刻）。
+    ///
+    /// `now + 1` のようにテストの冒頭で取った時刻から作ってはいけない。`lift_pause` は
+    /// 解除の時刻を自分で現在時刻から取るので、冒頭の `now` から解除までに秒をまたぐと
+    /// 解除の時刻が `now + 1` になり、「解除と同じ秒の観測」として無視される。並列で
+    /// 走る全テストの負荷の下でだけ失敗する不安定なテストになっていた。
+    fn after_lift(lifted: &PauseState, secs: i64) -> i64 {
+        lifted.lifted_at.expect("早期解除済みの状態") + secs
+    }
+
     #[test]
     fn lift_pause_marks_the_pause_lifted_without_deleting_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1869,7 +1879,11 @@ mod tests {
         let now = now_epoch();
         let lifted = lifted_pause(&path, now + 3600, now - 100);
         let again = PauseState::new(now + 3600, "five_hour", "request rejected (five_hour)")
-            .observed(PauseSource::Api, PauseCause::Rejected, now + 1)
+            .observed(
+                PauseSource::Api,
+                PauseCause::Rejected,
+                after_lift(&lifted, 1),
+            )
             .with_basis(100.0, Some(now + 3570));
         assert_eq!(
             write_pause(&path, &again).unwrap(),
@@ -1957,11 +1971,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("stop-pause.json");
         let now = now_epoch();
-        lifted_pause(&path, now + 3600, now - 100);
+        let lifted = lifted_pause(&path, now + 3600, now - 100);
         write_pause(
             &path,
             &PauseState::new(now + 3600, "five_hour", "request rejected (five_hour)")
-                .observed(PauseSource::Api, PauseCause::Rejected, now + 1)
+                .observed(
+                    PauseSource::Api,
+                    PauseCause::Rejected,
+                    after_lift(&lifted, 1),
+                )
                 .with_basis(100.0, Some(now + 3570)),
         )
         .unwrap();
@@ -1969,7 +1987,11 @@ mod tests {
             write_pause(
                 &path,
                 &PauseState::new(now + 4000, "five_hour", "usage-gate: five_hour 99%")
-                    .observed(PauseSource::AiUsage, PauseCause::Threshold, now + 2)
+                    .observed(
+                        PauseSource::AiUsage,
+                        PauseCause::Threshold,
+                        after_lift(&lifted, 2),
+                    )
                     .with_basis(99.0, Some(now + 3970)),
             )
             .unwrap(),
@@ -1999,7 +2021,7 @@ mod tests {
         let next = PauseState::new(now + 7200, "five_hour", "new window exhausted").observed(
             PauseSource::Api,
             PauseCause::Threshold,
-            now + 1,
+            after_lift(&lifted, 1),
         );
         assert_eq!(
             write_pause(&path, &next).unwrap(),
@@ -2586,14 +2608,14 @@ mod tests {
         let stop = tmp.path().join("stop");
         let pause_file = pause_path_for(&stop);
         let now = now_epoch();
-        lifted_pause(&pause_file, now + 3600, now - 10);
+        let lifted = lifted_pause(&pause_file, now + 3600, now - 10);
         // 解除より後（次の秒）に届いた拒否。
         write_pause(
             &pause_file,
             &PauseState::new(now + 3600, "five_hour", "request rejected (five_hour)").observed(
                 PauseSource::Api,
                 PauseCause::Rejected,
-                now + 1,
+                after_lift(&lifted, 1),
             ),
         )
         .unwrap();
