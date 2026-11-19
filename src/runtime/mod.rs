@@ -238,7 +238,18 @@ pub fn ansi_lines(lines: &[ratatui::text::Line<'_>]) -> Vec<String> {
                         output.push_str(&format!("\x1b[{code}m"));
                     }
                 }
-                output.push_str(&span.content);
+                // 1 つの文字列を 1 行に保つ。中身に改行があると、UI が読み直したときに行が増え、
+                // 高さちょうどに組んだモニター画面の最下行（進捗）が外へ押し出される（例: 改行を
+                // 含む command）。ESC などの制御文字は画面の操作として解釈されるので空白にする。
+                if span.content.chars().any(char::is_control) {
+                    output.extend(
+                        span.content
+                            .chars()
+                            .map(|ch| if ch.is_control() { ' ' } else { ch }),
+                    );
+                } else {
+                    output.push_str(&span.content);
+                }
             }
             output.push_str("\x1b[0m");
             output

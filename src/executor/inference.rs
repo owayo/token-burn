@@ -1,10 +1,11 @@
 //! 表示の初期値は明示指定だけから取り、CLI 内部の既定値はセッション記録に任せる。
 use std::path::PathBuf;
 
+use super::OutputPipeline;
 use crate::config::{RuntimeAgent, agent_runs_cli};
 use crate::monitor::inference::{Configuration, Provider, Settings};
 
-pub(super) fn configuration(agent: &RuntimeAgent) -> Configuration {
+pub(super) fn configuration(agent: &RuntimeAgent, output: OutputPipeline) -> Configuration {
     let provider = if agent_runs_cli(agent.provider.as_deref(), &agent.command, "claude") {
         Some(Provider::Claude)
     } else if agent_runs_cli(agent.provider.as_deref(), &agent.command, "codex") {
@@ -21,6 +22,13 @@ pub(super) fn configuration(agent: &RuntimeAgent) -> Configuration {
         return config;
     };
     config.settings = explicit_settings(&agent.command, provider);
+    // 人向けの出力（`CodexRaw`）のタスクは `.log` しか書かず、セッション ID を知る手掛かりが
+    // 無い。推定を動かしても値は得られないまま、ヘッダーが `collecting...` で止まっていた。
+    // 明示指定の値だけを出し、欠けた値は `not reported` にする（推定の処理も起動しない）。
+    if output == OutputPipeline::CodexRaw {
+        config.provider = None;
+        return config;
+    }
     let (variable, prefix) = match provider {
         Provider::Claude => ("CLAUDE_CONFIG_DIR", ".claude"),
         Provider::Codex => ("CODEX_HOME", ".codex"),
@@ -184,6 +192,27 @@ mod tests {
             &args.iter().map(|s| (*s).into()).collect::<Vec<_>>(),
             provider,
         )
+    }
+
+    #[test]
+    fn human_codex_output_reports_only_explicit_settings_without_probing() {
+        // 人向けの出力の codex は `.log` しか書かないので、セッションの記録を探しても値は
+        // 得られない。推定を起動せず（provider なし）、明示指定の値だけを残す。
+        let agent = RuntimeAgent {
+            name: "codex".into(),
+            provider: Some("codex".into()),
+            command: ["codex", "-m", "explicit-model", "exec"]
+                .map(String::from)
+                .to_vec(),
+            ..Default::default()
+        };
+        let raw = configuration(&agent, OutputPipeline::CodexRaw);
+        assert_eq!(raw.provider, None);
+        assert_eq!(raw.settings.model.as_deref(), Some("explicit-model"));
+        assert!(raw.session_roots.is_empty());
+        let json = configuration(&agent, OutputPipeline::CodexJson);
+        assert_eq!(json.provider, Some(Provider::Codex));
+        assert_eq!(json.settings.model.as_deref(), Some("explicit-model"));
     }
 
     #[test]

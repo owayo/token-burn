@@ -1148,7 +1148,7 @@ pub fn execute_plan(
         monitor: crate::monitor::Manifest {
             agent: plan.agent.name.clone(),
             command: display::format_command(&plan.agent.command),
-            inference: inference::configuration(&plan.agent),
+            inference: inference::configuration(&plan.agent, plan.output),
             reset: reset_info.into(),
             total: plan.tasks.len(),
             deadline_epoch,

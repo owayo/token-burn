@@ -91,6 +91,28 @@ fn claude_uses_the_matching_session_and_tracks_per_turn_effort() {
 }
 
 #[test]
+fn synthetic_assistant_records_do_not_replace_the_model() {
+    // 上限到達や認証切れの応答は Claude Code 自身が書き、モデルを `<synthetic>` にする
+    // （会話記録の実例: isApiErrorMessage:true・本文 `Not logged in · Please run /login`）。
+    let mut fixture = Fixture::new(Provider::Claude);
+    fixture.start(Provider::Claude);
+    let path = fixture.transcript(Provider::Claude);
+    fs::write(
+        &path,
+        concat!(
+            "{\"type\":\"assistant\",\"message\":{\"model\":\"actual-model\"},\"effort\":\"max\"}\n",
+            "{\"type\":\"assistant\",\"isApiErrorMessage\":true,\"parent_tool_use_id\":null,",
+            "\"message\":{\"model\":\"<synthetic>\",\"content\":[{\"type\":\"text\",",
+            "\"text\":\"You've hit your session limit\"}]}}\n",
+        ),
+    )
+    .unwrap();
+    let settings = fixture.monitor.poll();
+    assert_eq!(settings.model.as_deref(), Some("actual-model"));
+    assert_eq!(settings.effort.as_deref(), Some("max"));
+}
+
+#[test]
 fn codex_rollout_overrides_launch_settings_and_follows_model_changes() {
     let mut fixture = Fixture::new(Provider::Codex);
     fixture.start(Provider::Codex);

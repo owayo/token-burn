@@ -1711,6 +1711,45 @@ mod tests {
     }
 
     #[test]
+    fn newlines_in_the_header_do_not_push_the_progress_line_out_of_the_pane() {
+        // runner は画面を `ansi_lines` で 1 行 1 文字列にして公開し、UI は `parse_lines` で
+        // 読み直す。Agent や Command（設定の引数）に改行があると行が増え、高さちょうどに
+        // 組んだ画面の最下行（進捗）がペインの外へ押し出されていた。
+        let now = Instant::now();
+        let mut manifest = manifest();
+        manifest.agent = "claude\nreview".into();
+        manifest.command = "claude -p --append-system-prompt line1\nline2\r\n\u{1b}[2Jline3".into();
+        let controller = controller(Counts::default());
+        let load = LoadHistory::default();
+        let disk = DiskState::default();
+        let view = View {
+            manifest: &manifest,
+            controller: &controller,
+            usage: &[],
+            load: &load,
+            disk: &disk,
+            alerts: &[],
+            recovery: &recovery::Status::default(),
+            now,
+        };
+        // 内容より低いペイン（高さちょうどに組まれ、最下行が進捗になる）。
+        let height = 12;
+        assert!(layout(&view, 120, 200).len() > height);
+        let published = crate::runtime::ansi_lines(&layout(&view, 120, height));
+        assert_eq!(published.len(), height);
+        let reread: Vec<String> = published
+            .iter()
+            .flat_map(|line| super::super::ansi::parse_lines(line.as_bytes()))
+            .map(|line| line.to_string())
+            .collect();
+        assert_eq!(reread.len(), height, "{reread:#?}");
+        assert!(reread[height - 1].contains("0/10"), "{reread:#?}");
+        let command = find(&reread, "Command:");
+        assert!(command.contains("line1 line2"), "{command:?}");
+        assert!(!command.contains('\u{1b}'), "{command:?}");
+    }
+
+    #[test]
     fn the_gap_before_the_progress_line_never_takes_a_row_from_the_errors() {
         // 進捗・通知の後に 1 行しか残らないときは、その行でエラーの要約を出す
         // （割り当て順: 進捗 → 警告 → 通知 → エラー → 本文。空行はこの順に無い）。

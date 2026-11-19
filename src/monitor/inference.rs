@@ -275,6 +275,10 @@ fn observe_claude(value: &Value, settings: &mut Settings) {
     if value["type"] != "assistant"
         || !value["parent_tool_use_id"].is_null()
         || value["isSidechain"] == true
+        // Claude Code がモデルを呼ばずに自分で書く応答（上限到達・API エラー・
+        // `Not logged in · Please run /login` など）は、`message.model` が `<synthetic>` になる。
+        // 採用すると、上限に達して一時停止している間ずっと `Model: <synthetic>` と出ていた。
+        || value["message"]["model"] == "<synthetic>"
     {
         return;
     }
